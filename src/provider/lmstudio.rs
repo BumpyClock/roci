@@ -30,6 +30,10 @@ impl LmStudioProvider {
 
 #[async_trait]
 impl ModelProvider for LmStudioProvider {
+    fn provider_name(&self) -> &str {
+        "lmstudio"
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

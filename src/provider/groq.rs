@@ -30,6 +30,10 @@ impl GroqProvider {
 
 #[async_trait]
 impl ModelProvider for GroqProvider {
+    fn provider_name(&self) -> &str {
+        "groq"
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

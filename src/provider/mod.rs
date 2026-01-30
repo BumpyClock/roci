@@ -1,6 +1,8 @@
 //! Model provider trait and implementations.
 
+pub mod format;
 pub mod http;
+pub mod schema;
 
 #[cfg(feature = "openai")]
 pub mod openai;
@@ -76,6 +78,8 @@ pub struct ProviderResponse {
 /// Core trait implemented by all model providers.
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
+    /// Provider name (e.g., "openai", "google").
+    fn provider_name(&self) -> &str;
     /// The model ID this provider instance serves.
     fn model_id(&self) -> &str;
 

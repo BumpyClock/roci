@@ -30,6 +30,10 @@ impl ReplicateProvider {
 
 #[async_trait]
 impl ModelProvider for ReplicateProvider {
+    fn provider_name(&self) -> &str {
+        "replicate"
+    }
+
     fn model_id(&self) -> &str {
         &self.model_id
     }

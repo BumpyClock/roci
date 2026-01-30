@@ -142,6 +142,10 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
+    fn provider_name(&self) -> &str {
+        "anthropic"
+    }
+
     fn model_id(&self) -> &str {
         self.model.as_str()
     }

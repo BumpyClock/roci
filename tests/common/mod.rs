@@ -62,6 +62,10 @@ impl MockProvider {
 
 #[async_trait]
 impl ModelProvider for MockProvider {
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+
     fn model_id(&self) -> &str {
         &self.model_id
     }

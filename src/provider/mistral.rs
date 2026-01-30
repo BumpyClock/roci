@@ -30,6 +30,10 @@ impl MistralProvider {
 
 #[async_trait]
 impl ModelProvider for MistralProvider {
+    fn provider_name(&self) -> &str {
+        "mistral"
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

@@ -19,12 +19,14 @@ pub async fn generate_object<T: DeserializeOwned>(
 ) -> Result<GenerateObjectResult<T>, RociError> {
     let supports_json_schema = provider.capabilities().supports_json_schema;
     let supports_json_mode = provider.capabilities().supports_json_mode;
+    let normalized_schema =
+        crate::provider::schema::normalize_schema_for_provider(&schema, provider.provider_name());
 
     let mut settings = settings;
 
     if supports_json_schema {
         settings.response_format = Some(ResponseFormat::JsonSchema {
-            schema: schema.clone(),
+            schema: normalized_schema.clone(),
             name: type_name.to_string(),
         });
     } else if supports_json_mode {
@@ -32,14 +34,14 @@ pub async fn generate_object<T: DeserializeOwned>(
         // Prepend schema instruction to system message
         let schema_instruction = format!(
             "You must respond with valid JSON matching this schema:\n```json\n{}\n```",
-            serde_json::to_string_pretty(&schema).unwrap_or_default()
+            serde_json::to_string_pretty(&normalized_schema).unwrap_or_default()
         );
         messages.insert(0, ModelMessage::system(schema_instruction));
     } else {
         // Fallback: instruct via system message
         let schema_instruction = format!(
             "You must respond with ONLY valid JSON (no markdown, no explanation) matching this schema:\n```json\n{}\n```",
-            serde_json::to_string_pretty(&schema).unwrap_or_default()
+            serde_json::to_string_pretty(&normalized_schema).unwrap_or_default()
         );
         messages.insert(0, ModelMessage::system(schema_instruction));
     }
@@ -51,7 +53,7 @@ pub async fn generate_object<T: DeserializeOwned>(
     // Strip potential markdown code fences
     let json_text = strip_code_fences(&raw_text);
 
-    let object: T = serde_json::from_str(&json_text).map_err(|e| RociError::Serialization(e))?;
+    let object: T = serde_json::from_str(&json_text).map_err(RociError::Serialization)?;
 
     Ok(GenerateObjectResult {
         object,

@@ -11,6 +11,7 @@ use crate::models::capabilities::ModelCapabilities;
 use crate::models::openai::OpenAiModel;
 use crate::types::*;
 
+use super::format::tool_result_to_string;
 use super::http::{bearer_headers, shared_client};
 use super::{ModelProvider, ProviderRequest, ProviderResponse};
 
@@ -75,10 +76,18 @@ impl OpenAiResponsesProvider {
             obj.insert("top_p".into(), top_p.into());
         }
 
-        if let Some(ref effort) = request.settings.reasoning_effort {
+        let needs_reasoning = self.model.is_reasoning() || self.model.is_gpt5_family();
+        if needs_reasoning {
+            let effort = request
+                .settings
+                .reasoning_effort
+                .unwrap_or(ReasoningEffort::Medium);
             obj.insert(
                 "reasoning".into(),
-                serde_json::json!({ "effort": effort.to_string() }),
+                serde_json::json!({
+                    "effort": effort.to_string(),
+                    "summary": "auto",
+                }),
             );
         }
 
@@ -87,11 +96,12 @@ impl OpenAiResponsesProvider {
                 let tool_defs: Vec<serde_json::Value> = tools
                     .iter()
                     .map(|t| {
+                        let parameters = Self::normalize_tool_parameters(&t.parameters);
                         serde_json::json!({
                             "type": "function",
                             "name": t.name,
                             "description": t.description,
-                            "parameters": t.parameters,
+                            "parameters": parameters,
                         })
                     })
                     .collect();
@@ -115,11 +125,52 @@ impl OpenAiResponsesProvider {
                 text_obj.insert("format".into(), format);
             }
         }
-        if let Some(verbosity) = request.settings.text_verbosity {
+        let verbosity = request
+            .settings
+            .text_verbosity
+            .or_else(|| self.model.is_gpt5_family().then_some(TextVerbosity::High));
+        if let Some(verbosity) = verbosity {
             text_obj.insert("verbosity".into(), verbosity.to_string().into());
         }
         if !text_obj.is_empty() {
             obj.insert("text".into(), serde_json::Value::Object(text_obj));
+        }
+
+        if let Some(ref user) = request.settings.user {
+            obj.insert("user".into(), user.clone().into());
+        }
+
+        if let Some(ref options) = request.settings.openai_responses {
+            if let Some(parallel_tool_calls) = options.parallel_tool_calls {
+                obj.insert("parallel_tool_calls".into(), parallel_tool_calls.into());
+            }
+            if let Some(ref previous_response_id) = options.previous_response_id {
+                obj.insert(
+                    "previous_response_id".into(),
+                    previous_response_id.clone().into(),
+                );
+            }
+            if let Some(ref instructions) = options.instructions {
+                obj.insert("instructions".into(), instructions.clone().into());
+            }
+            if let Some(ref metadata) = options.metadata {
+                obj.insert("metadata".into(), serde_json::json!(metadata));
+            }
+            if let Some(service_tier) = options.service_tier {
+                obj.insert("service_tier".into(), service_tier.to_string().into());
+            }
+            if let Some(truncation) = options.truncation {
+                obj.insert("truncation".into(), truncation.to_string().into());
+            }
+            if let Some(store) = options.store {
+                obj.insert("store".into(), store.into());
+            }
+        }
+        if obj.get("truncation").is_none() && self.model.is_reasoning() {
+            obj.insert(
+                "truncation".into(),
+                OpenAiTruncation::Auto.to_string().into(),
+            );
         }
 
         body
@@ -191,7 +242,7 @@ impl OpenAiResponsesProvider {
                             input.push(serde_json::json!({
                                 "type": "function_call_output",
                                 "call_id": tr.tool_call_id,
-                                "output": tr.result.to_string(),
+                                "output": tool_result_to_string(&tr.result),
                             }));
                         }
                     }
@@ -200,10 +251,164 @@ impl OpenAiResponsesProvider {
         }
         input
     }
+
+    /// Convert a Responses API payload into a provider response.
+    fn parse_response(data: ResponsesApiResponse) -> Result<ProviderResponse, RociError> {
+        if let Some(outputs) = data.output {
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+
+            for output in outputs {
+                match output.r#type.as_str() {
+                    "message" => {
+                        if let Some(content) = output.content {
+                            for chunk in content {
+                                match chunk.r#type.as_str() {
+                                    "output_text" => {
+                                        if let Some(segment) = chunk.text {
+                                            text.push_str(&segment);
+                                        }
+                                    }
+                                    "tool_call" => {
+                                        if let Some(tool_call) = chunk.tool_call {
+                                            tool_calls.push(Self::convert_tool_call(tool_call));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    "function_call" => {
+                        if let (Some(id), Some(name), Some(args)) =
+                            (output.call_id, output.name, output.arguments)
+                        {
+                            tool_calls.push(Self::convert_flat_tool_call(&id, &name, &args));
+                        }
+                    }
+                    "tool_call" => {
+                        if let Some(tool_call) = output.tool_call {
+                            tool_calls.push(Self::convert_tool_call(tool_call));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let finish_reason = if !tool_calls.is_empty() {
+                Some(FinishReason::ToolCalls)
+            } else {
+                data.status.as_deref().and_then(|s| match s {
+                    "completed" => Some(FinishReason::Stop),
+                    "incomplete" => Some(FinishReason::Length),
+                    _ => None,
+                })
+            };
+
+            return Ok(ProviderResponse {
+                text,
+                usage: Self::map_usage(data.usage),
+                tool_calls,
+                finish_reason,
+            });
+        }
+
+        if let Some(choices) = data.choices {
+            let choice = choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| RociError::api(200, "No choices in OpenAI response"))?;
+            let tool_calls = choice
+                .message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(Self::convert_tool_call)
+                .collect::<Vec<_>>();
+            let finish_reason = choice
+                .finish_reason
+                .as_deref()
+                .and_then(|reason| match reason {
+                    "stop" => Some(FinishReason::Stop),
+                    "length" => Some(FinishReason::Length),
+                    "tool_calls" => Some(FinishReason::ToolCalls),
+                    _ => None,
+                });
+            let finish_reason = if !tool_calls.is_empty() {
+                Some(FinishReason::ToolCalls)
+            } else {
+                finish_reason
+            };
+
+            return Ok(ProviderResponse {
+                text: choice.message.content.unwrap_or_default(),
+                usage: Self::map_usage(data.usage),
+                tool_calls,
+                finish_reason,
+            });
+        }
+
+        Err(RociError::api(
+            200,
+            "No output or choices in OpenAI response",
+        ))
+    }
+
+    fn convert_flat_tool_call(id: &str, name: &str, args: &str) -> AgentToolCall {
+        AgentToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::from_str(args)
+                .unwrap_or(serde_json::Value::String(args.to_string())),
+            recipient: None,
+        }
+    }
+
+    fn convert_tool_call(tool_call: ResponsesToolCall) -> AgentToolCall {
+        Self::convert_flat_tool_call(
+            &tool_call.id,
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+        )
+    }
+
+    fn map_usage(usage: Option<ResponsesUsage>) -> Usage {
+        usage
+            .map(|u| {
+                let input_tokens = u.input_tokens.or(u.prompt_tokens).unwrap_or(0);
+                let output_tokens = u.output_tokens.or(u.completion_tokens).unwrap_or(0);
+                let total_tokens = u.total_tokens.unwrap_or(input_tokens + output_tokens);
+                Usage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    ..Default::default()
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    fn normalize_tool_parameters(schema: &serde_json::Value) -> serde_json::Value {
+        let normalized = crate::provider::schema::normalize_schema_for_provider(schema, "openai");
+        if let Some(obj) = normalized.as_object() {
+            let mut next = obj.clone();
+            if matches!(next.get("type"), Some(serde_json::Value::String(t)) if t == "object") {
+                next.entry("required")
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            }
+            serde_json::Value::Object(next)
+        } else {
+            normalized
+        }
+    }
 }
 
 #[async_trait]
 impl ModelProvider for OpenAiResponsesProvider {
+    fn provider_name(&self) -> &str {
+        "openai"
+    }
+
     fn model_id(&self) -> &str {
         self.model.as_str()
     }
@@ -239,57 +444,7 @@ impl ModelProvider for OpenAiResponsesProvider {
         }
 
         let data: ResponsesApiResponse = resp.json().await?;
-
-        let mut text = String::new();
-        let mut tool_calls = Vec::new();
-
-        for item in &data.output {
-            if let Some(content) = &item.content {
-                for c in content {
-                    if let Some(ref t) = c.text {
-                        text.push_str(t);
-                    }
-                }
-            }
-            if item.r#type == "function_call" {
-                if let (Some(ref id), Some(ref name), Some(ref args)) =
-                    (&item.call_id, &item.name, &item.arguments)
-                {
-                    tool_calls.push(AgentToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: serde_json::from_str(args)
-                            .unwrap_or(serde_json::Value::String(args.clone())),
-                        recipient: None,
-                    });
-                }
-            }
-        }
-
-        let finish_reason = if !tool_calls.is_empty() {
-            Some(FinishReason::ToolCalls)
-        } else {
-            data.status.as_deref().and_then(|s| match s {
-                "completed" => Some(FinishReason::Stop),
-                "incomplete" => Some(FinishReason::Length),
-                _ => None,
-            })
-        };
-
-        Ok(ProviderResponse {
-            text,
-            usage: data
-                .usage
-                .map(|u| Usage {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    total_tokens: u.input_tokens + u.output_tokens,
-                    ..Default::default()
-                })
-                .unwrap_or_default(),
-            tool_calls,
-            finish_reason,
-        })
+        Self::parse_response(data)
     }
 
     async fn stream_text(
@@ -320,6 +475,10 @@ impl ModelProvider for OpenAiResponsesProvider {
         let stream = async_stream::stream! {
             let mut buffer = String::new();
             let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut call_arguments: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut emitted_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut saw_tool_call = false;
+            let mut saw_text_delta = false;
             futures::pin_mut!(byte_stream);
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -347,13 +506,74 @@ impl ModelProvider for OpenAiResponsesProvider {
                             match event_type {
                                 "response.output_item.added" => {
                                     if let Some(item) = event.get("item") {
+                                        if item.get("type").and_then(|t| t.as_str()) == Some("message")
+                                            && !saw_text_delta
+                                        {
+                                            if let Some(content) =
+                                                item.get("content").and_then(|v| v.as_array())
+                                            {
+                                                for part in content {
+                                                    if part.get("type").and_then(|t| t.as_str())
+                                                        == Some("output_text")
+                                                    {
+                                                        if let Some(text) =
+                                                            part.get("text").and_then(|t| t.as_str())
+                                                        {
+                                                            if !text.is_empty() {
+                                                                saw_text_delta = true;
+                                                                yield Ok(TextStreamDelta {
+                                                                    text: text.to_string(),
+                                                                    event_type: StreamEventType::TextDelta,
+                                                                    tool_call: None,
+                                                                    finish_reason: None,
+                                                                    usage: None,
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
                                             if let (Some(id), Some(name)) = (
                                                 item.get("call_id").and_then(|v| v.as_str()).or_else(|| item.get("id").and_then(|v| v.as_str())),
                                                 item.get("name").and_then(|v| v.as_str()),
                                             ) {
                                                 call_names.insert(id.to_string(), name.to_string());
+                                                if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+                                                    if !emitted_calls.contains(id) {
+                                                        let arguments = serde_json::from_str(args)
+                                                            .unwrap_or(serde_json::Value::String(args.to_string()));
+                                                        yield Ok(TextStreamDelta {
+                                                            text: String::new(),
+                                                            event_type: StreamEventType::ToolCallDelta,
+                                                            tool_call: Some(AgentToolCall {
+                                                                id: id.to_string(),
+                                                                name: name.to_string(),
+                                                                arguments,
+                                                                recipient: None,
+                                                            }),
+                                                            finish_reason: None,
+                                                            usage: None,
+                                                        });
+                                                        emitted_calls.insert(id.to_string());
+                                                        saw_tool_call = true;
+                                                    }
+                                                }
                                             }
+                                        }
+                                    }
+                                }
+                                "response.function_call_arguments.delta" => {
+                                    if let Some(call_id) = event.get("call_id")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| event.get("item_id").and_then(|v| v.as_str()))
+                                    {
+                                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                            call_arguments
+                                                .entry(call_id.to_string())
+                                                .or_default()
+                                                .push_str(delta);
                                         }
                                     }
                                 }
@@ -366,24 +586,34 @@ impl ModelProvider for OpenAiResponsesProvider {
                                         .and_then(|v| v.as_str())
                                         .map(|v| v.to_string())
                                         .or_else(|| call_id.as_ref().and_then(|id| call_names.get(id).cloned()));
-                                    if let (Some(id), Some(name), Some(args)) = (
-                                        call_id,
-                                        name,
-                                        event.get("arguments").and_then(|v| v.as_str()),
-                                    ) {
-                                        let arguments = serde_json::from_str(args)
-                                            .unwrap_or(serde_json::Value::String(args.to_string()));
-                                        yield Ok(TextStreamDelta {
-                                            text: String::new(),
-                                            event_type: StreamEventType::ToolCallDelta,
-                                            tool_call: Some(AgentToolCall { id, name, arguments, recipient: None }),
-                                            finish_reason: None,
-                                            usage: None,
+                                    let args = event
+                                        .get("arguments")
+                                        .and_then(|v| v.as_str())
+                                        .map(|v| v.to_string())
+                                        .or_else(|| {
+                                            call_id
+                                                .as_ref()
+                                                .and_then(|id| call_arguments.remove(id))
                                         });
+                                    if let (Some(id), Some(name), Some(args)) = (call_id, name, args) {
+                                        if !emitted_calls.contains(&id) {
+                                            let arguments = serde_json::from_str(&args)
+                                                .unwrap_or(serde_json::Value::String(args.to_string()));
+                                            yield Ok(TextStreamDelta {
+                                                text: String::new(),
+                                                event_type: StreamEventType::ToolCallDelta,
+                                                tool_call: Some(AgentToolCall { id: id.clone(), name, arguments, recipient: None }),
+                                                finish_reason: None,
+                                                usage: None,
+                                            });
+                                            emitted_calls.insert(id);
+                                            saw_tool_call = true;
+                                        }
                                     }
                                 }
                                 "response.output_text.delta" => {
                                     if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                                        saw_text_delta = true;
                                         yield Ok(TextStreamDelta {
                                             text: delta.to_string(),
                                             event_type: StreamEventType::TextDelta,
@@ -391,6 +621,21 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             finish_reason: None,
                                             usage: None,
                                         });
+                                    }
+                                }
+                                "response.output_text.done" => {
+                                    if !saw_text_delta {
+                                        if let Some(text) = event.get("text").and_then(|t| t.as_str()) {
+                                            if !text.is_empty() {
+                                                yield Ok(TextStreamDelta {
+                                                    text: text.to_string(),
+                                                    event_type: StreamEventType::TextDelta,
+                                                    tool_call: None,
+                                                    finish_reason: None,
+                                                    usage: None,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                                 "response.completed" => {
@@ -416,7 +661,11 @@ impl ModelProvider for OpenAiResponsesProvider {
                                         text: String::new(),
                                         event_type: StreamEventType::Done,
                                         tool_call: None,
-                                        finish_reason: finish.or(Some(FinishReason::Stop)),
+                                        finish_reason: if saw_tool_call {
+                                            Some(FinishReason::ToolCalls)
+                                        } else {
+                                            finish.or(Some(FinishReason::Stop))
+                                        },
                                         usage,
                                     });
                                 }
@@ -436,7 +685,8 @@ impl ModelProvider for OpenAiResponsesProvider {
 
 #[derive(Deserialize)]
 struct ResponsesApiResponse {
-    output: Vec<ResponsesOutputItem>,
+    output: Option<Vec<ResponsesOutputItem>>,
+    choices: Option<Vec<ResponsesChoice>>,
     status: Option<String>,
     usage: Option<ResponsesUsage>,
 }
@@ -444,27 +694,89 @@ struct ResponsesApiResponse {
 #[derive(Deserialize)]
 struct ResponsesOutputItem {
     r#type: String,
-    content: Option<Vec<ResponsesContent>>,
-    // function_call fields
+    content: Option<Vec<ResponsesOutputContent>>,
+    #[serde(default)]
     call_id: Option<String>,
+    #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
     arguments: Option<String>,
+    #[serde(default)]
+    tool_call: Option<ResponsesToolCall>,
 }
 
 #[derive(Deserialize)]
-struct ResponsesContent {
+struct ResponsesOutputContent {
+    r#type: String,
+    #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    tool_call: Option<ResponsesToolCall>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesChoice {
+    message: ResponsesChoiceMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesChoiceMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ResponsesToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesToolCall {
+    id: String,
+    function: ResponsesToolCallFunction,
+}
+
+#[derive(Deserialize)]
+struct ResponsesToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
 struct ResponsesUsage {
-    input_tokens: u32,
-    output_tokens: u32,
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ToolDefinition;
+
+    fn settings() -> GenerationSettings {
+        GenerationSettings {
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            reasoning_effort: None,
+            text_verbosity: None,
+            response_format: None,
+            openai_responses: None,
+            user: None,
+        }
+    }
 
     #[test]
     fn gpt5_rejects_sampling_settings() {
@@ -553,5 +865,214 @@ mod tests {
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["text"]["verbosity"], "low");
         assert_eq!(body["text"]["format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn request_body_defaults_reasoning_and_text_for_gpt5() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["text"]["verbosity"], "high");
+        assert!(body.get("truncation").is_none());
+    }
+
+    #[test]
+    fn request_body_defaults_truncation_for_reasoning_models() {
+        let provider = OpenAiResponsesProvider::new(OpenAiModel::O3, "test-key".to_string(), None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["truncation"], "auto");
+        assert!(body.get("text").is_none());
+    }
+
+    #[test]
+    fn request_body_includes_openai_responses_options() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("tag".to_string(), "value".to_string());
+        let settings = GenerationSettings {
+            user: Some("user-1".to_string()),
+            openai_responses: Some(OpenAiResponsesOptions {
+                parallel_tool_calls: Some(false),
+                previous_response_id: Some("resp_1".to_string()),
+                instructions: Some("Be brief".to_string()),
+                metadata: Some(metadata),
+                service_tier: Some(OpenAiServiceTier::Flex),
+                truncation: Some(OpenAiTruncation::Auto),
+                store: Some(true),
+            }),
+            ..Default::default()
+        };
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings,
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["user"], "user-1");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["previous_response_id"], "resp_1");
+        assert_eq!(body["instructions"], "Be brief");
+        assert_eq!(body["metadata"]["tag"], "value");
+        assert_eq!(body["service_tier"], "flex");
+        assert_eq!(body["truncation"], "auto");
+        assert_eq!(body["store"], true);
+    }
+
+    #[test]
+    fn tool_parameters_are_normalized_for_responses_api() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings::default(),
+            tools: Some(vec![ToolDefinition {
+                name: "get_date".to_string(),
+                description: "Return a date".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "format": {"type": "string"}
+                    }
+                }),
+            }]),
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(
+            body["tools"][0]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            body["tools"][0]["parameters"]["required"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn response_parses_function_call_output_item() {
+        let response = ResponsesApiResponse {
+            output: Some(vec![ResponsesOutputItem {
+                r#type: "function_call".to_string(),
+                content: None,
+                call_id: Some("call_1".to_string()),
+                name: Some("get_date".to_string()),
+                arguments: Some(r#"{"date":"today"}"#.to_string()),
+                tool_call: None,
+            }]),
+            choices: None,
+            status: Some("completed".to_string()),
+            usage: None,
+        };
+
+        let parsed = OpenAiResponsesProvider::parse_response(response).unwrap();
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "get_date");
+        assert_eq!(parsed.finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    #[test]
+    fn response_parses_message_tool_call_content() {
+        let tool_call = ResponsesToolCall {
+            id: "call_1".to_string(),
+            function: ResponsesToolCallFunction {
+                name: "get_date".to_string(),
+                arguments: r#"{"date":"today"}"#.to_string(),
+            },
+        };
+        let response = ResponsesApiResponse {
+            output: Some(vec![ResponsesOutputItem {
+                r#type: "message".to_string(),
+                content: Some(vec![
+                    ResponsesOutputContent {
+                        r#type: "output_text".to_string(),
+                        text: Some("ok".to_string()),
+                        tool_call: None,
+                    },
+                    ResponsesOutputContent {
+                        r#type: "tool_call".to_string(),
+                        text: None,
+                        tool_call: Some(tool_call),
+                    },
+                ]),
+                call_id: None,
+                name: None,
+                arguments: None,
+                tool_call: None,
+            }]),
+            choices: None,
+            status: Some("completed".to_string()),
+            usage: None,
+        };
+
+        let parsed = OpenAiResponsesProvider::parse_response(response).unwrap();
+        assert_eq!(parsed.text, "ok");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "get_date");
+    }
+
+    #[test]
+    fn response_parses_choices_fallback() {
+        let tool_call = ResponsesToolCall {
+            id: "call_1".to_string(),
+            function: ResponsesToolCallFunction {
+                name: "get_date".to_string(),
+                arguments: r#"{"date":"today"}"#.to_string(),
+            },
+        };
+        let response = ResponsesApiResponse {
+            output: None,
+            choices: Some(vec![ResponsesChoice {
+                message: ResponsesChoiceMessage {
+                    content: Some("ok".to_string()),
+                    tool_calls: Some(vec![tool_call]),
+                },
+                finish_reason: Some("stop".to_string()),
+            }]),
+            status: None,
+            usage: None,
+        };
+
+        let parsed = OpenAiResponsesProvider::parse_response(response).unwrap();
+        assert_eq!(parsed.text, "ok");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "get_date");
+    }
+
+    #[test]
+    fn tool_output_uses_plain_string_content() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::tool_result(
+                "call_1",
+                serde_json::Value::String("ok".to_string()),
+                false,
+            )],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["input"][0]["type"], "function_call_output");
+        assert_eq!(body["input"][0]["output"], "ok");
     }
 }

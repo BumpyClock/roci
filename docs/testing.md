@@ -16,6 +16,8 @@ Required environment variables:
 - `OPENAI_API_KEY`
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
 - `OPENAI_COMPAT_API_KEY`, `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_MODEL` (for OpenAI-compatible test)
+Optional environment variables:
+- `OPENAI_COMPAT_SUPPORTS_JSON_SCHEMA=true` to enable OpenAI-compatible JSON schema live test.
 
 ## Environment
 

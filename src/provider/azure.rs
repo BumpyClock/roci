@@ -36,6 +36,10 @@ impl AzureOpenAiProvider {
 
 #[async_trait]
 impl ModelProvider for AzureOpenAiProvider {
+    fn provider_name(&self) -> &str {
+        "azure"
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

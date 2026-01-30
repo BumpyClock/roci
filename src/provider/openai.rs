@@ -11,6 +11,7 @@ use crate::models::capabilities::ModelCapabilities;
 use crate::models::openai::OpenAiModel;
 use crate::types::*;
 
+use super::format::tool_result_to_string;
 use super::http::{bearer_headers, shared_client};
 use super::{ModelProvider, ProviderRequest, ProviderResponse};
 
@@ -49,23 +50,37 @@ impl OpenAiProvider {
 
         let obj = body.as_object_mut().unwrap();
 
+        let is_gpt5 = self.model.is_gpt5_family_id();
         if let Some(max) = request.settings.max_tokens {
-            obj.insert("max_tokens".into(), max.into());
+            let key = if is_gpt5 {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            obj.insert(key.into(), max.into());
         }
         if let Some(temp) = request.settings.temperature {
-            obj.insert("temperature".into(), temp.into());
+            if !is_gpt5 {
+                obj.insert("temperature".into(), temp.into());
+            }
         }
         if let Some(top_p) = request.settings.top_p {
-            obj.insert("top_p".into(), top_p.into());
+            if !is_gpt5 {
+                obj.insert("top_p".into(), top_p.into());
+            }
         }
         if let Some(ref stops) = request.settings.stop_sequences {
             obj.insert("stop".into(), serde_json::json!(stops));
         }
         if let Some(pp) = request.settings.presence_penalty {
-            obj.insert("presence_penalty".into(), pp.into());
+            if !is_gpt5 {
+                obj.insert("presence_penalty".into(), pp.into());
+            }
         }
         if let Some(fp) = request.settings.frequency_penalty {
-            obj.insert("frequency_penalty".into(), fp.into());
+            if !is_gpt5 {
+                obj.insert("frequency_penalty".into(), fp.into());
+            }
         }
         if let Some(seed) = request.settings.seed {
             obj.insert("seed".into(), seed.into());
@@ -124,6 +139,10 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiProvider {
+    fn provider_name(&self) -> &str {
+        "openai"
+    }
+
     fn model_id(&self) -> &str {
         self.model.as_str()
     }
@@ -353,7 +372,7 @@ fn message_to_openai(msg: &ModelMessage) -> serde_json::Value {
             return serde_json::json!({
                 "role": "tool",
                 "tool_call_id": tr.tool_call_id,
-                "content": tr.result.to_string(),
+                "content": tool_result_to_string(&tr.result),
             });
         }
     }
@@ -478,4 +497,76 @@ struct OpenAiStreamToolCallDelta {
 struct OpenAiStreamFunctionDelta {
     name: Option<String>,
     arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(
+        max_tokens: Option<u32>,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        presence_penalty: Option<f64>,
+        frequency_penalty: Option<f64>,
+    ) -> GenerationSettings {
+        GenerationSettings {
+            max_tokens,
+            temperature,
+            top_p,
+            top_k: None,
+            stop_sequences: None,
+            presence_penalty,
+            frequency_penalty,
+            seed: None,
+            reasoning_effort: None,
+            text_verbosity: None,
+            response_format: None,
+            openai_responses: None,
+            user: None,
+        }
+    }
+
+    #[test]
+    fn chat_request_uses_max_completion_tokens_for_gpt5() {
+        let provider = OpenAiProvider::new(
+            OpenAiModel::Custom("gpt-5-nano".to_string()),
+            "test-key".to_string(),
+            None,
+        );
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(Some(128), Some(0.4), Some(0.5), Some(0.1), Some(0.2)),
+            tools: None,
+            response_format: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+
+        assert_eq!(
+            body.get("max_completion_tokens").and_then(|v| v.as_u64()),
+            Some(128)
+        );
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("presence_penalty").is_none());
+        assert!(body.get("frequency_penalty").is_none());
+    }
+
+    #[test]
+    fn tool_result_uses_plain_string_content() {
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "test-key".to_string(), None);
+        let message =
+            ModelMessage::tool_result("call_1", serde_json::Value::String("ok".to_string()), false);
+        let request = ProviderRequest {
+            messages: vec![message],
+            settings: settings(None, None, None, None, None),
+            tools: None,
+            response_format: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["messages"][0]["content"], "ok");
+    }
 }

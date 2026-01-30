@@ -30,6 +30,10 @@ impl OllamaProvider {
 
 #[async_trait]
 impl ModelProvider for OllamaProvider {
+    fn provider_name(&self) -> &str {
+        "ollama"
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

@@ -45,6 +45,18 @@ fn openai_model_uses_responses_api() {
 }
 
 #[test]
+fn openai_gpt41_uses_chat_completions() {
+    assert!(!openai::OpenAiModel::Gpt41.uses_responses_api());
+}
+
+#[test]
+fn openai_gpt51_uses_responses_api() {
+    assert!(openai::OpenAiModel::Gpt51.uses_responses_api());
+    assert!(openai::OpenAiModel::Gpt5Pro.uses_responses_api());
+    assert!(openai::OpenAiModel::Gpt5Thinking.uses_responses_api());
+}
+
+#[test]
 fn openai_model_is_reasoning() {
     assert!(openai::OpenAiModel::O1.is_reasoning());
     assert!(openai::OpenAiModel::O3Mini.is_reasoning());
@@ -102,4 +114,18 @@ fn model_selector_parses_gemini_preview_models() {
     let pro = ModelSelector::parse("google:gemini-3-pro-preview").unwrap();
     assert_eq!(pro.provider_name(), "google");
     assert_eq!(pro.model_id(), "gemini-3-pro-preview");
+}
+
+#[test]
+fn model_selector_parses_gpt5_thinking_models() {
+    let model = ModelSelector::parse("openai:gpt-5-thinking").unwrap();
+    assert_eq!(model.provider_name(), "openai");
+    assert_eq!(model.model_id(), "gpt-5-thinking");
+}
+
+#[test]
+fn model_selector_parses_gemini_flash_lite() {
+    let model = ModelSelector::parse("google:gemini-2.5-flash-lite").unwrap();
+    assert_eq!(model.provider_name(), "google");
+    assert_eq!(model.model_id(), "gemini-2.5-flash-lite");
 }

@@ -2,6 +2,7 @@
 
 use bon::Builder;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use strum::{Display, EnumString};
 
 /// Settings controlling text generation.
@@ -10,6 +11,7 @@ pub struct GenerationSettings {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
     pub stop_sequences: Option<Vec<String>>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
@@ -17,7 +19,54 @@ pub struct GenerationSettings {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub text_verbosity: Option<TextVerbosity>,
     pub response_format: Option<ResponseFormat>,
+    pub openai_responses: Option<OpenAiResponsesOptions>,
     pub user: Option<String>,
+}
+
+/// OpenAI Responses API request options.
+///
+/// Example:
+/// ```
+/// use roci::types::{GenerationSettings, OpenAiResponsesOptions, OpenAiServiceTier};
+///
+/// let settings = GenerationSettings {
+///     openai_responses: Some(OpenAiResponsesOptions {
+///         parallel_tool_calls: Some(false),
+///         service_tier: Some(OpenAiServiceTier::Priority),
+///         ..Default::default()
+///     }),
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenAiResponsesOptions {
+    pub parallel_tool_calls: Option<bool>,
+    pub previous_response_id: Option<String>,
+    pub instructions: Option<String>,
+    pub metadata: Option<HashMap<String, String>>,
+    pub service_tier: Option<OpenAiServiceTier>,
+    pub truncation: Option<OpenAiTruncation>,
+    pub store: Option<bool>,
+}
+
+/// OpenAI service tier for Responses API requests.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum OpenAiServiceTier {
+    Auto,
+    Default,
+    Flex,
+    Priority,
+}
+
+/// OpenAI truncation strategy for Responses API requests.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum OpenAiTruncation {
+    Auto,
+    Disabled,
 }
 
 /// Reasoning effort level for reasoning models.

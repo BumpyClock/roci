@@ -26,6 +26,10 @@ impl AnthropicCompatibleProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicCompatibleProvider {
+    fn provider_name(&self) -> &str {
+        "anthropic-compatible"
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

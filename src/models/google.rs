@@ -12,6 +12,8 @@ pub enum GoogleModel {
     Gemini25Pro,
     #[strum(serialize = "gemini-2.5-flash")]
     Gemini25Flash,
+    #[strum(serialize = "gemini-2.5-flash-lite")]
+    Gemini25FlashLite,
     #[strum(serialize = "gemini-2.0-flash")]
     Gemini20Flash,
     #[strum(serialize = "gemini-3-flash")]
@@ -34,6 +36,7 @@ impl GoogleModel {
         match self {
             Self::Gemini25Pro => "gemini-2.5-pro",
             Self::Gemini25Flash => "gemini-2.5-flash",
+            Self::Gemini25FlashLite => "gemini-2.5-flash-lite",
             Self::Gemini20Flash => "gemini-2.0-flash",
             Self::Gemini3Flash => "gemini-3-flash",
             Self::Gemini3FlashPreview => "gemini-3-flash-preview",
@@ -46,7 +49,7 @@ impl GoogleModel {
 
     pub fn capabilities(&self) -> ModelCapabilities {
         let ctx = match self {
-            Self::Gemini25Pro | Self::Gemini25Flash => 1_000_000,
+            Self::Gemini25Pro | Self::Gemini25Flash | Self::Gemini25FlashLite => 1_000_000,
             Self::Gemini20Flash
             | Self::Gemini3Flash
             | Self::Gemini3FlashPreview

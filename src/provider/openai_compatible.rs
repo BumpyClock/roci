@@ -26,6 +26,10 @@ impl OpenAiCompatibleProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleProvider {
+    fn provider_name(&self) -> &str {
+        "openai-compatible"
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

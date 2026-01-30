@@ -32,6 +32,13 @@ impl GoogleProvider {
         }
     }
 
+    fn api_model_id(&self) -> &str {
+        match self.model {
+            GoogleModel::Gemini3Flash => "gemini-3-flash-preview",
+            _ => self.model.as_str(),
+        }
+    }
+
     fn build_request_body(&self, request: &ProviderRequest) -> serde_json::Value {
         let mut system_instruction = None;
         let mut contents = Vec::new();
@@ -130,16 +137,16 @@ impl GoogleProvider {
             obj.insert("systemInstruction".into(), sys);
         }
 
+        let max_tokens = request.settings.max_tokens.unwrap_or(2048);
+        let temperature = request.settings.temperature.unwrap_or(0.7);
+        let top_p = request.settings.top_p.unwrap_or(0.95);
+        let top_k = request.settings.top_k.unwrap_or(40);
+
         let mut gen_config = serde_json::Map::new();
-        if let Some(max) = request.settings.max_tokens {
-            gen_config.insert("maxOutputTokens".into(), max.into());
-        }
-        if let Some(temp) = request.settings.temperature {
-            gen_config.insert("temperature".into(), temp.into());
-        }
-        if let Some(top_p) = request.settings.top_p {
-            gen_config.insert("topP".into(), top_p.into());
-        }
+        gen_config.insert("maxOutputTokens".into(), max_tokens.into());
+        gen_config.insert("temperature".into(), temperature.into());
+        gen_config.insert("topP".into(), top_p.into());
+        gen_config.insert("topK".into(), top_k.into());
         if let Some(ref stops) = request.settings.stop_sequences {
             gen_config.insert("stopSequences".into(), serde_json::json!(stops));
         }
@@ -150,18 +157,16 @@ impl GoogleProvider {
                 }
                 ResponseFormat::JsonSchema { schema, .. } => {
                     gen_config.insert("responseMimeType".into(), "application/json".into());
-                    gen_config.insert("responseSchema".into(), schema.clone());
+                    gen_config.insert("responseJsonSchema".into(), schema.clone());
                 }
                 ResponseFormat::Text => {}
             }
         }
 
-        if !gen_config.is_empty() {
-            obj.insert(
-                "generationConfig".into(),
-                serde_json::Value::Object(gen_config),
-            );
-        }
+        obj.insert(
+            "generationConfig".into(),
+            serde_json::Value::Object(gen_config),
+        );
 
         if let Some(ref tools) = request.tools {
             if !tools.is_empty() {
@@ -188,6 +193,10 @@ impl GoogleProvider {
 
 #[async_trait]
 impl ModelProvider for GoogleProvider {
+    fn provider_name(&self) -> &str {
+        "google"
+    }
+
     fn model_id(&self) -> &str {
         self.model.as_str()
     }
@@ -204,7 +213,7 @@ impl ModelProvider for GoogleProvider {
         let url = format!(
             "{}/models/{}:generateContent?key={}",
             BASE_URL,
-            self.model.as_str(),
+            self.api_model_id(),
             self.api_key
         );
 
@@ -284,7 +293,7 @@ impl ModelProvider for GoogleProvider {
         let url = format!(
             "{}/models/{}:streamGenerateContent?alt=sse&key={}",
             BASE_URL,
-            self.model.as_str(),
+            self.api_model_id(),
             self.api_key
         );
 
@@ -443,13 +452,38 @@ struct GeminiFunctionCall {
 #[serde(rename_all = "camelCase")]
 struct GeminiUsage {
     prompt_token_count: u32,
+    #[serde(default)]
     candidates_token_count: u32,
+    #[serde(default)]
     total_token_count: u32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn settings(
+        max_tokens: Option<u32>,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        top_k: Option<u32>,
+    ) -> GenerationSettings {
+        GenerationSettings {
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            stop_sequences: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            reasoning_effort: None,
+            text_verbosity: None,
+            response_format: None,
+            openai_responses: None,
+            user: None,
+        }
+    }
 
     #[test]
     fn build_request_body_includes_thought_signature_and_call_id() {
@@ -516,5 +550,80 @@ mod tests {
             body["contents"][1]["parts"][0]["functionResponse"]["name"],
             "get_weather"
         );
+    }
+
+    #[test]
+    fn build_request_body_includes_response_json_schema() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("Return JSON")],
+            settings: GenerationSettings {
+                response_format: Some(ResponseFormat::JsonSchema {
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "ok": { "type": "boolean" } },
+                        "required": ["ok"]
+                    }),
+                    name: "Flag".to_string(),
+                }),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: Some(ResponseFormat::JsonSchema {
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"]
+                }),
+                name: "Flag".to_string(),
+            }),
+        };
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(body["generationConfig"]["responseJsonSchema"].is_object());
+    }
+
+    #[test]
+    fn build_request_body_defaults_generation_config() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(None, None, None, None),
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"].as_u64(),
+            Some(2048)
+        );
+        assert_eq!(body["generationConfig"]["temperature"].as_f64(), Some(0.7));
+        assert_eq!(body["generationConfig"]["topP"].as_f64(), Some(0.95));
+        assert_eq!(body["generationConfig"]["topK"].as_u64(), Some(40));
+    }
+
+    #[test]
+    fn build_request_body_respects_generation_config_overrides() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(Some(1200), Some(0.3), Some(0.5), Some(12)),
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"].as_u64(),
+            Some(1200)
+        );
+        assert_eq!(body["generationConfig"]["temperature"].as_f64(), Some(0.3));
+        assert_eq!(body["generationConfig"]["topP"].as_f64(), Some(0.5));
+        assert_eq!(body["generationConfig"]["topK"].as_u64(), Some(12));
     }
 }
