@@ -4,7 +4,7 @@ Port is in progress but partity not achieved yet. Continue iterating and testing
 
 ## Flow
 0. Read feature-gap-analysis.md for current gaps. If it doesn't exist, create it by comparing Tachikoma and Roci. Do a thorough analysis. Write down all gaps in detail.
-1. Identify the feature / implementation gap between Tachikoma and Roci.
+1. Pick the next  the feature / implementation gap between Tachikoma and Roci that is not marked `Complete` `Closed` or `**In progress**` . Mark it as `**In Progress**`
 2. Implement feature / fix gap in Roci.
 3. Write test against real providers to validate implementation.
 4. Run tests to ensure parity.
@@ -13,7 +13,7 @@ Port is in progress but partity not achieved yet. Continue iterating and testing
 7. Update docs if needed.
 8. Commit and push changes.
 9. update `LEARNINGS.md` with any new learnings from the implementation.
-10. Update `feature-gap-analysis.md` to reflect closed gaps.
+10. Update `feature-gap-analysis.md` to mark the gap `Complete`.
 11. Validate that `feature-gap-analysis.md` is accurate and no new gaps were introduced. If they were update feature-gap-analysis.md.
 12. If all gaps are closed, output `Task Complete` and nothing else.
 13. Run Tachikoma from ~/Projects/references/Tachikoma and it's associated tests to cross compare behavior and outputs.
