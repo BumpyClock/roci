@@ -108,7 +108,7 @@ impl GoogleProvider {
                                 .cloned()
                                 .unwrap_or_else(|| tr.tool_call_id.clone());
                             contents.push(serde_json::json!({
-                                "role": "function",
+                                "role": "tool",
                                 "parts": [{
                                     "functionResponse": {
                                         "id": tr.tool_call_id,
@@ -511,6 +511,7 @@ mod tests {
             body["contents"][1]["parts"][0]["functionResponse"]["id"],
             "call_1"
         );
+        assert_eq!(body["contents"][1]["role"], "tool");
         assert_eq!(
             body["contents"][1]["parts"][0]["functionResponse"]["name"],
             "get_weather"

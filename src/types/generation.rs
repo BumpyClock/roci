@@ -15,6 +15,7 @@ pub struct GenerationSettings {
     pub frequency_penalty: Option<f64>,
     pub seed: Option<u64>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub text_verbosity: Option<TextVerbosity>,
     pub response_format: Option<ResponseFormat>,
     pub user: Option<String>,
 }
@@ -25,6 +26,16 @@ pub struct GenerationSettings {
 #[strum(serialize_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
+    Low,
+    Medium,
+    High,
+}
+
+/// Text verbosity level for GPT-5 responses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum TextVerbosity {
     Low,
     Medium,
     High,

@@ -7,3 +7,4 @@ roci notes:
 - Adapters live under `src/providers`; keep new providers consistent with existing patterns.
 - Docs are under `docs/`; read & update as needed.
 - Use `.env` for sensitive keys; refer to `.env.example` for structure. Keep `.env.example` updated as needed.
+- Tests validate new features and implementations against real endpoints.

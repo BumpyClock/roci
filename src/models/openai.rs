@@ -110,6 +110,14 @@ impl OpenAiModel {
         }
     }
 
+    /// Whether the model supports GPT-5 text verbosity controls.
+    pub fn supports_text_verbosity(&self) -> bool {
+        matches!(
+            self,
+            Self::Gpt5 | Self::Gpt52 | Self::Gpt5Mini | Self::Gpt5Nano
+        )
+    }
+
     pub fn capabilities(&self) -> ModelCapabilities {
         let (ctx, vision, tools, reasoning, json_schema) = match self {
             Self::Gpt4o | Self::Gpt4oMini => (128_000, true, true, false, true),

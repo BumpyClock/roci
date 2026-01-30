@@ -45,6 +45,12 @@ impl OpenAiResponsesProvider {
                 self.model.as_str()
             )));
         }
+        if settings.text_verbosity.is_some() && !self.model.supports_text_verbosity() {
+            return Err(RociError::InvalidArgument(format!(
+                "text verbosity not supported for model {}",
+                self.model.as_str()
+            )));
+        }
         Ok(())
     }
 
@@ -93,6 +99,7 @@ impl OpenAiResponsesProvider {
             }
         }
 
+        let mut text_obj = serde_json::Map::new();
         if let Some(ref fmt) = request.response_format {
             let text_format = match fmt {
                 ResponseFormat::JsonObject => Some(serde_json::json!({"type": "json_object"})),
@@ -105,8 +112,14 @@ impl OpenAiResponsesProvider {
                 ResponseFormat::Text => None,
             };
             if let Some(format) = text_format {
-                obj.insert("text".into(), serde_json::json!({ "format": format }));
+                text_obj.insert("format".into(), format);
             }
+        }
+        if let Some(verbosity) = request.settings.text_verbosity {
+            text_obj.insert("verbosity".into(), verbosity.to_string().into());
+        }
+        if !text_obj.is_empty() {
+            obj.insert("text".into(), serde_json::Value::Object(text_obj));
         }
 
         body
@@ -499,5 +512,46 @@ mod tests {
             ..Default::default()
         };
         assert!(provider.validate_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn gpt41_rejects_text_verbosity_setting() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None);
+        let settings = GenerationSettings {
+            text_verbosity: Some(TextVerbosity::Low),
+            ..Default::default()
+        };
+        let err = provider.validate_settings(&settings).unwrap_err();
+        assert!(matches!(err, RociError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn gpt5_allows_text_verbosity_setting() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+        let settings = GenerationSettings {
+            text_verbosity: Some(TextVerbosity::High),
+            ..Default::default()
+        };
+        assert!(provider.validate_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn request_body_includes_text_verbosity_and_format() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                text_verbosity: Some(TextVerbosity::Low),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: Some(ResponseFormat::JsonObject),
+        };
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert_eq!(body["text"]["format"]["type"], "json_object");
     }
 }

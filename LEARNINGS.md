@@ -12,3 +12,10 @@
 ## 2026-01-30: Provider parity notes
 - GPT-5 sampling params only valid for gpt-5.2 with `reasoning_effort = none`; other GPT-5 models reject `temperature` and `top_p`.
 - Gemini function calls may include `thoughtSignature`; preserve it on tool call round-trips.
+
+## 2026-01-30: GPT-5 verbosity + Gemini tool role
+- GPT-5 family supports Responses API `text.verbosity` via `GenerationSettings.text_verbosity`.
+- Gemini tool responses should use role "tool" with `functionResponse` parts.
+
+## 2026-01-30: Live tool coverage
+- Live provider tests now include tool-call flows per provider.

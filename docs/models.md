@@ -13,6 +13,7 @@ Notes:
 - GPT-5 family uses the Responses API. `GenerationSettings.max_tokens` maps to `max_output_tokens`.
 - GPT-5, GPT-5-mini, and GPT-5-nano do not accept `temperature` or `top_p`.
 - GPT-5.2 accepts `temperature` or `top_p` only when `reasoning_effort = none`.
+- GPT-5 models support `GenerationSettings.text_verbosity` with `low`, `medium`, or `high`.
 
 ## Google (`LanguageModel::Google`)
 
