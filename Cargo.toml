@@ -1,0 +1,58 @@
+[package]
+name = "roci"
+version = "0.1.0"
+edition = "2021"
+description = "Rust AI SDK — spiritual port of Tachikoma"
+license = "MIT"
+rust-version = "1.75"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+tokio-stream = "0.1"
+reqwest-eventsource = "0.6"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+bon = "3"
+strum = { version = "0.27", features = ["derive"] }
+regex = "1"
+dotenvy = "0.15"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+pretty_assertions = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+default = ["openai", "anthropic", "google"]
+openai = []
+anthropic = []
+google = []
+grok = []
+groq = []
+mistral = []
+ollama = []
+lmstudio = []
+azure = ["openai"]
+openrouter = ["openai"]
+together = ["openai"]
+replicate = []
+openai-compatible = ["openai"]
+anthropic-compatible = ["anthropic"]
+agent = []
+audio = ["dep:tokio-tungstenite"]
+mcp = ["dep:tokio-tungstenite"]
+cli = ["dep:clap", "agent"]
+all-providers = ["openai","anthropic","google","grok","groq","mistral","ollama","lmstudio","azure","openrouter","together","replicate","openai-compatible","anthropic-compatible"]
+full = ["all-providers","agent","audio","mcp","cli"]
