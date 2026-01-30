@@ -1,0 +1,30 @@
+# Models
+
+Roci ships with built-in model enums per provider plus custom model IDs.
+
+## OpenAI (`LanguageModel::OpenAi`)
+
+- gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-4, gpt-3.5-turbo
+- gpt-4.1, gpt-4.1-mini, gpt-4.1-nano
+- o1, o1-mini, o1-pro, o3, o3-mini, o4-mini
+- gpt-5, gpt-5.2, gpt-5-mini, gpt-5-nano
+
+Notes:
+- GPT-5 family uses the Responses API. `GenerationSettings.max_tokens` maps to `max_output_tokens`.
+- GPT-5, GPT-5-mini, and GPT-5-nano do not accept `temperature` or `top_p`.
+- GPT-5.2 accepts `temperature` or `top_p` only when `reasoning_effort = none`.
+
+## Google (`LanguageModel::Google`)
+
+- gemini-3-flash, gemini-3-flash-preview, gemini-3-pro-preview
+- gemini-2.5-pro, gemini-2.5-flash, gemini-2.0-flash
+- gemini-1.5-pro, gemini-1.5-flash
+
+## OpenAI compatible (`LanguageModel::OpenAiCompatible`)
+
+- `OpenAiCompatibleModel { model_id, base_url }`
+- Uses OpenAI-compatible Chat Completions API.
+
+## Other providers
+
+See enums under `src/models` for the current catalog.

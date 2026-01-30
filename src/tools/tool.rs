@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::RociError;
 use super::arguments::ToolArguments;
 use super::types::AgentToolParameters;
+use crate::error::RociError;
 
 /// Context available during tool execution.
 #[derive(Debug, Clone, Default)]

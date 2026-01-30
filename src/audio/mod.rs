@@ -1,10 +1,10 @@
 //! Audio capabilities: transcription, TTS, and realtime.
 
-pub mod types;
+pub mod realtime;
 pub mod transcription;
 pub mod tts;
-pub mod realtime;
+pub mod types;
 
-pub use types::*;
 pub use transcription::AudioProvider;
 pub use tts::SpeechProvider;
+pub use types::*;

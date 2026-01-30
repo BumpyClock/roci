@@ -2,9 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::generation::FinishReason;
 use super::message::ModelMessage;
 use super::usage::Usage;
-use super::generation::FinishReason;
 
 /// Result of a text generation call.
 #[derive(Debug, Clone)]

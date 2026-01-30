@@ -46,7 +46,11 @@ impl ModelMessage {
     }
 
     /// Create a tool result message.
-    pub fn tool_result(tool_call_id: impl Into<String>, result: serde_json::Value, is_error: bool) -> Self {
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        result: serde_json::Value,
+        is_error: bool,
+    ) -> Self {
         Self {
             role: Role::Tool,
             content: vec![ContentPart::ToolResult(AgentToolResult {
@@ -65,7 +69,10 @@ impl ModelMessage {
             role: Role::User,
             content: vec![
                 ContentPart::Text { text: text.into() },
-                ContentPart::Image(ImageContent { data: image_data, mime_type }),
+                ContentPart::Image(ImageContent {
+                    data: image_data,
+                    mime_type,
+                }),
             ],
             name: None,
             timestamp: Some(Utc::now()),
@@ -129,6 +136,8 @@ pub struct AgentToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
 }
 
 /// A tool execution result.

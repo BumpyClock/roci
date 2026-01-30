@@ -8,7 +8,7 @@ async fn main() -> roci::error::Result<()> {
     let config = RociConfig::from_env();
     let provider = roci::provider::create_provider(&model, &config)?;
 
-    let weather_tool: Box<dyn Tool> = Box::new(AgentTool::new(
+    let weather_tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(AgentTool::new(
         "get_weather",
         "Get weather for a city",
         AgentToolParameters::object()
@@ -34,7 +34,10 @@ async fn main() -> roci::error::Result<()> {
 
     println!("{}", result.text);
     println!("Steps: {}", result.steps.len());
-    println!("Tokens: {} in / {} out", result.usage.input_tokens, result.usage.output_tokens);
+    println!(
+        "Tokens: {} in / {} out",
+        result.usage.input_tokens, result.usage.output_tokens
+    );
 
     Ok(())
 }

@@ -53,7 +53,9 @@ impl AuthManager {
     /// Resolve a credential to its string value.
     pub fn resolve(&self, provider: &str) -> Result<String, RociError> {
         self.get(provider)
-            .ok_or_else(|| RociError::Authentication(format!("No credentials for provider: {provider}")))?
+            .ok_or_else(|| {
+                RociError::Authentication(format!("No credentials for provider: {provider}"))
+            })?
             .resolve()
     }
 

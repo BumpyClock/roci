@@ -14,9 +14,13 @@ pub async fn generate(
     let config = RociConfig::global();
     let provider = provider::create_provider(model, config)?;
     let messages = vec![ModelMessage::user(prompt)];
-    let result =
-        super::text::generate_text(provider.as_ref(), messages, GenerationSettings::default(), &[])
-            .await?;
+    let result = super::text::generate_text(
+        provider.as_ref(),
+        messages,
+        GenerationSettings::default(),
+        &[],
+    )
+    .await?;
     Ok(result.text)
 }
 
@@ -27,8 +31,15 @@ pub async fn stream(
 ) -> Result<futures::stream::BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
     let config = RociConfig::global();
     let provider = provider::create_provider(model, config)?;
+    let provider = std::sync::Arc::from(provider);
     let messages = vec![ModelMessage::user(prompt)];
-    super::stream::stream_text(provider.as_ref(), messages, GenerationSettings::default(), &[]).await
+    super::stream::stream_text(
+        provider,
+        messages,
+        GenerationSettings::default(),
+        Vec::new(),
+    )
+    .await
 }
 
 /// Analyze content: model + system prompt + content → text.
@@ -39,12 +50,13 @@ pub async fn analyze(
 ) -> Result<String, RociError> {
     let config = RociConfig::global();
     let provider = provider::create_provider(model, config)?;
-    let messages = vec![
-        ModelMessage::system(system),
-        ModelMessage::user(content),
-    ];
-    let result =
-        super::text::generate_text(provider.as_ref(), messages, GenerationSettings::default(), &[])
-            .await?;
+    let messages = vec![ModelMessage::system(system), ModelMessage::user(content)];
+    let result = super::text::generate_text(
+        provider.as_ref(),
+        messages,
+        GenerationSettings::default(),
+        &[],
+    )
+    .await?;
     Ok(result.text)
 }

@@ -38,7 +38,10 @@ impl ModelProvider for ReplicateProvider {
         &self.capabilities
     }
 
-    async fn generate_text(&self, _request: &ProviderRequest) -> Result<ProviderResponse, RociError> {
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
         Err(RociError::UnsupportedOperation(
             "Replicate provider not yet implemented".into(),
         ))

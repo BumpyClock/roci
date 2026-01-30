@@ -16,45 +16,87 @@ pub trait StreamTransform: Send + Sync {
 }
 
 /// Filter deltas based on a predicate.
-pub struct FilterTransform<F: Fn(&TextStreamDelta) -> bool + Send + Sync + 'static> {
-    predicate: F,
+pub struct FilterTransform {
+    predicate: std::sync::Arc<dyn Fn(&TextStreamDelta) -> bool + Send + Sync>,
 }
 
-impl<F: Fn(&TextStreamDelta) -> bool + Send + Sync + 'static> FilterTransform<F> {
-    pub fn new(predicate: F) -> Self {
-        Self { predicate }
+impl FilterTransform {
+    pub fn new<F>(predicate: F) -> Self
+    where
+        F: Fn(&TextStreamDelta) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            predicate: std::sync::Arc::new(predicate),
+        }
     }
 }
 
-impl<F: Fn(&TextStreamDelta) -> bool + Send + Sync + 'static> StreamTransform for FilterTransform<F> {
+impl StreamTransform for FilterTransform {
     fn transform(
         &self,
         stream: BoxStream<'static, Result<TextStreamDelta, RociError>>,
     ) -> BoxStream<'static, Result<TextStreamDelta, RociError>> {
-        // We need to move the predicate; since we can't clone Fn, use a reference-counted wrapper
-        // For simplicity, consume self's predicate concept via a new stream
-        // Note: This is a limitation — in practice, wrap in Arc
-        stream // pass-through for now; real impl needs Arc<F>
+        let predicate = self.predicate.clone();
+        let transformed = async_stream::stream! {
+            let mut inner = std::pin::pin!(stream);
+            while let Some(item) = inner.next().await {
+                match item {
+                    Ok(delta) => {
+                        if (predicate)(&delta) {
+                            yield Ok(delta);
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                }
+            }
+        };
+        Box::pin(transformed)
     }
 }
 
 /// Map/transform each delta's text.
-pub struct MapTransform<F: Fn(String) -> String + Send + Sync + 'static> {
-    mapper: F,
+pub struct MapTransform {
+    mapper: std::sync::Arc<dyn Fn(String) -> String + Send + Sync>,
 }
 
-impl<F: Fn(String) -> String + Send + Sync + 'static> MapTransform<F> {
-    pub fn new(mapper: F) -> Self {
-        Self { mapper }
+impl MapTransform {
+    pub fn new<F>(mapper: F) -> Self
+    where
+        F: Fn(String) -> String + Send + Sync + 'static,
+    {
+        Self {
+            mapper: std::sync::Arc::new(mapper),
+        }
     }
 }
 
-impl<F: Fn(String) -> String + Send + Sync + 'static> StreamTransform for MapTransform<F> {
+impl StreamTransform for MapTransform {
     fn transform(
         &self,
         stream: BoxStream<'static, Result<TextStreamDelta, RociError>>,
     ) -> BoxStream<'static, Result<TextStreamDelta, RociError>> {
-        stream // pass-through stub
+        let mapper = self.mapper.clone();
+        let transformed = async_stream::stream! {
+            let mut inner = std::pin::pin!(stream);
+            while let Some(item) = inner.next().await {
+                match item {
+                    Ok(mut delta) => {
+                        if !delta.text.is_empty() {
+                            delta.text = (mapper)(delta.text);
+                        }
+                        yield Ok(delta);
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                }
+            }
+        };
+        Box::pin(transformed)
     }
 }
 
@@ -97,6 +139,7 @@ impl StreamTransform for BufferTransform {
                 yield Ok(TextStreamDelta {
                     text: buffer,
                     event_type: crate::types::StreamEventType::TextDelta,
+                    tool_call: None,
                     finish_reason: None,
                     usage: None,
                 });

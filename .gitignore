@@ -2,4 +2,5 @@
 target/
 *.log
 .claude
-/ai_agents/
+.ai_agents/
+.env

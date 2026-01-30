@@ -2,8 +2,8 @@
 
 use std::str::FromStr;
 
-use crate::error::RociError;
 use super::LanguageModel;
+use crate::error::RociError;
 
 /// Parse a "provider:model" string into a LanguageModel.
 pub struct ModelSelector;
@@ -13,11 +13,11 @@ impl ModelSelector {
     ///
     /// Examples: "openai:gpt-4o", "anthropic:claude-opus-4-5-20251101", "ollama:llama3.3"
     pub fn parse(s: &str) -> Result<LanguageModel, RociError> {
-        let (provider, model_id) = s
-            .split_once(':')
-            .ok_or_else(|| RociError::InvalidArgument(format!(
+        let (provider, model_id) = s.split_once(':').ok_or_else(|| {
+            RociError::InvalidArgument(format!(
                 "Invalid model selector '{s}': expected 'provider:model_id'"
-            )))?;
+            ))
+        })?;
 
         match provider {
             #[cfg(feature = "openai")]
@@ -75,6 +75,13 @@ impl ModelSelector {
                 let m = LmStudioModel::from_str(model_id)
                     .unwrap_or(LmStudioModel::Custom(model_id.to_string()));
                 Ok(LanguageModel::LmStudio(m))
+            }
+            #[cfg(feature = "openai-compatible")]
+            "openai-compatible" | "openai_compatible" => {
+                use super::openai_compatible::OpenAiCompatibleModel;
+                Ok(LanguageModel::OpenAiCompatible(OpenAiCompatibleModel::new(
+                    model_id, None,
+                )))
             }
             _ => Ok(LanguageModel::Custom {
                 provider: provider.to_string(),

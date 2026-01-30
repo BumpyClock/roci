@@ -30,12 +30,22 @@ impl GroqProvider {
 
 #[async_trait]
 impl ModelProvider for GroqProvider {
-    fn model_id(&self) -> &str { self.inner.model_id() }
-    fn capabilities(&self) -> &ModelCapabilities { self.inner.capabilities() }
-    async fn generate_text(&self, request: &ProviderRequest) -> Result<ProviderResponse, RociError> {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn capabilities(&self) -> &ModelCapabilities {
+        self.inner.capabilities()
+    }
+    async fn generate_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
         self.inner.generate_text(request).await
     }
-    async fn stream_text(&self, request: &ProviderRequest) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+    async fn stream_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         self.inner.stream_text(request).await
     }
 }

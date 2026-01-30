@@ -19,7 +19,9 @@ pub struct StringStop {
 
 impl StringStop {
     pub fn new(pattern: impl Into<String>) -> Self {
-        Self { pattern: pattern.into() }
+        Self {
+            pattern: pattern.into(),
+        }
     }
 }
 

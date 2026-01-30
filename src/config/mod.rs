@@ -39,6 +39,7 @@ impl RociConfig {
 
         let env_mappings = [
             ("OPENAI_API_KEY", "openai"),
+            ("OPENAI_COMPAT_API_KEY", "openai-compatible"),
             ("ANTHROPIC_API_KEY", "anthropic"),
             ("GOOGLE_API_KEY", "google"),
             ("GEMINI_API_KEY", "google"),
@@ -60,6 +61,7 @@ impl RociConfig {
         // Base URL overrides
         let url_mappings = [
             ("OPENAI_BASE_URL", "openai"),
+            ("OPENAI_COMPAT_BASE_URL", "openai-compatible"),
             ("ANTHROPIC_BASE_URL", "anthropic"),
             ("OLLAMA_BASE_URL", "ollama"),
             ("LMSTUDIO_BASE_URL", "lmstudio"),
@@ -80,7 +82,10 @@ impl RociConfig {
     }
 
     pub fn set_api_key(&self, provider: &str, key: String) {
-        self.api_keys.write().unwrap().insert(provider.to_string(), key);
+        self.api_keys
+            .write()
+            .unwrap()
+            .insert(provider.to_string(), key);
     }
 
     pub fn get_api_key(&self, provider: &str) -> Option<String> {
@@ -88,7 +93,10 @@ impl RociConfig {
     }
 
     pub fn set_base_url(&self, provider: &str, url: String) {
-        self.base_urls.write().unwrap().insert(provider.to_string(), url);
+        self.base_urls
+            .write()
+            .unwrap()
+            .insert(provider.to_string(), url);
     }
 
     pub fn get_base_url(&self, provider: &str) -> Option<String> {

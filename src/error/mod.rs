@@ -70,7 +70,11 @@ impl RociError {
     }
 
     /// Create an API error with full details.
-    pub fn api_with_details(status: u16, message: impl Into<String>, details: ErrorDetails) -> Self {
+    pub fn api_with_details(
+        status: u16,
+        message: impl Into<String>,
+        details: ErrorDetails,
+    ) -> Self {
         Self::Api {
             status,
             message: message.into(),
@@ -103,7 +107,10 @@ impl RociError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.category(),
-            ErrorCategory::RateLimit | ErrorCategory::Network | ErrorCategory::Timeout | ErrorCategory::Server
+            ErrorCategory::RateLimit
+                | ErrorCategory::Network
+                | ErrorCategory::Timeout
+                | ErrorCategory::Server
         )
     }
 

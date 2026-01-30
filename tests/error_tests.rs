@@ -1,7 +1,7 @@
 //! Tests for the error system.
 
-use roci::error::*;
 use roci::error::unified::*;
+use roci::error::*;
 
 #[test]
 fn error_api_creation() {
@@ -12,9 +12,15 @@ fn error_api_creation() {
 
 #[test]
 fn error_category_classification() {
-    assert_eq!(RociError::Authentication("bad key".into()).category(), ErrorCategory::Authentication);
     assert_eq!(
-        RociError::RateLimited { retry_after_ms: Some(1000) }.category(),
+        RociError::Authentication("bad key".into()).category(),
+        ErrorCategory::Authentication
+    );
+    assert_eq!(
+        RociError::RateLimited {
+            retry_after_ms: Some(1000)
+        }
+        .category(),
         ErrorCategory::RateLimit
     );
     assert_eq!(RociError::Timeout(5000).category(), ErrorCategory::Timeout);
@@ -26,7 +32,10 @@ fn error_category_classification() {
 
 #[test]
 fn error_is_retryable() {
-    assert!(RociError::RateLimited { retry_after_ms: None }.is_retryable());
+    assert!(RociError::RateLimited {
+        retry_after_ms: None
+    }
+    .is_retryable());
     assert!(RociError::Timeout(5000).is_retryable());
     assert!(!RociError::Authentication("bad key".into()).is_retryable());
     assert!(!RociError::Configuration("bad".into()).is_retryable());
@@ -39,7 +48,10 @@ fn error_recovery_suggestions() {
         RecoverySuggestion::CheckCredentials
     );
     assert_eq!(
-        RociError::RateLimited { retry_after_ms: None }.recovery_suggestion(),
+        RociError::RateLimited {
+            retry_after_ms: None
+        }
+        .recovery_suggestion(),
         RecoverySuggestion::RetryWithBackoff
     );
     assert_eq!(

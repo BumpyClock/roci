@@ -17,26 +17,26 @@ pub mod google;
 pub mod grok;
 #[cfg(feature = "groq")]
 pub mod groq;
+#[cfg(feature = "lmstudio")]
+pub mod lmstudio;
 #[cfg(feature = "mistral")]
 pub mod mistral;
 #[cfg(feature = "ollama")]
 pub mod ollama;
-#[cfg(feature = "lmstudio")]
-pub mod lmstudio;
 
-#[cfg(feature = "openai-compatible")]
-pub mod openai_compatible;
 #[cfg(feature = "anthropic-compatible")]
 pub mod anthropic_compatible;
+#[cfg(feature = "openai-compatible")]
+pub mod openai_compatible;
 
 #[cfg(feature = "azure")]
 pub mod azure;
 #[cfg(feature = "openrouter")]
 pub mod openrouter;
-#[cfg(feature = "together")]
-pub mod together;
 #[cfg(feature = "replicate")]
 pub mod replicate;
+#[cfg(feature = "together")]
+pub mod together;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -44,9 +44,7 @@ use futures::stream::BoxStream;
 use crate::error::RociError;
 use crate::models::{capabilities::ModelCapabilities, LanguageModel};
 use crate::types::{
-    GenerationSettings, ModelMessage, Usage, FinishReason,
-    TextStreamDelta,
-    message::AgentToolCall,
+    message::AgentToolCall, FinishReason, GenerationSettings, ModelMessage, TextStreamDelta, Usage,
 };
 
 /// A request sent to a model provider.
@@ -85,7 +83,8 @@ pub trait ModelProvider: Send + Sync {
     fn capabilities(&self) -> &ModelCapabilities;
 
     /// Generate text (non-streaming).
-    async fn generate_text(&self, request: &ProviderRequest) -> Result<ProviderResponse, RociError>;
+    async fn generate_text(&self, request: &ProviderRequest)
+        -> Result<ProviderResponse, RociError>;
 
     /// Generate text (streaming).
     async fn stream_text(
@@ -135,10 +134,7 @@ pub fn create_provider(
             let api_key = config
                 .get_api_key("google")
                 .ok_or_else(|| RociError::Authentication("Missing GOOGLE_API_KEY".into()))?;
-            Ok(Box::new(google::GoogleProvider::new(
-                m.clone(),
-                api_key,
-            )))
+            Ok(Box::new(google::GoogleProvider::new(m.clone(), api_key)))
         }
         #[cfg(feature = "grok")]
         LanguageModel::Grok(m) => {
@@ -174,13 +170,32 @@ pub fn create_provider(
             let base_url = config
                 .get_base_url("lmstudio")
                 .unwrap_or_else(|| "http://localhost:1234".to_string());
-            Ok(Box::new(lmstudio::LmStudioProvider::new(m.clone(), base_url)))
-        }
-        LanguageModel::Custom { provider, .. } => {
-            Err(RociError::ModelNotFound(format!(
-                "No built-in provider for '{provider}'. Use openai_compatible or anthropic_compatible."
+            Ok(Box::new(lmstudio::LmStudioProvider::new(
+                m.clone(),
+                base_url,
             )))
         }
+        #[cfg(feature = "openai-compatible")]
+        LanguageModel::OpenAiCompatible(m) => {
+            let api_key = config
+                .get_api_key("openai-compatible")
+                .or_else(|| config.get_api_key("openai"))
+                .ok_or_else(|| RociError::Authentication("Missing OPENAI_COMPAT_API_KEY".into()))?;
+            let base_url = m
+                .base_url
+                .clone()
+                .or_else(|| config.get_base_url("openai-compatible"))
+                .or_else(|| config.get_base_url("openai"))
+                .ok_or_else(|| RociError::Configuration("Missing OPENAI_COMPAT_BASE_URL".into()))?;
+            Ok(Box::new(openai_compatible::OpenAiCompatibleProvider::new(
+                m.model_id.clone(),
+                api_key,
+                base_url,
+            )))
+        }
+        LanguageModel::Custom { provider, .. } => Err(RociError::ModelNotFound(format!(
+            "No built-in provider for '{provider}'. Use openai_compatible or anthropic_compatible."
+        ))),
         #[allow(unreachable_patterns)]
         _ => Err(RociError::ModelNotFound(format!(
             "Provider for model '{}' not enabled via feature flags",

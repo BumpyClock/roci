@@ -29,7 +29,10 @@ async fn main() -> roci::error::Result<()> {
     let response = agent.execute("And what about 3 * 7?").await?;
     println!("Agent: {response}");
 
-    println!("\nConversation length: {} messages", agent.conversation().len());
+    println!(
+        "\nConversation length: {} messages",
+        agent.conversation().len()
+    );
 
     Ok(())
 }

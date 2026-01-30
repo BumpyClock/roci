@@ -1,7 +1,7 @@
 //! Realtime audio session over WebSocket.
 
-use crate::error::RociError;
 use super::config::RealtimeConfiguration;
+use crate::error::RociError;
 
 /// A WebSocket-based realtime audio session.
 pub struct RealtimeSession {

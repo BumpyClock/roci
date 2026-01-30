@@ -95,6 +95,16 @@ fn finish_reason_display() {
 #[test]
 fn reasoning_effort_fromstr() {
     use std::str::FromStr;
-    assert_eq!(ReasoningEffort::from_str("high").unwrap(), ReasoningEffort::High);
-    assert_eq!(ReasoningEffort::from_str("low").unwrap(), ReasoningEffort::Low);
+    assert_eq!(
+        ReasoningEffort::from_str("high").unwrap(),
+        ReasoningEffort::High
+    );
+    assert_eq!(
+        ReasoningEffort::from_str("low").unwrap(),
+        ReasoningEffort::Low
+    );
+    assert_eq!(
+        ReasoningEffort::from_str("none").unwrap(),
+        ReasoningEffort::None
+    );
 }

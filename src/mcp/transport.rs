@@ -35,10 +35,14 @@ impl StdioTransport {
 #[async_trait]
 impl MCPTransport for StdioTransport {
     async fn send(&mut self, _message: serde_json::Value) -> Result<(), RociError> {
-        Err(RociError::UnsupportedOperation("Stdio MCP transport not yet implemented".into()))
+        Err(RociError::UnsupportedOperation(
+            "Stdio MCP transport not yet implemented".into(),
+        ))
     }
     async fn receive(&mut self) -> Result<serde_json::Value, RociError> {
-        Err(RociError::UnsupportedOperation("Stdio MCP transport not yet implemented".into()))
+        Err(RociError::UnsupportedOperation(
+            "Stdio MCP transport not yet implemented".into(),
+        ))
     }
     async fn close(&mut self) -> Result<(), RociError> {
         Ok(())
@@ -59,10 +63,14 @@ impl SSETransport {
 #[async_trait]
 impl MCPTransport for SSETransport {
     async fn send(&mut self, _message: serde_json::Value) -> Result<(), RociError> {
-        Err(RociError::UnsupportedOperation("SSE MCP transport not yet implemented".into()))
+        Err(RociError::UnsupportedOperation(
+            "SSE MCP transport not yet implemented".into(),
+        ))
     }
     async fn receive(&mut self) -> Result<serde_json::Value, RociError> {
-        Err(RociError::UnsupportedOperation("SSE MCP transport not yet implemented".into()))
+        Err(RociError::UnsupportedOperation(
+            "SSE MCP transport not yet implemented".into(),
+        ))
     }
     async fn close(&mut self) -> Result<(), RociError> {
         Ok(())

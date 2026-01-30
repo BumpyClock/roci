@@ -38,7 +38,10 @@ impl ModelProvider for GrokProvider {
         self.inner.capabilities()
     }
 
-    async fn generate_text(&self, request: &ProviderRequest) -> Result<ProviderResponse, RociError> {
+    async fn generate_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
         self.inner.generate_text(request).await
     }
 

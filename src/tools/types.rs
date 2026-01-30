@@ -43,7 +43,12 @@ pub struct ParameterBuilder {
 
 impl ParameterBuilder {
     /// Add a string property.
-    pub fn string(mut self, name: impl Into<String>, description: impl Into<String>, required: bool) -> Self {
+    pub fn string(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        required: bool,
+    ) -> Self {
         let name = name.into();
         self.properties.insert(
             name.clone(),
@@ -59,7 +64,12 @@ impl ParameterBuilder {
     }
 
     /// Add a number property.
-    pub fn number(mut self, name: impl Into<String>, description: impl Into<String>, required: bool) -> Self {
+    pub fn number(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        required: bool,
+    ) -> Self {
         let name = name.into();
         self.properties.insert(
             name.clone(),
@@ -75,7 +85,12 @@ impl ParameterBuilder {
     }
 
     /// Add a boolean property.
-    pub fn boolean(mut self, name: impl Into<String>, description: impl Into<String>, required: bool) -> Self {
+    pub fn boolean(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        required: bool,
+    ) -> Self {
         let name = name.into();
         self.properties.insert(
             name.clone(),

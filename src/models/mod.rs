@@ -3,8 +3,6 @@
 pub mod capabilities;
 pub mod selector;
 
-#[cfg(feature = "openai")]
-pub mod openai;
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
 #[cfg(feature = "google")]
@@ -13,12 +11,16 @@ pub mod google;
 pub mod grok;
 #[cfg(feature = "groq")]
 pub mod groq;
+#[cfg(feature = "lmstudio")]
+pub mod lmstudio;
 #[cfg(feature = "mistral")]
 pub mod mistral;
 #[cfg(feature = "ollama")]
 pub mod ollama;
-#[cfg(feature = "lmstudio")]
-pub mod lmstudio;
+#[cfg(feature = "openai")]
+pub mod openai;
+#[cfg(feature = "openai-compatible")]
+pub mod openai_compatible;
 
 pub use capabilities::ModelCapabilities;
 pub use selector::ModelSelector;
@@ -46,6 +48,8 @@ pub enum LanguageModel {
     Ollama(ollama::OllamaModel),
     #[cfg(feature = "lmstudio")]
     LmStudio(lmstudio::LmStudioModel),
+    #[cfg(feature = "openai-compatible")]
+    OpenAiCompatible(openai_compatible::OpenAiCompatibleModel),
     /// Custom model with explicit provider and model ID.
     Custom { provider: String, model_id: String },
 }
@@ -70,6 +74,8 @@ impl LanguageModel {
             Self::Ollama(m) => m.as_str(),
             #[cfg(feature = "lmstudio")]
             Self::LmStudio(m) => m.as_str(),
+            #[cfg(feature = "openai-compatible")]
+            Self::OpenAiCompatible(m) => m.model_id.as_str(),
             Self::Custom { model_id, .. } => model_id,
         }
     }
@@ -93,6 +99,8 @@ impl LanguageModel {
             Self::Ollama(_) => "ollama",
             #[cfg(feature = "lmstudio")]
             Self::LmStudio(_) => "lmstudio",
+            #[cfg(feature = "openai-compatible")]
+            Self::OpenAiCompatible(_) => "openai-compatible",
             Self::Custom { provider, .. } => provider,
         }
     }
@@ -116,6 +124,8 @@ impl LanguageModel {
             Self::Ollama(m) => m.capabilities(),
             #[cfg(feature = "lmstudio")]
             Self::LmStudio(m) => m.capabilities(),
+            #[cfg(feature = "openai-compatible")]
+            Self::OpenAiCompatible(m) => m.capabilities(),
             Self::Custom { .. } => ModelCapabilities::default(),
         }
     }

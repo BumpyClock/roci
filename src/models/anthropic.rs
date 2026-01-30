@@ -43,7 +43,10 @@ impl AnthropicModel {
 
     /// Whether this model supports extended thinking.
     pub fn supports_extended_thinking(&self) -> bool {
-        matches!(self, Self::ClaudeOpus45 | Self::ClaudeSonnet45 | Self::ClaudeSonnet4)
+        matches!(
+            self,
+            Self::ClaudeOpus45 | Self::ClaudeSonnet45 | Self::ClaudeSonnet4
+        )
     }
 
     pub fn capabilities(&self) -> ModelCapabilities {

@@ -150,7 +150,10 @@ impl ModelProvider for AnthropicProvider {
         &self.capabilities
     }
 
-    async fn generate_text(&self, request: &ProviderRequest) -> Result<ProviderResponse, RociError> {
+    async fn generate_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
         let body = self.build_request_body(request, false);
         let url = format!("{}/messages", self.base_url);
 
@@ -189,6 +192,7 @@ impl ModelProvider for AnthropicProvider {
                             id: id.clone(),
                             name: name.clone(),
                             arguments: input.clone(),
+                            recipient: None,
                         });
                     }
                 }
@@ -275,6 +279,7 @@ impl ModelProvider for AnthropicProvider {
                                             yield Ok(TextStreamDelta {
                                                 text: text.to_string(),
                                                 event_type: StreamEventType::TextDelta,
+                                                tool_call: None,
                                                 finish_reason: None,
                                                 usage: None,
                                             });
@@ -285,6 +290,7 @@ impl ModelProvider for AnthropicProvider {
                                     yield Ok(TextStreamDelta {
                                         text: String::new(),
                                         event_type: StreamEventType::Done,
+                                        tool_call: None,
                                         finish_reason: Some(FinishReason::Stop),
                                         usage: None,
                                     });
@@ -309,6 +315,7 @@ impl ModelProvider for AnthropicProvider {
                                         yield Ok(TextStreamDelta {
                                             text: String::new(),
                                             event_type: StreamEventType::Done,
+                                            tool_call: None,
                                             finish_reason: finish,
                                             usage,
                                         });

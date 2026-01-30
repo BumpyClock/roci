@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 
-use crate::error::RociError;
 use super::types::TranscriptionResult;
+use crate::error::RociError;
 
 /// Trait for audio transcription providers.
 #[async_trait]

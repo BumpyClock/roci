@@ -85,3 +85,21 @@ fn model_selector_unknown_provider() {
 fn model_selector_invalid() {
     assert!(ModelSelector::parse("no-colon").is_err());
 }
+
+#[test]
+fn model_selector_parses_gpt5_nano() {
+    let model = ModelSelector::parse("openai:gpt-5-nano").unwrap();
+    assert_eq!(model.provider_name(), "openai");
+    assert_eq!(model.model_id(), "gpt-5-nano");
+}
+
+#[test]
+fn model_selector_parses_gemini_preview_models() {
+    let flash = ModelSelector::parse("google:gemini-3-flash-preview").unwrap();
+    assert_eq!(flash.provider_name(), "google");
+    assert_eq!(flash.model_id(), "gemini-3-flash-preview");
+
+    let pro = ModelSelector::parse("google:gemini-3-pro-preview").unwrap();
+    assert_eq!(pro.provider_name(), "google");
+    assert_eq!(pro.model_id(), "gemini-3-pro-preview");
+}

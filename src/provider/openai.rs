@@ -38,7 +38,7 @@ impl OpenAiProvider {
         let messages = request
             .messages
             .iter()
-            .map(|m| message_to_openai(m))
+            .map(message_to_openai)
             .collect::<Vec<_>>();
 
         let mut body = serde_json::json!({
@@ -96,17 +96,23 @@ impl OpenAiProvider {
         if let Some(ref fmt) = request.response_format {
             match fmt {
                 ResponseFormat::JsonObject => {
-                    obj.insert("response_format".into(), serde_json::json!({"type": "json_object"}));
+                    obj.insert(
+                        "response_format".into(),
+                        serde_json::json!({"type": "json_object"}),
+                    );
                 }
                 ResponseFormat::JsonSchema { schema, name } => {
-                    obj.insert("response_format".into(), serde_json::json!({
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": name,
-                            "schema": schema,
-                            "strict": true,
-                        }
-                    }));
+                    obj.insert(
+                        "response_format".into(),
+                        serde_json::json!({
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": name,
+                                "schema": schema,
+                                "strict": true,
+                            }
+                        }),
+                    );
                 }
                 _ => {}
             }
@@ -126,7 +132,10 @@ impl ModelProvider for OpenAiProvider {
         &self.capabilities
     }
 
-    async fn generate_text(&self, request: &ProviderRequest) -> Result<ProviderResponse, RociError> {
+    async fn generate_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
         let body = self.build_request_body(request, false);
         let url = format!("{}/chat/completions", self.base_url);
 
@@ -146,9 +155,11 @@ impl ModelProvider for OpenAiProvider {
         }
 
         let data: OpenAiChatResponse = resp.json().await?;
-        let choice = data.choices.into_iter().next().ok_or_else(|| {
-            RociError::api(200, "No choices in OpenAI response")
-        })?;
+        let choice = data
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| RociError::api(200, "No choices in OpenAI response"))?;
 
         let tool_calls = choice
             .message
@@ -160,19 +171,26 @@ impl ModelProvider for OpenAiProvider {
                 name: tc.function.name,
                 arguments: serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(serde_json::Value::String(tc.function.arguments)),
+                recipient: None,
             })
             .collect();
 
-        let finish_reason = choice.finish_reason.as_deref().and_then(parse_finish_reason);
+        let finish_reason = choice
+            .finish_reason
+            .as_deref()
+            .and_then(parse_finish_reason);
 
         Ok(ProviderResponse {
             text: choice.message.content.unwrap_or_default(),
-            usage: data.usage.map(|u| Usage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                ..Default::default()
-            }).unwrap_or_default(),
+            usage: data
+                .usage
+                .map(|u| Usage {
+                    input_tokens: u.prompt_tokens,
+                    output_tokens: u.completion_tokens,
+                    total_tokens: u.total_tokens,
+                    ..Default::default()
+                })
+                .unwrap_or_default(),
             tool_calls,
             finish_reason,
         })
@@ -202,8 +220,14 @@ impl ModelProvider for OpenAiProvider {
 
         let byte_stream = resp.bytes_stream();
 
+        struct ToolCallBuilder {
+            id: Option<String>,
+            name: Option<String>,
+            arguments: String,
+        }
         let stream = async_stream::stream! {
             let mut buffer = String::new();
+            let mut tool_calls: std::collections::HashMap<usize, ToolCallBuilder> = std::collections::HashMap::new();
             futures::pin_mut!(byte_stream);
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -226,20 +250,63 @@ impl ModelProvider for OpenAiProvider {
                     }
 
                     if let Some(data) = super::http::parse_sse_data(&line) {
-                        match serde_json::from_str::<OpenAiStreamChunk>(data) {
-                            Ok(chunk) => {
-                                if let Some(choice) = chunk.choices.into_iter().next() {
-                                    let text = choice.delta.content.unwrap_or_default();
-                                    let finish = choice.finish_reason.as_deref().and_then(parse_finish_reason);
-                                    let event_type = if finish.is_some() {
-                                        StreamEventType::Done
-                                    } else {
-                                        StreamEventType::TextDelta
-                                    };
+                        if let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk>(data) {
+                            if let Some(choice) = chunk.choices.into_iter().next() {
+                                if let Some(deltas) = choice.delta.tool_calls {
+                                    for delta in deltas {
+                                        let entry = tool_calls.entry(delta.index).or_insert_with(|| ToolCallBuilder {
+                                            id: None,
+                                            name: None,
+                                            arguments: String::new(),
+                                        });
+                                        if let Some(id) = delta.id {
+                                            entry.id = Some(id);
+                                        }
+                                        if let Some(func) = delta.function {
+                                            if let Some(name) = func.name {
+                                                entry.name = Some(name);
+                                            }
+                                            if let Some(args) = func.arguments {
+                                                entry.arguments.push_str(&args);
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(text) = choice.delta.content {
                                     yield Ok(TextStreamDelta {
                                         text,
-                                        event_type,
-                                        finish_reason: finish,
+                                        event_type: StreamEventType::TextDelta,
+                                        tool_call: None,
+                                        finish_reason: None,
+                                        usage: None,
+                                    });
+                                }
+                                let finish = choice.finish_reason.as_deref().and_then(parse_finish_reason);
+                                if let Some(reason) = finish {
+                                    if reason == FinishReason::ToolCalls {
+                                        let mut indices = tool_calls.keys().copied().collect::<Vec<_>>();
+                                        indices.sort_unstable();
+                                        for index in indices {
+                                            if let Some(builder) = tool_calls.remove(&index) {
+                                                if let (Some(id), Some(name)) = (builder.id, builder.name) {
+                                                    let args = serde_json::from_str(&builder.arguments)
+                                                        .unwrap_or(serde_json::Value::String(builder.arguments));
+                                                    yield Ok(TextStreamDelta {
+                                                        text: String::new(),
+                                                        event_type: StreamEventType::ToolCallDelta,
+                                                        tool_call: Some(AgentToolCall { id, name, arguments: args, recipient: None }),
+                                                        finish_reason: None,
+                                                        usage: None,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    yield Ok(TextStreamDelta {
+                                        text: String::new(),
+                                        event_type: StreamEventType::Done,
+                                        tool_call: None,
+                                        finish_reason: Some(reason),
                                         usage: chunk.usage.map(|u| Usage {
                                             input_tokens: u.prompt_tokens,
                                             output_tokens: u.completion_tokens,
@@ -249,7 +316,6 @@ impl ModelProvider for OpenAiProvider {
                                     });
                                 }
                             }
-                            Err(_) => {} // skip unparseable chunks
                         }
                     }
                 }
@@ -398,4 +464,18 @@ struct OpenAiStreamChoice {
 #[derive(Deserialize)]
 struct OpenAiStreamDelta {
     content: Option<String>,
+    tool_calls: Option<Vec<OpenAiStreamToolCallDelta>>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiStreamToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: Option<OpenAiStreamFunctionDelta>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiStreamFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }

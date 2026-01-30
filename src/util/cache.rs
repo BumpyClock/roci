@@ -39,7 +39,10 @@ impl ResponseCache {
         let ttl = inner.ttl;
 
         // Check expiry first
-        let expired = inner.entries.get(key).map(|e| e.inserted_at.elapsed() > ttl);
+        let expired = inner
+            .entries
+            .get(key)
+            .map(|e| e.inserted_at.elapsed() > ttl);
         match expired {
             Some(true) => {
                 inner.entries.remove(key);

@@ -6,7 +6,10 @@ use roci::config::RociConfig;
 fn config_set_get_api_key() {
     let config = RociConfig::new();
     config.set_api_key("openai", "sk-test-123".to_string());
-    assert_eq!(config.get_api_key("openai"), Some("sk-test-123".to_string()));
+    assert_eq!(
+        config.get_api_key("openai"),
+        Some("sk-test-123".to_string())
+    );
     assert_eq!(config.get_api_key("anthropic"), None);
 }
 
@@ -35,8 +38,14 @@ fn config_from_env_loads_keys() {
     std::env::set_var("ANTHROPIC_API_KEY", "test-anthropic-key");
 
     let config = RociConfig::from_env();
-    assert_eq!(config.get_api_key("openai"), Some("test-openai-key".to_string()));
-    assert_eq!(config.get_api_key("anthropic"), Some("test-anthropic-key".to_string()));
+    assert_eq!(
+        config.get_api_key("openai"),
+        Some("test-openai-key".to_string())
+    );
+    assert_eq!(
+        config.get_api_key("anthropic"),
+        Some("test-anthropic-key".to_string())
+    );
 
     // Clean up
     std::env::remove_var("OPENAI_API_KEY");

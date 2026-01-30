@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 
-use crate::error::RociError;
 use super::types::SpeechRequest;
+use crate::error::RociError;
 
 /// Trait for text-to-speech providers.
 #[async_trait]

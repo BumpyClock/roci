@@ -56,13 +56,13 @@ impl RetryPolicy {
 
                     // Jitter: 75%–125% of backoff
                     let jitter_factor = 0.75 + (rand_factor() * 0.5);
-                    let sleep_duration = Duration::from_secs_f64(
-                        backoff.as_secs_f64() * jitter_factor,
-                    );
+                    let sleep_duration =
+                        Duration::from_secs_f64(backoff.as_secs_f64() * jitter_factor);
                     tokio::time::sleep(sleep_duration).await;
 
                     backoff = Duration::from_secs_f64(
-                        (backoff.as_secs_f64() * self.multiplier).min(self.max_backoff.as_secs_f64()),
+                        (backoff.as_secs_f64() * self.multiplier)
+                            .min(self.max_backoff.as_secs_f64()),
                     );
 
                     last_error = Some(e);

@@ -1,11 +1,11 @@
 //! Tool system for function calling.
 
-pub mod types;
-pub mod tool;
 pub mod arguments;
 pub mod dynamic;
+pub mod tool;
+pub mod types;
 
-pub use tool::{Tool, AgentTool};
-pub use types::AgentToolParameters;
 pub use arguments::ToolArguments;
-pub use dynamic::{DynamicToolProvider, DynamicTool};
+pub use dynamic::{DynamicTool, DynamicToolProvider};
+pub use tool::{AgentTool, Tool};
+pub use types::AgentToolParameters;

@@ -8,3 +8,7 @@
 - Feature flags gate optional provider modules and capabilities (agent, audio, mcp, cli).
 - `bon` v3 for builder pattern — replaces manual builders.
 - `strum` 0.27 for enum Display/FromStr derivation.
+
+## 2026-01-30: Provider parity notes
+- GPT-5 sampling params only valid for gpt-5.2 with `reasoning_effort = none`; other GPT-5 models reject `temperature` and `top_p`.
+- Gemini function calls may include `thoughtSignature`; preserve it on tool call round-trips.

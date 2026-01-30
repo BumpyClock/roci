@@ -34,24 +34,22 @@ impl OpenAiResponsesProvider {
         }
     }
 
+    fn validate_settings(&self, settings: &GenerationSettings) -> Result<(), RociError> {
+        if (settings.temperature.is_some() || settings.top_p.is_some())
+            && !self
+                .model
+                .supports_sampling_params(settings.reasoning_effort)
+        {
+            return Err(RociError::InvalidArgument(format!(
+                "temperature/top_p not supported for model {}",
+                self.model.as_str()
+            )));
+        }
+        Ok(())
+    }
+
     fn build_request_body(&self, request: &ProviderRequest, stream: bool) -> serde_json::Value {
-        // Convert messages to Responses API "input" format
-        let input: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    Role::System => "system",
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::Tool => "tool",
-                };
-                serde_json::json!({
-                    "role": role,
-                    "content": m.text(),
-                })
-            })
-            .collect();
+        let input = Self::build_input_items(&request.messages);
 
         let mut body = serde_json::json!({
             "model": self.model.as_str(),
@@ -95,7 +93,99 @@ impl OpenAiResponsesProvider {
             }
         }
 
+        if let Some(ref fmt) = request.response_format {
+            let text_format = match fmt {
+                ResponseFormat::JsonObject => Some(serde_json::json!({"type": "json_object"})),
+                ResponseFormat::JsonSchema { schema, name } => Some(serde_json::json!({
+                    "type": "json_schema",
+                    "name": name,
+                    "schema": schema,
+                    "strict": true,
+                })),
+                ResponseFormat::Text => None,
+            };
+            if let Some(format) = text_format {
+                obj.insert("text".into(), serde_json::json!({ "format": format }));
+            }
+        }
+
         body
+    }
+
+    fn build_input_items(messages: &[ModelMessage]) -> Vec<serde_json::Value> {
+        let mut input = Vec::new();
+        for msg in messages {
+            let mut content_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            for part in &msg.content {
+                match part {
+                    ContentPart::Text { text } => {
+                        content_parts.push(serde_json::json!({
+                            "type": "input_text",
+                            "text": text,
+                        }));
+                    }
+                    ContentPart::Image(img) => {
+                        let url = format!("data:{};base64,{}", img.mime_type, img.data);
+                        content_parts.push(serde_json::json!({
+                            "type": "input_image",
+                            "image_url": url,
+                        }));
+                    }
+                    ContentPart::ToolCall(tc) => tool_calls.push(tc),
+                    ContentPart::ToolResult(_) => {}
+                }
+            }
+            match msg.role {
+                Role::System | Role::User | Role::Assistant => {
+                    if !content_parts.is_empty() {
+                        let content = if content_parts.len() == 1 {
+                            if let Some(text) =
+                                content_parts[0].get("text").and_then(|v| v.as_str())
+                            {
+                                serde_json::Value::String(text.to_string())
+                            } else {
+                                serde_json::Value::Array(content_parts)
+                            }
+                        } else {
+                            serde_json::Value::Array(content_parts)
+                        };
+                        let role = match msg.role {
+                            Role::System => "system",
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                            Role::Tool => "tool",
+                        };
+                        input.push(serde_json::json!({
+                            "role": role,
+                            "content": content,
+                        }));
+                    }
+                    if matches!(msg.role, Role::Assistant) {
+                        for tc in tool_calls {
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments.to_string(),
+                            }));
+                        }
+                    }
+                }
+                Role::Tool => {
+                    for part in &msg.content {
+                        if let ContentPart::ToolResult(tr) = part {
+                            input.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": tr.tool_call_id,
+                                "output": tr.result.to_string(),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        input
     }
 }
 
@@ -109,11 +199,18 @@ impl ModelProvider for OpenAiResponsesProvider {
         &self.capabilities
     }
 
-    async fn generate_text(&self, request: &ProviderRequest) -> Result<ProviderResponse, RociError> {
+    async fn generate_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        self.validate_settings(&request.settings)?;
         let body = self.build_request_body(request, false);
         let url = format!("{}/responses", self.base_url);
 
-        debug!(model = self.model.as_str(), "OpenAI Responses generate_text");
+        debug!(
+            model = self.model.as_str(),
+            "OpenAI Responses generate_text"
+        );
 
         let resp = shared_client()
             .post(&url)
@@ -145,11 +242,12 @@ impl ModelProvider for OpenAiResponsesProvider {
                 if let (Some(ref id), Some(ref name), Some(ref args)) =
                     (&item.call_id, &item.name, &item.arguments)
                 {
-                    tool_calls.push(message::AgentToolCall {
+                    tool_calls.push(AgentToolCall {
                         id: id.clone(),
                         name: name.clone(),
                         arguments: serde_json::from_str(args)
                             .unwrap_or(serde_json::Value::String(args.clone())),
+                        recipient: None,
                     });
                 }
             }
@@ -167,12 +265,15 @@ impl ModelProvider for OpenAiResponsesProvider {
 
         Ok(ProviderResponse {
             text,
-            usage: data.usage.map(|u| Usage {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-                total_tokens: u.input_tokens + u.output_tokens,
-                ..Default::default()
-            }).unwrap_or_default(),
+            usage: data
+                .usage
+                .map(|u| Usage {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                    total_tokens: u.input_tokens + u.output_tokens,
+                    ..Default::default()
+                })
+                .unwrap_or_default(),
             tool_calls,
             finish_reason,
         })
@@ -182,6 +283,7 @@ impl ModelProvider for OpenAiResponsesProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        self.validate_settings(&request.settings)?;
         let body = self.build_request_body(request, true);
         let url = format!("{}/responses", self.base_url);
 
@@ -204,6 +306,7 @@ impl ModelProvider for OpenAiResponsesProvider {
 
         let stream = async_stream::stream! {
             let mut buffer = String::new();
+            let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             futures::pin_mut!(byte_stream);
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -229,25 +332,82 @@ impl ModelProvider for OpenAiResponsesProvider {
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
                             let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             match event_type {
+                                "response.output_item.added" => {
+                                    if let Some(item) = event.get("item") {
+                                        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                                            if let (Some(id), Some(name)) = (
+                                                item.get("call_id").and_then(|v| v.as_str()).or_else(|| item.get("id").and_then(|v| v.as_str())),
+                                                item.get("name").and_then(|v| v.as_str()),
+                                            ) {
+                                                call_names.insert(id.to_string(), name.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                "response.function_call_arguments.done" => {
+                                    let call_id = event.get("call_id")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| event.get("item_id").and_then(|v| v.as_str()))
+                                        .map(|v| v.to_string());
+                                    let name = event.get("name")
+                                        .and_then(|v| v.as_str())
+                                        .map(|v| v.to_string())
+                                        .or_else(|| call_id.as_ref().and_then(|id| call_names.get(id).cloned()));
+                                    if let (Some(id), Some(name), Some(args)) = (
+                                        call_id,
+                                        name,
+                                        event.get("arguments").and_then(|v| v.as_str()),
+                                    ) {
+                                        let arguments = serde_json::from_str(args)
+                                            .unwrap_or(serde_json::Value::String(args.to_string()));
+                                        yield Ok(TextStreamDelta {
+                                            text: String::new(),
+                                            event_type: StreamEventType::ToolCallDelta,
+                                            tool_call: Some(AgentToolCall { id, name, arguments, recipient: None }),
+                                            finish_reason: None,
+                                            usage: None,
+                                        });
+                                    }
+                                }
                                 "response.output_text.delta" => {
                                     if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
                                         yield Ok(TextStreamDelta {
                                             text: delta.to_string(),
                                             event_type: StreamEventType::TextDelta,
+                                            tool_call: None,
                                             finish_reason: None,
                                             usage: None,
                                         });
                                     }
                                 }
                                 "response.completed" => {
+                                    let finish = event.get("response")
+                                        .and_then(|r| r.get("status"))
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|status| match status {
+                                            "completed" => Some(FinishReason::Stop),
+                                            "incomplete" => Some(FinishReason::Length),
+                                            _ => None,
+                                        });
+                                    let usage = event.get("response")
+                                        .and_then(|r| r.get("usage"))
+                                        .and_then(|u| {
+                                            Some(Usage {
+                                                input_tokens: u.get("input_tokens")?.as_u64()? as u32,
+                                                output_tokens: u.get("output_tokens")?.as_u64()? as u32,
+                                                total_tokens: u.get("total_tokens")?.as_u64()? as u32,
+                                                ..Default::default()
+                                            })
+                                        });
                                     yield Ok(TextStreamDelta {
                                         text: String::new(),
                                         event_type: StreamEventType::Done,
-                                        finish_reason: Some(FinishReason::Stop),
-                                        usage: None,
+                                        tool_call: None,
+                                        finish_reason: finish.or(Some(FinishReason::Stop)),
+                                        usage,
                                     });
                                 }
-                                _ => {} // skip other events
+                                _ => {}
                             }
                         }
                     }
@@ -287,4 +447,57 @@ struct ResponsesContent {
 struct ResponsesUsage {
     input_tokens: u32,
     output_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpt5_rejects_sampling_settings() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+        let settings = GenerationSettings {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let err = provider.validate_settings(&settings).unwrap_err();
+        assert!(matches!(err, RociError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn gpt52_rejects_sampling_without_reasoning_none() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt52, "test-key".to_string(), None);
+        let settings = GenerationSettings {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let err = provider.validate_settings(&settings).unwrap_err();
+        assert!(matches!(err, RociError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn gpt52_allows_sampling_with_reasoning_none() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt52, "test-key".to_string(), None);
+        let settings = GenerationSettings {
+            temperature: Some(0.7),
+            reasoning_effort: Some(ReasoningEffort::None),
+            ..Default::default()
+        };
+        assert!(provider.validate_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn gpt41_allows_sampling_settings() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None);
+        let settings = GenerationSettings {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+        assert!(provider.validate_settings(&settings).is_ok());
+    }
 }

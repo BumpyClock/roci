@@ -53,6 +53,7 @@ impl MockProvider {
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments: args,
+                recipient: None,
             }],
             finish_reason: Some(FinishReason::ToolCalls),
         });
@@ -69,7 +70,10 @@ impl ModelProvider for MockProvider {
         &self.capabilities
     }
 
-    async fn generate_text(&self, _request: &ProviderRequest) -> Result<ProviderResponse, RociError> {
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
             return Ok(ProviderResponse {
@@ -101,6 +105,7 @@ impl ModelProvider for MockProvider {
                 yield Ok(TextStreamDelta {
                     text,
                     event_type: StreamEventType::TextDelta,
+                    tool_call: None,
                     finish_reason: None,
                     usage: None,
                 });
@@ -108,6 +113,7 @@ impl ModelProvider for MockProvider {
             yield Ok(TextStreamDelta {
                 text: String::new(),
                 event_type: StreamEventType::Done,
+                tool_call: None,
                 finish_reason: Some(FinishReason::Stop),
                 usage: Some(Usage { input_tokens: 10, output_tokens: 20, total_tokens: 30, ..Default::default() }),
             });

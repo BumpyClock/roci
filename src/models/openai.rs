@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
 use super::capabilities::ModelCapabilities;
+use crate::types::ReasoningEffort;
 
 /// OpenAI models.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Display, EnumString)]
@@ -40,6 +41,10 @@ pub enum OpenAiModel {
     Gpt5,
     #[strum(serialize = "gpt-5.2")]
     Gpt52,
+    #[strum(serialize = "gpt-5-mini")]
+    Gpt5Mini,
+    #[strum(serialize = "gpt-5-nano")]
+    Gpt5Nano,
     /// Custom/unknown OpenAI model by ID.
     #[strum(default)]
     Custom(String),
@@ -65,6 +70,8 @@ impl OpenAiModel {
             Self::Gpt41Nano => "gpt-4.1-nano",
             Self::Gpt5 => "gpt-5",
             Self::Gpt52 => "gpt-5.2",
+            Self::Gpt5Mini => "gpt-5-mini",
+            Self::Gpt5Nano => "gpt-5-nano",
             Self::Custom(s) => s,
         }
     }
@@ -73,14 +80,34 @@ impl OpenAiModel {
     pub fn uses_responses_api(&self) -> bool {
         matches!(
             self,
-            Self::O3 | Self::O3Mini | Self::O4Mini | Self::Gpt41 | Self::Gpt41Mini
-                | Self::Gpt41Nano | Self::Gpt5 | Self::Gpt52
+            Self::O3
+                | Self::O3Mini
+                | Self::O4Mini
+                | Self::Gpt41
+                | Self::Gpt41Mini
+                | Self::Gpt41Nano
+                | Self::Gpt5
+                | Self::Gpt52
+                | Self::Gpt5Mini
+                | Self::Gpt5Nano
         )
     }
 
     /// Whether this is a reasoning model.
     pub fn is_reasoning(&self) -> bool {
-        matches!(self, Self::O1 | Self::O1Mini | Self::O1Pro | Self::O3 | Self::O3Mini | Self::O4Mini)
+        matches!(
+            self,
+            Self::O1 | Self::O1Mini | Self::O1Pro | Self::O3 | Self::O3Mini | Self::O4Mini
+        )
+    }
+
+    /// Whether the model accepts sampling parameters in the Responses API.
+    pub fn supports_sampling_params(&self, reasoning_effort: Option<ReasoningEffort>) -> bool {
+        match self {
+            Self::Gpt52 => matches!(reasoning_effort, Some(ReasoningEffort::None)),
+            Self::Gpt5 | Self::Gpt5Mini | Self::Gpt5Nano => false,
+            _ => true,
+        }
     }
 
     pub fn capabilities(&self) -> ModelCapabilities {
@@ -93,7 +120,9 @@ impl OpenAiModel {
             Self::O1Mini => (128_000, false, false, true, false),
             Self::O3 | Self::O3Mini | Self::O4Mini => (200_000, true, true, true, true),
             Self::Gpt41 | Self::Gpt41Mini | Self::Gpt41Nano => (1_000_000, true, true, false, true),
-            Self::Gpt5 | Self::Gpt52 => (1_000_000, true, true, true, true),
+            Self::Gpt5 | Self::Gpt52 | Self::Gpt5Mini | Self::Gpt5Nano => {
+                (1_000_000, true, true, true, true)
+            }
             Self::Custom(_) => (128_000, true, true, false, true),
         };
         ModelCapabilities {
@@ -103,7 +132,8 @@ impl OpenAiModel {
             supports_json_mode: true,
             supports_json_schema: json_schema,
             supports_reasoning: reasoning,
-            supports_system_messages: !self.is_reasoning() || matches!(self, Self::O3 | Self::O3Mini | Self::O4Mini),
+            supports_system_messages: !self.is_reasoning()
+                || matches!(self, Self::O3 | Self::O3Mini | Self::O4Mini),
             context_length: ctx,
             max_output_tokens: Some(if self.is_reasoning() { 100_000 } else { 16_384 }),
         }

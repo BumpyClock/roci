@@ -51,9 +51,7 @@ pub async fn generate_object<T: DeserializeOwned>(
     // Strip potential markdown code fences
     let json_text = strip_code_fences(&raw_text);
 
-    let object: T = serde_json::from_str(&json_text).map_err(|e| {
-        RociError::Serialization(e)
-    })?;
+    let object: T = serde_json::from_str(&json_text).map_err(|e| RociError::Serialization(e))?;
 
     Ok(GenerateObjectResult {
         object,
@@ -101,7 +99,10 @@ mod tests {
 
     #[test]
     fn strip_code_fences_plain_json() {
-        assert_eq!(strip_code_fences(r#"{"key": "value"}"#), r#"{"key": "value"}"#);
+        assert_eq!(
+            strip_code_fences(r#"{"key": "value"}"#),
+            r#"{"key": "value"}"#
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
 /// Settings controlling text generation.
-#[derive(Debug, Clone, Builder, Serialize, Deserialize)]
+#[derive(Debug, Clone, Builder, Serialize, Deserialize, Default)]
 pub struct GenerationSettings {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
@@ -19,28 +19,12 @@ pub struct GenerationSettings {
     pub user: Option<String>,
 }
 
-impl Default for GenerationSettings {
-    fn default() -> Self {
-        Self {
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stop_sequences: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: None,
-            reasoning_effort: None,
-            response_format: None,
-            user: None,
-        }
-    }
-}
-
 /// Reasoning effort level for reasoning models.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum ReasoningEffort {
+    None,
     Low,
     Medium,
     High,
@@ -52,7 +36,10 @@ pub enum ReasoningEffort {
 pub enum ResponseFormat {
     Text,
     JsonObject,
-    JsonSchema { schema: serde_json::Value, name: String },
+    JsonSchema {
+        schema: serde_json::Value,
+        name: String,
+    },
 }
 
 /// Why generation finished.

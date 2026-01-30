@@ -35,6 +35,15 @@ impl GoogleProvider {
     fn build_request_body(&self, request: &ProviderRequest) -> serde_json::Value {
         let mut system_instruction = None;
         let mut contents = Vec::new();
+        let mut tool_name_map = std::collections::HashMap::new();
+
+        for msg in &request.messages {
+            for part in &msg.content {
+                if let ContentPart::ToolCall(tc) = part {
+                    tool_name_map.insert(tc.id.clone(), tc.name.clone());
+                }
+            }
+        }
 
         for msg in &request.messages {
             match msg.role {
@@ -51,20 +60,60 @@ impl GoogleProvider {
                     }));
                 }
                 Role::Assistant => {
-                    contents.push(serde_json::json!({
-                        "role": "model",
-                        "parts": [{"text": msg.text()}],
-                    }));
+                    let mut parts = Vec::new();
+                    for part in &msg.content {
+                        match part {
+                            ContentPart::Text { text } => {
+                                parts.push(serde_json::json!({ "text": text }))
+                            }
+                            ContentPart::Image(img) => parts.push(serde_json::json!({
+                                "inlineData": {
+                                    "mimeType": img.mime_type,
+                                    "data": img.data,
+                                }
+                            })),
+                            ContentPart::ToolCall(tc) => {
+                                let mut part = serde_json::json!({
+                                    "functionCall": {
+                                        "id": tc.id,
+                                        "name": tc.name,
+                                        "args": tc.arguments.clone(),
+                                    }
+                                });
+                                if let Some(ref recipient) = tc.recipient {
+                                    if let Some(obj) = part.as_object_mut() {
+                                        obj.insert(
+                                            "thoughtSignature".into(),
+                                            recipient.clone().into(),
+                                        );
+                                    }
+                                }
+                                parts.push(part);
+                            }
+                            ContentPart::ToolResult(_) => {}
+                        }
+                    }
+                    if !parts.is_empty() {
+                        contents.push(serde_json::json!({
+                            "role": "model",
+                            "parts": parts,
+                        }));
+                    }
                 }
                 Role::Tool => {
                     for part in &msg.content {
                         if let ContentPart::ToolResult(tr) = part {
+                            let name = tool_name_map
+                                .get(&tr.tool_call_id)
+                                .cloned()
+                                .unwrap_or_else(|| tr.tool_call_id.clone());
                             contents.push(serde_json::json!({
                                 "role": "function",
                                 "parts": [{
                                     "functionResponse": {
-                                        "name": tr.tool_call_id,
-                                        "response": tr.result,
+                                        "id": tr.tool_call_id,
+                                        "name": name,
+                                        "response": tr.result.clone(),
                                     }
                                 }]
                             }));
@@ -94,8 +143,24 @@ impl GoogleProvider {
         if let Some(ref stops) = request.settings.stop_sequences {
             gen_config.insert("stopSequences".into(), serde_json::json!(stops));
         }
+        if let Some(ref fmt) = request.response_format {
+            match fmt {
+                ResponseFormat::JsonObject => {
+                    gen_config.insert("responseMimeType".into(), "application/json".into());
+                }
+                ResponseFormat::JsonSchema { schema, .. } => {
+                    gen_config.insert("responseMimeType".into(), "application/json".into());
+                    gen_config.insert("responseSchema".into(), schema.clone());
+                }
+                ResponseFormat::Text => {}
+            }
+        }
+
         if !gen_config.is_empty() {
-            obj.insert("generationConfig".into(), serde_json::Value::Object(gen_config));
+            obj.insert(
+                "generationConfig".into(),
+                serde_json::Value::Object(gen_config),
+            );
         }
 
         if let Some(ref tools) = request.tools {
@@ -131,7 +196,10 @@ impl ModelProvider for GoogleProvider {
         &self.capabilities
     }
 
-    async fn generate_text(&self, request: &ProviderRequest) -> Result<ProviderResponse, RociError> {
+    async fn generate_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
         let body = self.build_request_body(request);
         let url = format!(
             "{}/models/{}:generateContent?key={}",
@@ -142,11 +210,7 @@ impl ModelProvider for GoogleProvider {
 
         debug!(model = self.model.as_str(), "Google generate_text");
 
-        let resp = shared_client()
-            .post(&url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = shared_client().post(&url).json(&body).send().await?;
 
         let status = resp.status().as_u16();
         if status != 200 {
@@ -156,22 +220,33 @@ impl ModelProvider for GoogleProvider {
 
         let data: GeminiResponse = resp.json().await?;
 
-        let candidate = data.candidates.into_iter().next().ok_or_else(|| {
-            RociError::api(200, "No candidates in Gemini response")
-        })?;
+        let candidate = data
+            .candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| RociError::api(200, "No candidates in Gemini response"))?;
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();
 
         for part in candidate.content.parts {
-            if let Some(t) = part.text {
+            let GeminiPart {
+                text: part_text,
+                function_call,
+                thought_signature,
+            } = part;
+            if let Some(t) = part_text {
                 text.push_str(&t);
             }
-            if let Some(fc) = part.function_call {
-                tool_calls.push(message::AgentToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
+            if let Some(fc) = function_call {
+                let id = fc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                tool_calls.push(AgentToolCall {
+                    id,
                     name: fc.name,
-                    arguments: fc.args.unwrap_or(serde_json::Value::Object(Default::default())),
+                    arguments: fc
+                        .args
+                        .unwrap_or(serde_json::Value::Object(Default::default())),
+                    recipient: thought_signature,
                 });
             }
         }
@@ -183,12 +258,15 @@ impl ModelProvider for GoogleProvider {
             _ => None,
         };
 
-        let usage = data.usage_metadata.map(|u| Usage {
-            input_tokens: u.prompt_token_count,
-            output_tokens: u.candidates_token_count,
-            total_tokens: u.total_token_count,
-            ..Default::default()
-        }).unwrap_or_default();
+        let usage = data
+            .usage_metadata
+            .map(|u| Usage {
+                input_tokens: u.prompt_token_count,
+                output_tokens: u.candidates_token_count,
+                total_tokens: u.total_token_count,
+                ..Default::default()
+            })
+            .unwrap_or_default();
 
         Ok(ProviderResponse {
             text,
@@ -212,11 +290,7 @@ impl ModelProvider for GoogleProvider {
 
         debug!(model = self.model.as_str(), "Google stream_text");
 
-        let resp = shared_client()
-            .post(&url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = shared_client().post(&url).json(&body).send().await?;
 
         let status = resp.status().as_u16();
         if status != 200 {
@@ -228,6 +302,9 @@ impl ModelProvider for GoogleProvider {
 
         let stream = async_stream::stream! {
             let mut buffer = String::new();
+            let mut saw_tool_call = false;
+            let mut finish_reason: Option<FinishReason> = None;
+            let mut usage: Option<Usage> = None;
             futures::pin_mut!(byte_stream);
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -235,7 +312,7 @@ impl ModelProvider for GoogleProvider {
                     Ok(c) => c,
                     Err(e) => {
                         yield Err(RociError::Network(e));
-                        break;
+                        return;
                     }
                 };
 
@@ -247,33 +324,62 @@ impl ModelProvider for GoogleProvider {
 
                     if let Some(data) = super::http::parse_sse_data(&line) {
                         if let Ok(resp) = serde_json::from_str::<GeminiResponse>(data) {
-                            if let Some(candidate) = resp.candidates.into_iter().next() {
+                            let GeminiResponse { candidates, usage_metadata } = resp;
+                            if let Some(candidate) = candidates.into_iter().next() {
                                 for part in candidate.content.parts {
-                                    if let Some(t) = part.text {
-                                        let done = candidate.finish_reason.is_some();
-                                        let finish = if done {
-                                            Some(FinishReason::Stop)
-                                        } else {
-                                            None
-                                        };
+                                    let GeminiPart { text: part_text, function_call, thought_signature } = part;
+                                    if let Some(call) = function_call {
+                                        saw_tool_call = true;
+                                        let id = call.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                        let args = call.args.unwrap_or(serde_json::Value::Object(Default::default()));
+                                        yield Ok(TextStreamDelta {
+                                            text: String::new(),
+                                            event_type: StreamEventType::ToolCallDelta,
+                                            tool_call: Some(AgentToolCall { id, name: call.name, arguments: args, recipient: thought_signature }),
+                                            finish_reason: None,
+                                            usage: None,
+                                        });
+                                    }
+                                    if let Some(t) = part_text {
                                         yield Ok(TextStreamDelta {
                                             text: t,
-                                            event_type: if done { StreamEventType::Done } else { StreamEventType::TextDelta },
-                                            finish_reason: finish,
-                                            usage: resp.usage_metadata.as_ref().map(|u| Usage {
-                                                input_tokens: u.prompt_token_count,
-                                                output_tokens: u.candidates_token_count,
-                                                total_tokens: u.total_token_count,
-                                                ..Default::default()
-                                            }),
+                                            event_type: StreamEventType::TextDelta,
+                                            tool_call: None,
+                                            finish_reason: None,
+                                            usage: None,
                                         });
                                     }
                                 }
+                                if let Some(reason) = candidate.finish_reason.as_deref() {
+                                    finish_reason = match reason {
+                                        "STOP" => Some(FinishReason::Stop),
+                                        "MAX_TOKENS" => Some(FinishReason::Length),
+                                        "SAFETY" => Some(FinishReason::ContentFilter),
+                                        _ => finish_reason,
+                                    };
+                                }
+                            }
+                            if let Some(meta) = usage_metadata {
+                                usage = Some(Usage {
+                                    input_tokens: meta.prompt_token_count,
+                                    output_tokens: meta.candidates_token_count,
+                                    total_tokens: meta.total_token_count,
+                                    ..Default::default()
+                                });
                             }
                         }
                     }
                 }
             }
+
+            let done_reason = if saw_tool_call { Some(FinishReason::ToolCalls) } else { finish_reason };
+            yield Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: done_reason,
+                usage,
+            });
         };
 
         Ok(Box::pin(stream))
@@ -322,10 +428,13 @@ struct GeminiContent {
 struct GeminiPart {
     text: Option<String>,
     function_call: Option<GeminiFunctionCall>,
+    thought_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct GeminiFunctionCall {
+    #[serde(default)]
+    id: Option<String>,
     name: String,
     args: Option<serde_json::Value>,
 }
@@ -336,4 +445,75 @@ struct GeminiUsage {
     prompt_token_count: u32,
     candidates_token_count: u32,
     total_token_count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_request_body_includes_thought_signature_and_call_id() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let tool_call = AgentToolCall {
+            id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({"city": "Paris"}),
+            recipient: Some("sig".to_string()),
+        };
+        let messages = vec![ModelMessage {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall(tool_call)],
+            name: None,
+            timestamp: None,
+        }];
+        let request = ProviderRequest {
+            messages,
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["contents"][0]["parts"][0]["functionCall"]["id"],
+            "call_1"
+        );
+        assert_eq!(body["contents"][0]["parts"][0]["thoughtSignature"], "sig");
+    }
+
+    #[test]
+    fn build_request_body_includes_function_response_id() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let tool_call = AgentToolCall {
+            id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({"city": "Paris"}),
+            recipient: None,
+        };
+        let messages = vec![
+            ModelMessage {
+                role: Role::Assistant,
+                content: vec![ContentPart::ToolCall(tool_call)],
+                name: None,
+                timestamp: None,
+            },
+            ModelMessage::tool_result("call_1", serde_json::json!({"temp": 18}), false),
+        ];
+        let request = ProviderRequest {
+            messages,
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["name"],
+            "get_weather"
+        );
+    }
 }

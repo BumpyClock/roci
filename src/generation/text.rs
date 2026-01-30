@@ -4,8 +4,8 @@ use tracing::{debug, warn};
 
 use crate::error::RociError;
 use crate::provider::{ModelProvider, ProviderRequest, ToolDefinition};
-use crate::tools::tool::{Tool, ToolExecutionContext};
 use crate::tools::arguments::ToolArguments;
+use crate::tools::tool::{Tool, ToolExecutionContext};
 use crate::types::*;
 
 /// Maximum tool loop iterations to prevent infinite loops.
@@ -19,7 +19,7 @@ pub async fn generate_text(
     provider: &dyn ModelProvider,
     mut messages: Vec<ModelMessage>,
     settings: GenerationSettings,
-    tools: &[Box<dyn Tool>],
+    tools: &[std::sync::Arc<dyn Tool>],
 ) -> Result<GenerateTextResult, RociError> {
     let tool_defs: Option<Vec<ToolDefinition>> = if tools.is_empty() {
         None

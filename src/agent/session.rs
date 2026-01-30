@@ -17,9 +17,7 @@ impl AgentSessionManager {
 
     /// Get or create a session by ID.
     pub fn get_or_create(&mut self, session_id: &str) -> &mut Conversation {
-        self.sessions
-            .entry(session_id.to_string())
-            .or_default()
+        self.sessions.entry(session_id.to_string()).or_default()
     }
 
     /// Get an existing session.

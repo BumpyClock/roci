@@ -1,7 +1,7 @@
 //! Tests for the tool system.
 
-use roci::tools::*;
 use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::*;
 
 #[test]
 fn parameter_builder_constructs_schema() {
@@ -94,6 +94,9 @@ async fn agent_tool_executes() {
     assert_eq!(tool.description(), "Greet a person");
 
     let args = ToolArguments::new(serde_json::json!({"name": "World"}));
-    let result = tool.execute(&args, &ToolExecutionContext::default()).await.unwrap();
+    let result = tool
+        .execute(&args, &ToolExecutionContext::default())
+        .await
+        .unwrap();
     assert_eq!(result["greeting"], "Hello, World!");
 }

@@ -16,7 +16,7 @@ pub struct Agent {
     model: LanguageModel,
     config: RociConfig,
     system_prompt: Option<String>,
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<std::sync::Arc<dyn Tool>>,
     settings: GenerationSettings,
     conversation: Conversation,
 }
@@ -48,6 +48,12 @@ impl Agent {
 
     /// Add a tool.
     pub fn with_tool(mut self, tool: Box<dyn Tool>) -> Self {
+        self.tools.push(std::sync::Arc::from(tool));
+        self
+    }
+
+    /// Add a tool from an existing shared reference.
+    pub fn with_tool_ref(mut self, tool: std::sync::Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
     }
@@ -89,6 +95,7 @@ impl Agent {
         message: impl Into<String>,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         let provider = provider::create_provider(&self.model, &self.config)?;
+        let provider = std::sync::Arc::from(provider);
 
         self.conversation.add_user_message(message);
 
@@ -98,11 +105,12 @@ impl Agent {
         }
         messages.extend(self.conversation.messages().iter().cloned());
 
-        crate::generation::stream::stream_text(
-            provider.as_ref(),
+        crate::generation::stream::stream_text_with_tools(
+            provider,
             messages,
             self.settings.clone(),
-            &[],
+            &self.tools,
+            Vec::new(),
         )
         .await
     }

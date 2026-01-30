@@ -18,17 +18,17 @@
 //! # }
 //! ```
 
+pub mod config;
 pub mod error;
-pub mod types;
-pub mod models;
-pub mod provider;
-pub mod tools;
 pub mod generation;
+pub mod models;
+pub mod prelude;
+pub mod provider;
 pub mod stop;
 pub mod stream_transform;
-pub mod config;
+pub mod tools;
+pub mod types;
 pub mod util;
-pub mod prelude;
 
 #[cfg(feature = "agent")]
 pub mod agent;
