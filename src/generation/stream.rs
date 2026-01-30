@@ -63,6 +63,9 @@ pub async fn stream_text_with_tools(
                     tool_call: None,
                     finish_reason: Some(FinishReason::Length),
                     usage: None,
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
                 });
                 break;
             }
@@ -134,6 +137,9 @@ pub async fn stream_text_with_tools(
                     tool_call: None,
                     finish_reason: Some(FinishReason::Stop),
                     usage: None,
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
                 });
                 break;
             }

@@ -29,8 +29,8 @@ pub fn bearer_headers(api_key: &str) -> HeaderMap {
     headers
 }
 
-/// Build Anthropic-style headers (x-api-key).
-pub fn anthropic_headers(api_key: &str, version: &str) -> HeaderMap {
+/// Build Anthropic-style headers (x-api-key) with optional beta flag.
+pub fn anthropic_headers(api_key: &str, version: &str, beta: Option<&str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Ok(val) = HeaderValue::from_str(api_key) {
@@ -38,6 +38,11 @@ pub fn anthropic_headers(api_key: &str, version: &str) -> HeaderMap {
     }
     if let Ok(val) = HeaderValue::from_str(version) {
         headers.insert("anthropic-version", val);
+    }
+    if let Some(beta_val) = beta {
+        if let Ok(val) = HeaderValue::from_str(beta_val) {
+            headers.insert("anthropic-beta", val);
+        }
     }
     headers
 }

@@ -98,6 +98,8 @@ impl GoogleProvider {
                                 parts.push(part);
                             }
                             ContentPart::ToolResult(_) => {}
+                            ContentPart::Thinking(_) => {}
+                            ContentPart::RedactedThinking(_) => {}
                         }
                     }
                     if !parts.is_empty() {
@@ -282,6 +284,7 @@ impl ModelProvider for GoogleProvider {
             usage,
             tool_calls,
             finish_reason,
+            thinking: Vec::new(),
         })
     }
 
@@ -347,6 +350,9 @@ impl ModelProvider for GoogleProvider {
                                             tool_call: Some(AgentToolCall { id, name: call.name, arguments: args, recipient: thought_signature }),
                                             finish_reason: None,
                                             usage: None,
+                                            reasoning: None,
+                                            reasoning_signature: None,
+                                            reasoning_type: None,
                                         });
                                     }
                                     if let Some(t) = part_text {
@@ -356,6 +362,9 @@ impl ModelProvider for GoogleProvider {
                                             tool_call: None,
                                             finish_reason: None,
                                             usage: None,
+                                            reasoning: None,
+                                            reasoning_signature: None,
+                                            reasoning_type: None,
                                         });
                                     }
                                 }
@@ -388,6 +397,9 @@ impl ModelProvider for GoogleProvider {
                 tool_call: None,
                 finish_reason: done_reason,
                 usage,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
             });
         };
 
@@ -482,6 +494,8 @@ mod tests {
             response_format: None,
             openai_responses: None,
             user: None,
+            anthropic: None,
+            tool_choice: None,
         }
     }
 

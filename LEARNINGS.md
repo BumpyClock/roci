@@ -37,3 +37,17 @@
 - GPT-5 Responses requests now default reasoning effort to medium and text verbosity to high.
 - O3/O4 Responses requests default truncation to auto.
 - OpenAI chat requests use max_completion_tokens and drop sampling/penalty params for gpt-5 IDs.
+
+## 2026-01-30: Anthropic extended thinking + tool choice
+- Extended thinking implemented: `ThinkingMode::Enabled { budget_tokens }` in `AnthropicOptions`.
+- Temperature must NOT be sent when thinking is enabled (Anthropic API rejects it).
+- `max_tokens` must be ≥ `budget_tokens + 4096` and ≥ 16,384 when thinking is on.
+- Beta headers (`interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14`) are always sent.
+- Thinking blocks use `thinking` + `signature` fields; redacted blocks use `data` + `signature`.
+- Streaming handles `content_block_start` (tracks block type), `content_block_delta` (text/thinking/signature/input_json), `content_block_stop` (emits tool calls).
+- Anthropic tool_choice maps: `Required` → `"any"`, `Function(name)` → `{"type": "tool", "name": name}`.
+- Tachikoma's `ToolChoice` enum is defined but NOT wired to text providers (only Realtime API); Roci now has it in `GenerationSettings` and Anthropic provider.
+- `ProviderResponse` now carries `thinking: Vec<ContentPart>` for thinking blocks.
+- `TextStreamDelta` now carries `reasoning`, `reasoning_signature`, `reasoning_type` optional fields.
+- `ContentPart` now has `Thinking` and `RedactedThinking` variants.
+- ANTHROPIC_API_KEY needed for live tests; add to `.env`.

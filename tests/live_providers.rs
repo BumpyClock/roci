@@ -3,9 +3,11 @@
 use roci::config::RociConfig;
 use roci::generation;
 use roci::generation::stream::collect_stream;
-use roci::models::{google, openai, LanguageModel};
+use roci::models::{anthropic, google, openai, LanguageModel};
 use roci::tools::{AgentTool, AgentToolParameters};
-use roci::types::{GenerationSettings, ModelMessage, TextVerbosity};
+use roci::types::{
+    AnthropicOptions, GenerationSettings, ModelMessage, TextVerbosity, ThinkingMode,
+};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -605,4 +607,135 @@ async fn live_openai_compatible_returns_json_object() {
     run_json_object_test(provider.as_ref(), "openai-compatible json object")
         .await
         .unwrap();
+}
+
+// --- Anthropic extended thinking tests ---
+
+#[tokio::test]
+#[ignore]
+async fn live_anthropic_sonnet4_generates_text() {
+    let _permit = live_test_semaphore().acquire().await.unwrap();
+    let model = LanguageModel::Anthropic(anthropic::AnthropicModel::ClaudeSonnet4);
+    let config = RociConfig::from_env();
+    let provider = roci::provider::create_provider(&model, &config).unwrap();
+    let result = generation::generate_text(
+        provider.as_ref(),
+        vec![ModelMessage::user("Say 'ok' and today's date")],
+        GenerationSettings::default(),
+        &[],
+    )
+    .await
+    .unwrap();
+    print_result("anthropic:claude-sonnet-4", &result.text);
+    assert!(!result.text.trim().is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_anthropic_sonnet4_extended_thinking() {
+    let _permit = live_test_semaphore().acquire().await.unwrap();
+    let model = LanguageModel::Anthropic(anthropic::AnthropicModel::ClaudeSonnet4);
+    let config = RociConfig::from_env();
+    let provider = roci::provider::create_provider(&model, &config).unwrap();
+    let result = generation::generate_text(
+        provider.as_ref(),
+        vec![ModelMessage::user(
+            "What is 15 * 37? Think step by step.",
+        )],
+        GenerationSettings {
+            anthropic: Some(AnthropicOptions {
+                thinking: Some(ThinkingMode::Enabled {
+                    budget_tokens: 10000,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        &[],
+    )
+    .await
+    .unwrap();
+    print_result("anthropic:claude-sonnet-4 thinking", &result.text);
+    assert!(!result.text.trim().is_empty());
+    // The response should contain "555"
+    assert!(
+        result.text.contains("555"),
+        "Expected answer 555 in response"
+    );
+    // Check thinking blocks are returned
+    assert!(
+        !result.steps.is_empty(),
+        "Expected at least one generation step"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_anthropic_sonnet4_streams_text() {
+    let _permit = live_test_semaphore().acquire().await.unwrap();
+    let model = LanguageModel::Anthropic(anthropic::AnthropicModel::ClaudeSonnet4);
+    let config = RociConfig::from_env();
+    let provider = roci::provider::create_provider(&model, &config).unwrap();
+    run_stream_test(Arc::from(provider), "anthropic:claude-sonnet-4 stream")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_anthropic_sonnet4_streams_with_thinking() {
+    let _permit = live_test_semaphore().acquire().await.unwrap();
+    let model = LanguageModel::Anthropic(anthropic::AnthropicModel::ClaudeSonnet4);
+    let config = RociConfig::from_env();
+    let provider = roci::provider::create_provider(&model, &config).unwrap();
+    let stream = generation::stream_text(
+        Arc::from(provider),
+        vec![ModelMessage::user("What is 15 * 37? Think step by step.")],
+        GenerationSettings {
+            anthropic: Some(AnthropicOptions {
+                thinking: Some(ThinkingMode::Enabled {
+                    budget_tokens: 10000,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let result = collect_stream(stream).await.unwrap();
+    print_result("anthropic:claude-sonnet-4 stream+thinking", &result.text);
+    assert!(!result.text.trim().is_empty());
+    assert!(
+        result.text.contains("555"),
+        "Expected answer 555 in streamed response"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_anthropic_sonnet4_executes_tool_call() {
+    let _permit = live_test_semaphore().acquire().await.unwrap();
+    let model = LanguageModel::Anthropic(anthropic::AnthropicModel::ClaudeSonnet4);
+    let config = RociConfig::from_env();
+    let provider = roci::provider::create_provider(&model, &config).unwrap();
+    run_tool_flow_test(provider.as_ref(), "anthropic:claude-sonnet-4 tool")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_anthropic_sonnet4_streams_tool_call() {
+    let _permit = live_test_semaphore().acquire().await.unwrap();
+    let model = LanguageModel::Anthropic(anthropic::AnthropicModel::ClaudeSonnet4);
+    let config = RociConfig::from_env();
+    let provider = roci::provider::create_provider(&model, &config).unwrap();
+    run_stream_tool_flow_test(
+        Arc::from(provider),
+        "anthropic:claude-sonnet-4 stream tool",
+    )
+    .await
+    .unwrap();
 }

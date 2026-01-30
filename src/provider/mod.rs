@@ -46,7 +46,8 @@ use futures::stream::BoxStream;
 use crate::error::RociError;
 use crate::models::{capabilities::ModelCapabilities, LanguageModel};
 use crate::types::{
-    message::AgentToolCall, FinishReason, GenerationSettings, ModelMessage, TextStreamDelta, Usage,
+    message::{AgentToolCall, ContentPart},
+    FinishReason, GenerationSettings, ModelMessage, TextStreamDelta, Usage,
 };
 
 /// A request sent to a model provider.
@@ -73,6 +74,8 @@ pub struct ProviderResponse {
     pub usage: Usage,
     pub tool_calls: Vec<AgentToolCall>,
     pub finish_reason: Option<FinishReason>,
+    /// Thinking content blocks (Anthropic extended thinking).
+    pub thinking: Vec<ContentPart>,
 }
 
 /// Core trait implemented by all model providers.

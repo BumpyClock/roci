@@ -212,6 +212,7 @@ impl ModelProvider for OpenAiProvider {
                 .unwrap_or_default(),
             tool_calls,
             finish_reason,
+            thinking: Vec::new(),
         })
     }
 
@@ -298,6 +299,9 @@ impl ModelProvider for OpenAiProvider {
                                         tool_call: None,
                                         finish_reason: None,
                                         usage: None,
+                                        reasoning: None,
+                                        reasoning_signature: None,
+                                        reasoning_type: None,
                                     });
                                 }
                                 let finish = choice.finish_reason.as_deref().and_then(parse_finish_reason);
@@ -316,6 +320,9 @@ impl ModelProvider for OpenAiProvider {
                                                         tool_call: Some(AgentToolCall { id, name, arguments: args, recipient: None }),
                                                         finish_reason: None,
                                                         usage: None,
+                                                        reasoning: None,
+                                                        reasoning_signature: None,
+                                                        reasoning_type: None,
                                                     });
                                                 }
                                             }
@@ -332,6 +339,9 @@ impl ModelProvider for OpenAiProvider {
                                             total_tokens: u.total_tokens,
                                             ..Default::default()
                                         }),
+                                        reasoning: None,
+                                        reasoning_signature: None,
+                                        reasoning_type: None,
                                     });
                                 }
                             }
@@ -399,6 +409,8 @@ fn message_to_openai(msg: &ModelMessage) -> serde_json::Value {
                 }
             })),
             ContentPart::ToolResult(_) => None, // handled at message level
+            ContentPart::Thinking(_) => None,
+            ContentPart::RedactedThinking(_) => None,
         })
         .collect();
 
@@ -524,6 +536,8 @@ mod tests {
             response_format: None,
             openai_responses: None,
             user: None,
+            anthropic: None,
+            tool_choice: None,
         }
     }
 

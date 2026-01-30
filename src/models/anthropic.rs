@@ -51,10 +51,15 @@ impl AnthropicModel {
 
     pub fn capabilities(&self) -> ModelCapabilities {
         let ctx = match self {
-            Self::ClaudeOpus45 | Self::ClaudeSonnet45 | Self::ClaudeSonnet4 => 200_000,
+            Self::ClaudeOpus45 | Self::ClaudeSonnet45 | Self::ClaudeSonnet4 => 500_000,
             Self::ClaudeHaiku35 => 200_000,
             Self::Claude3Opus | Self::Claude3Sonnet | Self::Claude3Haiku => 200_000,
             Self::Custom(_) => 200_000,
+        };
+        let max_output = if self.supports_extended_thinking() {
+            16_384
+        } else {
+            8_192
         };
         ModelCapabilities {
             supports_vision: true,
@@ -65,7 +70,7 @@ impl AnthropicModel {
             supports_reasoning: self.supports_extended_thinking(),
             supports_system_messages: true,
             context_length: ctx,
-            max_output_tokens: Some(8_192),
+            max_output_tokens: Some(max_output),
         }
     }
 }

@@ -36,6 +36,7 @@ impl MockProvider {
             },
             tool_calls: vec![],
             finish_reason: Some(FinishReason::Stop),
+            thinking: vec![],
         });
     }
 
@@ -56,6 +57,7 @@ impl MockProvider {
                 recipient: None,
             }],
             finish_reason: Some(FinishReason::ToolCalls),
+            thinking: vec![],
         });
     }
 }
@@ -85,6 +87,7 @@ impl ModelProvider for MockProvider {
                 usage: Usage::default(),
                 tool_calls: vec![],
                 finish_reason: Some(FinishReason::Stop),
+                thinking: vec![],
             });
         }
         Ok(responses.remove(0))
@@ -112,6 +115,9 @@ impl ModelProvider for MockProvider {
                     tool_call: None,
                     finish_reason: None,
                     usage: None,
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
                 });
             }
             yield Ok(TextStreamDelta {
@@ -120,6 +126,9 @@ impl ModelProvider for MockProvider {
                 tool_call: None,
                 finish_reason: Some(FinishReason::Stop),
                 usage: Some(Usage { input_tokens: 10, output_tokens: 20, total_tokens: 30, ..Default::default() }),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
             });
         };
 

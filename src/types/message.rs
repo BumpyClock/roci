@@ -121,6 +121,24 @@ pub enum ContentPart {
     Image(ImageContent),
     ToolCall(AgentToolCall),
     ToolResult(AgentToolResult),
+    /// Extended thinking content (Anthropic).
+    Thinking(ThinkingContent),
+    /// Redacted thinking content (Anthropic).
+    RedactedThinking(RedactedThinkingContent),
+}
+
+/// Extended thinking block from Anthropic models.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThinkingContent {
+    pub thinking: String,
+    pub signature: String,
+}
+
+/// Redacted thinking block from Anthropic models.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RedactedThinkingContent {
+    pub data: String,
+    pub signature: String,
 }
 
 /// Image content embedded in a message.

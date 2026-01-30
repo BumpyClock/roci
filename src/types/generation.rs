@@ -20,6 +20,8 @@ pub struct GenerationSettings {
     pub text_verbosity: Option<TextVerbosity>,
     pub response_format: Option<ResponseFormat>,
     pub openai_responses: Option<OpenAiResponsesOptions>,
+    pub anthropic: Option<AnthropicOptions>,
+    pub tool_choice: Option<ToolChoice>,
     pub user: Option<String>,
 }
 
@@ -88,6 +90,52 @@ pub enum TextVerbosity {
     Low,
     Medium,
     High,
+}
+
+/// Anthropic-specific request options.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AnthropicOptions {
+    /// Enable extended thinking with a budget.
+    pub thinking: Option<ThinkingMode>,
+    /// Prompt caching control.
+    pub cache_control: Option<CacheControl>,
+    /// Request metadata.
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+/// Anthropic extended thinking mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingMode {
+    /// Thinking disabled.
+    Disabled,
+    /// Thinking enabled with a token budget.
+    Enabled {
+        #[serde(rename = "budget_tokens")]
+        budget_tokens: u32,
+    },
+}
+
+/// Anthropic cache control policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CacheControl {
+    Ephemeral,
+}
+
+/// Tool selection strategy for providers that support tool calling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Model decides whether to call tools.
+    Auto,
+    /// Model must call at least one tool.
+    Required,
+    /// Model must not call any tool.
+    None,
+    /// Model must call the specific named function.
+    Function(String),
 }
 
 /// Requested response format.

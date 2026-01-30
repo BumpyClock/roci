@@ -198,6 +198,8 @@ impl OpenAiResponsesProvider {
                     }
                     ContentPart::ToolCall(tc) => tool_calls.push(tc),
                     ContentPart::ToolResult(_) => {}
+                    ContentPart::Thinking(_) => {}
+                    ContentPart::RedactedThinking(_) => {}
                 }
             }
             match msg.role {
@@ -310,6 +312,7 @@ impl OpenAiResponsesProvider {
                 usage: Self::map_usage(data.usage),
                 tool_calls,
                 finish_reason,
+                thinking: Vec::new(),
             });
         }
 
@@ -345,6 +348,7 @@ impl OpenAiResponsesProvider {
                 usage: Self::map_usage(data.usage),
                 tool_calls,
                 finish_reason,
+                thinking: Vec::new(),
             });
         }
 
@@ -527,6 +531,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                                                                     tool_call: None,
                                                                     finish_reason: None,
                                                                     usage: None,
+                                                                    reasoning: None,
+                                                                    reasoning_signature: None,
+                                                                    reasoning_type: None,
                                                                 });
                                                             }
                                                         }
@@ -555,6 +562,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                                                             }),
                                                             finish_reason: None,
                                                             usage: None,
+                                                            reasoning: None,
+                                                            reasoning_signature: None,
+                                                            reasoning_type: None,
                                                         });
                                                         emitted_calls.insert(id.to_string());
                                                         saw_tool_call = true;
@@ -605,6 +615,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                                                 tool_call: Some(AgentToolCall { id: id.clone(), name, arguments, recipient: None }),
                                                 finish_reason: None,
                                                 usage: None,
+                                                reasoning: None,
+                                                reasoning_signature: None,
+                                                reasoning_type: None,
                                             });
                                             emitted_calls.insert(id);
                                             saw_tool_call = true;
@@ -620,6 +633,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             tool_call: None,
                                             finish_reason: None,
                                             usage: None,
+                                            reasoning: None,
+                                            reasoning_signature: None,
+                                            reasoning_type: None,
                                         });
                                     }
                                 }
@@ -633,6 +649,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                                                     tool_call: None,
                                                     finish_reason: None,
                                                     usage: None,
+                                                    reasoning: None,
+                                                    reasoning_signature: None,
+                                                    reasoning_type: None,
                                                 });
                                             }
                                         }
@@ -667,6 +686,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             finish.or(Some(FinishReason::Stop))
                                         },
                                         usage,
+                                        reasoning: None,
+                                        reasoning_signature: None,
+                                        reasoning_type: None,
                                     });
                                 }
                                 _ => {}
@@ -775,6 +797,8 @@ mod tests {
             response_format: None,
             openai_responses: None,
             user: None,
+            anthropic: None,
+            tool_choice: None,
         }
     }
 

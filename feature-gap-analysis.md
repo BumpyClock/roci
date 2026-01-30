@@ -92,7 +92,7 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 | `textDelta` | Yes | Yes |
 | `toolCall` | Yes | Yes (ToolCallDelta) |
 | `toolResult` | Yes | No |
-| `reasoning` | Yes | No |
+| `reasoning` | Yes | Yes (thinking_delta, signature_delta) |
 | `done` | Yes | Yes |
 | `error` | Structured propagation | Basic |
 | `start` | Yes | Yes |
@@ -104,14 +104,14 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 | Feature | Tachikoma | Roci |
 |---------|-----------|------|
 | Tool definitions | Full schema + typed parameters + `ParameterDefinition` enum | JSON Schema via serde_json |
-| **Tool choice** (`auto`/`required`/`none`/specific) | Yes (`OpenAIOptions.toolChoice`) | **Not implemented** |
+| **Tool choice** (`auto`/`required`/`none`/specific) | Yes (`OpenAIOptions.toolChoice`) | Implemented in Anthropic; Tachikoma text providers also unimplemented |
 | Parallel tool calls | `OpenAIOptions.parallelToolCalls` | Only `OpenAiResponsesOptions` |
 | Tool result handling | Automatic loop with context | Manual or `stream_text_with_tools` |
 | Tool execution context | Full: messages, model, settings, sessionId, stepIndex, metadata | Not provided to tools |
 | Dynamic tool discovery | `DynamicToolProvider` protocol | Not implemented |
 | Namespace/multi-agent routing | `AgentToolCall.namespace` | Only `recipient` field |
 | Typed arguments | `AnyAgentToolValue` (runtime type info) | `serde_json::Value` |
-| Streaming tool calls | Partial JSON accumulation from deltas | Not supported |
+| Streaming tool calls | Partial JSON accumulation from deltas | Anthropic: `input_json_delta` accumulation + `content_block_stop` emit |
 | Max tool iterations | Configurable (default 5) | Fixed at 20 |
 | Schema normalization | Broader framework | OpenAI: adds `additionalProperties: false`; Google: strips it |
 
@@ -121,12 +121,12 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 
 | Feature | Tachikoma | Roci |
 |---------|-----------|------|
-| **Extended thinking** | Full: `ThinkingMode` (enabled/disabled), `budgetTokens`, thinking + redacted_thinking content blocks | `supports_extended_thinking()` exists but unused; no config, no blocks |
+| **Extended thinking** | Full: `ThinkingMode` (enabled/disabled), `budgetTokens`, thinking + redacted_thinking content blocks | Full: `ThinkingMode` enum, `AnthropicOptions.thinking`, thinking/redacted content blocks, streaming deltas |
 | **Prompt caching** | `CacheControl` enum (ephemeral/persistent) in `AnthropicOptions` | Only tracks cache tokens in `Usage` response |
-| **Beta headers** | Configurable with flag merging (`interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14`) | Not supported |
+| **Beta headers** | Configurable with flag merging (`interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14`) | Always sent via `anthropic_headers()` with beta parameter |
 | **Auth flexibility** | API key + Bearer token fallback chain | API key only |
 | **Error parsing** | `AnthropicErrorResponse` structure (type + message extraction) | Generic `status_to_error()` |
-| **top_k** parameter | Yes | Not sent to API |
+| **top_k** parameter | Yes | Sent to API |
 | **metadata** in request | Yes | Not sent |
 | **Debug mode** | `DEBUG_ANTHROPIC` env var | Not supported |
 | **Thinking fallback** | Graceful fallback from thinking mode on failure | N/A |
@@ -327,10 +327,10 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 
 1. **Tool choice support** (`auto`/`required`/`none`/specific) — affects all providers — **Closed** (Tachikoma also unimplemented for text providers; only defined in Realtime API)
 
-2. **Anthropic extended thinking** — thinking mode, budget tokens, thinking/redacted content blocks — **In Progress**
-3. **Anthropic streaming fidelity** — `content_block_start/stop`, `thinking_delta`, `signature_delta`, `input_json_delta` (tool streaming)
-4. **Context length corrections** — Anthropic at 200k should be 500k+
-5. **Provider-specific options architecture** — extensible per-provider settings container
+2. **Anthropic extended thinking** — thinking mode, budget tokens, thinking/redacted content blocks — **Complete**
+3. **Anthropic streaming fidelity** — `content_block_start/stop`, `thinking_delta`, `signature_delta`, `input_json_delta` (tool streaming) — **Complete**
+4. **Context length corrections** — Anthropic at 200k should be 500k+ — **Complete** (already fixed)
+5. **Provider-specific options architecture** — extensible per-provider settings container — **Complete** (`AnthropicOptions` in `GenerationSettings`)
 
 ### P1 — High (significant functionality gaps)
 
@@ -338,8 +338,8 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 7. **Multi-step agent loop** — automatic tool execution with configurable max steps & step tracking
 8. **Prompt caching control** — Anthropic `cache_control` headers in requests
 9. **Google thinking config** — Gemini 2.5+ thinking budget + includeThoughts
-10. **Beta header support** — Anthropic `interleaved-thinking`, `fine-grained-tool-streaming`
-11. **Missing content parts** — audio, file, refusal, reasoning in `ContentPart` enum
+10. **Beta header support** — Anthropic `interleaved-thinking`, `fine-grained-tool-streaming` — **Complete**
+11. **Missing content parts** — audio, file, refusal, reasoning in `ContentPart` enum — Partially addressed (thinking/redacted_thinking added; audio/file/refusal still missing)
 12. **Response channels** — thinking vs final output differentiation
 
 ### P2 — Medium (feature completeness)

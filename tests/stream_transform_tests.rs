@@ -13,6 +13,9 @@ async fn filter_transform_keeps_matching_deltas() {
             tool_call: None,
             finish_reason: None,
             usage: None,
+            reasoning: None,
+            reasoning_signature: None,
+            reasoning_type: None,
         });
         yield Ok(TextStreamDelta {
             text: "drop".to_string(),
@@ -20,6 +23,9 @@ async fn filter_transform_keeps_matching_deltas() {
             tool_call: None,
             finish_reason: None,
             usage: None,
+            reasoning: None,
+            reasoning_signature: None,
+            reasoning_type: None,
         });
         yield Ok(TextStreamDelta {
             text: String::new(),
@@ -27,6 +33,9 @@ async fn filter_transform_keeps_matching_deltas() {
             tool_call: None,
             finish_reason: Some(FinishReason::Stop),
             usage: None,
+            reasoning: None,
+            reasoning_signature: None,
+            reasoning_type: None,
         });
     };
 
@@ -53,6 +62,9 @@ async fn map_transform_rewrites_text() {
             tool_call: None,
             finish_reason: None,
             usage: None,
+            reasoning: None,
+            reasoning_signature: None,
+            reasoning_type: None,
         });
         yield Ok(TextStreamDelta {
             text: String::new(),
@@ -60,6 +72,9 @@ async fn map_transform_rewrites_text() {
             tool_call: None,
             finish_reason: Some(FinishReason::Stop),
             usage: None,
+            reasoning: None,
+            reasoning_signature: None,
+            reasoning_type: None,
         });
     };
 

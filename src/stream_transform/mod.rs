@@ -142,6 +142,9 @@ impl StreamTransform for BufferTransform {
                     tool_call: None,
                     finish_reason: None,
                     usage: None,
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
                 });
             }
         };

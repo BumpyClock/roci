@@ -22,6 +22,15 @@ pub struct TextStreamDelta {
     /// Usage (typically only on the final delta).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Reasoning/thinking content (Anthropic extended thinking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Reasoning signature (Anthropic extended thinking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
+    /// Reasoning block type ("thinking" or "redacted_thinking").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_type: Option<String>,
 }
 
 /// Type of stream event.
@@ -32,6 +41,8 @@ pub enum StreamEventType {
     TextDelta,
     /// Tool call being built.
     ToolCallDelta,
+    /// Reasoning/thinking delta (Anthropic extended thinking).
+    Reasoning,
     /// Stream started.
     Start,
     /// Stream finished.

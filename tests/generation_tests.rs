@@ -40,6 +40,7 @@ impl CaptureProvider {
                 usage: Usage::default(),
                 tool_calls: Vec::new(),
                 finish_reason: Some(FinishReason::Stop),
+                thinking: vec![],
             });
     }
 
@@ -75,6 +76,7 @@ impl roci::provider::ModelProvider for CaptureProvider {
                 usage: Usage::default(),
                 tool_calls: Vec::new(),
                 finish_reason: Some(FinishReason::Stop),
+                thinking: vec![],
             }))
     }
 
@@ -413,6 +415,9 @@ async fn stream_text_executes_tool_calls_and_continues() {
                         }),
                         finish_reason: None,
                         usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
                     });
                     yield Ok(TextStreamDelta {
                         text: String::new(),
@@ -420,6 +425,9 @@ async fn stream_text_executes_tool_calls_and_continues() {
                         tool_call: None,
                         finish_reason: Some(FinishReason::ToolCalls),
                         usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
                     });
                 };
                 Ok(Box::pin(stream))
@@ -431,6 +439,9 @@ async fn stream_text_executes_tool_calls_and_continues() {
                         tool_call: None,
                         finish_reason: None,
                         usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
                     });
                     yield Ok(TextStreamDelta {
                         text: String::new(),
@@ -438,6 +449,9 @@ async fn stream_text_executes_tool_calls_and_continues() {
                         tool_call: None,
                         finish_reason: Some(FinishReason::Stop),
                         usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
                     });
                 };
                 Ok(Box::pin(stream))
@@ -522,6 +536,9 @@ async fn stream_text_stops_when_condition_matches() {
                     tool_call: None,
                     finish_reason: None,
                     usage: None,
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
                 });
                 yield Ok(TextStreamDelta {
                     text: "should-not-see".to_string(),
@@ -529,6 +546,9 @@ async fn stream_text_stops_when_condition_matches() {
                     tool_call: None,
                     finish_reason: None,
                     usage: None,
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
                 });
             };
             Ok(Box::pin(stream))
