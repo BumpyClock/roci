@@ -51,3 +51,11 @@
 - `TextStreamDelta` now carries `reasoning`, `reasoning_signature`, `reasoning_type` optional fields.
 - `ContentPart` now has `Thinking` and `RedactedThinking` variants.
 - ANTHROPIC_API_KEY needed for live tests; add to `.env`.
+
+## 2026-01-30: Google thinking config + safety settings
+- `GoogleOptions` in `GenerationSettings` with `thinking_config` and `safety_settings`.
+- `GoogleThinkingConfig` has `budget_tokens` (Gemini 2.5), `include_thoughts`, `thinking_level` (Gemini 3).
+- `GoogleThinkingLevel`: Minimal/Low/Medium/High serialized as SCREAMING_SNAKE_CASE.
+- `GoogleSafetyLevel`: Strict/Moderate/Relaxed mapped to Gemini threshold strings.
+- Thinking config serialized inside `generationConfig.thinkingConfig`; safety settings as top-level `safetySettings` array.
+- Tachikoma defines `GoogleOptions.ThinkingConfig` but does NOT serialize it to API requests; Roci fully wires it.

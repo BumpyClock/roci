@@ -165,10 +165,57 @@ impl GoogleProvider {
             }
         }
 
+        // Google thinking config (inside generationConfig)
+        if let Some(ref google_opts) = request.settings.google {
+            if let Some(ref thinking) = google_opts.thinking_config {
+                let mut tc = serde_json::Map::new();
+                if let Some(budget) = thinking.budget_tokens {
+                    tc.insert("thinkingBudget".into(), budget.into());
+                }
+                if let Some(include) = thinking.include_thoughts {
+                    tc.insert("includeThoughts".into(), include.into());
+                }
+                if let Some(ref level) = thinking.thinking_level {
+                    tc.insert(
+                        "thinkingLevel".into(),
+                        serde_json::json!(level.to_string()),
+                    );
+                }
+                if !tc.is_empty() {
+                    gen_config
+                        .insert("thinkingConfig".into(), serde_json::Value::Object(tc));
+                }
+            }
+        }
+
         obj.insert(
             "generationConfig".into(),
             serde_json::Value::Object(gen_config),
         );
+
+        // Google safety settings (top-level)
+        if let Some(ref google_opts) = request.settings.google {
+            if let Some(ref safety) = google_opts.safety_settings {
+                let threshold = match safety {
+                    GoogleSafetyLevel::Strict => "BLOCK_LOW_AND_ABOVE",
+                    GoogleSafetyLevel::Moderate => "BLOCK_MEDIUM_AND_ABOVE",
+                    GoogleSafetyLevel::Relaxed => "BLOCK_ONLY_HIGH",
+                };
+                let categories = [
+                    "HARM_CATEGORY_HARASSMENT",
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "HARM_CATEGORY_DANGEROUS_CONTENT",
+                ];
+                let settings: Vec<serde_json::Value> = categories
+                    .iter()
+                    .map(|cat| {
+                        serde_json::json!({"category": cat, "threshold": threshold})
+                    })
+                    .collect();
+                obj.insert("safetySettings".into(), serde_json::json!(settings));
+            }
+        }
 
         if let Some(ref tools) = request.tools {
             if !tools.is_empty() {
@@ -495,6 +542,7 @@ mod tests {
             openai_responses: None,
             user: None,
             anthropic: None,
+            google: None,
             tool_choice: None,
         }
     }
@@ -639,5 +687,85 @@ mod tests {
         assert_eq!(body["generationConfig"]["temperature"].as_f64(), Some(0.3));
         assert_eq!(body["generationConfig"]["topP"].as_f64(), Some(0.5));
         assert_eq!(body["generationConfig"]["topK"].as_u64(), Some(12));
+    }
+
+    #[test]
+    fn build_request_body_includes_thinking_config() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini25Pro, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                google: Some(GoogleOptions {
+                    thinking_config: Some(GoogleThinkingConfig {
+                        budget_tokens: Some(5000),
+                        include_thoughts: Some(true),
+                        thinking_level: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            5000
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+    }
+
+    #[test]
+    fn build_request_body_includes_thinking_level() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                google: Some(GoogleOptions {
+                    thinking_config: Some(GoogleThinkingConfig {
+                        budget_tokens: None,
+                        include_thoughts: None,
+                        thinking_level: Some(GoogleThinkingLevel::High),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+    }
+
+    #[test]
+    fn build_request_body_includes_safety_settings() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                google: Some(GoogleOptions {
+                    safety_settings: Some(GoogleSafetyLevel::Moderate),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: None,
+        };
+        let body = provider.build_request_body(&request);
+        let settings = body["safetySettings"].as_array().unwrap();
+        assert_eq!(settings.len(), 4);
+        assert_eq!(settings[0]["threshold"], "BLOCK_MEDIUM_AND_ABOVE");
     }
 }

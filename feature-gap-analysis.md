@@ -139,11 +139,11 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 
 | Provider | Option | Impact |
 |----------|--------|--------|
-| **Anthropic** | thinking mode (enabled/disabled + budget) | Critical for Claude 4+ |
-| **Anthropic** | cache_control (ephemeral/persistent) | Prompt caching |
+| **Anthropic** | thinking mode (enabled/disabled + budget) | ✅ Implemented |
+| **Anthropic** | cache_control (ephemeral/persistent) | ✅ Type defined (matches Tachikoma) |
 | **Anthropic** | metadata | Request metadata |
-| **Google** | thinkingConfig (budgetTokens + includeThoughts) | Gemini 2.5+ thinking |
-| **Google** | safetySettings (strict/moderate/relaxed) | Content safety |
+| **Google** | thinkingConfig (budgetTokens + includeThoughts) | ✅ Implemented |
+| **Google** | safetySettings (strict/moderate/relaxed) | ✅ Implemented |
 | **Mistral** | safeMode | Safety mode |
 | **Groq** | speed (normal/fast/ultraFast) | Inference speed |
 | **Grok** | funMode, includeCurrentEvents | Provider-specific |
@@ -336,8 +336,8 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 
 6. **MCP implementation** — full protocol (Stdio + SSE transports minimum)
 7. **Multi-step agent loop** — automatic tool execution with configurable max steps & step tracking
-8. **Prompt caching control** — Anthropic `cache_control` headers in requests
-9. **Google thinking config** — Gemini 2.5+ thinking budget + includeThoughts
+8. **Prompt caching control** — Anthropic `cache_control` headers in requests — **Closed** (Tachikoma defines CacheControl enum but doesn't wire to API; Roci has matching CacheControl in AnthropicOptions)
+9. **Google thinking config** — Gemini 2.5+ thinking budget + includeThoughts — **Complete** (`GoogleOptions`, `GoogleThinkingConfig`, `GoogleThinkingLevel`, `GoogleSafetyLevel` types; serialized into `generationConfig.thinkingConfig` and top-level `safetySettings`)
 10. **Beta header support** — Anthropic `interleaved-thinking`, `fine-grained-tool-streaming` — **Complete**
 11. **Missing content parts** — audio, file, refusal, reasoning in `ContentPart` enum — Partially addressed (thinking/redacted_thinking added; audio/file/refusal still missing)
 12. **Response channels** — thinking vs final output differentiation
@@ -351,7 +351,7 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 17. **Missing model definitions** — Grok vision variants, expanded Ollama/LMStudio/Groq catalogs
 18. **Audio capability flags** — `supports_audio_input`/`supports_audio_output`
 19. **Dynamic tool discovery** — `DynamicToolProvider` equivalent
-20. **Streaming tool call accumulation** — partial JSON from deltas
+20. **Streaming tool call accumulation** — partial JSON from deltas — Partially **Complete** (Anthropic: input_json_delta; OpenAI/Gemini: not yet)
 
 ### P3 — Low (nice-to-have)
 
@@ -361,7 +361,7 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 24. **Stop conditions** — programmatic stop functions
 25. **Health checks** — LMStudio/Ollama health endpoint checking
 26. **Snapshot testing** — CLI output validation
-27. **Reasoning signature tracking** — signature + reasoning type per stream delta
+27. **Reasoning signature tracking** — signature + reasoning type per stream delta — **Complete**
 28. **Finish reason variants** — add `Cancelled`, `Other`
 29. **Anthropic error parsing** — dedicated `AnthropicErrorResponse` structure
 30. **Conversation builder** — fluent API for message construction

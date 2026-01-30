@@ -798,6 +798,7 @@ mod tests {
             openai_responses: None,
             user: None,
             anthropic: None,
+            google: None,
             tool_choice: None,
         }
     }

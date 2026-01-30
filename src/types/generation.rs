@@ -21,6 +21,7 @@ pub struct GenerationSettings {
     pub response_format: Option<ResponseFormat>,
     pub openai_responses: Option<OpenAiResponsesOptions>,
     pub anthropic: Option<AnthropicOptions>,
+    pub google: Option<GoogleOptions>,
     pub tool_choice: Option<ToolChoice>,
     pub user: Option<String>,
 }
@@ -122,6 +123,47 @@ pub enum ThinkingMode {
 #[strum(serialize_all = "snake_case")]
 pub enum CacheControl {
     Ephemeral,
+}
+
+/// Google/Gemini-specific request options.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GoogleOptions {
+    /// Thinking configuration for Gemini 2.5+/3 models.
+    pub thinking_config: Option<GoogleThinkingConfig>,
+    /// Safety settings level.
+    pub safety_settings: Option<GoogleSafetyLevel>,
+}
+
+/// Google Gemini thinking configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GoogleThinkingConfig {
+    /// Token budget for thinking (Gemini 2.5). 0 disables thinking.
+    pub budget_tokens: Option<u32>,
+    /// Whether to include thought summaries in the response.
+    pub include_thoughts: Option<bool>,
+    /// Thinking level (Gemini 3): minimal, low, medium, high.
+    pub thinking_level: Option<GoogleThinkingLevel>,
+}
+
+/// Google Gemini thinking level (for Gemini 3 models).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub enum GoogleThinkingLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+/// Google safety settings level.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GoogleSafetyLevel {
+    Strict,
+    Moderate,
+    Relaxed,
 }
 
 /// Tool selection strategy for providers that support tool calling.
