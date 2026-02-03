@@ -25,6 +25,8 @@ bon = "3"
 strum = { version = "0.27", features = ["derive"] }
 regex = "1"
 dotenvy = "0.15"
+toml = "0.9"
+directories = "6"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
@@ -56,3 +58,9 @@ mcp = ["dep:tokio-tungstenite"]
 cli = ["dep:clap", "agent"]
 all-providers = ["openai","anthropic","google","grok","groq","mistral","ollama","lmstudio","azure","openrouter","together","replicate","openai-compatible","anthropic-compatible"]
 full = ["all-providers","agent","audio","mcp","cli"]
+
+[workspace]
+
+[[example]]
+name = "agent"
+required-features = ["agent"]

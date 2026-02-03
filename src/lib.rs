@@ -19,6 +19,7 @@
 //! ```
 
 pub mod config;
+pub mod auth;
 pub mod error;
 pub mod generation;
 pub mod models;

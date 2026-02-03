@@ -59,3 +59,7 @@
 - `GoogleSafetyLevel`: Strict/Moderate/Relaxed mapped to Gemini threshold strings.
 - Thinking config serialized inside `generationConfig.thinkingConfig`; safety settings as top-level `safetySettings` array.
 - Tachikoma defines `GoogleOptions.ThinkingConfig` but does NOT serialize it to API requests; Roci fully wires it.
+
+## 2026-02-03: Auth foundations
+- Added `roci::auth` module with token store, device-code session types, and provider helpers for OpenAI Codex, GitHub Copilot, and Claude Code imports.
+- File-backed token storage uses TOML and `directories` for cross-platform home resolution.
