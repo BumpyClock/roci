@@ -30,6 +30,18 @@ use super::types::{RunId, RunResult};
 
 /// Callback used for streaming run events.
 pub type RunEventSink = Arc<dyn Fn(RunEvent) + Send + Sync>;
+/// Hook to compact/prune a message history before the next provider call.
+pub type CompactionHandler =
+    Arc<dyn Fn(&[ModelMessage]) -> Option<Vec<ModelMessage>> + Send + Sync>;
+/// Hook to redact/transform tool results before persistence or context assembly.
+pub type ToolResultPersistHandler =
+    Arc<dyn Fn(AgentToolResult) -> AgentToolResult + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct RunHooks {
+    pub compaction: Option<CompactionHandler>,
+    pub tool_result_persist: Option<ToolResultPersistHandler>,
+}
 
 /// Request payload to start a run.
 #[derive(Clone)]
@@ -43,6 +55,7 @@ pub struct RunRequest {
     pub approval_handler: Option<ApprovalHandler>,
     pub metadata: HashMap<String, String>,
     pub event_sink: Option<RunEventSink>,
+    pub hooks: RunHooks,
 }
 
 impl RunRequest {
@@ -57,6 +70,7 @@ impl RunRequest {
             approval_handler: None,
             metadata: HashMap::new(),
             event_sink: None,
+            hooks: RunHooks::default(),
         }
     }
 
@@ -77,6 +91,11 @@ impl RunRequest {
 
     pub fn with_approval_handler(mut self, handler: ApprovalHandler) -> Self {
         self.approval_handler = Some(handler);
+        self
+    }
+
+    pub fn with_hooks(mut self, hooks: RunHooks) -> Self {
+        self.hooks = hooks;
         self
     }
 }
@@ -232,6 +251,12 @@ impl Runner for LoopRunner {
 
                 while let Ok(message) = input_rx.try_recv() {
                     messages.push(message);
+                }
+
+                if let Some(compact) = request.hooks.compaction.as_ref() {
+                    if let Some(compacted) = compact(&messages) {
+                        messages = compacted;
+                    }
                 }
 
                 let sanitized_messages =
@@ -478,6 +503,12 @@ impl Runner for LoopRunner {
                             result: serde_json::json!({ "error": "approval declined" }),
                             is_error: true,
                         }
+                    };
+
+                    let result = if let Some(handler) = request.hooks.tool_result_persist.as_ref() {
+                        handler(result)
+                    } else {
+                        result
                     };
 
                     emitter.emit(
