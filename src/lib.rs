@@ -34,6 +34,9 @@ pub mod util;
 #[cfg(feature = "agent")]
 pub mod agent;
 
+#[cfg(feature = "agent")]
+pub mod agent_loop;
+
 #[cfg(feature = "audio")]
 pub mod audio;
 

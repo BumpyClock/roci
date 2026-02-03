@@ -15,6 +15,10 @@ use crate::error::RociError;
 pub struct ToolExecutionContext {
     /// Additional metadata for the tool.
     pub metadata: serde_json::Value,
+    /// Tool call id (if provided by the model).
+    pub tool_call_id: Option<String>,
+    /// Tool name as requested by the model.
+    pub tool_name: Option<String>,
 }
 
 /// Core tool trait — implement to create custom tools.

@@ -27,6 +27,13 @@ impl ModelSelector {
                     .unwrap_or(OpenAiModel::Custom(model_id.to_string()));
                 Ok(LanguageModel::OpenAi(m))
             }
+            #[cfg(feature = "openai")]
+            "openai-codex" | "openai_codex" => {
+                use super::openai::OpenAiModel;
+                let m = OpenAiModel::from_str(model_id)
+                    .unwrap_or(OpenAiModel::Custom(model_id.to_string()));
+                Ok(LanguageModel::OpenAiCodex(m))
+            }
             #[cfg(feature = "anthropic")]
             "anthropic" => {
                 use super::anthropic::AnthropicModel;

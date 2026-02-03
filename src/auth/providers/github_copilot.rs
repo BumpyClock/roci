@@ -57,6 +57,21 @@ impl GitHubCopilotAuth {
         self
     }
 
+    pub fn with_device_code_url(mut self, url: impl Into<String>) -> Self {
+        self.device_code_url = url.into();
+        self
+    }
+
+    pub fn with_access_token_url(mut self, url: impl Into<String>) -> Self {
+        self.access_token_url = url.into();
+        self
+    }
+
+    pub fn with_copilot_token_url(mut self, url: impl Into<String>) -> Self {
+        self.copilot_token_url = url.into();
+        self
+    }
+
     pub async fn logged_in(&self) -> Result<bool, AuthError> {
         Ok(self
             .token_store

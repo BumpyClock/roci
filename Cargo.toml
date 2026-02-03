@@ -59,8 +59,6 @@ cli = ["dep:clap", "agent"]
 all-providers = ["openai","anthropic","google","grok","groq","mistral","ollama","lmstudio","azure","openrouter","together","replicate","openai-compatible","anthropic-compatible"]
 full = ["all-providers","agent","audio","mcp","cli"]
 
-[workspace]
-
 [[example]]
 name = "agent"
 required-features = ["agent"]

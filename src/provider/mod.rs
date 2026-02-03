@@ -101,6 +101,7 @@ pub trait ModelProvider: Send + Sync {
 }
 
 /// Create a provider for the given model, using the provided config.
+#[allow(unused_variables)]
 pub fn create_provider(
     model: &LanguageModel,
     config: &crate::config::RociConfig,
@@ -122,6 +123,28 @@ pub fn create_provider(
                     m.clone(),
                     api_key,
                     config.get_base_url("openai"),
+                )))
+            }
+        }
+        #[cfg(feature = "openai")]
+        LanguageModel::OpenAiCodex(m) => {
+            let api_key = config
+                .get_api_key("openai-codex")
+                .ok_or_else(|| RociError::Authentication("Missing OPENAI_CODEX_TOKEN".into()))?;
+            let base_url = config
+                .get_base_url("openai-codex")
+                .or_else(|| config.get_base_url("openai"));
+            if m.uses_responses_api() {
+                Ok(Box::new(openai_responses::OpenAiResponsesProvider::new(
+                    m.clone(),
+                    api_key,
+                    base_url,
+                )))
+            } else {
+                Ok(Box::new(openai::OpenAiProvider::new(
+                    m.clone(),
+                    api_key,
+                    base_url,
                 )))
             }
         }

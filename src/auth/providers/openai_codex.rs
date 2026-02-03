@@ -381,6 +381,12 @@ fn needs_refresh(token: &Token) -> bool {
 }
 
 fn default_codex_home() -> PathBuf {
+    if let Some(value) = std::env::var_os("CODEX_HOME") {
+        let path = PathBuf::from(value);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
     let base = directories::UserDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));

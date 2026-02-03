@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 /// Convert a tool result JSON value into a string payload for providers.
+#[allow(dead_code)]
 pub(crate) fn tool_result_to_string(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),

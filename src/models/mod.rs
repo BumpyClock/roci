@@ -34,6 +34,8 @@ use std::fmt;
 pub enum LanguageModel {
     #[cfg(feature = "openai")]
     OpenAi(openai::OpenAiModel),
+    #[cfg(feature = "openai")]
+    OpenAiCodex(openai::OpenAiModel),
     #[cfg(feature = "anthropic")]
     Anthropic(anthropic::AnthropicModel),
     #[cfg(feature = "google")]
@@ -60,6 +62,8 @@ impl LanguageModel {
         match self {
             #[cfg(feature = "openai")]
             Self::OpenAi(m) => m.as_str(),
+            #[cfg(feature = "openai")]
+            Self::OpenAiCodex(m) => m.as_str(),
             #[cfg(feature = "anthropic")]
             Self::Anthropic(m) => m.as_str(),
             #[cfg(feature = "google")]
@@ -85,6 +89,8 @@ impl LanguageModel {
         match self {
             #[cfg(feature = "openai")]
             Self::OpenAi(_) => "openai",
+            #[cfg(feature = "openai")]
+            Self::OpenAiCodex(_) => "openai-codex",
             #[cfg(feature = "anthropic")]
             Self::Anthropic(_) => "anthropic",
             #[cfg(feature = "google")]
@@ -110,6 +116,8 @@ impl LanguageModel {
         match self {
             #[cfg(feature = "openai")]
             Self::OpenAi(m) => m.capabilities(),
+            #[cfg(feature = "openai")]
+            Self::OpenAiCodex(m) => m.capabilities(),
             #[cfg(feature = "anthropic")]
             Self::Anthropic(m) => m.capabilities(),
             #[cfg(feature = "google")]

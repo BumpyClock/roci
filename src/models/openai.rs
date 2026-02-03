@@ -99,22 +99,29 @@ impl OpenAiModel {
 
     /// Whether this model uses the Responses API (vs Chat Completions).
     pub fn uses_responses_api(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::O3
-                | Self::O3Mini
-                | Self::O4Mini
-                | Self::Gpt5
-                | Self::Gpt51
-                | Self::Gpt52
-                | Self::Gpt5Pro
-                | Self::Gpt5Mini
-                | Self::Gpt5Nano
-                | Self::Gpt5Thinking
-                | Self::Gpt5ThinkingMini
-                | Self::Gpt5ThinkingNano
-                | Self::Gpt5ChatLatest
-        )
+            | Self::O3Mini
+            | Self::O4Mini
+            | Self::Gpt5
+            | Self::Gpt51
+            | Self::Gpt52
+            | Self::Gpt5Pro
+            | Self::Gpt5Mini
+            | Self::Gpt5Nano
+            | Self::Gpt5Thinking
+            | Self::Gpt5ThinkingMini
+            | Self::Gpt5ThinkingNano
+            | Self::Gpt5ChatLatest => true,
+            Self::Custom(id) => {
+                let lower = id.to_ascii_lowercase();
+                lower.starts_with("gpt-5")
+                    || lower.starts_with("o3")
+                    || lower.starts_with("o4")
+                    || lower.contains("codex")
+            }
+            _ => false,
+        }
     }
 
     /// Whether this is a reasoning model.

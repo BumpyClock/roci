@@ -248,6 +248,9 @@ impl ModelProvider for OpenAiProvider {
         let stream = async_stream::stream! {
             let mut buffer = String::new();
             let mut tool_calls: std::collections::HashMap<usize, ToolCallBuilder> = std::collections::HashMap::new();
+            let mut chunk_count: u64 = 0;
+            let mut line_count: u64 = 0;
+            let mut byte_count: u64 = 0;
             futures::pin_mut!(byte_stream);
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -259,6 +262,12 @@ impl ModelProvider for OpenAiProvider {
                     }
                 };
 
+                chunk_count += 1;
+                byte_count += chunk.len() as u64;
+                if debug_enabled() && chunk_count == 1 {
+                    debug!(chunk_len = chunk.len(), "OpenAI stream first chunk");
+                }
+
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 while let Some(line_end) = buffer.find('\n') {
@@ -266,6 +275,24 @@ impl ModelProvider for OpenAiProvider {
                     buffer = buffer[line_end + 1..].to_string();
 
                     if line.is_empty() || line.starts_with(':') {
+                        continue;
+                    }
+
+                    line_count += 1;
+                    if line == "data: [DONE]" {
+                        if debug_enabled() {
+                            debug!(chunk_count, line_count, byte_count, "OpenAI stream done");
+                        }
+                        yield Ok(TextStreamDelta {
+                            text: String::new(),
+                            event_type: StreamEventType::Done,
+                            tool_call: None,
+                            finish_reason: None,
+                            usage: None,
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        });
                         continue;
                     }
 
@@ -345,9 +372,15 @@ impl ModelProvider for OpenAiProvider {
                                     });
                                 }
                             }
+                        } else if debug_enabled() {
+                            debug!(line_len = line.len(), "OpenAI stream parse failed");
                         }
                     }
                 }
+            }
+
+            if debug_enabled() {
+                debug!(chunk_count, line_count, byte_count, "OpenAI stream ended");
             }
         };
 
@@ -363,6 +396,11 @@ fn parse_finish_reason(s: &str) -> Option<FinishReason> {
         "content_filter" => Some(FinishReason::ContentFilter),
         _ => None,
     }
+}
+
+fn debug_enabled() -> bool {
+    matches!(std::env::var("HOMIE_DEBUG").as_deref(), Ok("1"))
+        || matches!(std::env::var("HOME_DEBUG").as_deref(), Ok("1"))
 }
 
 fn message_to_openai(msg: &ModelMessage) -> serde_json::Value {
