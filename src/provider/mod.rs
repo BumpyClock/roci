@@ -2,6 +2,7 @@
 
 pub mod format;
 pub mod http;
+pub mod sanitize;
 pub mod schema;
 
 #[cfg(feature = "openai")]
@@ -49,6 +50,8 @@ use crate::types::{
     message::{AgentToolCall, ContentPart},
     FinishReason, GenerationSettings, ModelMessage, TextStreamDelta, Usage,
 };
+
+pub use sanitize::sanitize_messages_for_provider;
 
 /// A request sent to a model provider.
 #[derive(Debug, Clone)]

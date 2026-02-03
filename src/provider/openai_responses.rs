@@ -623,6 +623,23 @@ impl OpenAiResponsesProvider {
     }
 }
 
+fn extract_response_error(event: &serde_json::Value) -> Option<String> {
+    let error = event
+        .get("error")
+        .or_else(|| event.get("response").and_then(|r| r.get("error")));
+    let error = error?;
+    if let Some(message) = error.get("message").and_then(|v| v.as_str()) {
+        return Some(message.to_string());
+    }
+    if let Some(detail) = error.get("detail").and_then(|v| v.as_str()) {
+        return Some(detail.to_string());
+    }
+    if let Some(text) = error.as_str() {
+        return Some(text.to_string());
+    }
+    Some(error.to_string())
+}
+
 fn debug_enabled() -> bool {
     matches!(env::var("HOMIE_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
         || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
@@ -989,7 +1006,19 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             }
                                         }
                                     }
+                                    "response.failed" | "response.error" => {
+                                        let message = extract_response_error(&event)
+                                            .unwrap_or_else(|| "OpenAI Responses error".to_string());
+                                        yield Err(RociError::api(400, message));
+                                        saw_done = true;
+                                        break;
+                                    }
                                     "response.completed" | "response.done" => {
+                                        if let Some(message) = extract_response_error(&event) {
+                                            yield Err(RociError::api(400, message));
+                                            saw_done = true;
+                                            break;
+                                        }
                                         if !saw_text_delta {
                                             if let Some(response) = event.get("response") {
                                                 if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
@@ -1035,6 +1064,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             .and_then(|status| match status {
                                                 "completed" => Some(FinishReason::Stop),
                                                 "incomplete" => Some(FinishReason::Length),
+                                                "failed" => Some(FinishReason::Error),
                                                 _ => None,
                                             });
                                         let usage = event.get("response")

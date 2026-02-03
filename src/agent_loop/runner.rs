@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -85,21 +87,32 @@ pub struct RunHandle {
     run_id: RunId,
     abort_tx: Option<oneshot::Sender<()>>,
     result_rx: oneshot::Receiver<RunResult>,
+    input_tx: Option<mpsc::UnboundedSender<ModelMessage>>,
 }
 
 impl RunHandle {
     /// Create a new run handle and expose internal channels to a runner implementation.
-    pub fn new(run_id: RunId) -> (Self, oneshot::Receiver<()>, oneshot::Sender<RunResult>) {
+    pub fn new(
+        run_id: RunId,
+    ) -> (
+        Self,
+        oneshot::Receiver<()>,
+        oneshot::Sender<RunResult>,
+        mpsc::UnboundedReceiver<ModelMessage>,
+    ) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
         (
             Self {
                 run_id,
                 abort_tx: Some(abort_tx),
                 result_rx,
+                input_tx: Some(input_tx),
             },
             abort_rx,
             result_tx,
+            input_rx,
         )
     }
 
@@ -110,6 +123,13 @@ impl RunHandle {
     pub fn abort(&mut self) -> bool {
         if let Some(tx) = self.abort_tx.take() {
             return tx.send(()).is_ok();
+        }
+        false
+    }
+
+    pub fn queue_message(&self, message: ModelMessage) -> bool {
+        if let Some(tx) = &self.input_tx {
+            return tx.send(message).is_ok();
         }
         false
     }
@@ -141,7 +161,7 @@ impl LoopRunner {
 #[async_trait]
 impl Runner for LoopRunner {
     async fn start(&self, request: RunRequest) -> Result<RunHandle, RociError> {
-        let (handle, mut abort_rx, result_tx) = RunHandle::new(request.run_id);
+        let (handle, mut abort_rx, result_tx, mut input_rx) = RunHandle::new(request.run_id);
         let config = self.config.clone();
 
         tokio::spawn(async move {
@@ -210,8 +230,14 @@ impl Runner for LoopRunner {
                     return;
                 }
 
+                while let Ok(message) = input_rx.try_recv() {
+                    messages.push(message);
+                }
+
+                let sanitized_messages =
+                    provider::sanitize_messages_for_provider(&messages, provider.provider_name());
                 let req = ProviderRequest {
-                    messages: messages.clone(),
+                    messages: sanitized_messages,
                     settings: request.settings.clone(),
                     tools: tool_defs.clone(),
                     response_format: request.settings.response_format.clone(),
@@ -236,6 +262,9 @@ impl Runner for LoopRunner {
                 let mut iteration_text = String::new();
                 let mut tool_calls: HashMap<String, AgentToolCall> = HashMap::new();
                 let mut stream_done = false;
+                let idle_timeout_ms = request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
+                let mut idle_sleep = (idle_timeout_ms > 0)
+                    .then(|| Box::pin(time::sleep(Duration::from_millis(idle_timeout_ms))));
                 loop {
                     tokio::select! {
                         _ = &mut abort_rx => {
@@ -248,10 +277,27 @@ impl Runner for LoopRunner {
                             let _ = result_tx.send(RunResult::canceled());
                             return;
                         }
+                        _ = idle_sleep.as_mut().unwrap(), if idle_sleep.is_some() => {
+                            emitter.emit(
+                                RunEventStream::Lifecycle,
+                                RunEventPayload::Lifecycle {
+                                    state: RunLifecycle::Failed {
+                                        error: "stream idle timeout".to_string(),
+                                    },
+                                },
+                            );
+                            let _ = result_tx.send(RunResult::failed("stream idle timeout"));
+                            return;
+                        }
                         delta = stream.next() => {
                             let Some(delta) = delta else { break; };
                             match delta {
                                 Ok(delta) => {
+                                    if let Some(ref mut sleep) = idle_sleep {
+                                        sleep.as_mut().reset(
+                                            time::Instant::now() + Duration::from_millis(idle_timeout_ms),
+                                        );
+                                    }
                                     match delta.event_type {
                                         StreamEventType::ToolCallDelta => {
                                             if let Some(tc) = delta.tool_call.clone() {
@@ -288,6 +334,23 @@ impl Runner for LoopRunner {
                                                     RunEventPayload::AssistantDelta { text: delta.text.clone() },
                                                 );
                                             }
+                                        }
+                                        StreamEventType::Error => {
+                                            let message = if !delta.text.is_empty() {
+                                                delta.text.clone()
+                                            } else {
+                                                "stream error".to_string()
+                                            };
+                                            emitter.emit(
+                                                RunEventStream::Lifecycle,
+                                                RunEventPayload::Lifecycle {
+                                                    state: RunLifecycle::Failed {
+                                                        error: message,
+                                                    },
+                                                },
+                                            );
+                                            let _ = result_tx.send(RunResult::failed("stream error"));
+                                            return;
                                         }
                                         StreamEventType::Done => {
                                             stream_done = true;

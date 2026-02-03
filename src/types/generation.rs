@@ -24,6 +24,7 @@ pub struct GenerationSettings {
     pub google: Option<GoogleOptions>,
     pub tool_choice: Option<ToolChoice>,
     pub user: Option<String>,
+    pub stream_idle_timeout_ms: Option<u64>,
 }
 
 /// OpenAI Responses API request options.
