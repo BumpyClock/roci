@@ -22,6 +22,7 @@ impl TogetherProvider {
                 model,
                 api_key,
                 Some("https://api.together.xyz/v1".to_string()),
+                None,
             ),
         }
     }

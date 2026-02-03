@@ -29,7 +29,7 @@ impl AzureOpenAiProvider {
         );
         let model = crate::models::openai::OpenAiModel::Custom(deployment);
         Self {
-            inner: OpenAiProvider::new(model, api_key, Some(base_url)),
+            inner: OpenAiProvider::new(model, api_key, Some(base_url), None),
         }
     }
 }

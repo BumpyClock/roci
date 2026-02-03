@@ -19,7 +19,7 @@ impl OpenAiCompatibleProvider {
     pub fn new(model_id: String, api_key: String, base_url: String) -> Self {
         let model = crate::models::openai::OpenAiModel::Custom(model_id);
         Self {
-            inner: OpenAiProvider::new(model, api_key, Some(base_url)),
+            inner: OpenAiProvider::new(model, api_key, Some(base_url), None),
         }
     }
 }

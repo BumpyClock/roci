@@ -5,6 +5,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
 use tracing::debug;
+use std::env;
 
 use crate::error::RociError;
 use crate::models::capabilities::ModelCapabilities;
@@ -16,23 +17,85 @@ use super::http::{bearer_headers, shared_client};
 use super::{ModelProvider, ProviderRequest, ProviderResponse};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Homie, a helpful assistant.";
 
 pub struct OpenAiResponsesProvider {
     model: OpenAiModel,
     api_key: String,
     base_url: String,
+    account_id: Option<String>,
     capabilities: ModelCapabilities,
+    is_codex: bool,
 }
 
 impl OpenAiResponsesProvider {
-    pub fn new(model: OpenAiModel, api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(
+        model: OpenAiModel,
+        api_key: String,
+        base_url: Option<String>,
+        account_id: Option<String>,
+    ) -> Self {
         let capabilities = model.capabilities();
+        let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let is_codex = base_url.contains("chatgpt.com/backend-api/codex");
         Self {
-            base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            base_url,
             model,
             api_key,
+            account_id,
             capabilities,
+            is_codex,
         }
+    }
+
+    fn build_headers(&self) -> Result<reqwest::header::HeaderMap, RociError> {
+        let mut headers = bearer_headers(&self.api_key);
+        if self.is_codex {
+            let account_id = match (&self.account_id, extract_codex_account_id(&self.api_key)) {
+                (Some(id), _) => Some(id.clone()),
+                (None, Ok(id)) => Some(id),
+                (None, Err(err)) => {
+                    return Err(RociError::Authentication(format!(
+                        "Missing Codex account id ({err})"
+                    )))
+                }
+            };
+            if let Some(account_id) = account_id {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(&account_id) {
+                    headers.insert("chatgpt-account-id", value);
+                }
+            }
+            headers.insert(
+                "OpenAI-Beta",
+                reqwest::header::HeaderValue::from_static("responses=experimental"),
+            );
+            headers.insert(
+                "originator",
+                reqwest::header::HeaderValue::from_static("pi"),
+            );
+            headers.insert(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static("text/event-stream"),
+            );
+            let user_agent = format!("roci ({} {})", std::env::consts::OS, std::env::consts::ARCH);
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&user_agent) {
+                headers.insert(reqwest::header::USER_AGENT, value);
+            }
+        } else if let Some(account_id) = &self.account_id {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(account_id) {
+                headers.insert("ChatGPT-Account-ID", value);
+            }
+        }
+        if debug_enabled() {
+            tracing::debug!(
+                model = self.model.as_str(),
+                base_url = %self.base_url,
+                account_id_present = self.account_id.is_some(),
+                codex_headers = self.is_codex,
+                "OpenAI Responses headers prepared"
+            );
+        }
+        Ok(headers)
     }
 
     fn validate_settings(&self, settings: &GenerationSettings) -> Result<(), RociError> {
@@ -56,6 +119,9 @@ impl OpenAiResponsesProvider {
     }
 
     fn build_request_body(&self, request: &ProviderRequest, stream: bool) -> serde_json::Value {
+        if self.is_codex {
+            return self.build_codex_request_body(request, stream);
+        }
         let input = Self::build_input_items(&request.messages);
 
         let mut body = serde_json::json!({
@@ -176,6 +242,119 @@ impl OpenAiResponsesProvider {
         body
     }
 
+    fn build_codex_request_body(
+        &self,
+        request: &ProviderRequest,
+        stream: bool,
+    ) -> serde_json::Value {
+        let (instructions, filtered_messages, system_count) =
+            Self::extract_codex_instructions(&request.messages, request.settings.openai_responses.as_ref().and_then(|o| o.instructions.as_ref()));
+        let input = Self::build_input_items(&filtered_messages);
+
+        if debug_enabled() {
+            tracing::debug!(
+                model = self.model.as_str(),
+                instructions_len = instructions.len(),
+                system_count,
+                input_count = input.len(),
+                "OpenAI Codex request prepared"
+            );
+        }
+
+        let mut body = serde_json::json!({
+            "model": self.model.as_str(),
+            "store": false,
+            "stream": stream,
+            "instructions": instructions,
+            "input": input,
+            "text": { "verbosity": request.settings.text_verbosity.unwrap_or(TextVerbosity::Medium).to_string() },
+            "include": ["reasoning.encrypted_content"],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+        });
+
+        let obj = body.as_object_mut().unwrap();
+
+        if let Some(max) = request.settings.max_tokens {
+            obj.insert("max_output_tokens".into(), max.into());
+        }
+        if let Some(temp) = request.settings.temperature {
+            obj.insert("temperature".into(), temp.into());
+        }
+        if let Some(top_p) = request.settings.top_p {
+            obj.insert("top_p".into(), top_p.into());
+        }
+
+        let needs_reasoning = self.model.is_reasoning() || self.model.is_gpt5_family();
+        if needs_reasoning {
+            let effort = request
+                .settings
+                .reasoning_effort
+                .unwrap_or(ReasoningEffort::Medium);
+            obj.insert(
+                "reasoning".into(),
+                serde_json::json!({
+                    "effort": effort.to_string(),
+                    "summary": "auto",
+                }),
+            );
+        }
+
+        if let Some(ref tools) = request.tools {
+            if !tools.is_empty() {
+                let tool_defs: Vec<serde_json::Value> = tools
+                    .iter()
+                    .map(|t| {
+                        let parameters = Self::normalize_tool_parameters(&t.parameters);
+                        serde_json::json!({
+                            "type": "function",
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": parameters,
+                        })
+                    })
+                    .collect();
+                obj.insert("tools".into(), tool_defs.into());
+            }
+        }
+
+        if let Some(ref user) = request.settings.user {
+            obj.insert("user".into(), user.clone().into());
+        }
+
+        if let Some(ref options) = request.settings.openai_responses {
+            if let Some(parallel_tool_calls) = options.parallel_tool_calls {
+                obj.insert("parallel_tool_calls".into(), parallel_tool_calls.into());
+            }
+            if let Some(ref previous_response_id) = options.previous_response_id {
+                obj.insert(
+                    "previous_response_id".into(),
+                    previous_response_id.clone().into(),
+                );
+            }
+            if let Some(ref metadata) = options.metadata {
+                obj.insert("metadata".into(), serde_json::json!(metadata));
+            }
+            if let Some(service_tier) = options.service_tier {
+                obj.insert("service_tier".into(), service_tier.to_string().into());
+            }
+            if let Some(truncation) = options.truncation {
+                obj.insert("truncation".into(), truncation.to_string().into());
+            }
+            if let Some(store) = options.store {
+                obj.insert("store".into(), store.into());
+            }
+        }
+        if obj.get("truncation").is_none() && self.model.is_reasoning() {
+            obj.insert(
+                "truncation".into(),
+                OpenAiTruncation::Auto.to_string().into(),
+            );
+        }
+
+        body
+    }
+
     fn build_input_items(messages: &[ModelMessage]) -> Vec<serde_json::Value> {
         let mut input = Vec::new();
         for msg in messages {
@@ -252,6 +431,41 @@ impl OpenAiResponsesProvider {
             }
         }
         input
+    }
+
+    fn extract_codex_instructions(
+        messages: &[ModelMessage],
+        override_instructions: Option<&String>,
+    ) -> (String, Vec<ModelMessage>, usize) {
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut filtered: Vec<ModelMessage> = Vec::with_capacity(messages.len());
+        let mut system_count = 0usize;
+
+        for msg in messages {
+            if msg.role == Role::System {
+                system_count += 1;
+                for part in &msg.content {
+                    if let ContentPart::Text { text } = part {
+                        if !text.trim().is_empty() {
+                            system_parts.push(text.trim().to_string());
+                        }
+                    }
+                }
+            } else {
+                filtered.push(msg.clone());
+            }
+        }
+
+        let mut instructions = override_instructions
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| system_parts.join("\n\n").trim().to_string());
+
+        if instructions.is_empty() {
+            instructions = DEFAULT_CODEX_INSTRUCTIONS.to_string();
+        }
+
+        (instructions, filtered, system_count)
     }
 
     /// Convert a Responses API payload into a provider response.
@@ -407,6 +621,36 @@ impl OpenAiResponsesProvider {
     }
 }
 
+fn debug_enabled() -> bool {
+    matches!(env::var("HOMIE_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
+        || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
+}
+
+fn extract_codex_account_id(token: &str) -> Result<String, RociError> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let mut parts = token.split('.');
+    let _header = parts.next().ok_or_else(|| {
+        RociError::Authentication("Invalid Codex token (missing JWT header)".into())
+    })?;
+    let payload = parts.next().ok_or_else(|| {
+        RociError::Authentication("Invalid Codex token (missing JWT payload)".into())
+    })?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| RociError::Authentication("Invalid Codex token payload encoding".into()))?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).map_err(|_| {
+        RociError::Authentication("Invalid Codex token payload JSON".into())
+    })?;
+    let account_id = value
+        .get("https://api.openai.com/auth")
+        .and_then(|v| v.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RociError::Authentication("Missing Codex account id claim".into()))?;
+    Ok(account_id.to_string())
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiResponsesProvider {
     fn provider_name(&self) -> &str {
@@ -436,7 +680,7 @@ impl ModelProvider for OpenAiResponsesProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(bearer_headers(&self.api_key))
+            .headers(self.build_headers()?)
             .json(&body)
             .send()
             .await?;
@@ -463,7 +707,7 @@ impl ModelProvider for OpenAiResponsesProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(bearer_headers(&self.api_key))
+            .headers(self.build_headers()?)
             .json(&body)
             .send()
             .await?;
@@ -657,7 +901,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                                         }
                                     }
                                 }
-                                "response.completed" => {
+                                "response.completed" | "response.done" => {
                                     let finish = event.get("response")
                                         .and_then(|r| r.get("status"))
                                         .and_then(|v| v.as_str())
@@ -806,7 +1050,7 @@ mod tests {
     #[test]
     fn gpt5_rejects_sampling_settings() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
         let settings = GenerationSettings {
             temperature: Some(0.7),
             ..Default::default()
@@ -818,7 +1062,7 @@ mod tests {
     #[test]
     fn gpt52_rejects_sampling_without_reasoning_none() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt52, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt52, "test-key".to_string(), None, None);
         let settings = GenerationSettings {
             temperature: Some(0.7),
             ..Default::default()
@@ -830,7 +1074,7 @@ mod tests {
     #[test]
     fn gpt52_allows_sampling_with_reasoning_none() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt52, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt52, "test-key".to_string(), None, None);
         let settings = GenerationSettings {
             temperature: Some(0.7),
             reasoning_effort: Some(ReasoningEffort::None),
@@ -842,7 +1086,7 @@ mod tests {
     #[test]
     fn gpt41_allows_sampling_settings() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None, None);
         let settings = GenerationSettings {
             temperature: Some(0.7),
             top_p: Some(0.9),
@@ -854,7 +1098,7 @@ mod tests {
     #[test]
     fn gpt41_rejects_text_verbosity_setting() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None, None);
         let settings = GenerationSettings {
             text_verbosity: Some(TextVerbosity::Low),
             ..Default::default()
@@ -866,7 +1110,7 @@ mod tests {
     #[test]
     fn gpt5_allows_text_verbosity_setting() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
         let settings = GenerationSettings {
             text_verbosity: Some(TextVerbosity::High),
             ..Default::default()
@@ -877,7 +1121,7 @@ mod tests {
     #[test]
     fn request_body_includes_text_verbosity_and_format() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
@@ -895,7 +1139,7 @@ mod tests {
     #[test]
     fn request_body_defaults_reasoning_and_text_for_gpt5() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: settings(),
@@ -911,7 +1155,7 @@ mod tests {
 
     #[test]
     fn request_body_defaults_truncation_for_reasoning_models() {
-        let provider = OpenAiResponsesProvider::new(OpenAiModel::O3, "test-key".to_string(), None);
+        let provider = OpenAiResponsesProvider::new(OpenAiModel::O3, "test-key".to_string(), None, None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: settings(),
@@ -928,7 +1172,7 @@ mod tests {
     #[test]
     fn request_body_includes_openai_responses_options() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("tag".to_string(), "value".to_string());
         let settings = GenerationSettings {
@@ -964,7 +1208,7 @@ mod tests {
     #[test]
     fn tool_parameters_are_normalized_for_responses_api() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings::default(),
@@ -1084,7 +1328,7 @@ mod tests {
     #[test]
     fn tool_output_uses_plain_string_content() {
         let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None);
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::tool_result(
                 "call_1",

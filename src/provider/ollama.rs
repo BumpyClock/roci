@@ -23,6 +23,7 @@ impl OllamaProvider {
                 openai_model,
                 String::new(), // no API key for local
                 Some(format!("{}/v1", base_url.trim_end_matches('/'))),
+                None,
             ),
         }
     }

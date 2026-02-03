@@ -5,6 +5,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
 use tracing::debug;
+use std::env;
 
 use crate::error::RociError;
 use crate::models::capabilities::ModelCapabilities;
@@ -21,18 +22,43 @@ pub struct OpenAiProvider {
     model: OpenAiModel,
     api_key: String,
     base_url: String,
+    account_id: Option<String>,
     capabilities: ModelCapabilities,
 }
 
 impl OpenAiProvider {
-    pub fn new(model: OpenAiModel, api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(
+        model: OpenAiModel,
+        api_key: String,
+        base_url: Option<String>,
+        account_id: Option<String>,
+    ) -> Self {
         let capabilities = model.capabilities();
         Self {
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             model,
             api_key,
+            account_id,
             capabilities,
         }
+    }
+
+    fn build_headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = bearer_headers(&self.api_key);
+        if let Some(account_id) = &self.account_id {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(account_id) {
+                headers.insert("ChatGPT-Account-ID", value);
+            }
+        }
+        if debug_enabled() {
+            tracing::debug!(
+                model = self.model.as_str(),
+                base_url = %self.base_url,
+                account_id_present = self.account_id.is_some(),
+                "OpenAI Chat headers prepared"
+            );
+        }
+        headers
     }
 
     fn build_request_body(&self, request: &ProviderRequest, stream: bool) -> serde_json::Value {
@@ -137,6 +163,11 @@ impl OpenAiProvider {
     }
 }
 
+fn debug_enabled() -> bool {
+    matches!(env::var("HOMIE_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
+        || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiProvider {
     fn provider_name(&self) -> &str {
@@ -162,7 +193,7 @@ impl ModelProvider for OpenAiProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(bearer_headers(&self.api_key))
+            .headers(self.build_headers())
             .json(&body)
             .send()
             .await?;
@@ -227,7 +258,7 @@ impl ModelProvider for OpenAiProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(bearer_headers(&self.api_key))
+            .headers(self.build_headers())
             .json(&body)
             .send()
             .await?;
@@ -396,11 +427,6 @@ fn parse_finish_reason(s: &str) -> Option<FinishReason> {
         "content_filter" => Some(FinishReason::ContentFilter),
         _ => None,
     }
-}
-
-fn debug_enabled() -> bool {
-    matches!(std::env::var("HOMIE_DEBUG").as_deref(), Ok("1"))
-        || matches!(std::env::var("HOME_DEBUG").as_deref(), Ok("1"))
 }
 
 fn message_to_openai(msg: &ModelMessage) -> serde_json::Value {
@@ -586,6 +612,7 @@ mod tests {
             OpenAiModel::Custom("gpt-5-nano".to_string()),
             "test-key".to_string(),
             None,
+            None,
         );
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
@@ -609,7 +636,7 @@ mod tests {
 
     #[test]
     fn tool_result_uses_plain_string_content() {
-        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "test-key".to_string(), None);
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "test-key".to_string(), None, None);
         let message =
             ModelMessage::tool_result("call_1", serde_json::Value::String("ok".to_string()), false);
         let request = ProviderRequest {

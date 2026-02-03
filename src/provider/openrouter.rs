@@ -22,6 +22,7 @@ impl OpenRouterProvider {
                 model,
                 api_key,
                 Some("https://openrouter.ai/api/v1".to_string()),
+                None,
             ),
         }
     }

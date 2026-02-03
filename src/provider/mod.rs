@@ -117,12 +117,14 @@ pub fn create_provider(
                     m.clone(),
                     api_key,
                     config.get_base_url("openai"),
+                    None,
                 )))
             } else {
                 Ok(Box::new(openai::OpenAiProvider::new(
                     m.clone(),
                     api_key,
                     config.get_base_url("openai"),
+                    None,
                 )))
             }
         }
@@ -133,18 +135,22 @@ pub fn create_provider(
                 .ok_or_else(|| RociError::Authentication("Missing OPENAI_CODEX_TOKEN".into()))?;
             let base_url = config
                 .get_base_url("openai-codex")
-                .or_else(|| config.get_base_url("openai"));
+                .or_else(|| config.get_base_url("openai"))
+                .or_else(|| Some("https://chatgpt.com/backend-api/codex".to_string()));
+            let account_id = config.get_account_id("openai-codex");
             if m.uses_responses_api() {
                 Ok(Box::new(openai_responses::OpenAiResponsesProvider::new(
                     m.clone(),
                     api_key,
                     base_url,
+                    account_id,
                 )))
             } else {
                 Ok(Box::new(openai::OpenAiProvider::new(
                     m.clone(),
                     api_key,
                     base_url,
+                    account_id,
                 )))
             }
         }

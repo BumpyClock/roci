@@ -23,6 +23,7 @@ impl MistralProvider {
                 openai_model,
                 api_key,
                 Some("https://api.mistral.ai/v1".to_string()),
+                None,
             ),
         }
     }

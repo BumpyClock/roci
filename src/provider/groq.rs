@@ -23,6 +23,7 @@ impl GroqProvider {
                 openai_model,
                 api_key,
                 Some("https://api.groq.com/openai/v1".to_string()),
+                None,
             ),
         }
     }

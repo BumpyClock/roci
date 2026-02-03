@@ -15,6 +15,7 @@ static DEFAULT_CONFIG: OnceLock<RociConfig> = OnceLock::new();
 pub struct RociConfig {
     api_keys: Arc<RwLock<HashMap<String, String>>>,
     base_urls: Arc<RwLock<HashMap<String, String>>>,
+    account_ids: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl Default for RociConfig {
@@ -29,6 +30,7 @@ impl RociConfig {
         Self {
             api_keys: Arc::new(RwLock::new(HashMap::new())),
             base_urls: Arc::new(RwLock::new(HashMap::new())),
+            account_ids: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -101,6 +103,17 @@ impl RociConfig {
 
     pub fn get_base_url(&self, provider: &str) -> Option<String> {
         self.base_urls.read().unwrap().get(provider).cloned()
+    }
+
+    pub fn set_account_id(&self, provider: &str, account_id: String) {
+        self.account_ids
+            .write()
+            .unwrap()
+            .insert(provider.to_string(), account_id);
+    }
+
+    pub fn get_account_id(&self, provider: &str) -> Option<String> {
+        self.account_ids.read().unwrap().get(provider).cloned()
     }
 
     /// Check if a provider has credentials configured.
