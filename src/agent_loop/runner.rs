@@ -477,17 +477,21 @@ async fn resolve_approval(
         ApprovalPolicy::Always => ApprovalDecision::Accept,
         ApprovalPolicy::Never => ApprovalDecision::Decline,
         ApprovalPolicy::Ask => {
-    let request = ApprovalRequest {
-        id: call.id.clone(),
-        kind: ApprovalKind::Other,
-        reason: Some(format!("Tool: {}", call.name)),
-        payload: serde_json::json!({
-            "tool_name": call.name.clone(),
-            "tool_call_id": call.id.clone(),
-            "arguments": call.arguments.clone(),
-        }),
-        suggested_policy_change: None,
-    };
+            let kind = approval_kind_for_tool(call);
+            if matches!(kind, ApprovalKind::Other) {
+                return ApprovalDecision::Accept;
+            }
+            let request = ApprovalRequest {
+                id: call.id.clone(),
+                kind,
+                reason: Some(format!("Tool: {}", call.name)),
+                payload: serde_json::json!({
+                    "tool_name": call.name.clone(),
+                    "tool_call_id": call.id.clone(),
+                    "arguments": call.arguments.clone(),
+                }),
+                suggested_policy_change: None,
+            };
             emitter.emit(
                 RunEventStream::Approval,
                 RunEventPayload::ApprovalRequired { request: request.clone() },
@@ -497,6 +501,14 @@ async fn resolve_approval(
             };
             handler(request).await
         }
+    }
+}
+
+fn approval_kind_for_tool(call: &AgentToolCall) -> ApprovalKind {
+    match call.name.as_str() {
+        "exec" | "process" => ApprovalKind::CommandExecution,
+        "apply_patch" | "write" | "edit" => ApprovalKind::FileChange,
+        _ => ApprovalKind::Other,
     }
 }
 

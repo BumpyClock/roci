@@ -73,7 +73,22 @@ impl ToolArguments {
 
     /// Deserialize the entire arguments into a typed struct.
     pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, RociError> {
-        serde_json::from_value(self.value.clone()).map_err(|e| {
+        let value = match &self.value {
+            serde_json::Value::String(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {
+                        RociError::InvalidArgument(format!(
+                            "Failed to deserialize arguments: {e}"
+                        ))
+                    })?
+                }
+            }
+            other => other.clone(),
+        };
+        serde_json::from_value(value).map_err(|e| {
             RociError::InvalidArgument(format!("Failed to deserialize arguments: {e}"))
         })
     }

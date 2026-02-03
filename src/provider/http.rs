@@ -49,7 +49,8 @@ pub fn anthropic_headers(api_key: &str, version: &str, beta: Option<&str>) -> He
 
 /// Parse an SSE "data:" line, returning None for "[DONE]".
 pub fn parse_sse_data(line: &str) -> Option<&str> {
-    let data = line.strip_prefix("data: ")?;
+    let data = line.strip_prefix("data:")?;
+    let data = data.strip_prefix(' ').unwrap_or(data);
     if data == "[DONE]" {
         return None;
     }

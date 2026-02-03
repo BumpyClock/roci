@@ -727,6 +727,9 @@ impl ModelProvider for OpenAiResponsesProvider {
             let mut emitted_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut saw_tool_call = false;
             let mut saw_text_delta = false;
+            let mut pending_data: Vec<String> = Vec::new();
+            let mut saw_done = false;
+            let mut debug_event_count = 0usize;
             futures::pin_mut!(byte_stream);
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -741,204 +744,341 @@ impl ModelProvider for OpenAiResponsesProvider {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 while let Some(line_end) = buffer.find('\n') {
-                    let line = buffer[..line_end].trim().to_string();
+                    let line = buffer[..line_end].to_string();
                     buffer = buffer[line_end + 1..].to_string();
 
-                    if line.is_empty() || line.starts_with(':') {
-                        continue;
-                    }
-
-                    if let Some(data) = super::http::parse_sse_data(&line) {
-                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            match event_type {
-                                "response.output_item.added" => {
-                                    if let Some(item) = event.get("item") {
-                                        if item.get("type").and_then(|t| t.as_str()) == Some("message")
-                                            && !saw_text_delta
-                                        {
-                                            if let Some(content) =
-                                                item.get("content").and_then(|v| v.as_array())
+                    let line = line.trim_end_matches('\r');
+                    if line.is_empty() {
+                        if pending_data.is_empty() {
+                            continue;
+                        }
+                        let data = pending_data.join("\n");
+                        pending_data.clear();
+                        if data == "[DONE]" {
+                            saw_done = true;
+                            break;
+                        }
+                        if debug_enabled() && debug_event_count < 5 {
+                            tracing::debug!(data = %data, "OpenAI Responses SSE raw");
+                            debug_event_count += 1;
+                        }
+                        match serde_json::from_str::<serde_json::Value>(&data) {
+                            Ok(event) => {
+                                let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                match event_type {
+                                    "response.output_item.added" => {
+                                        if let Some(item) = event.get("item") {
+                                            if item.get("type").and_then(|t| t.as_str()) == Some("message")
+                                                && !saw_text_delta
                                             {
-                                                for part in content {
-                                                    if part.get("type").and_then(|t| t.as_str())
-                                                        == Some("output_text")
-                                                    {
-                                                        if let Some(text) =
-                                                            part.get("text").and_then(|t| t.as_str())
+                                                if let Some(content) =
+                                                    item.get("content").and_then(|v| v.as_array())
+                                                {
+                                                    for part in content {
+                                                        if part.get("type").and_then(|t| t.as_str())
+                                                            == Some("output_text")
                                                         {
-                                                            if !text.is_empty() {
-                                                                saw_text_delta = true;
-                                                                yield Ok(TextStreamDelta {
-                                                                    text: text.to_string(),
-                                                                    event_type: StreamEventType::TextDelta,
-                                                                    tool_call: None,
-                                                                    finish_reason: None,
-                                                                    usage: None,
-                                                                    reasoning: None,
-                                                                    reasoning_signature: None,
-                                                                    reasoning_type: None,
-                                                                });
+                                                            if let Some(text) =
+                                                                part.get("text").and_then(|t| t.as_str())
+                                                            {
+                                                                if !text.is_empty() {
+                                                                    saw_text_delta = true;
+                                                                    yield Ok(TextStreamDelta {
+                                                                        text: text.to_string(),
+                                                                        event_type: StreamEventType::TextDelta,
+                                                                        tool_call: None,
+                                                                        finish_reason: None,
+                                                                        usage: None,
+                                                                        reasoning: None,
+                                                                        reasoning_signature: None,
+                                                                        reasoning_type: None,
+                                                                    });
+                                                                }
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
+                                            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                                                if let (Some(id), Some(name)) = (
+                                                    item.get("call_id").and_then(|v| v.as_str()).or_else(|| item.get("id").and_then(|v| v.as_str())),
+                                                    item.get("name").and_then(|v| v.as_str()),
+                                                ) {
+                                                    call_names.insert(id.to_string(), name.to_string());
+                                                    if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+                                                        if !args.trim().is_empty() && !emitted_calls.contains(id) {
+                                                            let arguments = serde_json::from_str(args)
+                                                                .unwrap_or(serde_json::Value::String(args.to_string()));
+                                                            yield Ok(TextStreamDelta {
+                                                                text: String::new(),
+                                                                event_type: StreamEventType::ToolCallDelta,
+                                                                tool_call: Some(AgentToolCall {
+                                                                    id: id.to_string(),
+                                                                    name: name.to_string(),
+                                                                    arguments,
+                                                                    recipient: None,
+                                                                }),
+                                                                finish_reason: None,
+                                                                usage: None,
+                                                                reasoning: None,
+                                                                reasoning_signature: None,
+                                                                reasoning_type: None,
+                                                            });
+                                                            emitted_calls.insert(id.to_string());
+                                                            saw_tool_call = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
-                                        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                            if let (Some(id), Some(name)) = (
-                                                item.get("call_id").and_then(|v| v.as_str()).or_else(|| item.get("id").and_then(|v| v.as_str())),
-                                                item.get("name").and_then(|v| v.as_str()),
-                                            ) {
-                                                call_names.insert(id.to_string(), name.to_string());
-                                                if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-                                                    if !emitted_calls.contains(id) {
-                                                        let arguments = serde_json::from_str(args)
-                                                            .unwrap_or(serde_json::Value::String(args.to_string()));
+                                    }
+                                    "response.output_item.done" => {
+                                        if let Some(item) = event.get("item") {
+                                            if item.get("type").and_then(|t| t.as_str()) == Some("message")
+                                                && !saw_text_delta
+                                            {
+                                                if let Some(content) =
+                                                    item.get("content").and_then(|v| v.as_array())
+                                                {
+                                                    let mut completed_text = String::new();
+                                                    for part in content {
+                                                        if part.get("type").and_then(|t| t.as_str())
+                                                            == Some("output_text")
+                                                        {
+                                                            if let Some(text) =
+                                                                part.get("text").and_then(|t| t.as_str())
+                                                            {
+                                                                completed_text.push_str(text);
+                                                            }
+                                                        }
+                                                    }
+                                                    if !completed_text.trim().is_empty() {
+                                                        saw_text_delta = true;
                                                         yield Ok(TextStreamDelta {
-                                                            text: String::new(),
-                                                            event_type: StreamEventType::ToolCallDelta,
-                                                            tool_call: Some(AgentToolCall {
-                                                                id: id.to_string(),
-                                                                name: name.to_string(),
-                                                                arguments,
-                                                                recipient: None,
-                                                            }),
+                                                            text: completed_text,
+                                                            event_type: StreamEventType::TextDelta,
+                                                            tool_call: None,
                                                             finish_reason: None,
                                                             usage: None,
                                                             reasoning: None,
                                                             reasoning_signature: None,
                                                             reasoning_type: None,
                                                         });
-                                                        emitted_calls.insert(id.to_string());
+                                                    }
+                                                }
+                                            }
+                                            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                                                let call_id = item
+                                                    .get("call_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                                                    .map(|v| v.to_string());
+                                                let name = item.get("name").and_then(|v| v.as_str()).map(|v| v.to_string());
+                                                let args = item
+                                                    .get("arguments")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|v| v.to_string())
+                                                    .or_else(|| {
+                                                        call_id
+                                                            .as_ref()
+                                                            .and_then(|id| call_arguments.remove(id))
+                                                    });
+                                                if let (Some(id), Some(name), Some(args)) = (call_id, name, args) {
+                                                    if !emitted_calls.contains(&id) {
+                                                        let arguments = serde_json::from_str(&args)
+                                                            .unwrap_or(serde_json::Value::String(args.to_string()));
+                                                        yield Ok(TextStreamDelta {
+                                                            text: String::new(),
+                                                            event_type: StreamEventType::ToolCallDelta,
+                                                            tool_call: Some(AgentToolCall { id: id.clone(), name, arguments, recipient: None }),
+                                                            finish_reason: None,
+                                                            usage: None,
+                                                            reasoning: None,
+                                                            reasoning_signature: None,
+                                                            reasoning_type: None,
+                                                        });
+                                                        emitted_calls.insert(id);
                                                         saw_tool_call = true;
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                "response.function_call_arguments.delta" => {
-                                    if let Some(call_id) = event.get("call_id")
-                                        .and_then(|v| v.as_str())
-                                        .or_else(|| event.get("item_id").and_then(|v| v.as_str()))
-                                    {
-                                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                            call_arguments
-                                                .entry(call_id.to_string())
-                                                .or_default()
-                                                .push_str(delta);
+                                    "response.function_call_arguments.delta" => {
+                                        if let Some(call_id) = event.get("call_id")
+                                            .and_then(|v| v.as_str())
+                                            .or_else(|| event.get("item_id").and_then(|v| v.as_str()))
+                                        {
+                                            if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                                call_arguments
+                                                    .entry(call_id.to_string())
+                                                    .or_default()
+                                                    .push_str(delta);
+                                            }
                                         }
                                     }
-                                }
-                                "response.function_call_arguments.done" => {
-                                    let call_id = event.get("call_id")
-                                        .and_then(|v| v.as_str())
-                                        .or_else(|| event.get("item_id").and_then(|v| v.as_str()))
-                                        .map(|v| v.to_string());
-                                    let name = event.get("name")
-                                        .and_then(|v| v.as_str())
-                                        .map(|v| v.to_string())
-                                        .or_else(|| call_id.as_ref().and_then(|id| call_names.get(id).cloned()));
-                                    let args = event
-                                        .get("arguments")
-                                        .and_then(|v| v.as_str())
-                                        .map(|v| v.to_string())
-                                        .or_else(|| {
-                                            call_id
-                                                .as_ref()
-                                                .and_then(|id| call_arguments.remove(id))
-                                        });
-                                    if let (Some(id), Some(name), Some(args)) = (call_id, name, args) {
-                                        if !emitted_calls.contains(&id) {
-                                            let arguments = serde_json::from_str(&args)
-                                                .unwrap_or(serde_json::Value::String(args.to_string()));
-                                            yield Ok(TextStreamDelta {
-                                                text: String::new(),
-                                                event_type: StreamEventType::ToolCallDelta,
-                                                tool_call: Some(AgentToolCall { id: id.clone(), name, arguments, recipient: None }),
-                                                finish_reason: None,
-                                                usage: None,
-                                                reasoning: None,
-                                                reasoning_signature: None,
-                                                reasoning_type: None,
+                                    "response.function_call_arguments.done" => {
+                                        let call_id = event.get("call_id")
+                                            .and_then(|v| v.as_str())
+                                            .or_else(|| event.get("item_id").and_then(|v| v.as_str()))
+                                            .map(|v| v.to_string());
+                                        let name = event.get("name")
+                                            .and_then(|v| v.as_str())
+                                            .map(|v| v.to_string())
+                                            .or_else(|| call_id.as_ref().and_then(|id| call_names.get(id).cloned()));
+                                        let args = event
+                                            .get("arguments")
+                                            .and_then(|v| v.as_str())
+                                            .map(|v| v.to_string())
+                                            .or_else(|| {
+                                                call_id
+                                                    .as_ref()
+                                                    .and_then(|id| call_arguments.remove(id))
                                             });
-                                            emitted_calls.insert(id);
-                                            saw_tool_call = true;
-                                        }
-                                    }
-                                }
-                                "response.output_text.delta" => {
-                                    if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                                        saw_text_delta = true;
-                                        yield Ok(TextStreamDelta {
-                                            text: delta.to_string(),
-                                            event_type: StreamEventType::TextDelta,
-                                            tool_call: None,
-                                            finish_reason: None,
-                                            usage: None,
-                                            reasoning: None,
-                                            reasoning_signature: None,
-                                            reasoning_type: None,
-                                        });
-                                    }
-                                }
-                                "response.output_text.done" => {
-                                    if !saw_text_delta {
-                                        if let Some(text) = event.get("text").and_then(|t| t.as_str()) {
-                                            if !text.is_empty() {
+                                        if let (Some(id), Some(name), Some(args)) = (call_id, name, args) {
+                                            if !emitted_calls.contains(&id) {
+                                                let arguments = serde_json::from_str(&args)
+                                                    .unwrap_or(serde_json::Value::String(args.to_string()));
                                                 yield Ok(TextStreamDelta {
-                                                    text: text.to_string(),
-                                                    event_type: StreamEventType::TextDelta,
-                                                    tool_call: None,
+                                                    text: String::new(),
+                                                    event_type: StreamEventType::ToolCallDelta,
+                                                    tool_call: Some(AgentToolCall { id: id.clone(), name, arguments, recipient: None }),
                                                     finish_reason: None,
                                                     usage: None,
                                                     reasoning: None,
                                                     reasoning_signature: None,
                                                     reasoning_type: None,
                                                 });
+                                                emitted_calls.insert(id);
+                                                saw_tool_call = true;
                                             }
                                         }
                                     }
-                                }
-                                "response.completed" | "response.done" => {
-                                    let finish = event.get("response")
-                                        .and_then(|r| r.get("status"))
-                                        .and_then(|v| v.as_str())
-                                        .and_then(|status| match status {
-                                            "completed" => Some(FinishReason::Stop),
-                                            "incomplete" => Some(FinishReason::Length),
-                                            _ => None,
+                                    "response.output_text.delta" => {
+                                        if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                                            saw_text_delta = true;
+                                            yield Ok(TextStreamDelta {
+                                                text: delta.to_string(),
+                                                event_type: StreamEventType::TextDelta,
+                                                tool_call: None,
+                                                finish_reason: None,
+                                                usage: None,
+                                                reasoning: None,
+                                                reasoning_signature: None,
+                                                reasoning_type: None,
+                                            });
+                                        }
+                                    }
+                                    "response.output_text.done" => {
+                                        if !saw_text_delta {
+                                            if let Some(text) = event.get("text").and_then(|t| t.as_str()) {
+                                                if !text.is_empty() {
+                                                    yield Ok(TextStreamDelta {
+                                                        text: text.to_string(),
+                                                        event_type: StreamEventType::TextDelta,
+                                                        tool_call: None,
+                                                        finish_reason: None,
+                                                        usage: None,
+                                                        reasoning: None,
+                                                        reasoning_signature: None,
+                                                        reasoning_type: None,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "response.completed" | "response.done" => {
+                                        if !saw_text_delta {
+                                            if let Some(response) = event.get("response") {
+                                                if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
+                                                    let mut completed_text = String::new();
+                                                    for item in output {
+                                                        if item.get("type").and_then(|t| t.as_str()) == Some("message") {
+                                                            if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                                                                for part in content {
+                                                                    if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                                                                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                                            completed_text.push_str(text);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else if item.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                                                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                                                completed_text.push_str(text);
+                                                            }
+                                                        }
+                                                    }
+                                                    if !completed_text.trim().is_empty() {
+                                                        saw_text_delta = true;
+                                                        yield Ok(TextStreamDelta {
+                                                            text: completed_text,
+                                                            event_type: StreamEventType::TextDelta,
+                                                            tool_call: None,
+                                                            finish_reason: None,
+                                                            usage: None,
+                                                            reasoning: None,
+                                                            reasoning_signature: None,
+                                                            reasoning_type: None,
+                                                        });
+                                                    } else if debug_enabled() {
+                                                        tracing::debug!("OpenAI Responses completed event had no output text");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let finish = event.get("response")
+                                            .and_then(|r| r.get("status"))
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|status| match status {
+                                                "completed" => Some(FinishReason::Stop),
+                                                "incomplete" => Some(FinishReason::Length),
+                                                _ => None,
+                                            });
+                                        let usage = event.get("response")
+                                            .and_then(|r| r.get("usage"))
+                                            .and_then(|u| {
+                                                Some(Usage {
+                                                    input_tokens: u.get("input_tokens")?.as_u64()? as u32,
+                                                    output_tokens: u.get("output_tokens")?.as_u64()? as u32,
+                                                    total_tokens: u.get("total_tokens")?.as_u64()? as u32,
+                                                    ..Default::default()
+                                                })
+                                            });
+                                        yield Ok(TextStreamDelta {
+                                            text: String::new(),
+                                            event_type: StreamEventType::Done,
+                                            tool_call: None,
+                                            finish_reason: if saw_tool_call {
+                                                Some(FinishReason::ToolCalls)
+                                            } else {
+                                                finish.or(Some(FinishReason::Stop))
+                                            },
+                                            usage,
+                                            reasoning: None,
+                                            reasoning_signature: None,
+                                            reasoning_type: None,
                                         });
-                                    let usage = event.get("response")
-                                        .and_then(|r| r.get("usage"))
-                                        .and_then(|u| {
-                                            Some(Usage {
-                                                input_tokens: u.get("input_tokens")?.as_u64()? as u32,
-                                                output_tokens: u.get("output_tokens")?.as_u64()? as u32,
-                                                total_tokens: u.get("total_tokens")?.as_u64()? as u32,
-                                                ..Default::default()
-                                            })
-                                        });
-                                    yield Ok(TextStreamDelta {
-                                        text: String::new(),
-                                        event_type: StreamEventType::Done,
-                                        tool_call: None,
-                                        finish_reason: if saw_tool_call {
-                                            Some(FinishReason::ToolCalls)
-                                        } else {
-                                            finish.or(Some(FinishReason::Stop))
-                                        },
-                                        usage,
-                                        reasoning: None,
-                                        reasoning_signature: None,
-                                        reasoning_type: None,
-                                    });
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
+                            }
+                            Err(e) => {
+                                if debug_enabled() {
+                                    tracing::debug!(error = %e, data = %data, "OpenAI Responses SSE parse failed");
+                                }
                             }
                         }
+                    } else if line.starts_with(':') {
+                        continue;
+                    } else if let Some(rest) = line.strip_prefix("data:") {
+                        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                        pending_data.push(rest.to_string());
                     }
+                }
+
+                if saw_done {
+                    break;
                 }
             }
         };
