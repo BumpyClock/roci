@@ -168,6 +168,7 @@ impl OpenAiResponsesProvider {
                             "name": t.name,
                             "description": t.description,
                             "parameters": parameters,
+                            "strict": false,
                         })
                     })
                     .collect();
@@ -311,6 +312,7 @@ impl OpenAiResponsesProvider {
                             "name": t.name,
                             "description": t.description,
                             "parameters": parameters,
+                            "strict": false,
                         })
                     })
                     .collect();

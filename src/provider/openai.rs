@@ -126,6 +126,7 @@ impl OpenAiProvider {
                                 "name": t.name,
                                 "description": t.description,
                                 "parameters": t.parameters,
+                                "strict": false,
                             }
                         })
                     })
