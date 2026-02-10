@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
-use tracing::debug;
 use std::env;
+use tracing::debug;
 
 use crate::error::RociError;
 use crate::models::capabilities::ModelCapabilities;
@@ -165,8 +165,10 @@ impl OpenAiProvider {
 }
 
 fn debug_enabled() -> bool {
-    matches!(env::var("HOMIE_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
-        || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
+    matches!(
+        env::var("HOMIE_DEBUG").as_deref(),
+        Ok("1" | "true" | "TRUE")
+    ) || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
 }
 
 #[async_trait]

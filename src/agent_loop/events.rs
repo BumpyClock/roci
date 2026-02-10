@@ -36,17 +36,40 @@ pub enum RunLifecycle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunEventPayload {
-    Lifecycle { state: RunLifecycle },
-    AssistantDelta { text: String },
-    ReasoningDelta { text: String },
-    ToolCallStarted { call: AgentToolCall },
-    ToolCallDelta { call_id: String, delta: serde_json::Value },
-    ToolCallCompleted { call: AgentToolCall },
-    ToolResult { result: AgentToolResult },
-    PlanUpdated { plan: String },
-    DiffUpdated { diff: String },
-    ApprovalRequired { request: ApprovalRequest },
-    Error { message: String },
+    Lifecycle {
+        state: RunLifecycle,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ToolCallStarted {
+        call: AgentToolCall,
+    },
+    ToolCallDelta {
+        call_id: String,
+        delta: serde_json::Value,
+    },
+    ToolCallCompleted {
+        call: AgentToolCall,
+    },
+    ToolResult {
+        result: AgentToolResult,
+    },
+    PlanUpdated {
+        plan: String,
+    },
+    DiffUpdated {
+        diff: String,
+    },
+    ApprovalRequired {
+        request: ApprovalRequest,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Envelope for streaming run events.

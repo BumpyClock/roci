@@ -117,7 +117,9 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     Image(ImageContent),
     ToolCall(AgentToolCall),
     ToolResult(AgentToolResult),

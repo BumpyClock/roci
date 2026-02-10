@@ -639,9 +639,7 @@ async fn live_anthropic_sonnet4_extended_thinking() {
     let provider = roci::provider::create_provider(&model, &config).unwrap();
     let result = generation::generate_text(
         provider.as_ref(),
-        vec![ModelMessage::user(
-            "What is 15 * 37? Think step by step.",
-        )],
+        vec![ModelMessage::user("What is 15 * 37? Think step by step.")],
         GenerationSettings {
             anthropic: Some(AnthropicOptions {
                 thinking: Some(ThinkingMode::Enabled {
@@ -732,10 +730,7 @@ async fn live_anthropic_sonnet4_streams_tool_call() {
     let model = LanguageModel::Anthropic(anthropic::AnthropicModel::ClaudeSonnet4);
     let config = RociConfig::from_env();
     let provider = roci::provider::create_provider(&model, &config).unwrap();
-    run_stream_tool_flow_test(
-        Arc::from(provider),
-        "anthropic:claude-sonnet-4 stream tool",
-    )
-    .await
-    .unwrap();
+    run_stream_tool_flow_test(Arc::from(provider), "anthropic:claude-sonnet-4 stream tool")
+        .await
+        .unwrap();
 }

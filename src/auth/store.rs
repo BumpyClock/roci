@@ -189,10 +189,7 @@ mod tests {
             account_id: None,
         };
         store.save("openai-codex", "default", &token).unwrap();
-        let loaded = store
-            .load("openai-codex", "default")
-            .unwrap()
-            .unwrap();
+        let loaded = store.load("openai-codex", "default").unwrap().unwrap();
         assert_eq!(loaded.access_token, "access");
         assert_eq!(loaded.refresh_token.as_deref(), Some("refresh"));
     }

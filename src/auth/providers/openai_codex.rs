@@ -112,10 +112,7 @@ impl OpenAiCodexAuth {
         let expires_at = Utc::now() + Duration::minutes(15);
         Ok(DeviceCodeSession {
             provider: "openai-codex".to_string(),
-            verification_url: format!(
-                "{}/codex/device",
-                self.issuer.trim_end_matches('/')
-            ),
+            verification_url: format!("{}/codex/device", self.issuer.trim_end_matches('/')),
             user_code: payload.user_code,
             device_code: payload.device_auth_id,
             interval_secs: payload.interval,
@@ -199,10 +196,7 @@ impl OpenAiCodexAuth {
         authorization_code: &str,
         code_verifier: &str,
     ) -> Result<Token, AuthError> {
-        let redirect_uri = format!(
-            "{}/deviceauth/callback",
-            self.issuer.trim_end_matches('/')
-        );
+        let redirect_uri = format!("{}/deviceauth/callback", self.issuer.trim_end_matches('/'));
         let url = format!("{}/oauth/token", self.issuer.trim_end_matches('/'));
         let resp = self
             .client
@@ -356,7 +350,11 @@ struct CodexTokens {
 fn extract_refresh_error_code(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 fn deserialize_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -376,7 +374,9 @@ fn needs_refresh(token: &Token) -> bool {
             return true;
         }
     }
-    let last = token.last_refresh.unwrap_or_else(|| DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+    let last = token
+        .last_refresh
+        .unwrap_or_else(|| DateTime::<Utc>::from(std::time::UNIX_EPOCH));
     now - last >= Duration::seconds(TOKEN_REFRESH_INTERVAL_SECS)
 }
 

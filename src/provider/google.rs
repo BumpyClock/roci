@@ -176,14 +176,10 @@ impl GoogleProvider {
                     tc.insert("includeThoughts".into(), include.into());
                 }
                 if let Some(ref level) = thinking.thinking_level {
-                    tc.insert(
-                        "thinkingLevel".into(),
-                        serde_json::json!(level.to_string()),
-                    );
+                    tc.insert("thinkingLevel".into(), serde_json::json!(level.to_string()));
                 }
                 if !tc.is_empty() {
-                    gen_config
-                        .insert("thinkingConfig".into(), serde_json::Value::Object(tc));
+                    gen_config.insert("thinkingConfig".into(), serde_json::Value::Object(tc));
                 }
             }
         }
@@ -209,9 +205,7 @@ impl GoogleProvider {
                 ];
                 let settings: Vec<serde_json::Value> = categories
                     .iter()
-                    .map(|cat| {
-                        serde_json::json!({"category": cat, "threshold": threshold})
-                    })
+                    .map(|cat| serde_json::json!({"category": cat, "threshold": threshold}))
                     .collect();
                 obj.insert("safetySettings".into(), serde_json::json!(settings));
             }
@@ -691,8 +685,7 @@ mod tests {
 
     #[test]
     fn build_request_body_includes_thinking_config() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini25Pro, "test-key".to_string());
+        let provider = GoogleProvider::new(GoogleModel::Gemini25Pro, "test-key".to_string());
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {

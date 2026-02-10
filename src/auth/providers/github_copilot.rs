@@ -85,7 +85,10 @@ impl GitHubCopilotAuth {
             .post(&self.device_code_url)
             .header("Accept", "application/json")
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[("client_id", self.client_id.as_str()), ("scope", "read:user")])
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("scope", "read:user"),
+            ])
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -178,7 +181,10 @@ impl GitHubCopilotAuth {
             .client
             .get(&self.copilot_token_url)
             .header("Accept", "application/json")
-            .header("Authorization", format!("Bearer {}", github_token.access_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", github_token.access_token),
+            )
             .send()
             .await?;
         if resp.status() == StatusCode::UNAUTHORIZED {
@@ -266,7 +272,11 @@ struct CopilotTokenResponse {
 
 fn parse_expires_at(value: serde_json::Value) -> Result<DateTime<Utc>, AuthError> {
     if let Some(num) = value.as_i64() {
-        let secs = if num > 10_000_000_000 { num / 1000 } else { num };
+        let secs = if num > 10_000_000_000 {
+            num / 1000
+        } else {
+            num
+        };
         let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
         return Ok(DateTime::<Utc>::from(time));
     }
@@ -274,7 +284,11 @@ fn parse_expires_at(value: serde_json::Value) -> Result<DateTime<Utc>, AuthError
         let parsed: i64 = text.parse().map_err(|_| {
             AuthError::InvalidResponse("Copilot token expires_at invalid".to_string())
         })?;
-        let secs = if parsed > 10_000_000_000 { parsed / 1000 } else { parsed };
+        let secs = if parsed > 10_000_000_000 {
+            parsed / 1000
+        } else {
+            parsed
+        };
         let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
         return Ok(DateTime::<Utc>::from(time));
     }
@@ -288,16 +302,14 @@ fn derive_copilot_base_url(token: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let proxy = trimmed
-        .split(';')
-        .find_map(|part| {
-            let part = part.trim();
-            if part.to_ascii_lowercase().starts_with("proxy-ep=") {
-                Some(part.trim_start_matches("proxy-ep=").trim().to_string())
-            } else {
-                None
-            }
-        })?;
+    let proxy = trimmed.split(';').find_map(|part| {
+        let part = part.trim();
+        if part.to_ascii_lowercase().starts_with("proxy-ep=") {
+            Some(part.trim_start_matches("proxy-ep=").trim().to_string())
+        } else {
+            None
+        }
+    })?;
     let host = proxy
         .replace("https://", "")
         .replace("http://", "")

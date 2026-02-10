@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
-use tracing::debug;
 use std::env;
+use tracing::debug;
 
 use crate::error::RociError;
 use crate::models::capabilities::ModelCapabilities;
@@ -248,8 +248,14 @@ impl OpenAiResponsesProvider {
         request: &ProviderRequest,
         stream: bool,
     ) -> serde_json::Value {
-        let (instructions, filtered_messages, system_count) =
-            Self::extract_codex_instructions(&request.messages, request.settings.openai_responses.as_ref().and_then(|o| o.instructions.as_ref()));
+        let (instructions, filtered_messages, system_count) = Self::extract_codex_instructions(
+            &request.messages,
+            request
+                .settings
+                .openai_responses
+                .as_ref()
+                .and_then(|o| o.instructions.as_ref()),
+        );
         let input = Self::build_input_items(&filtered_messages);
 
         if debug_enabled() {
@@ -628,6 +634,9 @@ fn extract_response_error(event: &serde_json::Value) -> Option<String> {
         .get("error")
         .or_else(|| event.get("response").and_then(|r| r.get("error")));
     let error = error?;
+    if error.is_null() {
+        return None;
+    }
     if let Some(message) = error.get("message").and_then(|v| v.as_str()) {
         return Some(message.to_string());
     }
@@ -641,8 +650,10 @@ fn extract_response_error(event: &serde_json::Value) -> Option<String> {
 }
 
 fn debug_enabled() -> bool {
-    matches!(env::var("HOMIE_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
-        || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
+    matches!(
+        env::var("HOMIE_DEBUG").as_deref(),
+        Ok("1" | "true" | "TRUE")
+    ) || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
 }
 
 fn extract_codex_account_id(token: &str) -> Result<String, RociError> {
@@ -659,9 +670,8 @@ fn extract_codex_account_id(token: &str) -> Result<String, RociError> {
     let decoded = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| RociError::Authentication("Invalid Codex token payload encoding".into()))?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded).map_err(|_| {
-        RociError::Authentication("Invalid Codex token payload JSON".into())
-    })?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded)
+        .map_err(|_| RociError::Authentication("Invalid Codex token payload JSON".into()))?;
     let account_id = value
         .get("https://api.openai.com/auth")
         .and_then(|v| v.get("chatgpt_account_id"))
@@ -1257,8 +1267,12 @@ mod tests {
 
     #[test]
     fn gpt41_allows_sampling_settings() {
-        let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None, None);
+        let provider = OpenAiResponsesProvider::new(
+            OpenAiModel::Gpt41Nano,
+            "test-key".to_string(),
+            None,
+            None,
+        );
         let settings = GenerationSettings {
             temperature: Some(0.7),
             top_p: Some(0.9),
@@ -1269,8 +1283,12 @@ mod tests {
 
     #[test]
     fn gpt41_rejects_text_verbosity_setting() {
-        let provider =
-            OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None, None);
+        let provider = OpenAiResponsesProvider::new(
+            OpenAiModel::Gpt41Nano,
+            "test-key".to_string(),
+            None,
+            None,
+        );
         let settings = GenerationSettings {
             text_verbosity: Some(TextVerbosity::Low),
             ..Default::default()
@@ -1327,7 +1345,8 @@ mod tests {
 
     #[test]
     fn request_body_defaults_truncation_for_reasoning_models() {
-        let provider = OpenAiResponsesProvider::new(OpenAiModel::O3, "test-key".to_string(), None, None);
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::O3, "test-key".to_string(), None, None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: settings(),

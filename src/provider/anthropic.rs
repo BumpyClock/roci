@@ -18,8 +18,7 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const API_VERSION: &str = "2023-06-01";
 
 /// Beta feature flags for interleaved thinking + fine-grained tool streaming.
-const BETA_FLAGS: &str =
-    "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
+const BETA_FLAGS: &str = "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
 
 pub struct AnthropicProvider {
     model: AnthropicModel,
@@ -643,16 +642,15 @@ mod tests {
 
     #[test]
     fn request_body_includes_thinking_config() {
-        let provider = AnthropicProvider::new(
-            AnthropicModel::ClaudeSonnet4,
-            "test-key".to_string(),
-            None,
-        );
+        let provider =
+            AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
                 anthropic: Some(AnthropicOptions {
-                    thinking: Some(ThinkingMode::Enabled { budget_tokens: 10000 }),
+                    thinking: Some(ThinkingMode::Enabled {
+                        budget_tokens: 10000,
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -669,11 +667,8 @@ mod tests {
 
     #[test]
     fn request_body_omits_thinking_when_disabled() {
-        let provider = AnthropicProvider::new(
-            AnthropicModel::ClaudeSonnet4,
-            "test-key".to_string(),
-            None,
-        );
+        let provider =
+            AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
@@ -694,11 +689,8 @@ mod tests {
 
     #[test]
     fn request_body_includes_thinking_blocks_in_messages() {
-        let provider = AnthropicProvider::new(
-            AnthropicModel::ClaudeSonnet4,
-            "test-key".to_string(),
-            None,
-        );
+        let provider =
+            AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
         let messages = vec![
             ModelMessage::user("hello"),
             ModelMessage {
@@ -708,7 +700,9 @@ mod tests {
                         thinking: "Let me think...".to_string(),
                         signature: "sig123".to_string(),
                     }),
-                    ContentPart::Text { text: "Here's my answer".to_string() },
+                    ContentPart::Text {
+                        text: "Here's my answer".to_string(),
+                    },
                 ],
                 name: None,
                 timestamp: None,
@@ -718,7 +712,9 @@ mod tests {
             messages,
             settings: GenerationSettings {
                 anthropic: Some(AnthropicOptions {
-                    thinking: Some(ThinkingMode::Enabled { budget_tokens: 10000 }),
+                    thinking: Some(ThinkingMode::Enabled {
+                        budget_tokens: 10000,
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -736,11 +732,8 @@ mod tests {
 
     #[test]
     fn request_body_excludes_thinking_blocks_when_not_enabled() {
-        let provider = AnthropicProvider::new(
-            AnthropicModel::ClaudeSonnet4,
-            "test-key".to_string(),
-            None,
-        );
+        let provider =
+            AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
         let messages = vec![
             ModelMessage::user("hello"),
             ModelMessage {
@@ -750,7 +743,9 @@ mod tests {
                         thinking: "Let me think...".to_string(),
                         signature: "sig123".to_string(),
                     }),
-                    ContentPart::Text { text: "Here's my answer".to_string() },
+                    ContentPart::Text {
+                        text: "Here's my answer".to_string(),
+                    },
                 ],
                 name: None,
                 timestamp: None,
@@ -771,11 +766,8 @@ mod tests {
 
     #[test]
     fn beta_headers_always_sent() {
-        let provider = AnthropicProvider::new(
-            AnthropicModel::ClaudeSonnet4,
-            "test-key".to_string(),
-            None,
-        );
+        let provider =
+            AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
         let headers = provider.build_headers();
         let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
         assert!(beta.contains("interleaved-thinking-2025-05-14"));
@@ -784,11 +776,8 @@ mod tests {
 
     #[test]
     fn tool_choice_serialization() {
-        let provider = AnthropicProvider::new(
-            AnthropicModel::ClaudeSonnet4,
-            "test-key".to_string(),
-            None,
-        );
+        let provider =
+            AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
         let tools = vec![ToolDefinition {
             name: "get_weather".to_string(),
             description: "Get weather".to_string(),

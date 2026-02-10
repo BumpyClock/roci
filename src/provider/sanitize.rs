@@ -11,10 +11,7 @@ pub fn sanitize_messages_for_provider(
     let mut sanitized: Vec<ModelMessage> = if supports_thinking(provider) {
         messages.to_vec()
     } else {
-        messages
-            .iter()
-            .filter_map(strip_thinking_blocks)
-            .collect()
+        messages.iter().filter_map(strip_thinking_blocks).collect()
     };
 
     if requires_tool_pairing(provider) {
@@ -35,7 +32,10 @@ fn requires_tool_pairing(provider: &str) -> bool {
 fn strip_thinking_blocks(message: &ModelMessage) -> Option<ModelMessage> {
     let mut parts = Vec::new();
     for part in &message.content {
-        if matches!(part, ContentPart::Thinking(_) | ContentPart::RedactedThinking(_)) {
+        if matches!(
+            part,
+            ContentPart::Thinking(_) | ContentPart::RedactedThinking(_)
+        ) {
             continue;
         }
         parts.push(part.clone());
@@ -70,8 +70,7 @@ fn sanitize_tool_result_pairing(messages: &[ModelMessage]) -> Vec<ModelMessage> 
             continue;
         }
 
-        let tool_call_ids: HashSet<String> =
-            tool_calls.iter().map(|tc| tc.id.clone()).collect();
+        let tool_call_ids: HashSet<String> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
         let mut span_results: HashMap<String, ModelMessage> = HashMap::new();
         let mut remainder: Vec<ModelMessage> = Vec::new();
 

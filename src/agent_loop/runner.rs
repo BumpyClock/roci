@@ -1,13 +1,13 @@
 //! Runner interfaces for the agent loop.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::mpsc;
-use tokio::time::{self, Duration};
 use tokio::sync::oneshot;
+use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::config::RociConfig;
@@ -16,15 +16,13 @@ use crate::models::LanguageModel;
 use crate::provider::{self, ProviderRequest, ToolDefinition};
 use crate::tools::tool::Tool;
 use crate::types::{
-    message::ContentPart,
-    AgentToolCall,
-    AgentToolResult,
-    GenerationSettings,
-    ModelMessage,
-    StreamEventType,
+    message::ContentPart, AgentToolCall, AgentToolResult, GenerationSettings, ModelMessage,
+    StreamEventType, TextStreamDelta,
 };
 
-use super::approvals::{ApprovalDecision, ApprovalHandler, ApprovalPolicy, ApprovalRequest, ApprovalKind};
+use super::approvals::{
+    ApprovalDecision, ApprovalHandler, ApprovalKind, ApprovalPolicy, ApprovalRequest,
+};
 use super::events::{RunEvent, RunEventPayload, RunEventStream, RunLifecycle};
 use super::types::{RunId, RunResult};
 
@@ -34,8 +32,7 @@ pub type RunEventSink = Arc<dyn Fn(RunEvent) + Send + Sync>;
 pub type CompactionHandler =
     Arc<dyn Fn(&[ModelMessage]) -> Option<Vec<ModelMessage>> + Send + Sync>;
 /// Hook to redact/transform tool results before persistence or context assembly.
-pub type ToolResultPersistHandler =
-    Arc<dyn Fn(AgentToolResult) -> AgentToolResult + Send + Sync>;
+pub type ToolResultPersistHandler = Arc<dyn Fn(AgentToolResult) -> AgentToolResult + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub struct RunHooks {
@@ -169,11 +166,99 @@ pub trait Runner: Send + Sync {
 /// Default agent-loop runner (tool loop + approvals + event stream).
 pub struct LoopRunner {
     config: RociConfig,
+    provider_factory: ProviderFactory,
 }
 
 impl LoopRunner {
     pub fn new(config: RociConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            provider_factory: Arc::new(|model, config| provider::create_provider(model, config)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_provider_factory(config: RociConfig, provider_factory: ProviderFactory) -> Self {
+        Self {
+            config,
+            provider_factory,
+        }
+    }
+}
+
+type ProviderFactory = Arc<
+    dyn Fn(&LanguageModel, &RociConfig) -> Result<Box<dyn provider::ModelProvider>, RociError>
+        + Send
+        + Sync,
+>;
+
+const DEFAULT_MAX_ITERATIONS: usize = 20;
+const DEFAULT_MAX_TOOL_FAILURES: usize = 8;
+const RUNNER_MAX_ITERATIONS_ENV: &str = "HOMIE_ROCI_RUNNER_MAX_ITERATIONS";
+const RUNNER_MAX_TOOL_FAILURES_ENV: &str = "HOMIE_ROCI_RUNNER_MAX_TOOL_FAILURES";
+const RUNNER_MAX_ITERATIONS_KEYS: [&str; 3] = [
+    "runner.max_iterations",
+    "agent_loop.max_iterations",
+    "max_iterations",
+];
+const RUNNER_MAX_TOOL_FAILURES_KEYS: [&str; 3] = [
+    "runner.max_tool_failures",
+    "agent_loop.max_tool_failures",
+    "max_tool_failures",
+];
+
+#[derive(Debug, Clone, Copy)]
+struct RunnerLimits {
+    max_iterations: usize,
+    max_tool_failures: usize,
+}
+
+impl RunnerLimits {
+    fn from_request(request: &RunRequest) -> Self {
+        Self {
+            max_iterations: parse_runner_limit(
+                &request.metadata,
+                &RUNNER_MAX_ITERATIONS_KEYS,
+                RUNNER_MAX_ITERATIONS_ENV,
+                DEFAULT_MAX_ITERATIONS,
+            ),
+            max_tool_failures: parse_runner_limit(
+                &request.metadata,
+                &RUNNER_MAX_TOOL_FAILURES_KEYS,
+                RUNNER_MAX_TOOL_FAILURES_ENV,
+                DEFAULT_MAX_TOOL_FAILURES,
+            ),
+        }
+    }
+}
+
+fn parse_runner_limit(
+    metadata: &HashMap<String, String>,
+    keys: &[&str],
+    env_key: &str,
+    default: usize,
+) -> usize {
+    for key in keys {
+        if let Some(value) = metadata.get(*key) {
+            if let Some(parsed) = parse_positive_usize(value) {
+                return parsed;
+            }
+        }
+    }
+    if let Ok(value) = std::env::var(env_key) {
+        if let Some(parsed) = parse_positive_usize(&value) {
+            return parsed;
+        }
+    }
+    default
+}
+
+fn parse_positive_usize(value: &str) -> Option<usize> {
+    let parsed = value.trim().parse::<usize>().ok()?;
+    if parsed == 0 {
+        None
+    } else {
+        Some(parsed)
     }
 }
 
@@ -182,6 +267,7 @@ impl Runner for LoopRunner {
     async fn start(&self, request: RunRequest) -> Result<RunHandle, RociError> {
         let (handle, mut abort_rx, result_tx, mut input_rx) = RunHandle::new(request.run_id);
         let config = self.config.clone();
+        let provider_factory = self.provider_factory.clone();
 
         tokio::spawn(async move {
             if debug_enabled() {
@@ -191,6 +277,7 @@ impl Runner for LoopRunner {
                     "roci run start"
                 );
             }
+            let limits = RunnerLimits::from_request(&request);
             let emitter = RunEventEmitter::new(request.run_id, request.event_sink);
             emitter.emit(
                 RunEventStream::Lifecycle,
@@ -199,18 +286,19 @@ impl Runner for LoopRunner {
                 },
             );
 
-            let provider = match provider::create_provider(&request.model, &config) {
+            if debug_enabled() {
+                tracing::debug!(
+                    run_id = %request.run_id,
+                    max_iterations = limits.max_iterations,
+                    max_tool_failures = limits.max_tool_failures,
+                    "roci runner limits"
+                );
+            }
+
+            let provider = match provider_factory(&request.model, &config) {
                 Ok(provider) => provider,
                 Err(err) => {
-                    emitter.emit(
-                        RunEventStream::Lifecycle,
-                        RunEventPayload::Lifecycle {
-                            state: RunLifecycle::Failed {
-                                error: err.to_string(),
-                            },
-                        },
-                    );
-                    let _ = result_tx.send(RunResult::failed(err.to_string()));
+                    let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
                     return;
                 }
             };
@@ -233,19 +321,16 @@ impl Runner for LoopRunner {
 
             let mut messages = request.messages.clone();
             let mut iteration = 0usize;
+            let mut consecutive_failed_iterations = 0usize;
 
             loop {
                 iteration += 1;
-                if iteration > 20 {
-                    emitter.emit(
-                        RunEventStream::Lifecycle,
-                        RunEventPayload::Lifecycle {
-                            state: RunLifecycle::Failed {
-                                error: "tool loop exceeded max iterations".to_string(),
-                            },
-                        },
+                if iteration > limits.max_iterations {
+                    let reason = format!(
+                        "tool loop exceeded max iterations (max_iterations={})",
+                        limits.max_iterations
                     );
-                    let _ = result_tx.send(RunResult::failed("tool loop exceeded max iterations"));
+                    let _ = result_tx.send(emit_failed_result(&emitter, reason));
                     return;
                 }
 
@@ -271,132 +356,96 @@ impl Runner for LoopRunner {
                 let mut stream = match provider.stream_text(&req).await {
                     Ok(stream) => stream,
                     Err(err) => {
-                        emitter.emit(
-                            RunEventStream::Lifecycle,
-                            RunEventPayload::Lifecycle {
-                                state: RunLifecycle::Failed {
-                                    error: err.to_string(),
-                                },
-                            },
-                        );
-                        let _ = result_tx.send(RunResult::failed(err.to_string()));
+                        let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
                         return;
                     }
                 };
 
                 let mut iteration_text = String::new();
-                let mut tool_calls: HashMap<String, AgentToolCall> = HashMap::new();
+                let mut tool_calls: BTreeMap<String, AgentToolCall> = BTreeMap::new();
                 let mut stream_done = false;
                 let idle_timeout_ms = request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
                 let mut idle_sleep = (idle_timeout_ms > 0)
                     .then(|| Box::pin(time::sleep(Duration::from_millis(idle_timeout_ms))));
                 loop {
-                    tokio::select! {
-                        _ = &mut abort_rx => {
-                            emitter.emit(
-                                RunEventStream::Lifecycle,
-                                RunEventPayload::Lifecycle {
-                                    state: RunLifecycle::Canceled,
-                                },
-                            );
-                            let _ = result_tx.send(RunResult::canceled());
-                            return;
-                        }
-                        _ = idle_sleep.as_mut().unwrap(), if idle_sleep.is_some() => {
-                            emitter.emit(
-                                RunEventStream::Lifecycle,
-                                RunEventPayload::Lifecycle {
-                                    state: RunLifecycle::Failed {
-                                        error: "stream idle timeout".to_string(),
+                    if let Some(ref mut sleep) = idle_sleep {
+                        tokio::select! {
+                            _ = &mut abort_rx => {
+                                emitter.emit(
+                                    RunEventStream::Lifecycle,
+                                    RunEventPayload::Lifecycle {
+                                        state: RunLifecycle::Canceled,
                                     },
-                                },
-                            );
-                            let _ = result_tx.send(RunResult::failed("stream idle timeout"));
-                            return;
-                        }
-                        delta = stream.next() => {
-                            let Some(delta) = delta else { break; };
-                            match delta {
-                                Ok(delta) => {
-                                    if let Some(ref mut sleep) = idle_sleep {
+                                );
+                                let _ = result_tx.send(RunResult::canceled());
+                                return;
+                            }
+                            _ = sleep.as_mut() => {
+                                let _ = result_tx.send(emit_failed_result(&emitter, "stream idle timeout"));
+                                return;
+                            }
+                            delta = stream.next() => {
+                                let Some(delta) = delta else { break; };
+                                match delta {
+                                    Ok(delta) => {
                                         sleep.as_mut().reset(
                                             time::Instant::now() + Duration::from_millis(idle_timeout_ms),
                                         );
-                                    }
-                                    match delta.event_type {
-                                        StreamEventType::ToolCallDelta => {
-                                            if let Some(tc) = delta.tool_call.clone() {
-                                                let is_new = !tool_calls.contains_key(&tc.id);
-                                                tool_calls.insert(tc.id.clone(), tc.clone());
-                                                if is_new {
-                                                    emitter.emit(
-                                                        RunEventStream::Tool,
-                                                        RunEventPayload::ToolCallStarted { call: tc.clone() },
-                                                    );
-                                                } else {
-                                                    emitter.emit(
-                                                        RunEventStream::Tool,
-                                                        RunEventPayload::ToolCallDelta { call_id: tc.id.clone(), delta: tc.arguments.clone() },
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        StreamEventType::Reasoning => {
-                                            if let Some(reasoning) = delta.reasoning.clone() {
-                                                if !reasoning.is_empty() {
-                                                    emitter.emit(
-                                                        RunEventStream::Reasoning,
-                                                        RunEventPayload::ReasoningDelta { text: reasoning },
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        StreamEventType::TextDelta => {
-                                            if !delta.text.is_empty() {
-                                                iteration_text.push_str(&delta.text);
-                                                emitter.emit(
-                                                    RunEventStream::Assistant,
-                                                    RunEventPayload::AssistantDelta { text: delta.text.clone() },
-                                                );
-                                            }
-                                        }
-                                        StreamEventType::Error => {
-                                            let message = if !delta.text.is_empty() {
-                                                delta.text.clone()
-                                            } else {
-                                                "stream error".to_string()
-                                            };
-                                            emitter.emit(
-                                                RunEventStream::Lifecycle,
-                                                RunEventPayload::Lifecycle {
-                                                    state: RunLifecycle::Failed {
-                                                        error: message,
-                                                    },
-                                                },
-                                            );
-                                            let _ = result_tx.send(RunResult::failed("stream error"));
+                                        if let Some(reason) = process_stream_delta(
+                                            &emitter,
+                                            delta,
+                                            &mut iteration_text,
+                                            &mut tool_calls,
+                                            &mut stream_done,
+                                        ) {
+                                            let _ = result_tx.send(emit_failed_result(&emitter, reason));
                                             return;
                                         }
-                                        StreamEventType::Done => {
-                                            stream_done = true;
+                                        if stream_done {
+                                            break;
                                         }
-                                        _ => {}
                                     }
-                                    if stream_done {
-                                        break;
+                                    Err(err) => {
+                                        let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
+                                        return;
                                     }
                                 }
-                                Err(err) => {
-                                    emitter.emit(
-                                        RunEventStream::Lifecycle,
-                                        RunEventPayload::Lifecycle {
-                                            state: RunLifecycle::Failed {
-                                                error: err.to_string(),
-                                            },
-                                        },
-                                    );
-                                    let _ = result_tx.send(RunResult::failed(err.to_string()));
-                                    return;
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = &mut abort_rx => {
+                                emitter.emit(
+                                    RunEventStream::Lifecycle,
+                                    RunEventPayload::Lifecycle {
+                                        state: RunLifecycle::Canceled,
+                                    },
+                                );
+                                let _ = result_tx.send(RunResult::canceled());
+                                return;
+                            }
+                            delta = stream.next() => {
+                                let Some(delta) = delta else { break; };
+                                match delta {
+                                    Ok(delta) => {
+                                        if let Some(reason) = process_stream_delta(
+                                            &emitter,
+                                            delta,
+                                            &mut iteration_text,
+                                            &mut tool_calls,
+                                            &mut stream_done,
+                                        ) {
+                                            let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                                            return;
+                                        }
+                                        if stream_done {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -430,7 +479,9 @@ impl Runner for LoopRunner {
 
                 let mut assistant_content: Vec<ContentPart> = Vec::new();
                 if !iteration_text.is_empty() {
-                    assistant_content.push(ContentPart::Text { text: iteration_text });
+                    assistant_content.push(ContentPart::Text {
+                        text: iteration_text,
+                    });
                 }
                 for call in tool_calls.values() {
                     assistant_content.push(ContentPart::ToolCall(call.clone()));
@@ -442,6 +493,7 @@ impl Runner for LoopRunner {
                     timestamp: Some(chrono::Utc::now()),
                 });
 
+                let mut iteration_failures = 0usize;
                 for call in tool_calls.values() {
                     let decision = resolve_approval(
                         &emitter,
@@ -472,7 +524,9 @@ impl Runner for LoopRunner {
                         let tool = request.tools.iter().find(|t| t.name() == call.name);
                         match tool {
                             Some(t) => {
-                                let args = crate::tools::arguments::ToolArguments::new(call.arguments.clone());
+                                let args = crate::tools::arguments::ToolArguments::new(
+                                    call.arguments.clone(),
+                                );
                                 let ctx = crate::tools::tool::ToolExecutionContext {
                                     metadata: serde_json::Value::Null,
                                     tool_call_id: Some(call.id.clone()),
@@ -511,9 +565,15 @@ impl Runner for LoopRunner {
                         result
                     };
 
+                    if result.is_error {
+                        iteration_failures = iteration_failures.saturating_add(1);
+                    }
+
                     emitter.emit(
                         RunEventStream::Tool,
-                        RunEventPayload::ToolResult { result: result.clone() },
+                        RunEventPayload::ToolResult {
+                            result: result.clone(),
+                        },
                     );
                     emitter.emit(
                         RunEventStream::Tool,
@@ -526,11 +586,122 @@ impl Runner for LoopRunner {
                         result.is_error,
                     ));
                 }
+
+                if iteration_failures == tool_calls.len() {
+                    consecutive_failed_iterations = consecutive_failed_iterations.saturating_add(1);
+                } else {
+                    consecutive_failed_iterations = 0;
+                }
+
+                if consecutive_failed_iterations >= limits.max_tool_failures {
+                    let reason = format!(
+                        "tool call failure limit reached (max_failures={}, consecutive_failures={})",
+                        limits.max_tool_failures,
+                        consecutive_failed_iterations
+                    );
+                    let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                    return;
+                }
             }
         });
 
         Ok(handle)
     }
+}
+
+fn emit_failed_result(emitter: &RunEventEmitter, reason: impl Into<String>) -> RunResult {
+    let reason = reason.into();
+    emitter.emit(
+        RunEventStream::Lifecycle,
+        RunEventPayload::Lifecycle {
+            state: RunLifecycle::Failed {
+                error: reason.clone(),
+            },
+        },
+    );
+    RunResult::failed(reason)
+}
+
+fn process_stream_delta(
+    emitter: &RunEventEmitter,
+    delta: TextStreamDelta,
+    iteration_text: &mut String,
+    tool_calls: &mut BTreeMap<String, AgentToolCall>,
+    stream_done: &mut bool,
+) -> Option<String> {
+    match delta.event_type {
+        StreamEventType::ToolCallDelta => {
+            if let Some(tc) = delta.tool_call {
+                if tc.id.trim().is_empty() || tc.name.trim().is_empty() {
+                    emitter.emit(
+                        RunEventStream::System,
+                        RunEventPayload::Error {
+                            message: "stream tool_call_delta missing id/name".to_string(),
+                        },
+                    );
+                    return None;
+                }
+
+                let is_new = !tool_calls.contains_key(&tc.id);
+                tool_calls.insert(tc.id.clone(), tc.clone());
+                if is_new {
+                    emitter.emit(
+                        RunEventStream::Tool,
+                        RunEventPayload::ToolCallStarted { call: tc },
+                    );
+                } else {
+                    emitter.emit(
+                        RunEventStream::Tool,
+                        RunEventPayload::ToolCallDelta {
+                            call_id: tc.id.clone(),
+                            delta: tc.arguments.clone(),
+                        },
+                    );
+                }
+            } else {
+                emitter.emit(
+                    RunEventStream::System,
+                    RunEventPayload::Error {
+                        message: "stream tool_call_delta missing tool_call payload".to_string(),
+                    },
+                );
+            }
+        }
+        StreamEventType::Reasoning => {
+            if let Some(reasoning) = delta.reasoning {
+                if !reasoning.is_empty() {
+                    emitter.emit(
+                        RunEventStream::Reasoning,
+                        RunEventPayload::ReasoningDelta { text: reasoning },
+                    );
+                }
+            }
+        }
+        StreamEventType::TextDelta => {
+            if !delta.text.is_empty() {
+                iteration_text.push_str(&delta.text);
+                emitter.emit(
+                    RunEventStream::Assistant,
+                    RunEventPayload::AssistantDelta {
+                        text: delta.text.clone(),
+                    },
+                );
+            }
+        }
+        StreamEventType::Error => {
+            let message = if delta.text.trim().is_empty() {
+                "stream error".to_string()
+            } else {
+                delta.text
+            };
+            return Some(message);
+        }
+        StreamEventType::Done => {
+            *stream_done = true;
+        }
+        _ => {}
+    }
+    None
 }
 
 struct RunEventEmitter {
@@ -549,7 +720,9 @@ impl RunEventEmitter {
     }
 
     fn emit(&self, stream: RunEventStream, payload: RunEventPayload) {
-        let Some(sink) = &self.sink else { return; };
+        let Some(sink) = &self.sink else {
+            return;
+        };
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (sink)(RunEvent {
             run_id: self.run_id,
@@ -588,7 +761,9 @@ async fn resolve_approval(
             };
             emitter.emit(
                 RunEventStream::Approval,
-                RunEventPayload::ApprovalRequired { request: request.clone() },
+                RunEventPayload::ApprovalRequired {
+                    request: request.clone(),
+                },
             );
             let Some(handler) = handler else {
                 return ApprovalDecision::Decline;
@@ -609,4 +784,244 @@ fn approval_kind_for_tool(call: &AgentToolCall) -> ApprovalKind {
 fn debug_enabled() -> bool {
     matches!(std::env::var("HOMIE_DEBUG").as_deref(), Ok("1"))
         || matches!(std::env::var("HOME_DEBUG").as_deref(), Ok("1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use futures::stream::{self, BoxStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{timeout, Duration};
+
+    use crate::agent_loop::RunStatus;
+    use crate::models::ModelCapabilities;
+    use crate::provider::{ModelProvider, ProviderResponse};
+    use crate::tools::tool::{AgentTool, ToolExecutionContext};
+    use crate::tools::types::AgentToolParameters;
+    use crate::types::Usage;
+
+    #[derive(Clone, Copy)]
+    enum ProviderScenario {
+        MissingOptionalFields,
+        RepeatedToolFailure,
+    }
+
+    struct StubProvider {
+        scenario: ProviderScenario,
+        calls: AtomicUsize,
+        capabilities: ModelCapabilities,
+    }
+
+    impl StubProvider {
+        fn new(scenario: ProviderScenario) -> Self {
+            Self {
+                scenario,
+                calls: AtomicUsize::new(0),
+                capabilities: ModelCapabilities::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StubProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn model_id(&self) -> &str {
+            "stub-model"
+        }
+
+        fn capabilities(&self) -> &ModelCapabilities {
+            &self.capabilities
+        }
+
+        async fn generate_text(
+            &self,
+            _request: &ProviderRequest,
+        ) -> Result<ProviderResponse, RociError> {
+            Err(RociError::UnsupportedOperation(
+                "stream-only stub provider".to_string(),
+            ))
+        }
+
+        async fn stream_text(
+            &self,
+            _request: &ProviderRequest,
+        ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+            let _ = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events = match self.scenario {
+                ProviderScenario::MissingOptionalFields => vec![
+                    Ok(TextStreamDelta {
+                        text: String::new(),
+                        event_type: StreamEventType::Reasoning,
+                        tool_call: None,
+                        finish_reason: None,
+                        usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                    Ok(TextStreamDelta {
+                        text: String::new(),
+                        event_type: StreamEventType::ToolCallDelta,
+                        tool_call: None,
+                        finish_reason: None,
+                        usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                    Ok(TextStreamDelta {
+                        text: "done".to_string(),
+                        event_type: StreamEventType::TextDelta,
+                        tool_call: None,
+                        finish_reason: None,
+                        usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                    Ok(TextStreamDelta {
+                        text: String::new(),
+                        event_type: StreamEventType::Done,
+                        tool_call: None,
+                        finish_reason: None,
+                        usage: Some(Usage::default()),
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                ],
+                ProviderScenario::RepeatedToolFailure => vec![
+                    Ok(TextStreamDelta {
+                        text: String::new(),
+                        event_type: StreamEventType::ToolCallDelta,
+                        tool_call: Some(AgentToolCall {
+                            id: "tool-call-1".to_string(),
+                            name: "failing_tool".to_string(),
+                            arguments: serde_json::json!({}),
+                            recipient: None,
+                        }),
+                        finish_reason: None,
+                        usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                    Ok(TextStreamDelta {
+                        text: String::new(),
+                        event_type: StreamEventType::Done,
+                        tool_call: None,
+                        finish_reason: None,
+                        usage: Some(Usage::default()),
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                ],
+            };
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    fn test_runner(scenario: ProviderScenario) -> LoopRunner {
+        let factory: ProviderFactory =
+            Arc::new(move |_model, _config| Ok(Box::new(StubProvider::new(scenario))));
+        LoopRunner::with_provider_factory(RociConfig::new(), factory)
+    }
+
+    fn test_model() -> LanguageModel {
+        LanguageModel::Custom {
+            provider: "stub".to_string(),
+            model_id: "stub-model".to_string(),
+        }
+    }
+
+    fn capture_events() -> (RunEventSink, Arc<std::sync::Mutex<Vec<RunEvent>>>) {
+        let events = Arc::new(std::sync::Mutex::new(Vec::<RunEvent>::new()));
+        let sink_events = events.clone();
+        let sink: RunEventSink = Arc::new(move |event| {
+            if let Ok(mut guard) = sink_events.lock() {
+                guard.push(event);
+            }
+        });
+        (sink, events)
+    }
+
+    fn failing_tool() -> Arc<dyn Tool> {
+        Arc::new(AgentTool::new(
+            "failing_tool",
+            "always fails",
+            AgentToolParameters::empty(),
+            |_args, _ctx: ToolExecutionContext| async move {
+                Err(RociError::ToolExecution {
+                    tool_name: "failing_tool".to_string(),
+                    message: "forced failure".to_string(),
+                })
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn no_panic_when_stream_optional_fields_missing() {
+        let runner = test_runner(ProviderScenario::MissingOptionalFields);
+        let (sink, _events) = capture_events();
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn tool_failures_are_bounded_with_deterministic_reason() {
+        let runner = test_runner(ProviderScenario::RepeatedToolFailure);
+        let (sink, events) = capture_events();
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run tool")]);
+        request.tools = vec![failing_tool()];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+        request
+            .metadata
+            .insert("runner.max_iterations".to_string(), "20".to_string());
+        request
+            .metadata
+            .insert("runner.max_tool_failures".to_string(), "2".to_string());
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+
+        let expected_error =
+            "tool call failure limit reached (max_failures=2, consecutive_failures=2)";
+        assert_eq!(result.status, RunStatus::Failed);
+        assert_eq!(result.error.as_deref(), Some(expected_error));
+
+        let events = events.lock().expect("event lock");
+        let failure_events: Vec<String> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                RunEventPayload::Lifecycle {
+                    state: RunLifecycle::Failed { error },
+                } => Some(error.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            failure_events.last().map(String::as_str),
+            Some(expected_error)
+        );
+
+        let tool_results = events
+            .iter()
+            .filter(|event| matches!(event.payload, RunEventPayload::ToolResult { .. }))
+            .count();
+        assert_eq!(tool_results, 2);
+    }
 }

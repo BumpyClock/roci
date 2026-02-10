@@ -80,9 +80,7 @@ impl ToolArguments {
                     serde_json::json!({})
                 } else {
                     serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {
-                        RociError::InvalidArgument(format!(
-                            "Failed to deserialize arguments: {e}"
-                        ))
+                        RociError::InvalidArgument(format!("Failed to deserialize arguments: {e}"))
                     })?
                 }
             }
