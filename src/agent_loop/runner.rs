@@ -1,10 +1,10 @@
 //! Runner interfaces for the agent loop.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{future, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::{self, Duration};
@@ -206,6 +206,8 @@ const RUNNER_MAX_TOOL_FAILURES_KEYS: [&str; 3] = [
     "agent_loop.max_tool_failures",
     "max_tool_failures",
 ];
+const PARALLEL_SAFE_TOOL_NAMES: [&str; 6] =
+    ["read", "ls", "find", "grep", "web_search", "web_fetch"];
 
 #[derive(Debug, Clone, Copy)]
 struct RunnerLimits {
@@ -260,6 +262,100 @@ fn parse_positive_usize(value: &str) -> Option<usize> {
     } else {
         Some(parsed)
     }
+}
+
+fn is_parallel_safe_tool(tool_name: &str) -> bool {
+    PARALLEL_SAFE_TOOL_NAMES
+        .iter()
+        .any(|candidate| candidate == &tool_name)
+}
+
+fn approval_allows_execution(decision: ApprovalDecision) -> bool {
+    matches!(
+        decision,
+        ApprovalDecision::Accept | ApprovalDecision::AcceptForSession
+    )
+}
+
+fn declined_tool_result(call: &AgentToolCall) -> AgentToolResult {
+    AgentToolResult {
+        tool_call_id: call.id.clone(),
+        result: serde_json::json!({ "error": "approval declined" }),
+        is_error: true,
+    }
+}
+
+async fn execute_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -> AgentToolResult {
+    let tool = tools.iter().find(|t| t.name() == call.name);
+    match tool {
+        Some(tool) => {
+            let args = crate::tools::arguments::ToolArguments::new(call.arguments.clone());
+            let ctx = crate::tools::tool::ToolExecutionContext {
+                metadata: serde_json::Value::Null,
+                tool_call_id: Some(call.id.clone()),
+                tool_name: Some(call.name.clone()),
+            };
+            match tool.execute(&args, &ctx).await {
+                Ok(val) => AgentToolResult {
+                    tool_call_id: call.id.clone(),
+                    result: val,
+                    is_error: false,
+                },
+                Err(error) => AgentToolResult {
+                    tool_call_id: call.id.clone(),
+                    result: serde_json::json!({ "error": error.to_string() }),
+                    is_error: true,
+                },
+            }
+        }
+        None => AgentToolResult {
+            tool_call_id: call.id.clone(),
+            result: serde_json::json!({ "error": format!("Tool '{}' not found", call.name) }),
+            is_error: true,
+        },
+    }
+}
+
+async fn execute_parallel_tool_calls(
+    tools: &[Arc<dyn Tool>],
+    calls: &[AgentToolCall],
+) -> Vec<AgentToolResult> {
+    let futures = calls.iter().map(|call| execute_tool_call(tools, call));
+    future::join_all(futures).await
+}
+
+fn append_tool_result(
+    hooks: &RunHooks,
+    emitter: &RunEventEmitter,
+    call: &AgentToolCall,
+    mut result: AgentToolResult,
+    iteration_failures: &mut usize,
+    messages: &mut Vec<ModelMessage>,
+) {
+    if let Some(handler) = hooks.tool_result_persist.as_ref() {
+        result = handler(result);
+    }
+
+    if result.is_error {
+        *iteration_failures = iteration_failures.saturating_add(1);
+    }
+
+    emitter.emit(
+        RunEventStream::Tool,
+        RunEventPayload::ToolResult {
+            result: result.clone(),
+        },
+    );
+    emitter.emit(
+        RunEventStream::Tool,
+        RunEventPayload::ToolCallCompleted { call: call.clone() },
+    );
+
+    messages.push(ModelMessage::tool_result(
+        result.tool_call_id.clone(),
+        result.result,
+        result.is_error,
+    ));
 }
 
 #[async_trait]
@@ -362,7 +458,7 @@ impl Runner for LoopRunner {
                 };
 
                 let mut iteration_text = String::new();
-                let mut tool_calls: BTreeMap<String, AgentToolCall> = BTreeMap::new();
+                let mut tool_calls: Vec<AgentToolCall> = Vec::new();
                 let mut stream_done = false;
                 let idle_timeout_ms = request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
                 let mut idle_sleep = (idle_timeout_ms > 0)
@@ -483,7 +579,7 @@ impl Runner for LoopRunner {
                         text: iteration_text,
                     });
                 }
-                for call in tool_calls.values() {
+                for call in &tool_calls {
                     assistant_content.push(ContentPart::ToolCall(call.clone()));
                 }
                 messages.push(ModelMessage {
@@ -494,7 +590,8 @@ impl Runner for LoopRunner {
                 });
 
                 let mut iteration_failures = 0usize;
-                for call in tool_calls.values() {
+                let mut pending_parallel_calls: Vec<AgentToolCall> = Vec::new();
+                for call in &tool_calls {
                     let decision = resolve_approval(
                         &emitter,
                         &request.approval_policy,
@@ -517,74 +614,63 @@ impl Runner for LoopRunner {
                         return;
                     }
 
-                    let result = if matches!(
-                        decision,
-                        ApprovalDecision::Accept | ApprovalDecision::AcceptForSession
-                    ) {
-                        let tool = request.tools.iter().find(|t| t.name() == call.name);
-                        match tool {
-                            Some(t) => {
-                                let args = crate::tools::arguments::ToolArguments::new(
-                                    call.arguments.clone(),
-                                );
-                                let ctx = crate::tools::tool::ToolExecutionContext {
-                                    metadata: serde_json::Value::Null,
-                                    tool_call_id: Some(call.id.clone()),
-                                    tool_name: Some(call.name.clone()),
-                                };
-                                match t.execute(&args, &ctx).await {
-                                    Ok(val) => AgentToolResult {
-                                        tool_call_id: call.id.clone(),
-                                        result: val,
-                                        is_error: false,
-                                    },
-                                    Err(e) => AgentToolResult {
-                                        tool_call_id: call.id.clone(),
-                                        result: serde_json::json!({ "error": e.to_string() }),
-                                        is_error: true,
-                                    },
-                                }
-                            }
-                            None => AgentToolResult {
-                                tool_call_id: call.id.clone(),
-                                result: serde_json::json!({ "error": format!("Tool '{}' not found", call.name) }),
-                                is_error: true,
-                            },
-                        }
-                    } else {
-                        AgentToolResult {
-                            tool_call_id: call.id.clone(),
-                            result: serde_json::json!({ "error": "approval declined" }),
-                            is_error: true,
-                        }
-                    };
-
-                    let result = if let Some(handler) = request.hooks.tool_result_persist.as_ref() {
-                        handler(result)
-                    } else {
-                        result
-                    };
-
-                    if result.is_error {
-                        iteration_failures = iteration_failures.saturating_add(1);
+                    let can_execute = approval_allows_execution(decision);
+                    if can_execute && is_parallel_safe_tool(&call.name) {
+                        pending_parallel_calls.push(call.clone());
+                        continue;
                     }
 
-                    emitter.emit(
-                        RunEventStream::Tool,
-                        RunEventPayload::ToolResult {
-                            result: result.clone(),
-                        },
-                    );
-                    emitter.emit(
-                        RunEventStream::Tool,
-                        RunEventPayload::ToolCallCompleted { call: call.clone() },
-                    );
+                    if !pending_parallel_calls.is_empty() {
+                        let parallel_results =
+                            execute_parallel_tool_calls(&request.tools, &pending_parallel_calls)
+                                .await;
+                        for (parallel_call, parallel_result) in pending_parallel_calls
+                            .drain(..)
+                            .zip(parallel_results.into_iter())
+                        {
+                            append_tool_result(
+                                &request.hooks,
+                                &emitter,
+                                &parallel_call,
+                                parallel_result,
+                                &mut iteration_failures,
+                                &mut messages,
+                            );
+                        }
+                    }
 
-                    messages.push(ModelMessage::tool_result(
-                        result.tool_call_id.clone(),
-                        result.result,
-                        result.is_error,
-                    ));
+                    let result = if can_execute {
+                        execute_tool_call(&request.tools, call).await
+                    } else {
+                        declined_tool_result(call)
+                    };
+
+                    append_tool_result(
+                        &request.hooks,
+                        &emitter,
+                        call,
+                        result,
+                        &mut iteration_failures,
+                        &mut messages,
+                    );
+                }
+
+                if !pending_parallel_calls.is_empty() {
+                    let parallel_results =
+                        execute_parallel_tool_calls(&request.tools, &pending_parallel_calls).await;
+                    for (parallel_call, parallel_result) in pending_parallel_calls
+                        .drain(..)
+                        .zip(parallel_results.into_iter())
+                    {
+                        append_tool_result(
+                            &request.hooks,
+                            &emitter,
+                            &parallel_call,
+                            parallel_result,
+                            &mut iteration_failures,
+                            &mut messages,
+                        );
+                    }
                 }
 
                 if iteration_failures == tool_calls.len() {
@@ -626,7 +712,7 @@ fn process_stream_delta(
     emitter: &RunEventEmitter,
     delta: TextStreamDelta,
     iteration_text: &mut String,
-    tool_calls: &mut BTreeMap<String, AgentToolCall>,
+    tool_calls: &mut Vec<AgentToolCall>,
     stream_done: &mut bool,
 ) -> Option<String> {
     match delta.event_type {
@@ -642,20 +728,20 @@ fn process_stream_delta(
                     return None;
                 }
 
-                let is_new = !tool_calls.contains_key(&tc.id);
-                tool_calls.insert(tc.id.clone(), tc.clone());
-                if is_new {
-                    emitter.emit(
-                        RunEventStream::Tool,
-                        RunEventPayload::ToolCallStarted { call: tc },
-                    );
-                } else {
+                if let Some(existing) = tool_calls.iter_mut().find(|call| call.id == tc.id) {
+                    *existing = tc.clone();
                     emitter.emit(
                         RunEventStream::Tool,
                         RunEventPayload::ToolCallDelta {
                             call_id: tc.id.clone(),
                             delta: tc.arguments.clone(),
                         },
+                    );
+                } else {
+                    tool_calls.push(tc.clone());
+                    emitter.emit(
+                        RunEventStream::Tool,
+                        RunEventPayload::ToolCallStarted { call: tc },
                     );
                 }
             } else {
@@ -799,26 +885,33 @@ mod tests {
     use crate::provider::{ModelProvider, ProviderResponse};
     use crate::tools::tool::{AgentTool, ToolExecutionContext};
     use crate::tools::types::AgentToolParameters;
-    use crate::types::Usage;
+    use crate::types::{ContentPart, Usage};
 
     #[derive(Clone, Copy)]
     enum ProviderScenario {
         MissingOptionalFields,
         RepeatedToolFailure,
+        ParallelSafeBatchThenComplete,
+        MutatingBatchThenComplete,
     }
 
     struct StubProvider {
         scenario: ProviderScenario,
         calls: AtomicUsize,
         capabilities: ModelCapabilities,
+        requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
     }
 
     impl StubProvider {
-        fn new(scenario: ProviderScenario) -> Self {
+        fn new(
+            scenario: ProviderScenario,
+            requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+        ) -> Self {
             Self {
                 scenario,
                 calls: AtomicUsize::new(0),
                 capabilities: ModelCapabilities::default(),
+                requests,
             }
         }
     }
@@ -848,9 +941,13 @@ mod tests {
 
         async fn stream_text(
             &self,
-            _request: &ProviderRequest,
+            request: &ProviderRequest,
         ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
-            let _ = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .expect("request lock")
+                .push(request.clone());
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
             let events = match self.scenario {
                 ProviderScenario::MissingOptionalFields => vec![
                     Ok(TextStreamDelta {
@@ -921,15 +1018,140 @@ mod tests {
                         reasoning_type: None,
                     }),
                 ],
+                ProviderScenario::ParallelSafeBatchThenComplete => {
+                    if call_index == 0 {
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "safe-read-1".to_string(),
+                                    name: "read".to_string(),
+                                    arguments: serde_json::json!({}),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "safe-ls-2".to_string(),
+                                    name: "ls".to_string(),
+                                    arguments: serde_json::json!({}),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
+                    } else {
+                        vec![Ok(TextStreamDelta {
+                            text: String::new(),
+                            event_type: StreamEventType::Done,
+                            tool_call: None,
+                            finish_reason: None,
+                            usage: Some(Usage::default()),
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        })]
+                    }
+                }
+                ProviderScenario::MutatingBatchThenComplete => {
+                    if call_index == 0 {
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "mutating-call-1".to_string(),
+                                    name: "apply_patch".to_string(),
+                                    arguments: serde_json::json!({}),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "safe-read-2".to_string(),
+                                    name: "read".to_string(),
+                                    arguments: serde_json::json!({}),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
+                    } else {
+                        vec![Ok(TextStreamDelta {
+                            text: String::new(),
+                            event_type: StreamEventType::Done,
+                            tool_call: None,
+                            finish_reason: None,
+                            usage: Some(Usage::default()),
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        })]
+                    }
+                }
             };
             Ok(Box::pin(stream::iter(events)))
         }
     }
 
-    fn test_runner(scenario: ProviderScenario) -> LoopRunner {
-        let factory: ProviderFactory =
-            Arc::new(move |_model, _config| Ok(Box::new(StubProvider::new(scenario))));
-        LoopRunner::with_provider_factory(RociConfig::new(), factory)
+    fn test_runner(
+        scenario: ProviderScenario,
+    ) -> (LoopRunner, Arc<std::sync::Mutex<Vec<ProviderRequest>>>) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<ProviderRequest>::new()));
+        let provider_requests = requests.clone();
+        let factory: ProviderFactory = Arc::new(move |_model, _config| {
+            Ok(Box::new(StubProvider::new(
+                scenario,
+                provider_requests.clone(),
+            )))
+        });
+        (
+            LoopRunner::with_provider_factory(RociConfig::new(), factory),
+            requests,
+        )
     }
 
     fn test_model() -> LanguageModel {
@@ -964,9 +1186,91 @@ mod tests {
         ))
     }
 
+    fn tracked_success_tool(
+        name: &str,
+        delay: Duration,
+        active_calls: Arc<AtomicUsize>,
+        max_active_calls: Arc<AtomicUsize>,
+    ) -> Arc<dyn Tool> {
+        let tool_name = name.to_string();
+        Arc::new(AgentTool::new(
+            tool_name.clone(),
+            format!("{tool_name} tool"),
+            AgentToolParameters::empty(),
+            move |_args, _ctx: ToolExecutionContext| {
+                let tool_name = tool_name.clone();
+                let active_calls = active_calls.clone();
+                let max_active_calls = max_active_calls.clone();
+                async move {
+                    let active_now = active_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut observed_max = max_active_calls.load(Ordering::SeqCst);
+                    while active_now > observed_max {
+                        match max_active_calls.compare_exchange(
+                            observed_max,
+                            active_now,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => break,
+                            Err(next) => observed_max = next,
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    active_calls.fetch_sub(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({ "tool": tool_name }))
+                }
+            },
+        ))
+    }
+
+    fn tool_result_ids_from_messages(messages: &[ModelMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| {
+                message.content.iter().find_map(|part| match part {
+                    ContentPart::ToolResult(result) => Some(result.tool_call_id.clone()),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    fn assistant_tool_call_message_count(messages: &[ModelMessage]) -> usize {
+        messages
+            .iter()
+            .filter(|message| {
+                matches!(message.role, crate::types::Role::Assistant)
+                    && message
+                        .content
+                        .iter()
+                        .any(|part| matches!(part, ContentPart::ToolCall(_)))
+            })
+            .count()
+    }
+
+    fn tool_result_ids_from_events(events: &[RunEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                RunEventPayload::ToolResult { result } => Some(result.tool_call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_call_completed_ids_from_events(events: &[RunEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                RunEventPayload::ToolCallCompleted { call } => Some(call.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn no_panic_when_stream_optional_fields_missing() {
-        let runner = test_runner(ProviderScenario::MissingOptionalFields);
+        let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
         let (sink, _events) = capture_events();
         let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
         request.event_sink = Some(sink);
@@ -980,7 +1284,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_failures_are_bounded_with_deterministic_reason() {
-        let runner = test_runner(ProviderScenario::RepeatedToolFailure);
+        let (runner, _requests) = test_runner(ProviderScenario::RepeatedToolFailure);
         let (sink, events) = capture_events();
         let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run tool")]);
         request.tools = vec![failing_tool()];
@@ -1023,5 +1327,113 @@ mod tests {
             .filter(|event| matches!(event.payload, RunEventPayload::ToolResult { .. }))
             .count();
         assert_eq!(tool_results, 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_tools_execute_concurrently_and_append_results_in_call_order() {
+        let (runner, requests) = test_runner(ProviderScenario::ParallelSafeBatchThenComplete);
+        let (sink, events) = capture_events();
+        let active_calls = Arc::new(AtomicUsize::new(0));
+        let max_active_calls = Arc::new(AtomicUsize::new(0));
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("parallel tools")]);
+        request.tools = vec![
+            tracked_success_tool(
+                "read",
+                Duration::from_millis(150),
+                active_calls.clone(),
+                max_active_calls.clone(),
+            ),
+            tracked_success_tool(
+                "ls",
+                Duration::from_millis(150),
+                active_calls,
+                max_active_calls.clone(),
+            ),
+        ];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert!(max_active_calls.load(Ordering::SeqCst) >= 2);
+
+        let requests = requests.lock().expect("request lock");
+        assert!(requests.len() >= 2);
+        let second_request_messages = &requests[1].messages;
+        assert_eq!(
+            assistant_tool_call_message_count(second_request_messages),
+            1
+        );
+        assert_eq!(
+            tool_result_ids_from_messages(second_request_messages),
+            vec!["safe-read-1".to_string(), "safe-ls-2".to_string()]
+        );
+
+        let events = events.lock().expect("event lock");
+        assert_eq!(
+            tool_result_ids_from_events(events.as_slice()),
+            vec!["safe-read-1".to_string(), "safe-ls-2".to_string()]
+        );
+        assert_eq!(
+            tool_call_completed_ids_from_events(events.as_slice()),
+            vec!["safe-read-1".to_string(), "safe-ls-2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_tools_remain_serialized_even_when_safe_tools_exist() {
+        let (runner, requests) = test_runner(ProviderScenario::MutatingBatchThenComplete);
+        let (sink, events) = capture_events();
+        let active_calls = Arc::new(AtomicUsize::new(0));
+        let max_active_calls = Arc::new(AtomicUsize::new(0));
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("mutating tools")]);
+        request.tools = vec![
+            tracked_success_tool(
+                "apply_patch",
+                Duration::from_millis(150),
+                active_calls.clone(),
+                max_active_calls.clone(),
+            ),
+            tracked_success_tool(
+                "read",
+                Duration::from_millis(150),
+                active_calls,
+                max_active_calls.clone(),
+            ),
+        ];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(max_active_calls.load(Ordering::SeqCst), 1);
+
+        let requests = requests.lock().expect("request lock");
+        assert!(requests.len() >= 2);
+        let second_request_messages = &requests[1].messages;
+        assert_eq!(
+            assistant_tool_call_message_count(second_request_messages),
+            1
+        );
+        assert_eq!(
+            tool_result_ids_from_messages(second_request_messages),
+            vec!["mutating-call-1".to_string(), "safe-read-2".to_string()]
+        );
+
+        let events = events.lock().expect("event lock");
+        assert_eq!(
+            tool_result_ids_from_events(events.as_slice()),
+            vec!["mutating-call-1".to_string(), "safe-read-2".to_string()]
+        );
+        assert_eq!(
+            tool_call_completed_ids_from_events(events.as_slice()),
+            vec!["mutating-call-1".to_string(), "safe-read-2".to_string()]
+        );
     }
 }
