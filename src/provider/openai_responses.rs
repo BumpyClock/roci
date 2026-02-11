@@ -629,6 +629,127 @@ impl OpenAiResponsesProvider {
     }
 }
 
+fn tool_call_delta(tool_call: AgentToolCall) -> TextStreamDelta {
+    TextStreamDelta {
+        text: String::new(),
+        event_type: StreamEventType::ToolCallDelta,
+        tool_call: Some(tool_call),
+        finish_reason: None,
+        usage: None,
+        reasoning: None,
+        reasoning_signature: None,
+        reasoning_type: None,
+    }
+}
+
+#[derive(Default)]
+struct StreamToolCallState {
+    call_order: Vec<String>,
+    seen_calls: std::collections::HashSet<String>,
+    call_names: std::collections::HashMap<String, String>,
+    call_arguments: std::collections::HashMap<String, String>,
+    ready_calls: std::collections::HashMap<String, AgentToolCall>,
+    emitted_calls: std::collections::HashSet<String>,
+    next_emit_index: usize,
+}
+
+impl StreamToolCallState {
+    fn observe_call(&mut self, call_id: &str, name: Option<&str>) {
+        if self.seen_calls.insert(call_id.to_string()) {
+            self.call_order.push(call_id.to_string());
+        }
+        if let Some(name) = name {
+            self.call_names
+                .insert(call_id.to_string(), name.to_string());
+        }
+    }
+
+    fn append_arguments_delta(&mut self, call_id: &str, delta: &str) {
+        self.observe_call(call_id, None);
+        self.call_arguments
+            .entry(call_id.to_string())
+            .or_default()
+            .push_str(delta);
+    }
+
+    fn finalize_call(
+        &mut self,
+        call_id: &str,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) -> Vec<AgentToolCall> {
+        self.observe_call(call_id, name);
+        if self.emitted_calls.contains(call_id) {
+            return Vec::new();
+        }
+        if !self.ready_calls.contains_key(call_id) {
+            let call_name = name
+                .map(|value| value.to_string())
+                .or_else(|| self.call_names.get(call_id).cloned());
+            let call_arguments = if let Some(arguments) = arguments {
+                self.call_arguments.remove(call_id);
+                Some(arguments.to_string())
+            } else {
+                self.call_arguments.remove(call_id)
+            };
+            if let (Some(call_name), Some(call_arguments)) = (call_name, call_arguments) {
+                self.ready_calls.insert(
+                    call_id.to_string(),
+                    OpenAiResponsesProvider::convert_flat_tool_call(
+                        call_id,
+                        &call_name,
+                        &call_arguments,
+                    ),
+                );
+            }
+        }
+        self.flush_ready(false)
+    }
+
+    fn finalize_from_response_output(
+        &mut self,
+        output: &[serde_json::Value],
+    ) -> Vec<AgentToolCall> {
+        let mut emitted = Vec::new();
+        for item in output {
+            if item.get("type").and_then(|value| value.as_str()) != Some("function_call") {
+                continue;
+            }
+            if let Some(call_id) = item
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                .or_else(|| item.get("id").and_then(|value| value.as_str()))
+            {
+                emitted.extend(self.finalize_call(
+                    call_id,
+                    item.get("name").and_then(|value| value.as_str()),
+                    item.get("arguments").and_then(|value| value.as_str()),
+                ));
+            }
+        }
+        emitted
+    }
+
+    fn flush_ready(&mut self, force: bool) -> Vec<AgentToolCall> {
+        let mut emitted = Vec::new();
+        while self.next_emit_index < self.call_order.len() {
+            let call_id = self.call_order[self.next_emit_index].clone();
+            if let Some(tool_call) = self.ready_calls.remove(&call_id) {
+                self.emitted_calls.insert(call_id);
+                self.next_emit_index += 1;
+                emitted.push(tool_call);
+                continue;
+            }
+            if self.emitted_calls.contains(&call_id) || force {
+                self.next_emit_index += 1;
+                continue;
+            }
+            break;
+        }
+        emitted
+    }
+}
+
 fn extract_response_error(event: &serde_json::Value) -> Option<String> {
     let error = event
         .get("error")
@@ -751,9 +872,7 @@ impl ModelProvider for OpenAiResponsesProvider {
 
         let stream = async_stream::stream! {
             let mut buffer = String::new();
-            let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-            let mut call_arguments: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-            let mut emitted_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut tool_call_state = StreamToolCallState::default();
             let mut saw_tool_call = false;
             let mut saw_text_delta = false;
             let mut pending_data: Vec<String> = Vec::new();
@@ -829,34 +948,15 @@ impl ModelProvider for OpenAiResponsesProvider {
                                                 }
                                             }
                                             if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                                if let (Some(id), Some(name)) = (
-                                                    item.get("call_id").and_then(|v| v.as_str()).or_else(|| item.get("id").and_then(|v| v.as_str())),
-                                                    item.get("name").and_then(|v| v.as_str()),
-                                                ) {
-                                                    call_names.insert(id.to_string(), name.to_string());
-                                                    if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-                                                        if !args.trim().is_empty() && !emitted_calls.contains(id) {
-                                                            let arguments = serde_json::from_str(args)
-                                                                .unwrap_or(serde_json::Value::String(args.to_string()));
-                                                            yield Ok(TextStreamDelta {
-                                                                text: String::new(),
-                                                                event_type: StreamEventType::ToolCallDelta,
-                                                                tool_call: Some(AgentToolCall {
-                                                                    id: id.to_string(),
-                                                                    name: name.to_string(),
-                                                                    arguments,
-                                                                    recipient: None,
-                                                                }),
-                                                                finish_reason: None,
-                                                                usage: None,
-                                                                reasoning: None,
-                                                                reasoning_signature: None,
-                                                                reasoning_type: None,
-                                                            });
-                                                            emitted_calls.insert(id.to_string());
-                                                            saw_tool_call = true;
-                                                        }
-                                                    }
+                                                if let Some(id) = item
+                                                    .get("call_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                                                {
+                                                    tool_call_state.observe_call(
+                                                        id,
+                                                        item.get("name").and_then(|v| v.as_str()),
+                                                    );
                                                 }
                                             }
                                         }
@@ -897,37 +997,19 @@ impl ModelProvider for OpenAiResponsesProvider {
                                                 }
                                             }
                                             if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                                let call_id = item
+                                                if let Some(call_id) = item
                                                     .get("call_id")
                                                     .and_then(|v| v.as_str())
                                                     .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                                                    .map(|v| v.to_string());
-                                                let name = item.get("name").and_then(|v| v.as_str()).map(|v| v.to_string());
-                                                let args = item
-                                                    .get("arguments")
-                                                    .and_then(|v| v.as_str())
-                                                    .map(|v| v.to_string())
-                                                    .or_else(|| {
-                                                        call_id
-                                                            .as_ref()
-                                                            .and_then(|id| call_arguments.remove(id))
-                                                    });
-                                                if let (Some(id), Some(name), Some(args)) = (call_id, name, args) {
-                                                    if !emitted_calls.contains(&id) {
-                                                        let arguments = serde_json::from_str(&args)
-                                                            .unwrap_or(serde_json::Value::String(args.to_string()));
-                                                        yield Ok(TextStreamDelta {
-                                                            text: String::new(),
-                                                            event_type: StreamEventType::ToolCallDelta,
-                                                            tool_call: Some(AgentToolCall { id: id.clone(), name, arguments, recipient: None }),
-                                                            finish_reason: None,
-                                                            usage: None,
-                                                            reasoning: None,
-                                                            reasoning_signature: None,
-                                                            reasoning_type: None,
-                                                        });
-                                                        emitted_calls.insert(id);
+                                                {
+                                                    let tool_calls = tool_call_state.finalize_call(
+                                                        call_id,
+                                                        item.get("name").and_then(|v| v.as_str()),
+                                                        item.get("arguments").and_then(|v| v.as_str()),
+                                                    );
+                                                    for tool_call in tool_calls {
                                                         saw_tool_call = true;
+                                                        yield Ok(tool_call_delta(tool_call));
                                                     }
                                                 }
                                             }
@@ -939,47 +1021,23 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             .or_else(|| event.get("item_id").and_then(|v| v.as_str()))
                                         {
                                             if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                                call_arguments
-                                                    .entry(call_id.to_string())
-                                                    .or_default()
-                                                    .push_str(delta);
+                                                tool_call_state.append_arguments_delta(call_id, delta);
                                             }
                                         }
                                     }
                                     "response.function_call_arguments.done" => {
-                                        let call_id = event.get("call_id")
+                                        if let Some(call_id) = event.get("call_id")
                                             .and_then(|v| v.as_str())
                                             .or_else(|| event.get("item_id").and_then(|v| v.as_str()))
-                                            .map(|v| v.to_string());
-                                        let name = event.get("name")
-                                            .and_then(|v| v.as_str())
-                                            .map(|v| v.to_string())
-                                            .or_else(|| call_id.as_ref().and_then(|id| call_names.get(id).cloned()));
-                                        let args = event
-                                            .get("arguments")
-                                            .and_then(|v| v.as_str())
-                                            .map(|v| v.to_string())
-                                            .or_else(|| {
-                                                call_id
-                                                    .as_ref()
-                                                    .and_then(|id| call_arguments.remove(id))
-                                            });
-                                        if let (Some(id), Some(name), Some(args)) = (call_id, name, args) {
-                                            if !emitted_calls.contains(&id) {
-                                                let arguments = serde_json::from_str(&args)
-                                                    .unwrap_or(serde_json::Value::String(args.to_string()));
-                                                yield Ok(TextStreamDelta {
-                                                    text: String::new(),
-                                                    event_type: StreamEventType::ToolCallDelta,
-                                                    tool_call: Some(AgentToolCall { id: id.clone(), name, arguments, recipient: None }),
-                                                    finish_reason: None,
-                                                    usage: None,
-                                                    reasoning: None,
-                                                    reasoning_signature: None,
-                                                    reasoning_type: None,
-                                                });
-                                                emitted_calls.insert(id);
+                                        {
+                                            let tool_calls = tool_call_state.finalize_call(
+                                                call_id,
+                                                event.get("name").and_then(|v| v.as_str()),
+                                                event.get("arguments").and_then(|v| v.as_str()),
+                                            );
+                                            for tool_call in tool_calls {
                                                 saw_tool_call = true;
+                                                yield Ok(tool_call_delta(tool_call));
                                             }
                                         }
                                     }
@@ -1029,9 +1087,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             saw_done = true;
                                             break;
                                         }
-                                        if !saw_text_delta {
-                                            if let Some(response) = event.get("response") {
-                                                if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
+                                        if let Some(response) = event.get("response") {
+                                            if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
+                                                if !saw_text_delta {
                                                     let mut completed_text = String::new();
                                                     for item in output {
                                                         if item.get("type").and_then(|t| t.as_str()) == Some("message") {
@@ -1066,7 +1124,17 @@ impl ModelProvider for OpenAiResponsesProvider {
                                                         tracing::debug!("OpenAI Responses completed event had no output text");
                                                     }
                                                 }
+                                                let tool_calls = tool_call_state.finalize_from_response_output(output);
+                                                for tool_call in tool_calls {
+                                                    saw_tool_call = true;
+                                                    yield Ok(tool_call_delta(tool_call));
+                                                }
                                             }
+                                        }
+                                        let trailing_tool_calls = tool_call_state.flush_ready(true);
+                                        for tool_call in trailing_tool_calls {
+                                            saw_tool_call = true;
+                                            yield Ok(tool_call_delta(tool_call));
                                         }
                                         let finish = event.get("response")
                                             .and_then(|r| r.get("status"))
@@ -1226,6 +1294,7 @@ mod tests {
             anthropic: None,
             google: None,
             tool_choice: None,
+            stream_idle_timeout_ms: None,
         }
     }
 
@@ -1514,6 +1583,70 @@ mod tests {
         assert_eq!(parsed.text, "ok");
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "get_date");
+    }
+
+    #[test]
+    fn stream_tool_calls_emit_only_after_finalize_events() {
+        let mut state = StreamToolCallState::default();
+
+        state.observe_call("call_1", Some("get_date"));
+        state.append_arguments_delta("call_1", r#"{"date":"to"#);
+        assert!(state.flush_ready(false).is_empty());
+
+        state.append_arguments_delta("call_1", r#"day"}"#);
+        let emitted = state.finalize_call("call_1", None, None);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].id, "call_1");
+        assert_eq!(emitted[0].name, "get_date");
+        assert_eq!(emitted[0].arguments, serde_json::json!({"date": "today"}));
+    }
+
+    #[test]
+    fn stream_tool_calls_preserve_order_until_prior_call_finishes() {
+        let mut state = StreamToolCallState::default();
+
+        state.observe_call("call_1", Some("first_tool"));
+        state.observe_call("call_2", Some("second_tool"));
+        assert!(state
+            .finalize_call("call_2", None, Some(r#"{"value":2}"#))
+            .is_empty());
+
+        let emitted = state.finalize_call("call_1", None, Some(r#"{"value":1}"#));
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].id, "call_1");
+        assert_eq!(emitted[1].id, "call_2");
+    }
+
+    #[test]
+    fn stream_tool_calls_avoid_duplicates_and_use_response_output_fallback() {
+        let mut state = StreamToolCallState::default();
+
+        state.observe_call("call_1", Some("first_tool"));
+        let first_emit = state.finalize_call("call_1", None, Some(r#"{"value":1}"#));
+        assert_eq!(first_emit.len(), 1);
+        assert!(state
+            .finalize_call("call_1", Some("first_tool"), Some(r#"{"value":1}"#))
+            .is_empty());
+
+        let response_output = vec![
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "first_tool",
+                "arguments": r#"{"value":1}"#,
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_2",
+                "name": "second_tool",
+                "arguments": r#"{"value":2}"#,
+            }),
+        ];
+        let mut emitted = state.finalize_from_response_output(&response_output);
+        emitted.extend(state.flush_ready(true));
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].id, "call_2");
+        assert_eq!(emitted[0].name, "second_tool");
     }
 
     #[test]

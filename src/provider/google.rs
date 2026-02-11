@@ -538,6 +538,7 @@ mod tests {
             anthropic: None,
             google: None,
             tool_choice: None,
+            stream_idle_timeout_ms: None,
         }
     }
 
