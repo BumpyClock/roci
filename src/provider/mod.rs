@@ -232,6 +232,30 @@ pub fn create_provider(
                 base_url,
             )))
         }
+        #[cfg(feature = "openai-compatible")]
+        LanguageModel::GitHubCopilot(m) => {
+            let api_key = config
+                .get_api_key("github-copilot")
+                .or_else(|| config.get_api_key("openai-compatible"))
+                .or_else(|| config.get_api_key("openai"))
+                .ok_or_else(|| {
+                    RociError::Authentication("Missing GITHUB_COPILOT_API_KEY".into())
+                })?;
+            let base_url = m
+                .base_url
+                .clone()
+                .or_else(|| config.get_base_url("github-copilot"))
+                .or_else(|| config.get_base_url("openai-compatible"))
+                .or_else(|| config.get_base_url("openai"))
+                .ok_or_else(|| {
+                    RociError::Configuration("Missing GITHUB_COPILOT_BASE_URL".into())
+                })?;
+            Ok(Box::new(openai_compatible::OpenAiCompatibleProvider::new(
+                m.model_id.clone(),
+                api_key,
+                base_url,
+            )))
+        }
         LanguageModel::Custom { provider, .. } => Err(RociError::ModelNotFound(format!(
             "No built-in provider for '{provider}'. Use openai_compatible or anthropic_compatible."
         ))),

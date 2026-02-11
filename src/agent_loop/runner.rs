@@ -478,8 +478,7 @@ impl Runner for LoopRunner {
                         ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
                             max_iterations =
                                 max_iterations.saturating_add(limits.iteration_extension);
-                            iteration_extensions_used =
-                                iteration_extensions_used.saturating_add(1);
+                            iteration_extensions_used = iteration_extensions_used.saturating_add(1);
                             if debug_enabled() {
                                 tracing::debug!(
                                     run_id = %request.run_id,

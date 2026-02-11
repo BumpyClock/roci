@@ -52,6 +52,8 @@ pub enum LanguageModel {
     LmStudio(lmstudio::LmStudioModel),
     #[cfg(feature = "openai-compatible")]
     OpenAiCompatible(openai_compatible::OpenAiCompatibleModel),
+    #[cfg(feature = "openai-compatible")]
+    GitHubCopilot(openai_compatible::OpenAiCompatibleModel),
     /// Custom model with explicit provider and model ID.
     Custom { provider: String, model_id: String },
 }
@@ -80,6 +82,8 @@ impl LanguageModel {
             Self::LmStudio(m) => m.as_str(),
             #[cfg(feature = "openai-compatible")]
             Self::OpenAiCompatible(m) => m.model_id.as_str(),
+            #[cfg(feature = "openai-compatible")]
+            Self::GitHubCopilot(m) => m.model_id.as_str(),
             Self::Custom { model_id, .. } => model_id,
         }
     }
@@ -107,6 +111,8 @@ impl LanguageModel {
             Self::LmStudio(_) => "lmstudio",
             #[cfg(feature = "openai-compatible")]
             Self::OpenAiCompatible(_) => "openai-compatible",
+            #[cfg(feature = "openai-compatible")]
+            Self::GitHubCopilot(_) => "github-copilot",
             Self::Custom { provider, .. } => provider,
         }
     }
@@ -134,6 +140,8 @@ impl LanguageModel {
             Self::LmStudio(m) => m.capabilities(),
             #[cfg(feature = "openai-compatible")]
             Self::OpenAiCompatible(m) => m.capabilities(),
+            #[cfg(feature = "openai-compatible")]
+            Self::GitHubCopilot(m) => m.capabilities(),
             Self::Custom { .. } => ModelCapabilities::default(),
         }
     }

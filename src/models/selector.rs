@@ -90,6 +90,13 @@ impl ModelSelector {
                     model_id, None,
                 )))
             }
+            #[cfg(feature = "openai-compatible")]
+            "github-copilot" | "github_copilot" => {
+                use super::openai_compatible::OpenAiCompatibleModel;
+                Ok(LanguageModel::GitHubCopilot(OpenAiCompatibleModel::new(
+                    model_id, None,
+                )))
+            }
             _ => Ok(LanguageModel::Custom {
                 provider: provider.to_string(),
                 model_id: model_id.to_string(),
@@ -142,6 +149,14 @@ mod tests {
         let model = ModelSelector::parse("somecloud:my-model").unwrap();
         assert_eq!(model.provider_name(), "somecloud");
         assert_eq!(model.model_id(), "my-model");
+    }
+
+    #[cfg(feature = "openai-compatible")]
+    #[test]
+    fn parse_github_copilot_model() {
+        let model = ModelSelector::parse("github-copilot:gpt-5.2-codex").unwrap();
+        assert_eq!(model.provider_name(), "github-copilot");
+        assert_eq!(model.model_id(), "gpt-5.2-codex");
     }
 
     #[test]
