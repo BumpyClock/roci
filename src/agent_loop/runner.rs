@@ -194,8 +194,12 @@ type ProviderFactory = Arc<
 
 const DEFAULT_MAX_ITERATIONS: usize = 20;
 const DEFAULT_MAX_TOOL_FAILURES: usize = 8;
+const DEFAULT_ITERATION_EXTENSION: usize = 20;
+const DEFAULT_MAX_ITERATION_EXTENSIONS: usize = 3;
 const RUNNER_MAX_ITERATIONS_ENV: &str = "HOMIE_ROCI_RUNNER_MAX_ITERATIONS";
 const RUNNER_MAX_TOOL_FAILURES_ENV: &str = "HOMIE_ROCI_RUNNER_MAX_TOOL_FAILURES";
+const RUNNER_ITERATION_EXTENSION_ENV: &str = "HOMIE_ROCI_RUNNER_ITERATION_EXTENSION";
+const RUNNER_MAX_ITERATION_EXTENSIONS_ENV: &str = "HOMIE_ROCI_RUNNER_MAX_ITERATION_EXTENSIONS";
 const RUNNER_MAX_ITERATIONS_KEYS: [&str; 3] = [
     "runner.max_iterations",
     "agent_loop.max_iterations",
@@ -206,6 +210,16 @@ const RUNNER_MAX_TOOL_FAILURES_KEYS: [&str; 3] = [
     "agent_loop.max_tool_failures",
     "max_tool_failures",
 ];
+const RUNNER_ITERATION_EXTENSION_KEYS: [&str; 3] = [
+    "runner.iteration_extension",
+    "agent_loop.iteration_extension",
+    "iteration_extension",
+];
+const RUNNER_MAX_ITERATION_EXTENSIONS_KEYS: [&str; 3] = [
+    "runner.max_iteration_extensions",
+    "agent_loop.max_iteration_extensions",
+    "max_iteration_extensions",
+];
 const PARALLEL_SAFE_TOOL_NAMES: [&str; 6] =
     ["read", "ls", "find", "grep", "web_search", "web_fetch"];
 
@@ -213,6 +227,8 @@ const PARALLEL_SAFE_TOOL_NAMES: [&str; 6] =
 struct RunnerLimits {
     max_iterations: usize,
     max_tool_failures: usize,
+    iteration_extension: usize,
+    max_iteration_extensions: usize,
 }
 
 impl RunnerLimits {
@@ -229,6 +245,18 @@ impl RunnerLimits {
                 &RUNNER_MAX_TOOL_FAILURES_KEYS,
                 RUNNER_MAX_TOOL_FAILURES_ENV,
                 DEFAULT_MAX_TOOL_FAILURES,
+            ),
+            iteration_extension: parse_runner_limit(
+                &request.metadata,
+                &RUNNER_ITERATION_EXTENSION_KEYS,
+                RUNNER_ITERATION_EXTENSION_ENV,
+                DEFAULT_ITERATION_EXTENSION,
+            ),
+            max_iteration_extensions: parse_runner_limit(
+                &request.metadata,
+                &RUNNER_MAX_ITERATION_EXTENSIONS_KEYS,
+                RUNNER_MAX_ITERATION_EXTENSIONS_ENV,
+                DEFAULT_MAX_ITERATION_EXTENSIONS,
             ),
         }
     }
@@ -387,6 +415,8 @@ impl Runner for LoopRunner {
                     run_id = %request.run_id,
                     max_iterations = limits.max_iterations,
                     max_tool_failures = limits.max_tool_failures,
+                    iteration_extension = limits.iteration_extension,
+                    max_iteration_extensions = limits.max_iteration_extensions,
                     "roci runner limits"
                 );
             }
@@ -418,16 +448,66 @@ impl Runner for LoopRunner {
             let mut messages = request.messages.clone();
             let mut iteration = 0usize;
             let mut consecutive_failed_iterations = 0usize;
+            let mut max_iterations = limits.max_iterations;
+            let mut iteration_extensions_used = 0usize;
 
             loop {
                 iteration += 1;
-                if iteration > limits.max_iterations {
-                    let reason = format!(
-                        "tool loop exceeded max iterations (max_iterations={})",
-                        limits.max_iterations
-                    );
-                    let _ = result_tx.send(emit_failed_result(&emitter, reason));
-                    return;
+                if iteration > max_iterations {
+                    if iteration_extensions_used >= limits.max_iteration_extensions {
+                        let reason = format!(
+                            "tool loop exceeded max iterations (max_iterations={}, extensions_used={})",
+                            max_iterations, iteration_extensions_used
+                        );
+                        let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                        return;
+                    }
+
+                    let decision = resolve_iteration_limit_approval(
+                        &emitter,
+                        request.approval_handler.as_ref(),
+                        request.run_id,
+                        iteration,
+                        max_iterations,
+                        limits.iteration_extension,
+                        iteration_extensions_used + 1,
+                    )
+                    .await;
+
+                    match decision {
+                        ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
+                            max_iterations =
+                                max_iterations.saturating_add(limits.iteration_extension);
+                            iteration_extensions_used =
+                                iteration_extensions_used.saturating_add(1);
+                            if debug_enabled() {
+                                tracing::debug!(
+                                    run_id = %request.run_id,
+                                    iteration,
+                                    max_iterations,
+                                    iteration_extensions_used,
+                                    "roci iteration limit extended"
+                                );
+                            }
+                        }
+                        ApprovalDecision::Cancel => {
+                            emitter.emit(
+                                RunEventStream::Lifecycle,
+                                RunEventPayload::Lifecycle {
+                                    state: RunLifecycle::Canceled,
+                                },
+                            );
+                            let _ = result_tx.send(RunResult::canceled());
+                            return;
+                        }
+                        ApprovalDecision::Decline => {
+                            let reason = format!(
+                                "tool loop exceeded max iterations (max_iterations={max_iterations}); continuation declined"
+                            );
+                            let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                            return;
+                        }
+                    }
                 }
 
                 while let Ok(message) = input_rx.try_recv() {
@@ -549,11 +629,17 @@ impl Runner for LoopRunner {
                 }
 
                 if debug_enabled() {
+                    let tool_names = tool_calls
+                        .iter()
+                        .map(|call| call.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
                     tracing::debug!(
                         run_id = %request.run_id,
                         iteration,
                         stream_done,
                         tool_calls = tool_calls.len(),
+                        tool_names = %tool_names,
                         text_len = iteration_text.len(),
                         "roci iteration complete"
                     );
@@ -857,6 +943,43 @@ async fn resolve_approval(
             handler(request).await
         }
     }
+}
+
+async fn resolve_iteration_limit_approval(
+    emitter: &RunEventEmitter,
+    handler: Option<&ApprovalHandler>,
+    run_id: RunId,
+    iteration: usize,
+    current_limit: usize,
+    extension: usize,
+    attempt: usize,
+) -> ApprovalDecision {
+    let request = ApprovalRequest {
+        id: format!("run-{run_id}-continue-{attempt}"),
+        kind: ApprovalKind::Other,
+        reason: Some(format!(
+            "Reached iteration limit ({current_limit}). Continue for {extension} more iterations?"
+        )),
+        payload: serde_json::json!({
+            "type": "iteration_limit",
+            "run_id": run_id.to_string(),
+            "iteration": iteration,
+            "current_limit": current_limit,
+            "extension": extension,
+            "attempt": attempt,
+        }),
+        suggested_policy_change: None,
+    };
+    emitter.emit(
+        RunEventStream::Approval,
+        RunEventPayload::ApprovalRequired {
+            request: request.clone(),
+        },
+    );
+    let Some(handler) = handler else {
+        return ApprovalDecision::Decline;
+    };
+    handler(request).await
 }
 
 fn approval_kind_for_tool(call: &AgentToolCall) -> ApprovalKind {
