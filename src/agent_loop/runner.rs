@@ -1015,6 +1015,9 @@ mod tests {
         RepeatedToolFailure,
         ParallelSafeBatchThenComplete,
         MutatingBatchThenComplete,
+        MixedTextAndParallelBatchThenComplete,
+        DuplicateToolCallDeltaThenComplete,
+        StreamEndsWithoutDoneThenComplete,
     }
 
     struct StubProvider {
@@ -1254,6 +1257,169 @@ mod tests {
                         })]
                     }
                 }
+                ProviderScenario::MixedTextAndParallelBatchThenComplete => {
+                    if call_index == 0 {
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: "Gathering context.".to_string(),
+                                event_type: StreamEventType::TextDelta,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "mixed-read-1".to_string(),
+                                    name: "read".to_string(),
+                                    arguments: serde_json::json!({ "path": "README.md" }),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "mixed-ls-2".to_string(),
+                                    name: "ls".to_string(),
+                                    arguments: serde_json::json!({ "path": "." }),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
+                    } else {
+                        vec![Ok(TextStreamDelta {
+                            text: "complete".to_string(),
+                            event_type: StreamEventType::TextDelta,
+                            tool_call: None,
+                            finish_reason: None,
+                            usage: None,
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        }), Ok(TextStreamDelta {
+                            text: String::new(),
+                            event_type: StreamEventType::Done,
+                            tool_call: None,
+                            finish_reason: None,
+                            usage: Some(Usage::default()),
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        })]
+                    }
+                }
+                ProviderScenario::DuplicateToolCallDeltaThenComplete => {
+                    if call_index == 0 {
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "dup-read-1".to_string(),
+                                    name: "read".to_string(),
+                                    arguments: serde_json::json!({ "path": "first" }),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "dup-read-1".to_string(),
+                                    name: "read".to_string(),
+                                    arguments: serde_json::json!({ "path": "second" }),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
+                    } else {
+                        vec![Ok(TextStreamDelta {
+                            text: String::new(),
+                            event_type: StreamEventType::Done,
+                            tool_call: None,
+                            finish_reason: None,
+                            usage: Some(Usage::default()),
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        })]
+                    }
+                }
+                ProviderScenario::StreamEndsWithoutDoneThenComplete => {
+                    if call_index == 0 {
+                        vec![Ok(TextStreamDelta {
+                            text: String::new(),
+                            event_type: StreamEventType::ToolCallDelta,
+                            tool_call: Some(AgentToolCall {
+                                id: "fallback-read-1".to_string(),
+                                name: "read".to_string(),
+                                arguments: serde_json::json!({ "path": "fallback" }),
+                                recipient: None,
+                            }),
+                            finish_reason: None,
+                            usage: None,
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        })]
+                    } else {
+                        vec![Ok(TextStreamDelta {
+                            text: String::new(),
+                            event_type: StreamEventType::Done,
+                            tool_call: None,
+                            finish_reason: None,
+                            usage: Some(Usage::default()),
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        })]
+                    }
+                }
             };
             Ok(Box::pin(stream::iter(events)))
         }
@@ -1368,6 +1534,33 @@ mod tests {
                         .any(|part| matches!(part, ContentPart::ToolCall(_)))
             })
             .count()
+    }
+
+    fn assistant_tool_calls(messages: &[ModelMessage]) -> Vec<AgentToolCall> {
+        messages
+            .iter()
+            .filter(|message| matches!(message.role, crate::types::Role::Assistant))
+            .flat_map(|message| {
+                message.content.iter().filter_map(|part| match part {
+                    ContentPart::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    fn assistant_text_content(messages: &[ModelMessage]) -> String {
+        messages
+            .iter()
+            .filter(|message| matches!(message.role, crate::types::Role::Assistant))
+            .flat_map(|message| {
+                message.content.iter().filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn tool_result_ids_from_events(events: &[RunEvent]) -> Vec<String> {
@@ -1556,6 +1749,142 @@ mod tests {
         assert_eq!(
             tool_call_completed_ids_from_events(events.as_slice()),
             vec!["mutating-call-1".to_string(), "safe-read-2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_text_and_parallel_tools_are_batched_before_single_followup() {
+        let (runner, requests) = test_runner(ProviderScenario::MixedTextAndParallelBatchThenComplete);
+        let (sink, events) = capture_events();
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("mixed stream")]);
+        request.tools = vec![
+            tracked_success_tool(
+                "read",
+                Duration::from_millis(80),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            tracked_success_tool(
+                "ls",
+                Duration::from_millis(80),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        ];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        let second_request_messages = &requests[1].messages;
+        assert_eq!(assistant_tool_call_message_count(second_request_messages), 1);
+        assert_eq!(
+            tool_result_ids_from_messages(second_request_messages),
+            vec!["mixed-read-1".to_string(), "mixed-ls-2".to_string()]
+        );
+        assert!(assistant_text_content(second_request_messages).contains("Gathering context."));
+
+        let events = events.lock().expect("event lock");
+        assert_eq!(
+            tool_result_ids_from_events(events.as_slice()),
+            vec!["mixed-read-1".to_string(), "mixed-ls-2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_deltas_are_deduplicated_by_call_id() {
+        let (runner, requests) = test_runner(ProviderScenario::DuplicateToolCallDeltaThenComplete);
+        let (sink, events) = capture_events();
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("dup tool call")]);
+        request.tools = vec![tracked_success_tool(
+            "read",
+            Duration::from_millis(50),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        let second_request_messages = &requests[1].messages;
+        assert_eq!(
+            tool_result_ids_from_messages(second_request_messages),
+            vec!["dup-read-1".to_string()]
+        );
+        let calls = assistant_tool_calls(second_request_messages);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "dup-read-1");
+        assert_eq!(calls[0].arguments["path"], serde_json::json!("second"));
+
+        let events = events.lock().expect("event lock");
+        let tool_starts = events
+            .iter()
+            .filter(|event| matches!(event.payload, RunEventPayload::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(tool_starts, 1);
+        assert_eq!(
+            tool_result_ids_from_events(events.as_slice()),
+            vec!["dup-read-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_end_without_done_falls_back_to_tool_execution_and_completion() {
+        let (runner, requests) = test_runner(ProviderScenario::StreamEndsWithoutDoneThenComplete);
+        let (sink, events) = capture_events();
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("fallback completion")]);
+        request.tools = vec![tracked_success_tool(
+            "read",
+            Duration::from_millis(50),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        let second_request_messages = &requests[1].messages;
+        assert_eq!(
+            tool_result_ids_from_messages(second_request_messages),
+            vec!["fallback-read-1".to_string()]
+        );
+
+        let events = events.lock().expect("event lock");
+        assert_eq!(
+            tool_result_ids_from_events(events.as_slice()),
+            vec!["fallback-read-1".to_string()]
+        );
+        assert!(
+            events.iter().all(|event| {
+                !matches!(
+                    event.payload,
+                    RunEventPayload::Lifecycle {
+                        state: RunLifecycle::Failed { .. },
+                    }
+                )
+            }),
+            "stream-end fallback should not emit failed lifecycle"
         );
     }
 }
