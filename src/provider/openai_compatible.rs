@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use reqwest::header::HeaderMap;
 
 use crate::error::RociError;
 use crate::models::capabilities::ModelCapabilities;
@@ -17,9 +18,24 @@ pub struct OpenAiCompatibleProvider {
 
 impl OpenAiCompatibleProvider {
     pub fn new(model_id: String, api_key: String, base_url: String) -> Self {
+        Self::new_with_headers(model_id, api_key, base_url, HeaderMap::new())
+    }
+
+    pub fn new_with_headers(
+        model_id: String,
+        api_key: String,
+        base_url: String,
+        extra_headers: HeaderMap,
+    ) -> Self {
         let model = crate::models::openai::OpenAiModel::Custom(model_id);
         Self {
-            inner: OpenAiProvider::new(model, api_key, Some(base_url), None),
+            inner: OpenAiProvider::new_with_extra_headers(
+                model,
+                api_key,
+                Some(base_url),
+                None,
+                extra_headers,
+            ),
         }
     }
 }

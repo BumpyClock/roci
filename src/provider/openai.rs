@@ -23,6 +23,7 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     account_id: Option<String>,
+    extra_headers: reqwest::header::HeaderMap,
     capabilities: ModelCapabilities,
 }
 
@@ -33,12 +34,29 @@ impl OpenAiProvider {
         base_url: Option<String>,
         account_id: Option<String>,
     ) -> Self {
+        Self::new_with_extra_headers(
+            model,
+            api_key,
+            base_url,
+            account_id,
+            reqwest::header::HeaderMap::new(),
+        )
+    }
+
+    pub fn new_with_extra_headers(
+        model: OpenAiModel,
+        api_key: String,
+        base_url: Option<String>,
+        account_id: Option<String>,
+        extra_headers: reqwest::header::HeaderMap,
+    ) -> Self {
         let capabilities = model.capabilities();
         Self {
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             model,
             api_key,
             account_id,
+            extra_headers,
             capabilities,
         }
     }
@@ -49,6 +67,9 @@ impl OpenAiProvider {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(account_id) {
                 headers.insert("ChatGPT-Account-ID", value);
             }
+        }
+        for (name, value) in self.extra_headers.iter() {
+            headers.insert(name, value.clone());
         }
         if debug_enabled() {
             tracing::debug!(

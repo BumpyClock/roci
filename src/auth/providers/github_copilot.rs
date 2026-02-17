@@ -14,6 +14,7 @@ const DEFAULT_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const DEFAULT_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const DEFAULT_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const DEFAULT_COPILOT_BASE_URL: &str = "https://api.individual.githubcopilot.com";
+const DEFAULT_GITHUB_USER_AGENT: &str = "homie-gateway";
 
 /// GitHub Copilot OAuth helper with device-code flow.
 ///
@@ -181,6 +182,7 @@ impl GitHubCopilotAuth {
             .client
             .get(&self.copilot_token_url)
             .header("Accept", "application/json")
+            .header("User-Agent", DEFAULT_GITHUB_USER_AGENT)
             .header(
                 "Authorization",
                 format!("Bearer {}", github_token.access_token),

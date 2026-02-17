@@ -31,6 +31,8 @@ pub mod ollama;
 pub mod anthropic_compatible;
 #[cfg(feature = "openai-compatible")]
 pub mod openai_compatible;
+#[cfg(feature = "openai-compatible")]
+pub mod github_copilot;
 
 #[cfg(feature = "azure")]
 pub mod azure;
@@ -236,8 +238,6 @@ pub fn create_provider(
         LanguageModel::GitHubCopilot(m) => {
             let api_key = config
                 .get_api_key("github-copilot")
-                .or_else(|| config.get_api_key("openai-compatible"))
-                .or_else(|| config.get_api_key("openai"))
                 .ok_or_else(|| {
                     RociError::Authentication("Missing GITHUB_COPILOT_API_KEY".into())
                 })?;
@@ -245,12 +245,10 @@ pub fn create_provider(
                 .base_url
                 .clone()
                 .or_else(|| config.get_base_url("github-copilot"))
-                .or_else(|| config.get_base_url("openai-compatible"))
-                .or_else(|| config.get_base_url("openai"))
                 .ok_or_else(|| {
                     RociError::Configuration("Missing GITHUB_COPILOT_BASE_URL".into())
                 })?;
-            Ok(Box::new(openai_compatible::OpenAiCompatibleProvider::new(
+            Ok(Box::new(github_copilot::GitHubCopilotProvider::new(
                 m.model_id.clone(),
                 api_key,
                 base_url,
