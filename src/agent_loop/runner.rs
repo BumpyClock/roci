@@ -1312,25 +1312,28 @@ mod tests {
                             }),
                         ]
                     } else {
-                        vec![Ok(TextStreamDelta {
-                            text: "complete".to_string(),
-                            event_type: StreamEventType::TextDelta,
-                            tool_call: None,
-                            finish_reason: None,
-                            usage: None,
-                            reasoning: None,
-                            reasoning_signature: None,
-                            reasoning_type: None,
-                        }), Ok(TextStreamDelta {
-                            text: String::new(),
-                            event_type: StreamEventType::Done,
-                            tool_call: None,
-                            finish_reason: None,
-                            usage: Some(Usage::default()),
-                            reasoning: None,
-                            reasoning_signature: None,
-                            reasoning_type: None,
-                        })]
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: "complete".to_string(),
+                                event_type: StreamEventType::TextDelta,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
                     }
                 }
                 ProviderScenario::DuplicateToolCallDeltaThenComplete => {
@@ -1754,7 +1757,8 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_text_and_parallel_tools_are_batched_before_single_followup() {
-        let (runner, requests) = test_runner(ProviderScenario::MixedTextAndParallelBatchThenComplete);
+        let (runner, requests) =
+            test_runner(ProviderScenario::MixedTextAndParallelBatchThenComplete);
         let (sink, events) = capture_events();
         let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("mixed stream")]);
         request.tools = vec![
@@ -1783,7 +1787,10 @@ mod tests {
         let requests = requests.lock().expect("request lock");
         assert_eq!(requests.len(), 2);
         let second_request_messages = &requests[1].messages;
-        assert_eq!(assistant_tool_call_message_count(second_request_messages), 1);
+        assert_eq!(
+            assistant_tool_call_message_count(second_request_messages),
+            1
+        );
         assert_eq!(
             tool_result_ids_from_messages(second_request_messages),
             vec!["mixed-read-1".to_string(), "mixed-ls-2".to_string()]
@@ -1845,8 +1852,10 @@ mod tests {
     async fn stream_end_without_done_falls_back_to_tool_execution_and_completion() {
         let (runner, requests) = test_runner(ProviderScenario::StreamEndsWithoutDoneThenComplete);
         let (sink, events) = capture_events();
-        let mut request =
-            RunRequest::new(test_model(), vec![ModelMessage::user("fallback completion")]);
+        let mut request = RunRequest::new(
+            test_model(),
+            vec![ModelMessage::user("fallback completion")],
+        );
         request.tools = vec![tracked_success_tool(
             "read",
             Duration::from_millis(50),
