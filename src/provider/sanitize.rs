@@ -26,7 +26,24 @@ fn supports_thinking(provider: &str) -> bool {
 }
 
 fn requires_tool_pairing(provider: &str) -> bool {
-    matches!(provider, "anthropic" | "anthropic-compatible" | "google")
+    matches!(
+        provider,
+        "anthropic"
+            | "anthropic-compatible"
+            | "google"
+            | "openai"
+            | "openai-compatible"
+            | "github-copilot"
+            | "openrouter"
+            | "azure"
+            | "groq"
+            | "grok"
+            | "mistral"
+            | "together"
+            | "lmstudio"
+            | "ollama"
+            | "replicate"
+    )
 }
 
 fn strip_thinking_blocks(message: &ModelMessage) -> Option<ModelMessage> {
@@ -124,4 +141,71 @@ fn extract_tool_result_id(message: &ModelMessage) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_messages_for_provider;
+    use crate::types::{AgentToolCall, ContentPart, ModelMessage, Role};
+
+    fn assistant_tool_call(id: &str, name: &str) -> ModelMessage {
+        ModelMessage {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall(AgentToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: serde_json::json!({}),
+                recipient: None,
+            })],
+            name: None,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn openai_family_providers_insert_synthetic_tool_result_for_dangling_tool_call() {
+        let messages = vec![
+            ModelMessage::user("hello"),
+            assistant_tool_call("call-1", "read"),
+            ModelMessage::assistant("partial assistant text"),
+        ];
+        let sanitized = sanitize_messages_for_provider(&messages, "openai-compatible");
+
+        assert_eq!(sanitized.len(), 4);
+        assert_eq!(sanitized[1].role, Role::Assistant);
+        assert_eq!(sanitized[2].role, Role::Tool);
+        let synthetic_error = sanitized[2]
+            .content
+            .iter()
+            .find_map(|part| match part {
+                ContentPart::ToolResult(result) => result.result.get("error"),
+                _ => None,
+            })
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(synthetic_error.contains("missing tool result"));
+    }
+
+    #[test]
+    fn github_copilot_providers_preserve_existing_tool_result() {
+        let messages = vec![
+            ModelMessage::user("hello"),
+            assistant_tool_call("call-1", "read"),
+            ModelMessage::tool_result("call-1", serde_json::json!({"ok": true}), false),
+            ModelMessage::assistant("done"),
+        ];
+        let sanitized = sanitize_messages_for_provider(&messages, "github-copilot");
+
+        assert_eq!(sanitized.len(), 4);
+        assert_eq!(sanitized[2].role, Role::Tool);
+        let is_error = sanitized[2]
+            .content
+            .iter()
+            .find_map(|part| match part {
+                ContentPart::ToolResult(result) => Some(result.is_error),
+                _ => None,
+            })
+            .unwrap_or(true);
+        assert!(!is_error);
+    }
 }
