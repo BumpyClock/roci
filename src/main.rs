@@ -62,13 +62,29 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         settings.max_tokens = Some(max);
     }
 
-    // Stream assistant text to stdout
+    // Stream events to terminal
     let sink = Arc::new(|event: roci::agent_loop::RunEvent| {
+        use std::io::Write;
         match &event.payload {
             RunEventPayload::AssistantDelta { text } => {
-                use std::io::Write;
                 print!("{text}");
                 let _ = std::io::stdout().flush();
+            }
+            RunEventPayload::ToolCallStarted { call } => {
+                eprintln!("\n⚡ {} ({})", call.name, call.id);
+            }
+            RunEventPayload::ToolResult { result } => {
+                let output = result.result.to_string();
+                let truncated = if output.len() > 200 {
+                    format!("{}...", &output[..200])
+                } else {
+                    output
+                };
+                if result.is_error {
+                    eprintln!("  ❌ {truncated}");
+                } else {
+                    eprintln!("  ✅ {truncated}");
+                }
             }
             RunEventPayload::Lifecycle {
                 state: RunLifecycle::Failed { error },
@@ -79,9 +95,13 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Register built-in tools
+    let tools = roci::tools::builtin::all_tools();
+
     let mut request = RunRequest::new(model, messages);
     request.settings = settings;
     request.event_sink = Some(sink);
+    request.tools = tools;
     request.approval_policy = ApprovalPolicy::Always;
 
     let handle = runner.start(request).await?;

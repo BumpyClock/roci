@@ -60,9 +60,7 @@ impl RociConfig {
             api_keys: Arc::new(RwLock::new(HashMap::new())),
             base_urls: Arc::new(RwLock::new(HashMap::new())),
             account_ids: Arc::new(RwLock::new(HashMap::new())),
-            token_store: Some(Arc::new(
-                crate::auth::store::FileTokenStore::new_default(),
-            )),
+            token_store: Some(Arc::new(crate::auth::store::FileTokenStore::new_default())),
         }
     }
 

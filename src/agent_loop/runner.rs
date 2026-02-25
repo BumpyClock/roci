@@ -484,7 +484,9 @@ impl Runner for LoopRunner {
                     state: RunLifecycle::Started,
                 },
             );
-            agent_emitter.emit(AgentEvent::AgentStart { run_id: request.run_id });
+            agent_emitter.emit(AgentEvent::AgentStart {
+                run_id: request.run_id,
+            });
 
             if debug_enabled() {
                 tracing::debug!(
@@ -502,8 +504,11 @@ impl Runner for LoopRunner {
             let provider = match provider_factory(&request.model, &config) {
                 Ok(provider) => provider,
                 Err(err) => {
-                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                    let _ = result_tx.send(emit_failed_result(&emitter, err.to_string(), &messages));
+                    agent_emitter.emit(AgentEvent::AgentEnd {
+                        run_id: request.run_id,
+                    });
+                    let _ =
+                        result_tx.send(emit_failed_result(&emitter, err.to_string(), &messages));
                     return;
                 }
             };
@@ -531,306 +536,418 @@ impl Runner for LoopRunner {
             let mut turn_index = 0usize;
 
             'outer: loop {
-            'inner: loop {
-                iteration += 1;
-                turn_index += 1;
-                agent_emitter.emit(AgentEvent::TurnStart { run_id: request.run_id, turn_index });
+                'inner: loop {
+                    iteration += 1;
+                    turn_index += 1;
+                    agent_emitter.emit(AgentEvent::TurnStart {
+                        run_id: request.run_id,
+                        turn_index,
+                    });
 
-                if iteration > max_iterations {
-                    if iteration_extensions_used >= limits.max_iteration_extensions {
-                        let reason = format!(
+                    if iteration > max_iterations {
+                        if iteration_extensions_used >= limits.max_iteration_extensions {
+                            let reason = format!(
                             "tool loop exceeded max iterations (max_iterations={}, extensions_used={})",
                             max_iterations, iteration_extensions_used
                         );
-                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                        let _ = result_tx.send(emit_failed_result(&emitter, reason, &messages));
-                        return;
-                    }
+                            agent_emitter.emit(AgentEvent::AgentEnd {
+                                run_id: request.run_id,
+                            });
+                            let _ = result_tx.send(emit_failed_result(&emitter, reason, &messages));
+                            return;
+                        }
 
-                    let decision = resolve_iteration_limit_approval(
-                        &emitter,
-                        request.approval_handler.as_ref(),
-                        request.run_id,
-                        iteration,
-                        max_iterations,
-                        limits.iteration_extension,
-                        iteration_extensions_used + 1,
-                    )
-                    .await;
+                        let decision = resolve_iteration_limit_approval(
+                            &emitter,
+                            request.approval_handler.as_ref(),
+                            request.run_id,
+                            iteration,
+                            max_iterations,
+                            limits.iteration_extension,
+                            iteration_extensions_used + 1,
+                        )
+                        .await;
 
-                    match decision {
-                        ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
-                            max_iterations =
-                                max_iterations.saturating_add(limits.iteration_extension);
-                            iteration_extensions_used = iteration_extensions_used.saturating_add(1);
-                            if debug_enabled() {
-                                tracing::debug!(
-                                    run_id = %request.run_id,
-                                    iteration,
-                                    max_iterations,
-                                    iteration_extensions_used,
-                                    "roci iteration limit extended"
+                        match decision {
+                            ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
+                                max_iterations =
+                                    max_iterations.saturating_add(limits.iteration_extension);
+                                iteration_extensions_used =
+                                    iteration_extensions_used.saturating_add(1);
+                                if debug_enabled() {
+                                    tracing::debug!(
+                                        run_id = %request.run_id,
+                                        iteration,
+                                        max_iterations,
+                                        iteration_extensions_used,
+                                        "roci iteration limit extended"
+                                    );
+                                }
+                            }
+                            ApprovalDecision::Cancel => {
+                                emitter.emit(
+                                    RunEventStream::Lifecycle,
+                                    RunEventPayload::Lifecycle {
+                                        state: RunLifecycle::Canceled,
+                                    },
                                 );
+                                agent_emitter.emit(AgentEvent::AgentEnd {
+                                    run_id: request.run_id,
+                                });
+                                let _ = result_tx
+                                    .send(RunResult::canceled_with_messages(messages.clone()));
+                                return;
+                            }
+                            ApprovalDecision::Decline => {
+                                let reason = format!(
+                                "tool loop exceeded max iterations (max_iterations={max_iterations}); continuation declined"
+                            );
+                                agent_emitter.emit(AgentEvent::AgentEnd {
+                                    run_id: request.run_id,
+                                });
+                                let _ =
+                                    result_tx.send(emit_failed_result(&emitter, reason, &messages));
+                                return;
                             }
                         }
-                        ApprovalDecision::Cancel => {
+                    }
+
+                    while let Ok(message) = input_rx.try_recv() {
+                        messages.push(message);
+                    }
+
+                    // Inject steering messages before LLM call
+                    if let Some(ref get_steering) = request.get_steering_messages {
+                        for msg in get_steering() {
+                            messages.push(msg);
+                        }
+                    }
+
+                    if let Some(compact) = request.hooks.compaction.as_ref() {
+                        if let Some(compacted) = compact(&messages) {
+                            messages = compacted;
+                        }
+                    }
+
+                    let provider_messages = if let Some(ref transform) = request.transform_context {
+                        let transformed = transform(messages.clone()).await;
+                        provider::sanitize_messages_for_provider(
+                            &transformed,
+                            provider.provider_name(),
+                        )
+                    } else {
+                        provider::sanitize_messages_for_provider(
+                            &messages,
+                            provider.provider_name(),
+                        )
+                    };
+                    let req = ProviderRequest {
+                        messages: provider_messages,
+                        settings: request.settings.clone(),
+                        tools: tool_defs.clone(),
+                        response_format: request.settings.response_format.clone(),
+                        session_id: request.session_id.clone(),
+                    };
+
+                    let mut stream = match provider.stream_text(&req).await {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            agent_emitter.emit(AgentEvent::AgentEnd {
+                                run_id: request.run_id,
+                            });
+                            let _ = result_tx.send(emit_failed_result(
+                                &emitter,
+                                err.to_string(),
+                                &messages,
+                            ));
+                            return;
+                        }
+                    };
+
+                    let mut iteration_text = String::new();
+                    let mut tool_calls: Vec<AgentToolCall> = Vec::new();
+                    let mut stream_done = false;
+                    let idle_timeout_ms =
+                        request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
+                    let mut idle_sleep = (idle_timeout_ms > 0)
+                        .then(|| Box::pin(time::sleep(Duration::from_millis(idle_timeout_ms))));
+                    loop {
+                        if let Some(ref mut sleep) = idle_sleep {
+                            tokio::select! {
+                                _ = &mut abort_rx => {
+                                    emitter.emit(
+                                        RunEventStream::Lifecycle,
+                                        RunEventPayload::Lifecycle {
+                                            state: RunLifecycle::Canceled,
+                                        },
+                                    );
+                                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                    let _ = result_tx
+                                        .send(RunResult::canceled_with_messages(messages.clone()));
+                                    return;
+                                }
+                                _ = sleep.as_mut() => {
+                                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                    let _ = result_tx.send(emit_failed_result(
+                                        &emitter,
+                                        "stream idle timeout",
+                                        &messages,
+                                    ));
+                                    return;
+                                }
+                                delta = stream.next() => {
+                                    let Some(delta) = delta else { break; };
+                                    match delta {
+                                        Ok(delta) => {
+                                            sleep.as_mut().reset(
+                                                time::Instant::now() + Duration::from_millis(idle_timeout_ms),
+                                            );
+                                            if let Some(reason) = process_stream_delta(
+                                                &emitter,
+                                                delta,
+                                                &mut iteration_text,
+                                                &mut tool_calls,
+                                                &mut stream_done,
+                                            ) {
+                                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                                let _ = result_tx.send(emit_failed_result(
+                                                    &emitter,
+                                                    reason,
+                                                    &messages,
+                                                ));
+                                                return;
+                                            }
+                                            if stream_done {
+                                                break;
+                                            }
+                                        }
+                                        Err(err) => {
+                                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                            let _ = result_tx.send(emit_failed_result(
+                                                &emitter,
+                                                err.to_string(),
+                                                &messages,
+                                            ));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            tokio::select! {
+                                _ = &mut abort_rx => {
+                                    emitter.emit(
+                                        RunEventStream::Lifecycle,
+                                        RunEventPayload::Lifecycle {
+                                            state: RunLifecycle::Canceled,
+                                        },
+                                    );
+                                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                    let _ = result_tx
+                                        .send(RunResult::canceled_with_messages(messages.clone()));
+                                    return;
+                                }
+                                delta = stream.next() => {
+                                    let Some(delta) = delta else { break; };
+                                    match delta {
+                                        Ok(delta) => {
+                                            if let Some(reason) = process_stream_delta(
+                                                &emitter,
+                                                delta,
+                                                &mut iteration_text,
+                                                &mut tool_calls,
+                                                &mut stream_done,
+                                            ) {
+                                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                                let _ = result_tx.send(emit_failed_result(
+                                                    &emitter,
+                                                    reason,
+                                                    &messages,
+                                                ));
+                                                return;
+                                            }
+                                            if stream_done {
+                                                break;
+                                            }
+                                        }
+                                        Err(err) => {
+                                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                            let _ = result_tx.send(emit_failed_result(
+                                                &emitter,
+                                                err.to_string(),
+                                                &messages,
+                                            ));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if debug_enabled() {
+                        let tool_names = tool_calls
+                            .iter()
+                            .map(|call| call.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        tracing::debug!(
+                            run_id = %request.run_id,
+                            iteration,
+                            stream_done,
+                            tool_calls = tool_calls.len(),
+                            tool_names = %tool_names,
+                            text_len = iteration_text.len(),
+                            "roci iteration complete"
+                        );
+                    }
+
+                    if tool_calls.is_empty() {
+                        agent_emitter.emit(AgentEvent::TurnEnd {
+                            run_id: request.run_id,
+                            turn_index,
+                            tool_results: vec![],
+                        });
+                        break 'inner;
+                    }
+
+                    let mut assistant_content: Vec<ContentPart> = Vec::new();
+                    if !iteration_text.is_empty() {
+                        assistant_content.push(ContentPart::Text {
+                            text: iteration_text,
+                        });
+                    }
+                    for call in &tool_calls {
+                        assistant_content.push(ContentPart::ToolCall(call.clone()));
+                    }
+                    messages.push(ModelMessage {
+                        role: crate::types::Role::Assistant,
+                        content: assistant_content,
+                        name: None,
+                        timestamp: Some(chrono::Utc::now()),
+                    });
+
+                    let mut iteration_failures = 0usize;
+                    let mut turn_tool_results: Vec<AgentToolResult> = Vec::new();
+                    let mut steering_interrupted = false;
+                    let mut pending_parallel_calls: Vec<AgentToolCall> = Vec::new();
+                    for (call_idx, call) in tool_calls.iter().enumerate() {
+                        let decision = resolve_approval(
+                            &emitter,
+                            &request.approval_policy,
+                            request.approval_handler.as_ref(),
+                            call,
+                        )
+                        .await;
+
+                        if matches!(decision, ApprovalDecision::Cancel) {
                             emitter.emit(
                                 RunEventStream::Lifecycle,
                                 RunEventPayload::Lifecycle {
                                     state: RunLifecycle::Canceled,
                                 },
                             );
-                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                            let _ = result_tx.send(RunResult::canceled_with_messages(messages.clone()));
-                            return;
-                        }
-                        ApprovalDecision::Decline => {
-                            let reason = format!(
-                                "tool loop exceeded max iterations (max_iterations={max_iterations}); continuation declined"
-                            );
-                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                            let _ = result_tx.send(emit_failed_result(&emitter, reason, &messages));
-                            return;
-                        }
-                    }
-                }
-
-                while let Ok(message) = input_rx.try_recv() {
-                    messages.push(message);
-                }
-
-                // Inject steering messages before LLM call
-                if let Some(ref get_steering) = request.get_steering_messages {
-                    for msg in get_steering() {
-                        messages.push(msg);
-                    }
-                }
-
-                if let Some(compact) = request.hooks.compaction.as_ref() {
-                    if let Some(compacted) = compact(&messages) {
-                        messages = compacted;
-                    }
-                }
-
-                let provider_messages = if let Some(ref transform) = request.transform_context {
-                    let transformed = transform(messages.clone()).await;
-                    provider::sanitize_messages_for_provider(&transformed, provider.provider_name())
-                } else {
-                    provider::sanitize_messages_for_provider(&messages, provider.provider_name())
-                };
-                let req = ProviderRequest {
-                    messages: provider_messages,
-                    settings: request.settings.clone(),
-                    tools: tool_defs.clone(),
-                    response_format: request.settings.response_format.clone(),
-                    session_id: request.session_id.clone(),
-                };
-
-                let mut stream = match provider.stream_text(&req).await {
-                    Ok(stream) => stream,
-                    Err(err) => {
-                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                        let _ =
-                            result_tx.send(emit_failed_result(&emitter, err.to_string(), &messages));
-                        return;
-                    }
-                };
-
-                let mut iteration_text = String::new();
-                let mut tool_calls: Vec<AgentToolCall> = Vec::new();
-                let mut stream_done = false;
-                let idle_timeout_ms = request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
-                let mut idle_sleep = (idle_timeout_ms > 0)
-                    .then(|| Box::pin(time::sleep(Duration::from_millis(idle_timeout_ms))));
-                loop {
-                    if let Some(ref mut sleep) = idle_sleep {
-                        tokio::select! {
-                            _ = &mut abort_rx => {
-                                emitter.emit(
-                                    RunEventStream::Lifecycle,
-                                    RunEventPayload::Lifecycle {
-                                        state: RunLifecycle::Canceled,
-                                    },
-                                );
-                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                let _ = result_tx
-                                    .send(RunResult::canceled_with_messages(messages.clone()));
-                                return;
+                            agent_emitter.emit(AgentEvent::AgentEnd {
+                                run_id: request.run_id,
+                            });
+                            let _ =
+                                result_tx.send(RunResult::canceled_with_messages(messages.clone()));
+                            if debug_enabled() {
+                                tracing::debug!(run_id = %request.run_id, "roci run canceled");
                             }
-                            _ = sleep.as_mut() => {
-                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                let _ = result_tx.send(emit_failed_result(
+                            return;
+                        }
+
+                        let can_execute = approval_allows_execution(decision);
+                        if can_execute && is_parallel_safe_tool(&call.name) {
+                            pending_parallel_calls.push(call.clone());
+                            continue;
+                        }
+
+                        if !pending_parallel_calls.is_empty() {
+                            let parallel_results = execute_parallel_tool_calls(
+                                &request.tools,
+                                &pending_parallel_calls,
+                            )
+                            .await;
+                            for (parallel_call, parallel_result) in pending_parallel_calls
+                                .drain(..)
+                                .zip(parallel_results.into_iter())
+                            {
+                                turn_tool_results.push(parallel_result.clone());
+                                append_tool_result(
+                                    &request.hooks,
                                     &emitter,
-                                    "stream idle timeout",
-                                    &messages,
-                                ));
-                                return;
-                            }
-                            delta = stream.next() => {
-                                let Some(delta) = delta else { break; };
-                                match delta {
-                                    Ok(delta) => {
-                                        sleep.as_mut().reset(
-                                            time::Instant::now() + Duration::from_millis(idle_timeout_ms),
-                                        );
-                                        if let Some(reason) = process_stream_delta(
-                                            &emitter,
-                                            delta,
-                                            &mut iteration_text,
-                                            &mut tool_calls,
-                                            &mut stream_done,
-                                        ) {
-                                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                            let _ = result_tx.send(emit_failed_result(
-                                                &emitter,
-                                                reason,
-                                                &messages,
-                                            ));
-                                            return;
-                                        }
-                                        if stream_done {
-                                            break;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                        let _ = result_tx.send(emit_failed_result(
-                                            &emitter,
-                                            err.to_string(),
-                                            &messages,
-                                        ));
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        tokio::select! {
-                            _ = &mut abort_rx => {
-                                emitter.emit(
-                                    RunEventStream::Lifecycle,
-                                    RunEventPayload::Lifecycle {
-                                        state: RunLifecycle::Canceled,
-                                    },
+                                    &parallel_call,
+                                    parallel_result,
+                                    &mut iteration_failures,
+                                    &mut messages,
                                 );
-                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                let _ = result_tx
-                                    .send(RunResult::canceled_with_messages(messages.clone()));
-                                return;
                             }
-                            delta = stream.next() => {
-                                let Some(delta) = delta else { break; };
-                                match delta {
-                                    Ok(delta) => {
-                                        if let Some(reason) = process_stream_delta(
-                                            &emitter,
-                                            delta,
-                                            &mut iteration_text,
-                                            &mut tool_calls,
-                                            &mut stream_done,
-                                        ) {
-                                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                            let _ = result_tx.send(emit_failed_result(
-                                                &emitter,
-                                                reason,
-                                                &messages,
-                                            ));
-                                            return;
-                                        }
-                                        if stream_done {
-                                            break;
-                                        }
+
+                            // Check for steering after parallel batch flush
+                            if let Some(ref get_steering) = request.get_steering_messages {
+                                let steering = get_steering();
+                                if !steering.is_empty() {
+                                    for remaining_call in &tool_calls[call_idx + 1..] {
+                                        messages.push(ModelMessage::tool_result(
+                                        remaining_call.id.clone(),
+                                        serde_json::json!({ "error": "Skipped due to steering message" }),
+                                        true,
+                                    ));
                                     }
-                                    Err(err) => {
-                                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                        let _ = result_tx.send(emit_failed_result(
-                                            &emitter,
-                                            err.to_string(),
-                                            &messages,
-                                        ));
-                                        return;
+                                    for msg in steering {
+                                        messages.push(msg);
                                     }
+                                    steering_interrupted = true;
+                                    break;
                                 }
                             }
                         }
-                    }
-                }
 
-                if debug_enabled() {
-                    let tool_names = tool_calls
-                        .iter()
-                        .map(|call| call.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    tracing::debug!(
-                        run_id = %request.run_id,
-                        iteration,
-                        stream_done,
-                        tool_calls = tool_calls.len(),
-                        tool_names = %tool_names,
-                        text_len = iteration_text.len(),
-                        "roci iteration complete"
-                    );
-                }
+                        let result = if can_execute {
+                            execute_tool_call(&request.tools, call).await
+                        } else {
+                            declined_tool_result(call)
+                        };
 
-                if tool_calls.is_empty() {
-                    agent_emitter.emit(AgentEvent::TurnEnd {
-                        run_id: request.run_id,
-                        turn_index,
-                        tool_results: vec![],
-                    });
-                    break 'inner;
-                }
-
-                let mut assistant_content: Vec<ContentPart> = Vec::new();
-                if !iteration_text.is_empty() {
-                    assistant_content.push(ContentPart::Text {
-                        text: iteration_text,
-                    });
-                }
-                for call in &tool_calls {
-                    assistant_content.push(ContentPart::ToolCall(call.clone()));
-                }
-                messages.push(ModelMessage {
-                    role: crate::types::Role::Assistant,
-                    content: assistant_content,
-                    name: None,
-                    timestamp: Some(chrono::Utc::now()),
-                });
-
-                let mut iteration_failures = 0usize;
-                let mut turn_tool_results: Vec<AgentToolResult> = Vec::new();
-                let mut steering_interrupted = false;
-                let mut pending_parallel_calls: Vec<AgentToolCall> = Vec::new();
-                for (call_idx, call) in tool_calls.iter().enumerate() {
-                    let decision = resolve_approval(
-                        &emitter,
-                        &request.approval_policy,
-                        request.approval_handler.as_ref(),
-                        call,
-                    )
-                    .await;
-
-                    if matches!(decision, ApprovalDecision::Cancel) {
-                        emitter.emit(
-                            RunEventStream::Lifecycle,
-                            RunEventPayload::Lifecycle {
-                                state: RunLifecycle::Canceled,
-                            },
+                        turn_tool_results.push(result.clone());
+                        append_tool_result(
+                            &request.hooks,
+                            &emitter,
+                            call,
+                            result,
+                            &mut iteration_failures,
+                            &mut messages,
                         );
-                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                        let _ =
-                            result_tx.send(RunResult::canceled_with_messages(messages.clone()));
-                        if debug_enabled() {
-                            tracing::debug!(run_id = %request.run_id, "roci run canceled");
+
+                        // Check for steering after sequential tool execution
+                        if let Some(ref get_steering) = request.get_steering_messages {
+                            let steering = get_steering();
+                            if !steering.is_empty() {
+                                for remaining_call in &tool_calls[call_idx + 1..] {
+                                    messages.push(ModelMessage::tool_result(
+                                    remaining_call.id.clone(),
+                                    serde_json::json!({ "error": "Skipped due to steering message" }),
+                                    true,
+                                ));
+                                }
+                                for msg in steering {
+                                    messages.push(msg);
+                                }
+                                steering_interrupted = true;
+                                break;
+                            }
                         }
-                        return;
                     }
 
-                    let can_execute = approval_allows_execution(decision);
-                    if can_execute && is_parallel_safe_tool(&call.name) {
-                        pending_parallel_calls.push(call.clone());
-                        continue;
+                    if steering_interrupted {
+                        agent_emitter.emit(AgentEvent::TurnEnd {
+                            run_id: request.run_id,
+                            turn_index,
+                            tool_results: turn_tool_results,
+                        });
+                        continue 'inner;
                     }
 
                     if !pending_parallel_calls.is_empty() {
@@ -851,133 +968,61 @@ impl Runner for LoopRunner {
                                 &mut messages,
                             );
                         }
-
-                        // Check for steering after parallel batch flush
-                        if let Some(ref get_steering) = request.get_steering_messages {
-                            let steering = get_steering();
-                            if !steering.is_empty() {
-                                for remaining_call in &tool_calls[call_idx + 1..] {
-                                    messages.push(ModelMessage::tool_result(
-                                        remaining_call.id.clone(),
-                                        serde_json::json!({ "error": "Skipped due to steering message" }),
-                                        true,
-                                    ));
-                                }
-                                for msg in steering { messages.push(msg); }
-                                steering_interrupted = true;
-                                break;
-                            }
-                        }
                     }
 
-                    let result = if can_execute {
-                        execute_tool_call(&request.tools, call).await
-                    } else {
-                        declined_tool_result(call)
-                    };
-
-                    turn_tool_results.push(result.clone());
-                    append_tool_result(
-                        &request.hooks,
-                        &emitter,
-                        call,
-                        result,
-                        &mut iteration_failures,
-                        &mut messages,
-                    );
-
-                    // Check for steering after sequential tool execution
-                    if let Some(ref get_steering) = request.get_steering_messages {
-                        let steering = get_steering();
-                        if !steering.is_empty() {
-                            for remaining_call in &tool_calls[call_idx + 1..] {
-                                messages.push(ModelMessage::tool_result(
-                                    remaining_call.id.clone(),
-                                    serde_json::json!({ "error": "Skipped due to steering message" }),
-                                    true,
-                                ));
-                            }
-                            for msg in steering { messages.push(msg); }
-                            steering_interrupted = true;
-                            break;
-                        }
-                    }
-                }
-
-                if steering_interrupted {
                     agent_emitter.emit(AgentEvent::TurnEnd {
                         run_id: request.run_id,
                         turn_index,
                         tool_results: turn_tool_results,
                     });
-                    continue 'inner;
-                }
 
-                if !pending_parallel_calls.is_empty() {
-                    let parallel_results =
-                        execute_parallel_tool_calls(&request.tools, &pending_parallel_calls).await;
-                    for (parallel_call, parallel_result) in pending_parallel_calls
-                        .drain(..)
-                        .zip(parallel_results.into_iter())
-                    {
-                        turn_tool_results.push(parallel_result.clone());
-                        append_tool_result(
-                            &request.hooks,
-                            &emitter,
-                            &parallel_call,
-                            parallel_result,
-                            &mut iteration_failures,
-                            &mut messages,
-                        );
+                    if iteration_failures == tool_calls.len() {
+                        consecutive_failed_iterations =
+                            consecutive_failed_iterations.saturating_add(1);
+                    } else {
+                        consecutive_failed_iterations = 0;
                     }
-                }
 
-                agent_emitter.emit(AgentEvent::TurnEnd {
-                    run_id: request.run_id,
-                    turn_index,
-                    tool_results: turn_tool_results,
-                });
-
-                if iteration_failures == tool_calls.len() {
-                    consecutive_failed_iterations = consecutive_failed_iterations.saturating_add(1);
-                } else {
-                    consecutive_failed_iterations = 0;
-                }
-
-                if consecutive_failed_iterations >= limits.max_tool_failures {
-                    let reason = format!(
+                    if consecutive_failed_iterations >= limits.max_tool_failures {
+                        let reason = format!(
                         "tool call failure limit reached (max_failures={}, consecutive_failures={})",
                         limits.max_tool_failures,
                         consecutive_failed_iterations
                     );
-                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                    let _ = result_tx.send(emit_failed_result(&emitter, reason, &messages));
-                    return;
-                }
-            } // end 'inner
+                        agent_emitter.emit(AgentEvent::AgentEnd {
+                            run_id: request.run_id,
+                        });
+                        let _ = result_tx.send(emit_failed_result(&emitter, reason, &messages));
+                        return;
+                    }
+                } // end 'inner
 
-            // Check for follow-up messages after the inner loop completes
-            if let Some(ref get_follow_ups) = request.get_follow_up_messages {
-                let follow_ups = get_follow_ups();
-                if !follow_ups.is_empty() {
-                    for msg in follow_ups { messages.push(msg); }
-                    continue 'outer;
+                // Check for follow-up messages after the inner loop completes
+                if let Some(ref get_follow_ups) = request.get_follow_up_messages {
+                    let follow_ups = get_follow_ups();
+                    if !follow_ups.is_empty() {
+                        for msg in follow_ups {
+                            messages.push(msg);
+                        }
+                        continue 'outer;
+                    }
                 }
-            }
 
-            // No follow-ups — complete
-            emitter.emit(
-                RunEventStream::Lifecycle,
-                RunEventPayload::Lifecycle {
-                    state: RunLifecycle::Completed,
-                },
-            );
-            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-            let _ = result_tx.send(RunResult::completed_with_messages(messages));
-            if debug_enabled() {
-                tracing::debug!(run_id = %request.run_id, "roci run completed");
-            }
-            return;
+                // No follow-ups — complete
+                emitter.emit(
+                    RunEventStream::Lifecycle,
+                    RunEventPayload::Lifecycle {
+                        state: RunLifecycle::Completed,
+                    },
+                );
+                agent_emitter.emit(AgentEvent::AgentEnd {
+                    run_id: request.run_id,
+                });
+                let _ = result_tx.send(RunResult::completed_with_messages(messages));
+                if debug_enabled() {
+                    tracing::debug!(run_id = %request.run_id, "roci run completed");
+                }
+                return;
             } // end 'outer
         });
 
@@ -1895,6 +1940,17 @@ mod tests {
             .await
             .expect("run wait timeout");
         assert_eq!(result.status, RunStatus::Completed);
+        assert!(
+            !result.messages.is_empty(),
+            "completed runs should carry final conversation messages"
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|message| matches!(message.role, crate::types::Role::User)),
+            "result should include persisted prompt context"
+        );
     }
 
     #[tokio::test]
@@ -1921,6 +1977,13 @@ mod tests {
             "tool call failure limit reached (max_failures=2, consecutive_failures=2)";
         assert_eq!(result.status, RunStatus::Failed);
         assert_eq!(result.error.as_deref(), Some(expected_error));
+        assert!(
+            !result.messages.is_empty(),
+            "failed runs should still expose conversation state"
+        );
+        let result_tool_ids = tool_result_ids_from_messages(&result.messages);
+        assert_eq!(result_tool_ids.len(), 2);
+        assert!(result_tool_ids.iter().all(|id| id == "tool-call-1"));
 
         let events = events.lock().expect("event lock");
         let failure_events: Vec<String> = events

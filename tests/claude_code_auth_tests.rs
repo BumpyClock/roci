@@ -6,9 +6,9 @@ use std::sync::Arc;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{Duration, Utc};
+use reqwest::Url;
 use roci::auth::providers::claude_code::ClaudeCodeAuth;
 use roci::auth::{AuthError, Token};
-use reqwest::Url;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -148,20 +148,32 @@ async fn start_auth_produces_valid_authorize_url_with_required_params() {
     let session = auth.start_auth().expect("start_auth should succeed");
 
     assert!(!session.state.is_empty());
-    assert!(session.state.len() == 64, "state should be 32-byte hex (64 chars)");
+    assert!(
+        session.state.len() == 64,
+        "state should be 32-byte hex (64 chars)"
+    );
     assert!(session.code_verifier.len() >= 43);
     assert!(session.code_verifier.len() <= 128);
 
     let url = Url::parse(&session.authorize_url).expect("valid URL");
     let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
-    assert_eq!(params.get("response_type").map(|v| v.as_ref()), Some("code"));
-    assert_eq!(params.get("code_challenge_method").map(|v| v.as_ref()), Some("S256"));
+    assert_eq!(
+        params.get("response_type").map(|v| v.as_ref()),
+        Some("code")
+    );
+    assert_eq!(
+        params.get("code_challenge_method").map(|v| v.as_ref()),
+        Some("S256")
+    );
     assert!(params.contains_key("client_id"));
     assert!(params.contains_key("redirect_uri"));
     assert!(params.contains_key("scope"));
     assert!(params.contains_key("state"));
     assert!(params.contains_key("code_challenge"));
-    assert_eq!(params.get("state").map(|v| v.as_ref()), Some(session.state.as_str()));
+    assert_eq!(
+        params.get("state").map(|v| v.as_ref()),
+        Some(session.state.as_str())
+    );
 }
 
 #[tokio::test]
@@ -216,23 +228,28 @@ async fn exchange_code_posts_correct_params_and_returns_token() {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::body_string_contains("grant_type=authorization_code"))
+        .and(wiremock::matchers::body_string_contains(
+            "grant_type=authorization_code",
+        ))
         .and(wiremock::matchers::body_string_contains("client_id="))
-        .and(wiremock::matchers::body_string_contains("code=my-auth-code"))
+        .and(wiremock::matchers::body_string_contains(
+            "code=my-auth-code",
+        ))
         .and(wiremock::matchers::body_string_contains("code_verifier="))
         .and(wiremock::matchers::body_string_contains("redirect_uri="))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "claude-new-access",
-            "refresh_token": "claude-new-refresh",
-            "expires_in": 3600
-        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "claude-new-access",
+                "refresh_token": "claude-new-refresh",
+                "expires_in": 3600
+            })),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
 
     let store = Arc::new(InMemoryTokenStore::new());
-    let auth = ClaudeCodeAuth::new(store.clone())
-        .with_token_url(mock_server.uri());
+    let auth = ClaudeCodeAuth::new(store.clone()).with_token_url(mock_server.uri());
 
     let session = auth.start_auth().expect("start_auth");
     let auth_response = format!("my-auth-code#{}", session.state);
@@ -255,18 +272,19 @@ async fn exchange_code_accepts_code_without_state_fragment() {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "access-no-state",
-            "refresh_token": "refresh-no-state",
-            "expires_in": 7200
-        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-no-state",
+                "refresh_token": "refresh-no-state",
+                "expires_in": 7200
+            })),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
 
     let store = Arc::new(InMemoryTokenStore::new());
-    let auth = ClaudeCodeAuth::new(store)
-        .with_token_url(mock_server.uri());
+    let auth = ClaudeCodeAuth::new(store).with_token_url(mock_server.uri());
     let session = auth.start_auth().expect("start_auth");
 
     let token = auth
@@ -282,16 +300,17 @@ async fn exchange_code_propagates_server_error() {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
-            "error": "invalid_grant"
-        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant"
+            })),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
 
     let store = Arc::new(InMemoryTokenStore::new());
-    let auth = ClaudeCodeAuth::new(store)
-        .with_token_url(mock_server.uri());
+    let auth = ClaudeCodeAuth::new(store).with_token_url(mock_server.uri());
     let session = auth.start_auth().expect("start_auth");
 
     let result = auth.exchange_code(&session, "bad-code").await;
@@ -304,21 +323,26 @@ async fn refresh_token_returns_new_token_on_success() {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::body_string_contains("grant_type=refresh_token"))
-        .and(wiremock::matchers::body_string_contains("refresh_token=old-refresh"))
+        .and(wiremock::matchers::body_string_contains(
+            "grant_type=refresh_token",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "refresh_token=old-refresh",
+        ))
         .and(wiremock::matchers::body_string_contains("client_id="))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "refreshed-access",
-            "refresh_token": "refreshed-refresh",
-            "expires_in": 3600
-        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "refreshed-access",
+                "refresh_token": "refreshed-refresh",
+                "expires_in": 3600
+            })),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
 
     let store = Arc::new(InMemoryTokenStore::new());
-    let auth = ClaudeCodeAuth::new(store.clone())
-        .with_token_url(mock_server.uri());
+    let auth = ClaudeCodeAuth::new(store.clone()).with_token_url(mock_server.uri());
 
     let old_token = Token {
         access_token: "old-access".to_string(),
@@ -336,7 +360,10 @@ async fn refresh_token_returns_new_token_on_success() {
         .expect("refresh should succeed");
 
     assert_eq!(refreshed.access_token, "refreshed-access");
-    assert_eq!(refreshed.refresh_token.as_deref(), Some("refreshed-refresh"));
+    assert_eq!(
+        refreshed.refresh_token.as_deref(),
+        Some("refreshed-refresh")
+    );
     assert!(refreshed.expires_at.is_some());
 
     let stored = store.get("claude-code", "default").expect("token stored");
@@ -368,12 +395,16 @@ async fn get_token_auto_refreshes_expired_token() {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::body_string_contains("grant_type=refresh_token"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "auto-refreshed-access",
-            "refresh_token": "auto-refreshed-refresh",
-            "expires_in": 3600
-        })))
+        .and(wiremock::matchers::body_string_contains(
+            "grant_type=refresh_token",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "auto-refreshed-access",
+                "refresh_token": "auto-refreshed-refresh",
+                "expires_in": 3600
+            })),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -390,13 +421,17 @@ async fn get_token_auto_refreshes_expired_token() {
     };
     store.seed("claude-code", "default", expired_token);
 
-    let auth = ClaudeCodeAuth::new(store.clone())
-        .with_token_url(mock_server.uri());
+    let auth = ClaudeCodeAuth::new(store.clone()).with_token_url(mock_server.uri());
 
-    let token = auth.get_token().await.expect("get_token should auto-refresh");
+    let token = auth
+        .get_token()
+        .await
+        .expect("get_token should auto-refresh");
 
     assert_eq!(token.access_token, "auto-refreshed-access");
-    let stored = store.get("claude-code", "default").expect("token persisted");
+    let stored = store
+        .get("claude-code", "default")
+        .expect("token persisted");
     assert_eq!(stored.access_token, "auto-refreshed-access");
 }
 
@@ -426,11 +461,13 @@ async fn get_token_within_grace_period_triggers_refresh() {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "grace-refreshed",
-            "refresh_token": "grace-refresh-tok",
-            "expires_in": 3600
-        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "grace-refreshed",
+                "refresh_token": "grace-refresh-tok",
+                "expires_in": 3600
+            })),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -447,10 +484,12 @@ async fn get_token_within_grace_period_triggers_refresh() {
     };
     store.seed("claude-code", "default", almost_expired_token);
 
-    let auth = ClaudeCodeAuth::new(store.clone())
-        .with_token_url(mock_server.uri());
+    let auth = ClaudeCodeAuth::new(store.clone()).with_token_url(mock_server.uri());
 
-    let token = auth.get_token().await.expect("get_token should refresh within grace period");
+    let token = auth
+        .get_token()
+        .await
+        .expect("get_token should refresh within grace period");
 
     assert_eq!(token.access_token, "grace-refreshed");
 }

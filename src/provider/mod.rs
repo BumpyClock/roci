@@ -247,7 +247,10 @@ pub fn create_provider(
                         .unwrap_or(false);
                     if is_valid {
                         let url = token.account_id.unwrap_or_default();
-                        (Some(token.access_token), if url.is_empty() { None } else { Some(url) })
+                        (
+                            Some(token.access_token),
+                            if url.is_empty() { None } else { Some(url) },
+                        )
                     } else {
                         (None, None)
                     }

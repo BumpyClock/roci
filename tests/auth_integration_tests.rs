@@ -115,8 +115,7 @@ fn config_get_api_key_falls_back_to_token_store() {
     let token = make_token("claude-oauth-tok", None, None);
     store.save("claude-code", "default", &token).unwrap();
 
-    let store_for_config =
-        FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
+    let store_for_config = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
     let config = RociConfig::new().with_token_store(Some(Arc::new(store_for_config)));
 
     assert_eq!(
@@ -132,8 +131,7 @@ fn config_explicit_key_takes_precedence_over_store() {
     let token = make_token("stored-key", None, None);
     store.save("openai-codex", "default", &token).unwrap();
 
-    let store_for_config =
-        FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
+    let store_for_config = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
     let config = RociConfig::new().with_token_store(Some(Arc::new(store_for_config)));
     config.set_api_key("openai", "explicit-key".to_string());
 
@@ -151,8 +149,7 @@ fn config_expired_token_not_returned() {
     let token = make_token("old-tok", None, Some(expired));
     store.save("openai-codex", "default", &token).unwrap();
 
-    let store_for_config =
-        FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
+    let store_for_config = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
     let config = RociConfig::new().with_token_store(Some(Arc::new(store_for_config)));
 
     assert_eq!(config.get_api_key("openai"), None);
@@ -166,14 +163,10 @@ fn config_non_expired_token_is_returned() {
     let token = make_token("fresh-tok", None, Some(future));
     store.save("openai-codex", "default", &token).unwrap();
 
-    let store_for_config =
-        FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
+    let store_for_config = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
     let config = RociConfig::new().with_token_store(Some(Arc::new(store_for_config)));
 
-    assert_eq!(
-        config.get_api_key("openai"),
-        Some("fresh-tok".to_string()),
-    );
+    assert_eq!(config.get_api_key("openai"), Some("fresh-tok".to_string()),);
 }
 
 // ---------------------------------------------------------------------------
@@ -200,8 +193,7 @@ mod cli_parse {
 
     #[test]
     fn parse_auth_status() {
-        let cli =
-            Cli::try_parse_from(["roci", "auth", "status"]).expect("parse should succeed");
+        let cli = Cli::try_parse_from(["roci", "auth", "status"]).expect("parse should succeed");
         match cli.command {
             Commands::Auth(auth) => {
                 assert!(matches!(auth.command, AuthCommands::Status));

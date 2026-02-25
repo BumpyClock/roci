@@ -24,9 +24,7 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
     }
 }
 
-async fn login_copilot(
-    store: Arc<FileTokenStore>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn login_copilot(store: Arc<FileTokenStore>) -> Result<(), Box<dyn std::error::Error>> {
     let auth = GitHubCopilotAuth::new(store.clone());
     let session = auth.start_device_code().await?;
 
@@ -56,7 +54,12 @@ async fn login_copilot(
                         println!("✅ GitHub Copilot login successful!");
                         println!(
                             "   API: {}",
-                            copilot_token.base_url.split('/').take(3).collect::<Vec<_>>().join("/")
+                            copilot_token
+                                .base_url
+                                .split('/')
+                                .take(3)
+                                .collect::<Vec<_>>()
+                                .join("/")
                         );
                     }
                     Err(e) => {
@@ -83,9 +86,7 @@ async fn login_copilot(
     }
 }
 
-async fn login_codex(
-    store: Arc<FileTokenStore>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn login_codex(store: Arc<FileTokenStore>) -> Result<(), Box<dyn std::error::Error>> {
     let auth = OpenAiCodexAuth::new(store);
 
     if let Ok(Some(_token)) = auth.import_codex_auth_json(None) {
@@ -123,9 +124,7 @@ async fn login_codex(
     }
 }
 
-async fn login_claude(
-    store: Arc<FileTokenStore>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn login_claude(store: Arc<FileTokenStore>) -> Result<(), Box<dyn std::error::Error>> {
     let auth = ClaudeCodeAuth::new(store);
 
     // Try importing existing credentials first (zero-friction path).

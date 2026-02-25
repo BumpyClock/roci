@@ -14,12 +14,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex, Notify};
 
-use crate::agent_loop::{
-    AgentEvent, LoopRunner, RunHandle, RunRequest, RunResult,
-    RunStatus, Runner,
-};
 use crate::agent_loop::runner::{
     AgentEventSink, FollowUpMessagesFn, SteeringMessagesFn, TransformContextFn,
+};
+use crate::agent_loop::{
+    AgentEvent, LoopRunner, RunHandle, RunRequest, RunResult, RunStatus, Runner,
 };
 use crate::config::RociConfig;
 use crate::error::RociError;
@@ -411,15 +410,6 @@ impl AgentRuntime {
         if let Some(ref id) = self.config.session_id {
             request = request.with_session_id(id.clone());
         }
-
-        if let Some(ref get_key) = self.config.get_api_key {
-            let key = get_key().await?;
-            request.metadata.insert("api_key".to_string(), key);
-        }
-        // When no callback is set, RociConfig.get_api_key() is called by
-        // create_provider() inside the LoopRunner. That method already
-        // checks env vars → credentials.json → OAuth token store, so no
-        // extra wiring is needed here for the default case.
 
         let run_result = async {
             if let Some(ref get_key) = self.config.get_api_key {
@@ -937,6 +927,42 @@ mod tests {
             result.unwrap_err(),
             RociError::Authentication(msg) if msg == "Token refresh failed"
         ));
+    }
+
+    #[tokio::test]
+    async fn prompt_get_api_key_error_restores_idle_state() {
+        let get_key: GetApiKeyFn = Arc::new(|| {
+            Box::pin(async {
+                Err(RociError::Authentication(
+                    "Token refresh failed".to_string(),
+                ))
+            })
+        });
+        let agent = AgentRuntime::new(
+            test_config(),
+            AgentConfig {
+                get_api_key: Some(get_key),
+                ..test_agent_config()
+            },
+        );
+
+        let err = agent.prompt("hello").await.unwrap_err();
+        assert!(matches!(
+            err,
+            RociError::Authentication(msg) if msg == "Token refresh failed"
+        ));
+        assert_eq!(agent.state().await, AgentState::Idle);
+
+        // Must not block after a failed prompt.
+        agent.wait_for_idle().await;
+
+        let snap = agent.snapshot().await;
+        assert_eq!(snap.state, AgentState::Idle);
+        assert!(!snap.is_streaming);
+        assert_eq!(
+            snap.last_error,
+            Some("Authentication error: Token refresh failed".into())
+        );
     }
 
     #[tokio::test]

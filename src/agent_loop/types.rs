@@ -62,10 +62,7 @@ impl RunResult {
         Self::failed_with_messages(error, Vec::new())
     }
 
-    pub fn failed_with_messages(
-        error: impl Into<String>,
-        messages: Vec<ModelMessage>,
-    ) -> Self {
+    pub fn failed_with_messages(error: impl Into<String>, messages: Vec<ModelMessage>) -> Self {
         Self {
             status: RunStatus::Failed,
             error: Some(error.into()),
