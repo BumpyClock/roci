@@ -28,6 +28,7 @@ dotenvy = "0.15"
 toml = "0.9"
 directories = "6"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+tokio-util = { version = "0.7", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
@@ -52,7 +53,7 @@ together = ["openai"]
 replicate = []
 openai-compatible = ["openai"]
 anthropic-compatible = ["anthropic"]
-agent = []
+agent = ["dep:tokio-util"]
 audio = ["dep:tokio-tungstenite"]
 mcp = ["dep:tokio-tungstenite"]
 cli = ["dep:clap", "agent"]

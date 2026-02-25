@@ -9,3 +9,6 @@ pub use approvals::*;
 pub use events::*;
 pub use runner::*;
 pub use types::*;
+
+// Re-export new pi-mono aligned types at module level
+pub use events::{AgentEvent, ToolUpdatePayload};

@@ -21,11 +21,26 @@ pub struct ToolExecutionContext {
     pub tool_name: Option<String>,
 }
 
+/// Callback for streaming partial tool results during execution.
+#[cfg(feature = "agent")]
+pub type ToolUpdateCallback = Arc<
+    dyn Fn(crate::agent_loop::events::ToolUpdatePayload) + Send + Sync,
+>;
+
 /// Core tool trait — implement to create custom tools.
+///
+/// Existing implementations only need [`execute`]. The agent loop calls
+/// [`execute_ext`] which delegates to [`execute`] by default. Override
+/// [`execute_ext`] to support cancellation tokens and streaming updates.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Tool name (must match what the model calls).
     fn name(&self) -> &str;
+
+    /// Human-readable label for UI display. Defaults to [`name`].
+    fn label(&self) -> &str {
+        self.name()
+    }
 
     /// Human-readable description.
     fn description(&self) -> &str;
@@ -39,6 +54,22 @@ pub trait Tool: Send + Sync {
         args: &ToolArguments,
         ctx: &ToolExecutionContext,
     ) -> Result<serde_json::Value, RociError>;
+
+    /// Extended execute with cancellation and streaming updates.
+    ///
+    /// The default implementation ignores `cancel` and `on_update`, delegating
+    /// to [`execute`]. Override this for tools that need streaming partial
+    /// results or cooperative cancellation.
+    #[cfg(feature = "agent")]
+    async fn execute_ext(
+        &self,
+        args: &ToolArguments,
+        ctx: &ToolExecutionContext,
+        _cancel: tokio_util::sync::CancellationToken,
+        _on_update: Option<ToolUpdateCallback>,
+    ) -> Result<serde_json::Value, RociError> {
+        self.execute(args, ctx).await
+    }
 }
 
 /// Type alias for the tool handler function.
