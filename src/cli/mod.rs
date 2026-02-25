@@ -42,21 +42,21 @@ pub enum AuthCommands {
 /// Arguments for `roci auth login`.
 #[derive(Parser, Debug)]
 pub struct LoginArgs {
-    /// Provider to login to (copilot, chatgpt, claude)
+    /// Provider to login to (copilot, codex, claude)
     pub provider: String,
 }
 
 /// Arguments for `roci auth logout`.
 #[derive(Parser, Debug)]
 pub struct LogoutArgs {
-    /// Provider to logout from (copilot, chatgpt, claude)
+    /// Provider to logout from (copilot, codex, claude)
     pub provider: String,
 }
 
 /// Arguments for the `chat` subcommand.
 #[derive(Parser, Debug)]
 pub struct ChatArgs {
-    /// Model to use (format: provider:model, e.g., openai:gpt-4o)
+    /// Model to use (format: provider:model, e.g., openai:gpt-4o or codex:gpt-5.3-codex-spark)
     #[arg(short, long, default_value = "openai:gpt-4o")]
     pub model: String,
 

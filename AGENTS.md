@@ -1,6 +1,6 @@
 # AGENTS.MD
 
-READ ~/Projects/dotfiles/.ai_agents/{AGENTS.MD,TOOLS.MD} BEFORE ANYTHING (skip if files missing).
+READ /Users/adityasharma/Projects/dotfiles/AGENTS.md BEFORE ANYTHING (skip if files missing).
 
 
 
@@ -11,6 +11,3 @@ roci notes:
 - Use `.env` for sensitive keys; refer to `.env.example` for structure. Keep `.env.example` updated as needed.
 - Tests validate new features and implementations against real endpoints using ` cargo test --test live_providers -- --ignored --nocapture`.
 - After each iteration run tests to ensure parity with Tachikoma.
-
-
-Tachikoma resides in `~/Projects/references/Tachikoma`.

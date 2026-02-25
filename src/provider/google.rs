@@ -564,6 +564,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request);
         assert_eq!(
@@ -598,6 +599,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request);
         assert_eq!(
@@ -638,6 +640,7 @@ mod tests {
                 name: "Flag".to_string(),
             }),
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request);
         assert_eq!(
@@ -657,6 +660,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request);
         assert_eq!(
@@ -678,6 +682,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request);
         assert_eq!(
@@ -708,6 +713,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request);
         assert_eq!(
@@ -740,6 +746,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request);
         assert_eq!(
@@ -764,6 +771,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request);
         let settings = body["safetySettings"].as_array().unwrap();

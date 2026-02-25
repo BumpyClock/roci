@@ -658,6 +658,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -683,6 +684,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request, false);
         assert!(body.get("thinking").is_none());
@@ -724,6 +726,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request, false);
         let assistant_content = &body["messages"][1]["content"];
@@ -760,6 +763,7 @@ mod tests {
             tools: None,
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request, false);
         let assistant_content = &body["messages"][1]["content"];
@@ -798,6 +802,7 @@ mod tests {
             tools: Some(tools.clone()),
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["tool_choice"]["type"], "auto");
@@ -812,6 +817,7 @@ mod tests {
             tools: Some(tools.clone()),
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["tool_choice"]["type"], "any");
@@ -826,6 +832,7 @@ mod tests {
             tools: Some(tools),
             response_format: None,
             session_id: None,
+            transport: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["tool_choice"]["type"], "tool");

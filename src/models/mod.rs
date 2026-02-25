@@ -94,7 +94,7 @@ impl LanguageModel {
             #[cfg(feature = "openai")]
             Self::OpenAi(_) => "openai",
             #[cfg(feature = "openai")]
-            Self::OpenAiCodex(_) => "openai-codex",
+            Self::OpenAiCodex(_) => "codex",
             #[cfg(feature = "anthropic")]
             Self::Anthropic(_) => "anthropic",
             #[cfg(feature = "google")]

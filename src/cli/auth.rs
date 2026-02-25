@@ -14,11 +14,11 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
 
     match provider {
         "copilot" | "github-copilot" | "github" => login_copilot(store).await,
-        "chatgpt" | "codex" | "openai" => login_codex(store).await,
+        "chatgpt" | "codex" => login_codex(store).await,
         "claude" | "anthropic" => login_claude(store).await,
         _ => {
             eprintln!("Unknown provider: {provider}");
-            eprintln!("Supported: copilot, chatgpt, claude");
+            eprintln!("Supported: copilot, codex, claude");
             std::process::exit(1);
         }
     }
@@ -163,7 +163,7 @@ pub async fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
 
     for (name, provider_key) in [
         ("GitHub Copilot", "github-copilot"),
-        ("OpenAI/ChatGPT", "openai-codex"),
+        ("Codex", "openai-codex"),
         ("Claude", "claude-code"),
     ] {
         match store.load(provider_key, "default") {
@@ -209,11 +209,11 @@ pub async fn handle_logout(provider: &str) -> Result<(), Box<dyn std::error::Err
 
     let provider_key = match provider {
         "copilot" | "github-copilot" | "github" => "github-copilot",
-        "chatgpt" | "codex" | "openai" => "openai-codex",
+        "chatgpt" | "codex" => "openai-codex",
         "claude" | "anthropic" => "claude-code",
         _ => {
             eprintln!("Unknown provider: {provider}");
-            eprintln!("Supported: copilot, chatgpt, claude");
+            eprintln!("Supported: copilot, codex, claude");
             std::process::exit(1);
         }
     };

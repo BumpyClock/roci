@@ -3,11 +3,14 @@
 //! Provides the pi-mono aligned API surface:
 //! - [`Agent::prompt`] — start a new conversation
 //! - [`Agent::continue_run`] — continue with additional context
+//! - [`Agent::continue_without_input`] — continue without appending a new user message
 //! - [`Agent::steer`] — interrupt tool execution with a message
 //! - [`Agent::follow_up`] — queue a message after natural completion
 //! - [`Agent::abort`] — cancel the current run
 //! - [`Agent::reset`] — clear conversation and state
 //! - [`Agent::wait_for_idle`] — block until the agent finishes
+//! - Runtime mutators (`set/clear` system prompt, `replace_messages`, `set_tools`) while idle
+//! - Fine-grained queue controls (`clear_*_queue`, `clear_all_queues`, `has_queued_messages`)
 
 use std::future::Future;
 use std::pin::Pin;
@@ -15,7 +18,7 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex, Notify};
 
 use crate::agent_loop::runner::{
-    AgentEventSink, FollowUpMessagesFn, SteeringMessagesFn, TransformContextFn,
+    AgentEventSink, ConvertToLlmFn, FollowUpMessagesFn, SteeringMessagesFn, TransformContextFn,
 };
 use crate::agent_loop::{
     AgentEvent, LoopRunner, RunHandle, RunRequest, RunResult, RunStatus, Runner,
@@ -24,7 +27,7 @@ use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::tools::tool::Tool;
-use crate::types::{GenerationSettings, ModelMessage};
+use crate::types::{GenerationSettings, ModelMessage, Role};
 
 /// Agent runtime state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +120,8 @@ pub struct AgentConfig {
     pub settings: GenerationSettings,
     /// Optional hook to transform the message context before each LLM call.
     pub transform_context: Option<TransformContextFn>,
+    /// Optional hook to convert/filter agent-level messages before provider requests.
+    pub convert_to_llm: Option<ConvertToLlmFn>,
     /// Optional sink for high-level [`AgentEvent`](crate::agent_loop::AgentEvent) emission.
     pub event_sink: Option<AgentEventSink>,
     /// Optional session ID for provider-side prompt caching.
@@ -155,6 +160,7 @@ pub struct AgentConfig {
 /// let agent = AgentRuntime::new(roci_config, config);
 /// let result = agent.prompt("Hello").await?;
 /// let result = agent.continue_run("Tell me more").await?;
+/// let result = agent.continue_without_input().await?;
 /// agent.reset().await;
 /// ```
 pub struct AgentRuntime {
@@ -163,6 +169,9 @@ pub struct AgentRuntime {
     state: Arc<Mutex<AgentState>>,
     state_tx: watch::Sender<AgentState>,
     state_rx: watch::Receiver<AgentState>,
+    model: Arc<Mutex<LanguageModel>>,
+    system_prompt: Arc<Mutex<Option<String>>>,
+    tools: Arc<Mutex<Vec<Arc<dyn Tool>>>>,
     messages: Arc<Mutex<Vec<ModelMessage>>>,
     steering_queue: Arc<Mutex<Vec<ModelMessage>>>,
     follow_up_queue: Arc<Mutex<Vec<ModelMessage>>>,
@@ -179,6 +188,9 @@ impl AgentRuntime {
     /// Create a new agent runtime with the given configuration.
     pub fn new(roci_config: RociConfig, config: AgentConfig) -> Self {
         let runner = LoopRunner::new(roci_config);
+        let model = Arc::new(Mutex::new(config.model.clone()));
+        let system_prompt = Arc::new(Mutex::new(config.system_prompt.clone()));
+        let tools = Arc::new(Mutex::new(config.tools.clone()));
         let (state_tx, state_rx) = watch::channel(AgentState::Idle);
         let initial_snapshot = AgentSnapshot {
             state: AgentState::Idle,
@@ -194,6 +206,9 @@ impl AgentRuntime {
             state: Arc::new(Mutex::new(AgentState::Idle)),
             state_tx,
             state_rx,
+            model,
+            system_prompt,
+            tools,
             messages: Arc::new(Mutex::new(Vec::new())),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
             follow_up_queue: Arc::new(Mutex::new(Vec::new())),
@@ -244,6 +259,108 @@ impl AgentRuntime {
         self.snapshot_rx.clone()
     }
 
+    /// Replace the configured system prompt.
+    ///
+    /// Runtime mutators are allowed only when idle. This method fails fast if a
+    /// run is active or the runtime state lock is contended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn set_system_prompt(&self, prompt: impl Into<String>) -> Result<(), RociError> {
+        let _state_guard = self.lock_state_for_idle_mutation()?;
+        let mut system_prompt = self.system_prompt.try_lock().map_err(|_| {
+            RociError::InvalidState("Agent is busy (system prompt lock contended)".into())
+        })?;
+        *system_prompt = Some(prompt.into());
+        Ok(())
+    }
+
+    /// Replace the configured model used for subsequent runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn set_model(&self, model: LanguageModel) -> Result<(), RociError> {
+        let _state_guard = self.lock_state_for_idle_mutation()?;
+        let mut runtime_model = self
+            .model
+            .try_lock()
+            .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?;
+        *runtime_model = model;
+        Ok(())
+    }
+
+    /// Clear the configured system prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn clear_system_prompt(&self) -> Result<(), RociError> {
+        let _state_guard = self.lock_state_for_idle_mutation()?;
+        let mut system_prompt = self.system_prompt.try_lock().map_err(|_| {
+            RociError::InvalidState("Agent is busy (system prompt lock contended)".into())
+        })?;
+        *system_prompt = None;
+        Ok(())
+    }
+
+    /// Replace the full conversation message history.
+    ///
+    /// This is an atomic replace operation and does not enqueue a run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn replace_messages(&self, messages: Vec<ModelMessage>) -> Result<(), RociError> {
+        let state_guard = self.lock_state_for_idle_mutation()?;
+        let mut existing_messages = self.messages.try_lock().map_err(|_| {
+            RociError::InvalidState("Agent is busy (messages lock contended)".into())
+        })?;
+        *existing_messages = messages;
+        drop(existing_messages);
+        drop(state_guard);
+        self.broadcast_snapshot().await;
+        Ok(())
+    }
+
+    /// Replace the tool registry used for subsequent runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) -> Result<(), RociError> {
+        let _state_guard = self.lock_state_for_idle_mutation()?;
+        let mut runtime_tools = self
+            .tools
+            .try_lock()
+            .map_err(|_| RociError::InvalidState("Agent is busy (tools lock contended)".into()))?;
+        *runtime_tools = tools;
+        Ok(())
+    }
+
+    /// Clear all queued steering messages.
+    pub async fn clear_steering_queue(&self) {
+        self.steering_queue.lock().await.clear();
+    }
+
+    /// Clear all queued follow-up messages.
+    pub async fn clear_follow_up_queue(&self) {
+        self.follow_up_queue.lock().await.clear();
+    }
+
+    /// Clear both steering and follow-up queues.
+    pub async fn clear_all_queues(&self) {
+        self.steering_queue.lock().await.clear();
+        self.follow_up_queue.lock().await.clear();
+    }
+
+    /// Returns true when either steering or follow-up queue has at least one message.
+    pub async fn has_queued_messages(&self) -> bool {
+        !self.steering_queue.lock().await.is_empty()
+            || !self.follow_up_queue.lock().await.is_empty()
+    }
+
     /// Start a new conversation with a user prompt.
     ///
     /// If the message history is empty and a system prompt is configured,
@@ -256,8 +373,9 @@ impl AgentRuntime {
         self.transition_to_running()?;
 
         let text = text.into();
+        let system_prompt = self.system_prompt.lock().await.clone();
         let mut msgs = self.messages.lock().await;
-        if let Some(ref sys) = self.config.system_prompt {
+        if let Some(ref sys) = system_prompt {
             if msgs.is_empty() {
                 msgs.push(ModelMessage::system(sys.clone()));
             }
@@ -285,6 +403,42 @@ impl AgentRuntime {
         msgs.push(ModelMessage::user(text));
         let snapshot = msgs.clone();
         drop(msgs);
+
+        self.run_loop(snapshot).await
+    }
+
+    /// Continue the conversation without appending a new user message.
+    ///
+    /// This mirrors pi-mono's `continue()` behavior and is useful for retrying
+    /// from existing context or draining queued steering/follow-up messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if:
+    /// - the agent is not idle,
+    /// - there is no message history to continue from,
+    /// - the last message is assistant and there are no queued steering/follow-ups.
+    pub async fn continue_without_input(&self) -> Result<RunResult, RociError> {
+        self.transition_to_running()?;
+
+        let snapshot = self.messages.lock().await.clone();
+        if snapshot.is_empty() {
+            self.restore_idle_after_preflight_error().await;
+            return Err(RociError::InvalidState(
+                "No messages to continue from".into(),
+            ));
+        }
+
+        if matches!(snapshot.last().map(|m| m.role), Some(Role::Assistant)) {
+            let has_steering = !self.steering_queue.lock().await.is_empty();
+            let has_follow_ups = !self.follow_up_queue.lock().await.is_empty();
+            if !has_steering && !has_follow_ups {
+                self.restore_idle_after_preflight_error().await;
+                return Err(RociError::InvalidState(
+                    "Cannot continue from message role: assistant".into(),
+                ));
+            }
+        }
 
         self.run_loop(snapshot).await
     }
@@ -396,6 +550,30 @@ impl AgentRuntime {
         Ok(())
     }
 
+    fn lock_state_for_idle_mutation(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, AgentState>, RociError> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| RociError::InvalidState("Agent is busy (state lock contended)".into()))?;
+        if *state != AgentState::Idle {
+            return Err(RociError::InvalidState(
+                "Agent is not idle; runtime mutation requires idle state".into(),
+            ));
+        }
+        Ok(state)
+    }
+
+    async fn restore_idle_after_preflight_error(&self) {
+        let mut state = self.state.lock().await;
+        *state = AgentState::Idle;
+        let _ = self.state_tx.send(AgentState::Idle);
+        drop(state);
+        self.broadcast_snapshot().await;
+        self.idle_notify.notify_waiters();
+    }
+
     /// Build a [`RunRequest`], start the loop, wait for the result, then
     /// transition back to Idle.
     async fn run_loop(&self, initial_messages: Vec<ModelMessage>) -> Result<RunResult, RociError> {
@@ -429,8 +607,11 @@ impl AgentRuntime {
 
         let intercepting_sink = self.build_intercepting_sink();
 
-        let mut request = RunRequest::new(self.config.model.clone(), initial_messages)
-            .with_tools(self.config.tools.clone())
+        let model = self.model.lock().await.clone();
+        let tools = self.tools.lock().await.clone();
+
+        let mut request = RunRequest::new(model, initial_messages)
+            .with_tools(tools)
             .with_steering_messages(steering_fn)
             .with_follow_up_messages(follow_up_fn)
             .with_agent_event_sink(intercepting_sink);
@@ -439,6 +620,9 @@ impl AgentRuntime {
 
         if let Some(ref transform) = self.config.transform_context {
             request = request.with_transform_context(transform.clone());
+        }
+        if let Some(ref convert) = self.config.convert_to_llm {
+            request = request.with_convert_to_llm(convert.clone());
         }
         if let Some(ref id) = self.config.session_id {
             request = request.with_session_id(id.clone());
@@ -535,6 +719,7 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{AgentTool, AgentToolParameters};
 
     fn test_config() -> RociConfig {
         RociConfig::new()
@@ -548,6 +733,7 @@ mod tests {
             tools: Vec::new(),
             settings: GenerationSettings::default(),
             transform_context: None,
+            convert_to_llm: None,
             event_sink: None,
             session_id: None,
             steering_mode: QueueDrainMode::All,
@@ -556,6 +742,15 @@ mod tests {
             max_retry_delay_ms: None,
             get_api_key: None,
         }
+    }
+
+    fn dummy_tool(name: &str) -> Arc<dyn Tool> {
+        Arc::new(AgentTool::new(
+            name,
+            "test tool",
+            AgentToolParameters::empty(),
+            |_args, _ctx| async move { Ok(serde_json::json!({ "ok": true })) },
+        ))
     }
 
     #[tokio::test]
@@ -624,6 +819,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_system_prompt_rejects_when_running() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+
+        *agent.state.lock().await = AgentState::Running;
+
+        let err = agent.set_system_prompt("new prompt").await.unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn set_model_rejects_when_running() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        *agent.state.lock().await = AgentState::Running;
+
+        let model: LanguageModel = "openai:gpt-4o-mini".parse().unwrap();
+        let err = agent.set_model(model).await.unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn set_model_replaces_runtime_model_when_idle() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        let model: LanguageModel = "openai:gpt-4o-mini".parse().unwrap();
+
+        agent.set_model(model.clone()).await.unwrap();
+        assert_eq!(*agent.model.lock().await, model);
+    }
+
+    #[tokio::test]
+    async fn set_and_clear_system_prompt_work_when_idle() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+
+        agent
+            .set_system_prompt("use concise replies")
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.system_prompt.lock().await.clone(),
+            Some("use concise replies".into())
+        );
+
+        agent.clear_system_prompt().await.unwrap();
+        assert_eq!(agent.system_prompt.lock().await.clone(), None);
+    }
+
+    #[tokio::test]
+    async fn replace_messages_rejects_when_not_idle() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        *agent.state.lock().await = AgentState::Aborting;
+
+        let err = agent
+            .replace_messages(vec![ModelMessage::user("replacement")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn replace_messages_updates_snapshot_and_history() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        let mut rx = agent.watch_snapshot();
+
+        agent
+            .replace_messages(vec![
+                ModelMessage::system("system"),
+                ModelMessage::user("hello"),
+                ModelMessage::assistant("response"),
+            ])
+            .await
+            .unwrap();
+
+        rx.changed().await.unwrap();
+        assert_eq!(agent.messages().await.len(), 3);
+        assert_eq!(rx.borrow().message_count, 3);
+    }
+
+    #[tokio::test]
+    async fn set_tools_rejects_when_running() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        *agent.state.lock().await = AgentState::Running;
+
+        let err = agent.set_tools(vec![dummy_tool("t1")]).await.unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn set_tools_replaces_runtime_tool_registry() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+
+        agent
+            .set_tools(vec![dummy_tool("t1"), dummy_tool("t2")])
+            .await
+            .unwrap();
+
+        let names: Vec<String> = agent
+            .tools
+            .lock()
+            .await
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["t1".to_string(), "t2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn clear_queue_apis_and_has_queued_messages_behave_consistently() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        assert!(!agent.has_queued_messages().await);
+
+        agent.steer("s1").await;
+        assert!(agent.has_queued_messages().await);
+        assert_eq!(agent.steering_queue.lock().await.len(), 1);
+        assert_eq!(agent.follow_up_queue.lock().await.len(), 0);
+
+        agent.clear_steering_queue().await;
+        assert!(!agent.has_queued_messages().await);
+        assert!(agent.steering_queue.lock().await.is_empty());
+
+        agent.follow_up("f1").await;
+        agent.follow_up("f2").await;
+        assert!(agent.has_queued_messages().await);
+        assert_eq!(agent.follow_up_queue.lock().await.len(), 2);
+
+        agent.clear_follow_up_queue().await;
+        assert!(!agent.has_queued_messages().await);
+        assert!(agent.follow_up_queue.lock().await.is_empty());
+
+        agent.steer("s2").await;
+        agent.follow_up("f3").await;
+        assert!(agent.has_queued_messages().await);
+
+        agent.clear_all_queues().await;
+        assert!(!agent.has_queued_messages().await);
+        assert!(agent.steering_queue.lock().await.is_empty());
+        assert!(agent.follow_up_queue.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clearing_queues_restores_continue_without_input_assistant_guard() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        agent
+            .messages
+            .lock()
+            .await
+            .push(ModelMessage::assistant("done"));
+        agent.steer("queued steer").await;
+
+        assert!(agent.has_queued_messages().await);
+        agent.clear_all_queues().await;
+        assert!(!agent.has_queued_messages().await);
+
+        let err = agent.continue_without_input().await.unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+        assert_eq!(
+            err.to_string(),
+            "Invalid state: Cannot continue from message role: assistant"
+        );
+    }
+
+    #[tokio::test]
     async fn transition_to_running_fails_when_not_idle() {
         let agent = AgentRuntime::new(test_config(), test_agent_config());
 
@@ -646,8 +1001,9 @@ mod tests {
         // the transition_to_running guard works and then manually check message assembly.
         // Directly test the message assembly logic:
         {
+            let system_prompt = agent.system_prompt.lock().await.clone();
             let mut msgs = agent.messages.lock().await;
-            if let Some(ref sys) = agent.config.system_prompt {
+            if let Some(ref sys) = system_prompt {
                 if msgs.is_empty() {
                     msgs.push(ModelMessage::system(sys.clone()));
                 }
@@ -671,6 +1027,47 @@ mod tests {
 
         let err = agent.continue_run("more").await.unwrap_err();
         assert!(matches!(err, RociError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn continue_without_input_rejects_when_running() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+
+        *agent.state.lock().await = AgentState::Running;
+
+        let err = agent.continue_without_input().await.unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn continue_without_input_rejects_when_history_is_empty() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+
+        let err = agent.continue_without_input().await.unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+        assert_eq!(
+            err.to_string(),
+            "Invalid state: No messages to continue from"
+        );
+        assert_eq!(agent.state().await, AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn continue_without_input_rejects_from_assistant_without_queued_messages() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        agent
+            .messages
+            .lock()
+            .await
+            .push(ModelMessage::assistant("done"));
+
+        let err = agent.continue_without_input().await.unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+        assert_eq!(
+            err.to_string(),
+            "Invalid state: Cannot continue from message role: assistant"
+        );
+        assert_eq!(agent.state().await, AgentState::Idle);
     }
 
     #[tokio::test]
@@ -828,6 +1225,16 @@ mod tests {
         *agent.state.lock().await = AgentState::Aborting;
 
         let err = agent.continue_run("more input").await.unwrap_err();
+        assert!(matches!(err, RociError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn continue_without_input_rejects_during_aborting() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+
+        *agent.state.lock().await = AgentState::Aborting;
+
+        let err = agent.continue_without_input().await.unwrap_err();
         assert!(matches!(err, RociError::InvalidState(_)));
     }
 

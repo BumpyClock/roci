@@ -46,7 +46,8 @@ impl Default for RociConfig {
 /// Map provider names used in `get_api_key` to token store keys used by `roci auth login`.
 fn provider_to_token_store_key(provider: &str) -> Option<&'static str> {
     match provider {
-        "openai" => Some("openai-codex"),
+        "codex" => Some("openai-codex"),
+        "openai-codex" => Some("openai-codex"),
         "anthropic" => Some("claude-code"),
         "github-copilot" => Some("github-copilot"),
         _ => None,
@@ -82,6 +83,8 @@ impl RociConfig {
 
         let env_mappings = [
             ("OPENAI_API_KEY", "openai"),
+            ("OPENAI_CODEX_TOKEN", "openai-codex"),
+            ("CHATGPT_TOKEN", "openai-codex"),
             ("OPENAI_COMPAT_API_KEY", "openai-compatible"),
             ("ANTHROPIC_API_KEY", "anthropic"),
             ("GOOGLE_API_KEY", "google"),
@@ -104,6 +107,8 @@ impl RociConfig {
         // Base URL overrides
         let url_mappings = [
             ("OPENAI_BASE_URL", "openai"),
+            ("OPENAI_CODEX_BASE_URL", "openai-codex"),
+            ("CHATGPT_BASE_URL", "openai-codex"),
             ("OPENAI_COMPAT_BASE_URL", "openai-compatible"),
             ("ANTHROPIC_BASE_URL", "anthropic"),
             ("OLLAMA_BASE_URL", "ollama"),
@@ -211,7 +216,19 @@ mod tests {
     }
 
     #[test]
-    fn get_api_key_falls_back_to_token_store() {
+    fn openai_does_not_fall_back_to_codex_token_store() {
+        let dir = TempDir::new().unwrap();
+        let store = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
+        let token = make_token("oauth-access-token", None);
+        store.save("openai-codex", "default", &token).unwrap();
+
+        let config = config_with_temp_store(dir.path());
+
+        assert_eq!(config.get_api_key("openai"), None);
+    }
+
+    #[test]
+    fn codex_falls_back_to_token_store() {
         let dir = TempDir::new().unwrap();
         let store = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
         let token = make_token("oauth-access-token", None);
@@ -220,7 +237,7 @@ mod tests {
         let config = config_with_temp_store(dir.path());
 
         assert_eq!(
-            config.get_api_key("openai"),
+            config.get_api_key("codex"),
             Some("oauth-access-token".to_string()),
         );
     }
@@ -242,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_token_in_store_returns_none() {
+    fn expired_codex_token_in_store_returns_none() {
         let dir = TempDir::new().unwrap();
         let store = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
         let expired = Utc::now() - Duration::hours(1);
@@ -251,11 +268,11 @@ mod tests {
 
         let config = config_with_temp_store(dir.path());
 
-        assert_eq!(config.get_api_key("openai"), None);
+        assert_eq!(config.get_api_key("codex"), None);
     }
 
     #[test]
-    fn non_expired_token_in_store_is_returned() {
+    fn non_expired_codex_token_in_store_is_returned() {
         let dir = TempDir::new().unwrap();
         let store = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
         let future = Utc::now() + Duration::hours(1);
@@ -264,14 +281,11 @@ mod tests {
 
         let config = config_with_temp_store(dir.path());
 
-        assert_eq!(
-            config.get_api_key("openai"),
-            Some("fresh-token".to_string()),
-        );
+        assert_eq!(config.get_api_key("codex"), Some("fresh-token".to_string()),);
     }
 
     #[test]
-    fn has_credentials_checks_token_store() {
+    fn has_credentials_checks_codex_token_store() {
         let dir = TempDir::new().unwrap();
         let store = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
         let token = make_token("token-for-creds-check", None);
@@ -279,7 +293,7 @@ mod tests {
 
         let config = config_with_temp_store(dir.path());
 
-        assert!(config.has_credentials("openai"));
+        assert!(config.has_credentials("codex"));
     }
 
     #[test]

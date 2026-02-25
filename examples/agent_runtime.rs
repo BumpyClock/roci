@@ -71,6 +71,7 @@ async fn main() {
         tools: vec![echo_tool],
         settings: GenerationSettings::default(),
         transform_context: None,
+        convert_to_llm: None,
         event_sink: Some(event_sink),
         session_id: None,
         steering_mode: QueueDrainMode::All,

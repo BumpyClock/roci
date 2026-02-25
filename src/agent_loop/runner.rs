@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
+use crate::agent::message::AgentMessage;
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
@@ -53,6 +54,15 @@ pub type TransformContextFn = Arc<
         + Sync,
 >;
 
+/// Hook to convert/filter agent-level messages into provider-facing LLM messages.
+///
+/// This runs before `transform_context` and provider sanitization.
+pub type ConvertToLlmFn = Arc<
+    dyn Fn(Vec<AgentMessage>) -> Pin<Box<dyn Future<Output = Vec<ModelMessage>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Sink for high-level AgentEvent emission (separate from RunEvent).
 pub type AgentEventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
@@ -81,6 +91,8 @@ pub struct RunRequest {
     pub get_follow_up_messages: Option<FollowUpMessagesFn>,
     /// Pre-LLM context transformation hook.
     pub transform_context: Option<TransformContextFn>,
+    /// Optional conversion/filter hook for agent-level messages.
+    pub convert_to_llm: Option<ConvertToLlmFn>,
     /// AgentEvent sink (separate from RunEvent sink).
     pub agent_event_sink: Option<AgentEventSink>,
     /// Optional session ID for provider-side prompt caching.
@@ -108,6 +120,7 @@ impl RunRequest {
             get_steering_messages: None,
             get_follow_up_messages: None,
             transform_context: None,
+            convert_to_llm: None,
             agent_event_sink: None,
             session_id: None,
             transport: None,
@@ -152,6 +165,11 @@ impl RunRequest {
 
     pub fn with_transform_context(mut self, f: TransformContextFn) -> Self {
         self.transform_context = Some(f);
+        self
+    }
+
+    pub fn with_convert_to_llm(mut self, f: ConvertToLlmFn) -> Self {
+        self.convert_to_llm = Some(f);
         self
     }
 
@@ -522,6 +540,15 @@ impl Runner for LoopRunner {
 
             let mut messages = request.messages.clone();
 
+            if let Err(err) = provider::validate_transport_preference(request.transport.as_deref())
+            {
+                agent_emitter.emit(AgentEvent::AgentEnd {
+                    run_id: request.run_id,
+                });
+                let _ = result_tx.send(emit_failed_result(&emitter, err.to_string(), &messages));
+                return;
+            }
+
             let provider = match provider_factory(&request.model, &config) {
                 Ok(provider) => provider,
                 Err(err) => {
@@ -650,24 +677,32 @@ impl Runner for LoopRunner {
                         }
                     }
 
-                    let provider_messages = if let Some(ref transform) = request.transform_context {
-                        let transformed = transform(messages.clone()).await;
-                        provider::sanitize_messages_for_provider(
-                            &transformed,
-                            provider.provider_name(),
-                        )
+                    let llm_context = if let Some(ref convert) = request.convert_to_llm {
+                        let agent_messages: Vec<AgentMessage> = messages
+                            .iter()
+                            .cloned()
+                            .map(AgentMessage::from_model)
+                            .collect();
+                        convert(agent_messages).await
                     } else {
-                        provider::sanitize_messages_for_provider(
-                            &messages,
-                            provider.provider_name(),
-                        )
+                        messages.clone()
                     };
+                    let transformed = if let Some(ref transform) = request.transform_context {
+                        transform(llm_context).await
+                    } else {
+                        llm_context
+                    };
+                    let provider_messages = provider::sanitize_messages_for_provider(
+                        &transformed,
+                        provider.provider_name(),
+                    );
                     let req = ProviderRequest {
                         messages: provider_messages,
                         settings: request.settings.clone(),
                         tools: tool_defs.clone(),
                         response_format: request.settings.response_format.clone(),
                         session_id: request.session_id.clone(),
+                        transport: request.transport.clone(),
                     };
 
                     let mut stream = loop {
@@ -1340,6 +1375,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{timeout, Duration};
 
+    use crate::agent::message::{convert_to_llm, AgentMessage};
     use crate::agent_loop::RunStatus;
     use crate::models::ModelCapabilities;
     use crate::provider::{ModelProvider, ProviderResponse};
@@ -1351,6 +1387,9 @@ mod tests {
     enum ProviderScenario {
         MissingOptionalFields,
         RepeatedToolFailure,
+        RateLimitedThenComplete,
+        RateLimitedExceedsCap,
+        RateLimitedWithoutRetryHint,
         ParallelSafeBatchThenComplete,
         MutatingBatchThenComplete,
         MixedTextAndParallelBatchThenComplete,
@@ -1487,6 +1526,33 @@ mod tests {
                         reasoning_type: None,
                     }),
                 ],
+                ProviderScenario::RateLimitedThenComplete => {
+                    if call_index == 0 {
+                        return Err(RociError::RateLimited {
+                            retry_after_ms: Some(1),
+                        });
+                    }
+                    vec![Ok(TextStreamDelta {
+                        text: "done".to_string(),
+                        event_type: StreamEventType::TextDelta,
+                        tool_call: None,
+                        finish_reason: None,
+                        usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    })]
+                }
+                ProviderScenario::RateLimitedExceedsCap => {
+                    return Err(RociError::RateLimited {
+                        retry_after_ms: Some(50),
+                    });
+                }
+                ProviderScenario::RateLimitedWithoutRetryHint => {
+                    return Err(RociError::RateLimited {
+                        retry_after_ms: None,
+                    });
+                }
                 ProviderScenario::ParallelSafeBatchThenComplete => {
                     if call_index == 0 {
                         vec![
@@ -2073,6 +2139,162 @@ mod tests {
             .filter(|event| matches!(event.payload, RunEventPayload::ToolResult { .. }))
             .count();
         assert_eq!(tool_results, 2);
+    }
+
+    #[tokio::test]
+    async fn request_transport_is_forwarded_to_provider_request() {
+        let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.transport = Some(provider::TRANSPORT_PROXY.to_string());
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let requests = requests.lock().expect("request lock");
+        assert!(
+            !requests.is_empty(),
+            "provider should receive at least one request"
+        );
+        assert_eq!(
+            requests[0].transport.as_deref(),
+            Some(provider::TRANSPORT_PROXY)
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_request_transport_is_rejected_before_provider_call() {
+        let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.transport = Some("satellite".to_string());
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsupported provider transport 'satellite'"),
+            "expected unsupported transport error, got: {:?}",
+            result.error
+        );
+
+        let requests = requests.lock().expect("request lock");
+        assert!(
+            requests.is_empty(),
+            "provider should not be called for unsupported transports"
+        );
+    }
+
+    #[tokio::test]
+    async fn convert_to_llm_hook_can_append_and_filter_custom_messages() {
+        let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.convert_to_llm = Some(Arc::new(|mut messages: Vec<AgentMessage>| {
+            Box::pin(async move {
+                messages.push(AgentMessage::custom(
+                    "artifact",
+                    serde_json::json!({ "hidden": true }),
+                ));
+                messages.push(AgentMessage::user("hook-added"));
+                convert_to_llm(&messages)
+            })
+        }));
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let requests = requests.lock().expect("request lock");
+        assert!(!requests.is_empty(), "provider should receive one request");
+        let first = &requests[0].messages;
+        assert!(
+            first.iter().any(|m| m.text() == "hook-added"),
+            "conversion hook should be able to append LLM-visible messages"
+        );
+        assert!(
+            first.iter().all(|m| matches!(
+                m.role,
+                crate::types::Role::System
+                    | crate::types::Role::User
+                    | crate::types::Role::Assistant
+                    | crate::types::Role::Tool
+            )),
+            "provider messages must remain LLM message roles after conversion"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_stream_retries_within_max_delay_cap() {
+        let (runner, requests) = test_runner(ProviderScenario::RateLimitedThenComplete);
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("retry")]);
+        request.max_retry_delay_ms = Some(10);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_stream_fails_when_retry_delay_exceeds_cap() {
+        let (runner, requests) = test_runner(ProviderScenario::RateLimitedExceedsCap);
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("retry")]);
+        request.max_retry_delay_ms = Some(10);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exceeds max_retry_delay_ms"),
+            "expected max retry delay failure, got: {:?}",
+            result.error
+        );
+
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_without_retry_hint_fails_immediately() {
+        let (runner, requests) = test_runner(ProviderScenario::RateLimitedWithoutRetryHint);
+        let request = RunRequest::new(test_model(), vec![ModelMessage::user("retry")]);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("without retry_after hint"),
+            "expected missing retry hint failure, got: {:?}",
+            result.error
+        );
+
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]

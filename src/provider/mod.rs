@@ -55,6 +55,10 @@ use crate::types::{
 
 pub use sanitize::sanitize_messages_for_provider;
 
+pub const TRANSPORT_DIRECT: &str = "direct";
+pub const TRANSPORT_PROXY: &str = "proxy";
+pub const SUPPORTED_TRANSPORTS: [&str; 2] = [TRANSPORT_DIRECT, TRANSPORT_PROXY];
+
 /// A request sent to a model provider.
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {
@@ -64,6 +68,23 @@ pub struct ProviderRequest {
     pub response_format: Option<crate::types::generation::ResponseFormat>,
     /// Optional session ID for provider-side prompt caching and session affinity.
     pub session_id: Option<String>,
+    /// Optional transport preference supplied by runtime/loop orchestration.
+    ///
+    /// Supported values are `"direct"` and `"proxy"`.
+    /// Unsupported values are rejected by the runner before provider execution.
+    pub transport: Option<String>,
+}
+
+pub fn validate_transport_preference(transport: Option<&str>) -> Result<(), RociError> {
+    if let Some(value) = transport {
+        if !SUPPORTED_TRANSPORTS.contains(&value) {
+            return Err(RociError::InvalidArgument(format!(
+                "unsupported provider transport '{value}' (supported: {})",
+                SUPPORTED_TRANSPORTS.join(", ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Tool definition sent to the provider API.
@@ -142,7 +163,6 @@ pub fn create_provider(
                 .ok_or_else(|| RociError::Authentication("Missing OPENAI_CODEX_TOKEN".into()))?;
             let base_url = config
                 .get_base_url("openai-codex")
-                .or_else(|| config.get_base_url("openai"))
                 .or_else(|| Some("https://chatgpt.com/backend-api/codex".to_string()));
             let account_id = config.get_account_id("openai-codex");
             if m.uses_responses_api() {

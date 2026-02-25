@@ -23,13 +23,15 @@ impl ModelSelector {
             #[cfg(feature = "openai")]
             "openai" => {
                 use super::openai::OpenAiModel;
+                // Keep openai:* on the OpenAI provider path. Do not infer Codex from model-id substrings.
                 let m = OpenAiModel::from_str(model_id)
                     .unwrap_or(OpenAiModel::Custom(model_id.to_string()));
                 Ok(LanguageModel::OpenAi(m))
             }
             #[cfg(feature = "openai")]
-            "openai-codex" | "openai_codex" => {
+            "openai-codex" | "openai_codex" | "codex" => {
                 use super::openai::OpenAiModel;
+                // Codex routing is explicit and provider-alias based.
                 let m = OpenAiModel::from_str(model_id)
                     .unwrap_or(OpenAiModel::Custom(model_id.to_string()));
                 Ok(LanguageModel::OpenAiCodex(m))
@@ -128,6 +130,34 @@ mod tests {
     fn parse_openai_custom_model() {
         let model = ModelSelector::parse("openai:ft:gpt-4o:my-org").unwrap();
         assert_eq!(model.model_id(), "ft:gpt-4o:my-org");
+        assert_eq!(model.provider_name(), "openai");
+    }
+
+    #[test]
+    fn parse_openai_codex_like_model_stays_openai() {
+        let model = ModelSelector::parse("openai:gpt-5.3-codex-spark").unwrap();
+        assert!(matches!(model, LanguageModel::OpenAi(_)));
+        assert_eq!(model.model_id(), "gpt-5.3-codex-spark");
+    }
+
+    #[test]
+    fn parse_openai_ft_codex_like_model_stays_openai() {
+        let model = ModelSelector::parse("openai:ft:gpt-5.3-codex-spark:my-org").unwrap();
+        assert!(matches!(model, LanguageModel::OpenAi(_)));
+        assert_eq!(model.model_id(), "ft:gpt-5.3-codex-spark:my-org");
+    }
+
+    #[test]
+    fn parse_codex_alias_models_route_to_openai_codex() {
+        for provider_alias in ["openai-codex", "openai_codex", "codex"] {
+            let model =
+                ModelSelector::parse(&format!("{provider_alias}:gpt-5.3-codex-spark")).unwrap();
+            assert!(
+                matches!(model, LanguageModel::OpenAiCodex(_)),
+                "expected OpenAiCodex for alias {provider_alias}, got {model:?}"
+            );
+            assert_eq!(model.model_id(), "gpt-5.3-codex-spark");
+        }
     }
 
     #[test]
