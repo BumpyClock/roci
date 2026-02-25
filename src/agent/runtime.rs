@@ -75,6 +75,16 @@ pub type GetApiKeyFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, RociError>> + Send>> + Send + Sync>;
 
 /// Configuration for creating an [`AgentRuntime`].
+///
+/// # API key resolution
+///
+/// By default, the agent resolves API keys automatically through the
+/// [`RociConfig`] passed to [`AgentRuntime::new`]. `RociConfig` checks
+/// (in order): environment variables → `credentials.json` → OAuth token
+/// store (from `roci auth login`).
+///
+/// Set [`get_api_key`](Self::get_api_key) only when you need per-request
+/// dynamic keys (e.g., token rotation or multi-tenant key injection).
 pub struct AgentConfig {
     /// The language model to use for generation.
     pub model: LanguageModel,
@@ -94,6 +104,12 @@ pub struct AgentConfig {
     ///
     /// When set, called at the start of each run. The resolved key is
     /// inserted into [`RunRequest::metadata`] under `"api_key"`.
+    ///
+    /// When `None` (the default), the agent resolves keys automatically
+    /// through [`RociConfig`] which checks: environment variables →
+    /// `credentials.json` → OAuth token store (from `roci auth login`).
+    /// No explicit key configuration is needed if any of those sources
+    /// has a valid credential for the provider.
     pub get_api_key: Option<GetApiKeyFn>,
 }
 
@@ -393,6 +409,10 @@ impl AgentRuntime {
             let key = get_key().await?;
             request.metadata.insert("api_key".to_string(), key);
         }
+        // When no callback is set, RociConfig.get_api_key() is called by
+        // create_provider() inside the LoopRunner. That method already
+        // checks env vars → credentials.json → OAuth token store, so no
+        // extra wiring is needed here for the default case.
 
         let handle = self.runner.start(request).await?;
 
@@ -891,6 +911,21 @@ mod tests {
             result.unwrap_err(),
             RociError::Authentication(msg) if msg == "Token refresh failed"
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_runtime_uses_config_api_key_by_default() {
+        let roci_config = RociConfig::new().with_token_store(None);
+        roci_config.set_api_key("openai", "sk-from-config".to_string());
+
+        let agent_config = AgentConfig {
+            get_api_key: None,
+            ..test_agent_config()
+        };
+        let agent = AgentRuntime::new(roci_config, agent_config);
+
+        assert!(agent.config.get_api_key.is_none());
+        assert_eq!(agent.state().await, AgentState::Idle);
     }
 
     #[tokio::test]

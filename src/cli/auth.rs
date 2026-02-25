@@ -103,16 +103,31 @@ async fn login_claude(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth = ClaudeCodeAuth::new(store);
 
+    // Try importing existing credentials first (zero-friction path).
     if let Ok(Some(_token)) = auth.import_cli_credentials(None) {
         println!("✅ Imported credentials from ~/.claude/.credentials.json");
         return Ok(());
     }
 
-    println!("🔗 Claude authentication requires the Claude CLI");
-    println!("   1. Install claude: https://docs.anthropic.com/en/docs/claude-cli");
-    println!("   2. Run: claude auth login");
-    println!("   3. Re-run: roci auth login claude");
+    // Fall back to interactive PKCE authorization-code flow.
+    let session = auth.start_auth()?;
+    println!("🔗 Visit: {}", session.authorize_url);
+    println!("📋 After authorizing, paste the response code below:");
+    print!("> ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
 
+    let mut response = String::new();
+    std::io::stdin().read_line(&mut response)?;
+    let response = response.trim();
+
+    if response.is_empty() {
+        eprintln!("❌ No code provided.");
+        std::process::exit(1);
+    }
+
+    auth.exchange_code(&session, response).await?;
+    println!("✅ Claude login successful!");
     Ok(())
 }
 
