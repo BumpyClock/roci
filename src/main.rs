@@ -76,7 +76,12 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             RunEventPayload::ToolResult { result } => {
                 let output = result.result.to_string();
                 let truncated = if output.len() > 200 {
-                    format!("{}...", &output[..200])
+                    // Find a valid UTF-8 char boundary at or before 200
+                    let mut end = 200;
+                    while end > 0 && !output.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &output[..end])
                 } else {
                     output
                 };

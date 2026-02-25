@@ -36,11 +36,15 @@ pub type CompactionHandler =
 /// Hook to redact/transform tool results before persistence or context assembly.
 pub type ToolResultPersistHandler = Arc<dyn Fn(AgentToolResult) -> AgentToolResult + Send + Sync>;
 
+/// Async callback to retrieve messages between loop phases.
+pub type MessageBatchFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<ModelMessage>> + Send>> + Send + Sync>;
+
 /// Callback to retrieve steering messages between tool batches.
-pub type SteeringMessagesFn = Arc<dyn Fn() -> Vec<ModelMessage> + Send + Sync>;
+pub type SteeringMessagesFn = MessageBatchFn;
 
 /// Callback to retrieve follow-up messages after the inner loop completes.
-pub type FollowUpMessagesFn = Arc<dyn Fn() -> Vec<ModelMessage> + Send + Sync>;
+pub type FollowUpMessagesFn = MessageBatchFn;
 
 /// Hook to transform the message context before each LLM call.
 pub type TransformContextFn = Arc<
@@ -81,6 +85,11 @@ pub struct RunRequest {
     pub agent_event_sink: Option<AgentEventSink>,
     /// Optional session ID for provider-side prompt caching.
     pub session_id: Option<String>,
+    /// Optional provider transport preference.
+    pub transport: Option<String>,
+    /// Optional cap for server-requested retry delays in milliseconds.
+    /// `Some(0)` disables the cap.
+    pub max_retry_delay_ms: Option<u64>,
 }
 
 impl RunRequest {
@@ -101,6 +110,8 @@ impl RunRequest {
             transform_context: None,
             agent_event_sink: None,
             session_id: None,
+            transport: None,
+            max_retry_delay_ms: None,
         }
     }
 
@@ -151,6 +162,16 @@ impl RunRequest {
 
     pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
         self.session_id = Some(id.into());
+        self
+    }
+
+    pub fn with_transport(mut self, transport: impl Into<String>) -> Self {
+        self.transport = Some(transport.into());
+        self
+    }
+
+    pub fn with_max_retry_delay_ms(mut self, max_retry_delay_ms: u64) -> Self {
+        self.max_retry_delay_ms = Some(max_retry_delay_ms);
         self
     }
 }
@@ -618,7 +639,7 @@ impl Runner for LoopRunner {
 
                     // Inject steering messages before LLM call
                     if let Some(ref get_steering) = request.get_steering_messages {
-                        for msg in get_steering() {
+                        for msg in get_steering().await {
                             messages.push(msg);
                         }
                     }
@@ -649,18 +670,65 @@ impl Runner for LoopRunner {
                         session_id: request.session_id.clone(),
                     };
 
-                    let mut stream = match provider.stream_text(&req).await {
-                        Ok(stream) => stream,
-                        Err(err) => {
-                            agent_emitter.emit(AgentEvent::AgentEnd {
-                                run_id: request.run_id,
-                            });
-                            let _ = result_tx.send(emit_failed_result(
-                                &emitter,
-                                err.to_string(),
-                                &messages,
-                            ));
-                            return;
+                    let mut stream = loop {
+                        match provider.stream_text(&req).await {
+                            Ok(stream) => break stream,
+                            Err(RociError::RateLimited { retry_after_ms }) => {
+                                let retry_after_ms = retry_after_ms.unwrap_or(0);
+                                if retry_after_ms == 0 {
+                                    agent_emitter.emit(AgentEvent::AgentEnd {
+                                        run_id: request.run_id,
+                                    });
+                                    let _ = result_tx.send(emit_failed_result(
+                                        &emitter,
+                                        "rate limited without retry_after hint",
+                                        &messages,
+                                    ));
+                                    return;
+                                }
+                                if let Some(max_retry_delay_ms) = request.max_retry_delay_ms {
+                                    if max_retry_delay_ms > 0 && retry_after_ms > max_retry_delay_ms
+                                    {
+                                        agent_emitter.emit(AgentEvent::AgentEnd {
+                                            run_id: request.run_id,
+                                        });
+                                        let _ = result_tx.send(emit_failed_result(
+                                            &emitter,
+                                            format!(
+                                                "rate limit retry delay {retry_after_ms}ms exceeds max_retry_delay_ms={max_retry_delay_ms}"
+                                            ),
+                                            &messages,
+                                        ));
+                                        return;
+                                    }
+                                }
+                                tokio::select! {
+                                    _ = &mut abort_rx => {
+                                        emitter.emit(
+                                            RunEventStream::Lifecycle,
+                                            RunEventPayload::Lifecycle {
+                                                state: RunLifecycle::Canceled,
+                                            },
+                                        );
+                                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                        let _ = result_tx
+                                            .send(RunResult::canceled_with_messages(messages.clone()));
+                                        return;
+                                    }
+                                    _ = time::sleep(Duration::from_millis(retry_after_ms)) => {}
+                                }
+                            }
+                            Err(err) => {
+                                agent_emitter.emit(AgentEvent::AgentEnd {
+                                    run_id: request.run_id,
+                                });
+                                let _ = result_tx.send(emit_failed_result(
+                                    &emitter,
+                                    err.to_string(),
+                                    &messages,
+                                ));
+                                return;
+                            }
                         }
                     };
 
@@ -887,7 +955,7 @@ impl Runner for LoopRunner {
 
                             // Check for steering after parallel batch flush
                             if let Some(ref get_steering) = request.get_steering_messages {
-                                let steering = get_steering();
+                                let steering = get_steering().await;
                                 if !steering.is_empty() {
                                     for remaining_call in &tool_calls[call_idx + 1..] {
                                         messages.push(ModelMessage::tool_result(
@@ -923,7 +991,7 @@ impl Runner for LoopRunner {
 
                         // Check for steering after sequential tool execution
                         if let Some(ref get_steering) = request.get_steering_messages {
-                            let steering = get_steering();
+                            let steering = get_steering().await;
                             if !steering.is_empty() {
                                 for remaining_call in &tool_calls[call_idx + 1..] {
                                     messages.push(ModelMessage::tool_result(
@@ -999,7 +1067,7 @@ impl Runner for LoopRunner {
 
                 // Check for follow-up messages after the inner loop completes
                 if let Some(ref get_follow_ups) = request.get_follow_up_messages {
-                    let follow_ups = get_follow_ups();
+                    let follow_ups = get_follow_ups().await;
                     if !follow_ups.is_empty() {
                         for msg in follow_ups {
                             messages.push(msg);

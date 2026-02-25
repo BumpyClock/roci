@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use roci::agent::runtime::AgentSnapshot;
-use roci::agent::{AgentConfig, AgentRuntime, AgentState};
+use roci::agent::{AgentConfig, AgentRuntime, AgentState, QueueDrainMode};
 use roci::agent_loop::AgentEvent;
 use roci::config::RociConfig;
 use roci::tools::{AgentTool, AgentToolParameters};
@@ -73,6 +73,10 @@ async fn main() {
         transform_context: None,
         event_sink: Some(event_sink),
         session_id: None,
+        steering_mode: QueueDrainMode::All,
+        follow_up_mode: QueueDrainMode::All,
+        transport: None,
+        max_retry_delay_ms: None,
         get_api_key: None,
     };
 

@@ -272,7 +272,7 @@ pub fn grep_tool() -> Arc<dyn Tool> {
             let path = args_val.get_str_opt("path").unwrap_or(".");
 
             let output = tokio::process::Command::new("grep")
-                .args(["-rn", pattern, path])
+                .args(["-rn", "--", pattern, path])
                 .output()
                 .await
                 .map_err(|e| RociError::ToolExecution {
@@ -763,6 +763,27 @@ mod tests {
         assert!(result.is_ok());
         let output = result.unwrap()["output"].as_str().unwrap().to_string();
         assert!(output.contains("findme"));
+    }
+
+    #[tokio::test]
+    async fn grep_treats_dash_prefixed_pattern_as_pattern_not_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dash.txt"), "-foo\nbar\n").unwrap();
+
+        let tool = grep_tool();
+        let result = tool
+            .execute(
+                &args(serde_json::json!({
+                    "pattern": "-foo",
+                    "path": dir.path().to_str().unwrap(),
+                })),
+                &default_ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["exit_code"], 0);
+        assert!(result["output"].as_str().unwrap().contains("-foo"));
     }
 
     // ── tool metadata ──────────────────────────────────────────────────

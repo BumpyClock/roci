@@ -37,6 +37,28 @@ pub enum AgentState {
     Aborting,
 }
 
+/// Queue drain behavior for steering/follow-up messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueDrainMode {
+    /// Drain all queued messages at once.
+    All,
+    /// Drain at most one message per turn/phase.
+    OneAtATime,
+}
+
+fn drain_queue(queue: &mut Vec<ModelMessage>, mode: QueueDrainMode) -> Vec<ModelMessage> {
+    match mode {
+        QueueDrainMode::All => std::mem::take(queue),
+        QueueDrainMode::OneAtATime => {
+            if queue.is_empty() {
+                Vec::new()
+            } else {
+                vec![queue.remove(0)]
+            }
+        }
+    }
+}
+
 /// Point-in-time snapshot of agent observable state.
 ///
 /// Captures all externally observable dimensions of an [`AgentRuntime`] at a
@@ -99,6 +121,15 @@ pub struct AgentConfig {
     pub event_sink: Option<AgentEventSink>,
     /// Optional session ID for provider-side prompt caching.
     pub session_id: Option<String>,
+    /// Drain mode for steering queue retrieval.
+    pub steering_mode: QueueDrainMode,
+    /// Drain mode for follow-up queue retrieval.
+    pub follow_up_mode: QueueDrainMode,
+    /// Optional provider transport preference.
+    pub transport: Option<String>,
+    /// Optional cap for server-requested retry delays in milliseconds.
+    /// `Some(0)` disables the cap.
+    pub max_retry_delay_ms: Option<u64>,
     /// Optional async callback to resolve an API key per run.
     ///
     /// When set, called at the start of each run. The resolved key is
@@ -374,23 +405,25 @@ impl AgentRuntime {
 
         let steering_queue = self.steering_queue.clone();
         let follow_up_queue = self.follow_up_queue.clone();
+        let steering_mode = self.config.steering_mode;
+        let follow_up_mode = self.config.follow_up_mode;
 
         let steering_fn: SteeringMessagesFn = Arc::new(move || {
-            if let Ok(mut queue) = steering_queue.try_lock() {
-                std::mem::take(&mut *queue)
-            } else {
-                Vec::new()
-            }
+            let queue = steering_queue.clone();
+            Box::pin(async move {
+                let mut queue = queue.lock().await;
+                drain_queue(&mut queue, steering_mode)
+            })
         });
 
         let follow_up_fn: FollowUpMessagesFn = {
             let queue = follow_up_queue.clone();
             Arc::new(move || {
-                if let Ok(mut q) = queue.try_lock() {
-                    std::mem::take(&mut *q)
-                } else {
-                    Vec::new()
-                }
+                let queue = queue.clone();
+                Box::pin(async move {
+                    let mut queue = queue.lock().await;
+                    drain_queue(&mut queue, follow_up_mode)
+                })
             })
         };
 
@@ -409,6 +442,12 @@ impl AgentRuntime {
         }
         if let Some(ref id) = self.config.session_id {
             request = request.with_session_id(id.clone());
+        }
+        if let Some(ref transport) = self.config.transport {
+            request = request.with_transport(transport.clone());
+        }
+        if let Some(max_retry_delay_ms) = self.config.max_retry_delay_ms {
+            request = request.with_max_retry_delay_ms(max_retry_delay_ms);
         }
 
         let run_result = async {
@@ -511,6 +550,10 @@ mod tests {
             transform_context: None,
             event_sink: None,
             session_id: None,
+            steering_mode: QueueDrainMode::All,
+            follow_up_mode: QueueDrainMode::All,
+            transport: None,
+            max_retry_delay_ms: None,
             get_api_key: None,
         }
     }
@@ -677,6 +720,29 @@ mod tests {
         let s3 = s.clone(); // Clone
         assert_eq!(s, s2);
         assert_eq!(s2, s3);
+    }
+
+    #[test]
+    fn queue_drain_mode_all_drains_everything() {
+        let mut queue = vec![ModelMessage::user("one"), ModelMessage::user("two")];
+        let drained = drain_queue(&mut queue, QueueDrainMode::All);
+        assert_eq!(drained.len(), 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn queue_drain_mode_one_at_a_time_drains_incrementally() {
+        let mut queue = vec![
+            ModelMessage::user("one"),
+            ModelMessage::user("two"),
+            ModelMessage::user("three"),
+        ];
+        let first = drain_queue(&mut queue, QueueDrainMode::OneAtATime);
+        assert_eq!(first.len(), 1);
+        assert_eq!(queue.len(), 2);
+        let second = drain_queue(&mut queue, QueueDrainMode::OneAtATime);
+        assert_eq!(second.len(), 1);
+        assert_eq!(queue.len(), 1);
     }
 
     // -- Lifecycle control tests --

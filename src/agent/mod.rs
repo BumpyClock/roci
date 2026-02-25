@@ -9,5 +9,7 @@ pub mod session;
 pub use agent::Agent;
 pub use conversation::Conversation;
 pub use message::{convert_to_llm, AgentMessage, AgentMessageExt};
-pub use runtime::{AgentConfig, AgentRuntime, AgentSnapshot, AgentState, GetApiKeyFn};
+pub use runtime::{
+    AgentConfig, AgentRuntime, AgentSnapshot, AgentState, GetApiKeyFn, QueueDrainMode,
+};
 pub use session::AgentSessionManager;
