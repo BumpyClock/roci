@@ -1,6 +1,8 @@
 //! Runner interfaces for the agent loop.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,7 +25,7 @@ use crate::types::{
 use super::approvals::{
     ApprovalDecision, ApprovalHandler, ApprovalKind, ApprovalPolicy, ApprovalRequest,
 };
-use super::events::{RunEvent, RunEventPayload, RunEventStream, RunLifecycle};
+use super::events::{AgentEvent, RunEvent, RunEventPayload, RunEventStream, RunLifecycle};
 use super::types::{RunId, RunResult};
 
 /// Callback used for streaming run events.
@@ -33,6 +35,22 @@ pub type CompactionHandler =
     Arc<dyn Fn(&[ModelMessage]) -> Option<Vec<ModelMessage>> + Send + Sync>;
 /// Hook to redact/transform tool results before persistence or context assembly.
 pub type ToolResultPersistHandler = Arc<dyn Fn(AgentToolResult) -> AgentToolResult + Send + Sync>;
+
+/// Callback to retrieve steering messages between tool batches.
+pub type SteeringMessagesFn = Arc<dyn Fn() -> Vec<ModelMessage> + Send + Sync>;
+
+/// Callback to retrieve follow-up messages after the inner loop completes.
+pub type FollowUpMessagesFn = Arc<dyn Fn() -> Vec<ModelMessage> + Send + Sync>;
+
+/// Hook to transform the message context before each LLM call.
+pub type TransformContextFn = Arc<
+    dyn Fn(Vec<ModelMessage>) -> Pin<Box<dyn Future<Output = Vec<ModelMessage>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Sink for high-level AgentEvent emission (separate from RunEvent).
+pub type AgentEventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub struct RunHooks {
@@ -53,6 +71,16 @@ pub struct RunRequest {
     pub metadata: HashMap<String, String>,
     pub event_sink: Option<RunEventSink>,
     pub hooks: RunHooks,
+    /// Callback to get steering messages (checked between tool batches).
+    pub get_steering_messages: Option<SteeringMessagesFn>,
+    /// Callback to get follow-up messages (checked after inner loop ends).
+    pub get_follow_up_messages: Option<FollowUpMessagesFn>,
+    /// Pre-LLM context transformation hook.
+    pub transform_context: Option<TransformContextFn>,
+    /// AgentEvent sink (separate from RunEvent sink).
+    pub agent_event_sink: Option<AgentEventSink>,
+    /// Optional session ID for provider-side prompt caching.
+    pub session_id: Option<String>,
 }
 
 impl RunRequest {
@@ -68,6 +96,11 @@ impl RunRequest {
             metadata: HashMap::new(),
             event_sink: None,
             hooks: RunHooks::default(),
+            get_steering_messages: None,
+            get_follow_up_messages: None,
+            transform_context: None,
+            agent_event_sink: None,
+            session_id: None,
         }
     }
 
@@ -93,6 +126,31 @@ impl RunRequest {
 
     pub fn with_hooks(mut self, hooks: RunHooks) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    pub fn with_steering_messages(mut self, f: SteeringMessagesFn) -> Self {
+        self.get_steering_messages = Some(f);
+        self
+    }
+
+    pub fn with_follow_up_messages(mut self, f: FollowUpMessagesFn) -> Self {
+        self.get_follow_up_messages = Some(f);
+        self
+    }
+
+    pub fn with_transform_context(mut self, f: TransformContextFn) -> Self {
+        self.transform_context = Some(f);
+        self
+    }
+
+    pub fn with_agent_event_sink(mut self, sink: AgentEventSink) -> Self {
+        self.agent_event_sink = Some(sink);
+        self
+    }
+
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(id.into());
         self
     }
 }
@@ -317,6 +375,18 @@ async fn execute_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -> Age
     let tool = tools.iter().find(|t| t.name() == call.name);
     match tool {
         Some(tool) => {
+            let schema = &tool.parameters().schema;
+            if let Err(validation_error) =
+                crate::tools::validation::validate_arguments(&call.arguments, schema)
+            {
+                return AgentToolResult {
+                    tool_call_id: call.id.clone(),
+                    result: serde_json::json!({
+                        "error": format!("Argument validation failed: {}", validation_error)
+                    }),
+                    is_error: true,
+                };
+            }
             let args = crate::tools::arguments::ToolArguments::new(call.arguments.clone());
             let ctx = crate::tools::tool::ToolExecutionContext {
                 metadata: serde_json::Value::Null,
@@ -403,12 +473,14 @@ impl Runner for LoopRunner {
             }
             let limits = RunnerLimits::from_request(&request);
             let emitter = RunEventEmitter::new(request.run_id, request.event_sink);
+            let agent_emitter = AgentEventEmitter::new(request.agent_event_sink.clone());
             emitter.emit(
                 RunEventStream::Lifecycle,
                 RunEventPayload::Lifecycle {
                     state: RunLifecycle::Started,
                 },
             );
+            agent_emitter.emit(AgentEvent::AgentStart { run_id: request.run_id });
 
             if debug_enabled() {
                 tracing::debug!(
@@ -424,6 +496,7 @@ impl Runner for LoopRunner {
             let provider = match provider_factory(&request.model, &config) {
                 Ok(provider) => provider,
                 Err(err) => {
+                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                     let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
                     return;
                 }
@@ -450,15 +523,21 @@ impl Runner for LoopRunner {
             let mut consecutive_failed_iterations = 0usize;
             let mut max_iterations = limits.max_iterations;
             let mut iteration_extensions_used = 0usize;
+            let mut turn_index = 0usize;
 
-            loop {
+            'outer: loop {
+            'inner: loop {
                 iteration += 1;
+                turn_index += 1;
+                agent_emitter.emit(AgentEvent::TurnStart { run_id: request.run_id, turn_index });
+
                 if iteration > max_iterations {
                     if iteration_extensions_used >= limits.max_iteration_extensions {
                         let reason = format!(
                             "tool loop exceeded max iterations (max_iterations={}, extensions_used={})",
                             max_iterations, iteration_extensions_used
                         );
+                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                         let _ = result_tx.send(emit_failed_result(&emitter, reason));
                         return;
                     }
@@ -496,6 +575,7 @@ impl Runner for LoopRunner {
                                     state: RunLifecycle::Canceled,
                                 },
                             );
+                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                             let _ = result_tx.send(RunResult::canceled());
                             return;
                         }
@@ -503,6 +583,7 @@ impl Runner for LoopRunner {
                             let reason = format!(
                                 "tool loop exceeded max iterations (max_iterations={max_iterations}); continuation declined"
                             );
+                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                             let _ = result_tx.send(emit_failed_result(&emitter, reason));
                             return;
                         }
@@ -513,24 +594,37 @@ impl Runner for LoopRunner {
                     messages.push(message);
                 }
 
+                // Inject steering messages before LLM call
+                if let Some(ref get_steering) = request.get_steering_messages {
+                    for msg in get_steering() {
+                        messages.push(msg);
+                    }
+                }
+
                 if let Some(compact) = request.hooks.compaction.as_ref() {
                     if let Some(compacted) = compact(&messages) {
                         messages = compacted;
                     }
                 }
 
-                let sanitized_messages =
-                    provider::sanitize_messages_for_provider(&messages, provider.provider_name());
+                let provider_messages = if let Some(ref transform) = request.transform_context {
+                    let transformed = transform(messages.clone()).await;
+                    provider::sanitize_messages_for_provider(&transformed, provider.provider_name())
+                } else {
+                    provider::sanitize_messages_for_provider(&messages, provider.provider_name())
+                };
                 let req = ProviderRequest {
-                    messages: sanitized_messages,
+                    messages: provider_messages,
                     settings: request.settings.clone(),
                     tools: tool_defs.clone(),
                     response_format: request.settings.response_format.clone(),
+                    session_id: request.session_id.clone(),
                 };
 
                 let mut stream = match provider.stream_text(&req).await {
                     Ok(stream) => stream,
                     Err(err) => {
+                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                         let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
                         return;
                     }
@@ -552,10 +646,12 @@ impl Runner for LoopRunner {
                                         state: RunLifecycle::Canceled,
                                     },
                                 );
+                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                 let _ = result_tx.send(RunResult::canceled());
                                 return;
                             }
                             _ = sleep.as_mut() => {
+                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                 let _ = result_tx.send(emit_failed_result(&emitter, "stream idle timeout"));
                                 return;
                             }
@@ -573,6 +669,7 @@ impl Runner for LoopRunner {
                                             &mut tool_calls,
                                             &mut stream_done,
                                         ) {
+                                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                             let _ = result_tx.send(emit_failed_result(&emitter, reason));
                                             return;
                                         }
@@ -581,6 +678,7 @@ impl Runner for LoopRunner {
                                         }
                                     }
                                     Err(err) => {
+                                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                         let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
                                         return;
                                     }
@@ -596,6 +694,7 @@ impl Runner for LoopRunner {
                                         state: RunLifecycle::Canceled,
                                     },
                                 );
+                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                 let _ = result_tx.send(RunResult::canceled());
                                 return;
                             }
@@ -610,6 +709,7 @@ impl Runner for LoopRunner {
                                             &mut tool_calls,
                                             &mut stream_done,
                                         ) {
+                                            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                             let _ = result_tx.send(emit_failed_result(&emitter, reason));
                                             return;
                                         }
@@ -618,6 +718,7 @@ impl Runner for LoopRunner {
                                         }
                                     }
                                     Err(err) => {
+                                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                         let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
                                         return;
                                     }
@@ -645,17 +746,12 @@ impl Runner for LoopRunner {
                 }
 
                 if tool_calls.is_empty() {
-                    emitter.emit(
-                        RunEventStream::Lifecycle,
-                        RunEventPayload::Lifecycle {
-                            state: RunLifecycle::Completed,
-                        },
-                    );
-                    let _ = result_tx.send(RunResult::completed());
-                    if debug_enabled() {
-                        tracing::debug!(run_id = %request.run_id, "roci run completed");
-                    }
-                    return;
+                    agent_emitter.emit(AgentEvent::TurnEnd {
+                        run_id: request.run_id,
+                        turn_index,
+                        tool_results: vec![],
+                    });
+                    break 'inner;
                 }
 
                 let mut assistant_content: Vec<ContentPart> = Vec::new();
@@ -675,8 +771,10 @@ impl Runner for LoopRunner {
                 });
 
                 let mut iteration_failures = 0usize;
+                let mut turn_tool_results: Vec<AgentToolResult> = Vec::new();
+                let mut steering_interrupted = false;
                 let mut pending_parallel_calls: Vec<AgentToolCall> = Vec::new();
-                for call in &tool_calls {
+                for (call_idx, call) in tool_calls.iter().enumerate() {
                     let decision = resolve_approval(
                         &emitter,
                         &request.approval_policy,
@@ -692,6 +790,7 @@ impl Runner for LoopRunner {
                                 state: RunLifecycle::Canceled,
                             },
                         );
+                        agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                         let _ = result_tx.send(RunResult::canceled());
                         if debug_enabled() {
                             tracing::debug!(run_id = %request.run_id, "roci run canceled");
@@ -713,6 +812,7 @@ impl Runner for LoopRunner {
                             .drain(..)
                             .zip(parallel_results.into_iter())
                         {
+                            turn_tool_results.push(parallel_result.clone());
                             append_tool_result(
                                 &request.hooks,
                                 &emitter,
@@ -722,6 +822,23 @@ impl Runner for LoopRunner {
                                 &mut messages,
                             );
                         }
+
+                        // Check for steering after parallel batch flush
+                        if let Some(ref get_steering) = request.get_steering_messages {
+                            let steering = get_steering();
+                            if !steering.is_empty() {
+                                for remaining_call in &tool_calls[call_idx + 1..] {
+                                    messages.push(ModelMessage::tool_result(
+                                        remaining_call.id.clone(),
+                                        serde_json::json!({ "error": "Skipped due to steering message" }),
+                                        true,
+                                    ));
+                                }
+                                for msg in steering { messages.push(msg); }
+                                steering_interrupted = true;
+                                break;
+                            }
+                        }
                     }
 
                     let result = if can_execute {
@@ -730,6 +847,7 @@ impl Runner for LoopRunner {
                         declined_tool_result(call)
                     };
 
+                    turn_tool_results.push(result.clone());
                     append_tool_result(
                         &request.hooks,
                         &emitter,
@@ -738,6 +856,32 @@ impl Runner for LoopRunner {
                         &mut iteration_failures,
                         &mut messages,
                     );
+
+                    // Check for steering after sequential tool execution
+                    if let Some(ref get_steering) = request.get_steering_messages {
+                        let steering = get_steering();
+                        if !steering.is_empty() {
+                            for remaining_call in &tool_calls[call_idx + 1..] {
+                                messages.push(ModelMessage::tool_result(
+                                    remaining_call.id.clone(),
+                                    serde_json::json!({ "error": "Skipped due to steering message" }),
+                                    true,
+                                ));
+                            }
+                            for msg in steering { messages.push(msg); }
+                            steering_interrupted = true;
+                            break;
+                        }
+                    }
+                }
+
+                if steering_interrupted {
+                    agent_emitter.emit(AgentEvent::TurnEnd {
+                        run_id: request.run_id,
+                        turn_index,
+                        tool_results: turn_tool_results,
+                    });
+                    continue 'inner;
                 }
 
                 if !pending_parallel_calls.is_empty() {
@@ -747,6 +891,7 @@ impl Runner for LoopRunner {
                         .drain(..)
                         .zip(parallel_results.into_iter())
                     {
+                        turn_tool_results.push(parallel_result.clone());
                         append_tool_result(
                             &request.hooks,
                             &emitter,
@@ -757,6 +902,12 @@ impl Runner for LoopRunner {
                         );
                     }
                 }
+
+                agent_emitter.emit(AgentEvent::TurnEnd {
+                    run_id: request.run_id,
+                    turn_index,
+                    tool_results: turn_tool_results,
+                });
 
                 if iteration_failures == tool_calls.len() {
                     consecutive_failed_iterations = consecutive_failed_iterations.saturating_add(1);
@@ -770,10 +921,35 @@ impl Runner for LoopRunner {
                         limits.max_tool_failures,
                         consecutive_failed_iterations
                     );
+                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                     let _ = result_tx.send(emit_failed_result(&emitter, reason));
                     return;
                 }
+            } // end 'inner
+
+            // Check for follow-up messages after the inner loop completes
+            if let Some(ref get_follow_ups) = request.get_follow_up_messages {
+                let follow_ups = get_follow_ups();
+                if !follow_ups.is_empty() {
+                    for msg in follow_ups { messages.push(msg); }
+                    continue 'outer;
+                }
             }
+
+            // No follow-ups — complete
+            emitter.emit(
+                RunEventStream::Lifecycle,
+                RunEventPayload::Lifecycle {
+                    state: RunLifecycle::Completed,
+                },
+            );
+            agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+            let _ = result_tx.send(RunResult::completed());
+            if debug_enabled() {
+                tracing::debug!(run_id = %request.run_id, "roci run completed");
+            }
+            return;
+            } // end 'outer
         });
 
         Ok(handle)
@@ -905,6 +1081,22 @@ impl RunEventEmitter {
     }
 }
 
+struct AgentEventEmitter {
+    sink: Option<AgentEventSink>,
+}
+
+impl AgentEventEmitter {
+    fn new(sink: Option<AgentEventSink>) -> Self {
+        Self { sink }
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        if let Some(sink) = &self.sink {
+            (sink)(event);
+        }
+    }
+}
+
 async fn resolve_approval(
     emitter: &RunEventEmitter,
     policy: &ApprovalPolicy,
@@ -1018,6 +1210,12 @@ mod tests {
         MixedTextAndParallelBatchThenComplete,
         DuplicateToolCallDeltaThenComplete,
         StreamEndsWithoutDoneThenComplete,
+        /// Tool call for "schema_tool" with empty args on call 0, then text "done" on call 1+.
+        SchemaToolBadArgs,
+        /// Tool call for "schema_tool" with valid args on call 0, then text "done" on call 1+.
+        SchemaToolValidArgs,
+        /// Tool call for "schema_tool" with type-mismatched args on call 0, then text "done" on call 1+.
+        SchemaToolTypeMismatch,
     }
 
     struct StubProvider {
@@ -1421,6 +1619,72 @@ mod tests {
                             reasoning_signature: None,
                             reasoning_type: None,
                         })]
+                    }
+                }
+                ProviderScenario::SchemaToolBadArgs
+                | ProviderScenario::SchemaToolValidArgs
+                | ProviderScenario::SchemaToolTypeMismatch => {
+                    let args = match self.scenario {
+                        ProviderScenario::SchemaToolBadArgs => serde_json::json!({}),
+                        ProviderScenario::SchemaToolValidArgs => {
+                            serde_json::json!({ "path": "/tmp/test" })
+                        }
+                        ProviderScenario::SchemaToolTypeMismatch => {
+                            serde_json::json!({ "path": 42 })
+                        }
+                        _ => unreachable!(),
+                    };
+                    if call_index == 0 {
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "schema-call-1".to_string(),
+                                    name: "schema_tool".to_string(),
+                                    arguments: args,
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
+                    } else {
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: "done".to_string(),
+                                event_type: StreamEventType::TextDelta,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
                     }
                 }
             };
@@ -1894,6 +2158,131 @@ mod tests {
                 )
             }),
             "stream-end fallback should not emit failed lifecycle"
+        );
+    }
+
+    /// Tool with a required string `path` parameter for schema-validation integration tests.
+    fn schema_tool() -> Arc<dyn Tool> {
+        Arc::new(AgentTool::new(
+            "schema_tool",
+            "tool with required path param",
+            AgentToolParameters::object()
+                .string("path", "file path", true)
+                .build(),
+            |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({ "ok": true })) },
+        ))
+    }
+
+    /// Extract `(tool_call_id, result_json, is_error)` triples from ToolResult events.
+    fn tool_results_from_events(events: &[RunEvent]) -> Vec<(String, serde_json::Value, bool)> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                RunEventPayload::ToolResult { result } => Some((
+                    result.tool_call_id.clone(),
+                    result.result.clone(),
+                    result.is_error,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tool_with_schema_rejects_bad_args_through_runner() {
+        let (runner, _requests) = test_runner(ProviderScenario::SchemaToolBadArgs);
+        let (sink, events) = capture_events();
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+        request.tools = vec![schema_tool()];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+
+        // The run must not panic and should complete (provider returns text-only on call 1).
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+        let (call_id, result_json, is_error) = &tool_results[0];
+        assert_eq!(call_id, "schema-call-1");
+        assert!(is_error, "validation failure must set is_error: true");
+        let error_msg = result_json["error"].as_str().unwrap_or("");
+        assert!(
+            error_msg.contains("Argument validation failed"),
+            "expected validation error prefix, got: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("missing required field 'path'"),
+            "expected missing field detail, got: {error_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_with_schema_accepts_valid_args_through_runner() {
+        let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+        let (sink, events) = capture_events();
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+        request.tools = vec![schema_tool()];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+        let (call_id, result_json, is_error) = &tool_results[0];
+        assert_eq!(call_id, "schema-call-1");
+        assert!(!is_error, "valid args must not set is_error");
+        assert_eq!(
+            result_json["ok"], true,
+            "tool handler should execute and return ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_with_type_mismatch_rejects_through_runner() {
+        let (runner, _requests) = test_runner(ProviderScenario::SchemaToolTypeMismatch);
+        let (sink, events) = capture_events();
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+        request.tools = vec![schema_tool()];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+        let (call_id, result_json, is_error) = &tool_results[0];
+        assert_eq!(call_id, "schema-call-1");
+        assert!(is_error, "type mismatch must set is_error: true");
+        let error_msg = result_json["error"].as_str().unwrap_or("");
+        assert!(
+            error_msg.contains("Argument validation failed"),
+            "expected validation error prefix, got: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("expected type 'string'"),
+            "expected type mismatch detail, got: {error_msg}"
         );
     }
 }

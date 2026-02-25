@@ -12,3 +12,4 @@ pub use types::*;
 
 // Re-export new pi-mono aligned types at module level
 pub use events::{AgentEvent, ToolUpdatePayload};
+pub use runner::{AgentEventSink, FollowUpMessagesFn, SteeringMessagesFn, TransformContextFn};

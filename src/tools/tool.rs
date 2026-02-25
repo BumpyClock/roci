@@ -23,9 +23,8 @@ pub struct ToolExecutionContext {
 
 /// Callback for streaming partial tool results during execution.
 #[cfg(feature = "agent")]
-pub type ToolUpdateCallback = Arc<
-    dyn Fn(crate::agent_loop::events::ToolUpdatePayload) + Send + Sync,
->;
+pub type ToolUpdateCallback =
+    Arc<dyn Fn(crate::agent_loop::events::ToolUpdatePayload) + Send + Sync>;
 
 /// Core tool trait — implement to create custom tools.
 ///

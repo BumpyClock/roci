@@ -644,6 +644,7 @@ mod tests {
             settings: settings(Some(128), Some(0.4), Some(0.5), Some(0.1), Some(0.2)),
             tools: None,
             response_format: None,
+            session_id: None,
         };
 
         let body = provider.build_request_body(&request, false);
@@ -669,6 +670,7 @@ mod tests {
             settings: settings(None, None, None, None, None),
             tools: None,
             response_format: None,
+            session_id: None,
         };
 
         let body = provider.build_request_body(&request, false);

@@ -74,6 +74,7 @@ pub async fn stream_text_with_tools(
                 settings: settings.clone(),
                 tools: tool_defs.clone(),
                 response_format: settings.response_format.clone(),
+                session_id: None,
             };
             let mut inner = match provider.stream_text(&request).await {
                 Ok(stream) => stream,

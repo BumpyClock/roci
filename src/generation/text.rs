@@ -45,6 +45,7 @@ pub async fn generate_text(
             settings: settings.clone(),
             tools: tool_defs.clone(),
             response_format: settings.response_format.clone(),
+            session_id: None,
         };
 
         debug!(iteration, "generate_text: calling provider");

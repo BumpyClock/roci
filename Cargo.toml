@@ -30,6 +30,7 @@ directories = "6"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
 tokio-util = { version = "0.7", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+rmcp = { version = "0.16", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -55,11 +56,15 @@ openai-compatible = ["openai"]
 anthropic-compatible = ["anthropic"]
 agent = ["dep:tokio-util"]
 audio = ["dep:tokio-tungstenite"]
-mcp = ["dep:tokio-tungstenite"]
+mcp = ["dep:tokio-tungstenite", "dep:rmcp"]
 cli = ["dep:clap", "agent"]
 all-providers = ["openai","anthropic","google","grok","groq","mistral","ollama","lmstudio","azure","openrouter","together","replicate","openai-compatible","anthropic-compatible"]
 full = ["all-providers","agent","audio","mcp","cli"]
 
 [[example]]
 name = "agent"
+required-features = ["agent"]
+
+[[example]]
+name = "agent_runtime"
 required-features = ["agent"]

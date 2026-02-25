@@ -56,6 +56,9 @@ pub enum RociError {
 
     #[error("Provider error: {provider} — {message}")]
     Provider { provider: String, message: String },
+
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
 }
 
 impl RociError {

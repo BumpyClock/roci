@@ -62,6 +62,8 @@ pub struct ProviderRequest {
     pub settings: GenerationSettings,
     pub tools: Option<Vec<ToolDefinition>>,
     pub response_format: Option<crate::types::generation::ResponseFormat>,
+    /// Optional session ID for provider-side prompt caching and session affinity.
+    pub session_id: Option<String>,
 }
 
 /// Tool definition sent to the provider API.

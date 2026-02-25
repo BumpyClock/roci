@@ -1389,6 +1389,7 @@ mod tests {
             },
             tools: None,
             response_format: Some(ResponseFormat::JsonObject),
+            session_id: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["text"]["verbosity"], "low");
@@ -1404,6 +1405,7 @@ mod tests {
             settings: settings(),
             tools: None,
             response_format: None,
+            session_id: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["reasoning"]["effort"], "medium");
@@ -1421,6 +1423,7 @@ mod tests {
             settings: settings(),
             tools: None,
             response_format: None,
+            session_id: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["reasoning"]["effort"], "medium");
@@ -1453,6 +1456,7 @@ mod tests {
             settings,
             tools: None,
             response_format: None,
+            session_id: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["user"], "user-1");
@@ -1483,6 +1487,7 @@ mod tests {
                 }),
             }]),
             response_format: None,
+            session_id: None,
         };
         let body = provider.build_request_body(&request, false);
         assert_eq!(
@@ -1662,6 +1667,7 @@ mod tests {
             settings: settings(),
             tools: None,
             response_format: None,
+            session_id: None,
         };
 
         let body = provider.build_request_body(&request, false);
