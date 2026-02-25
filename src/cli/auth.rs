@@ -1,0 +1,185 @@
+//! CLI auth command handlers for login, status, and logout.
+
+use std::sync::Arc;
+
+use crate::auth::device_code::DeviceCodePoll;
+use crate::auth::providers::claude_code::ClaudeCodeAuth;
+use crate::auth::providers::github_copilot::GitHubCopilotAuth;
+use crate::auth::providers::openai_codex::OpenAiCodexAuth;
+use crate::auth::store::{FileTokenStore, TokenStore};
+
+/// Handle `roci auth login <provider>`.
+pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(FileTokenStore::new_default());
+
+    match provider {
+        "copilot" | "github-copilot" | "github" => login_copilot(store).await,
+        "chatgpt" | "codex" | "openai" => login_codex(store).await,
+        "claude" | "anthropic" => login_claude(store).await,
+        _ => {
+            eprintln!("Unknown provider: {provider}");
+            eprintln!("Supported: copilot, chatgpt, claude");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn login_copilot(
+    store: Arc<FileTokenStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let auth = GitHubCopilotAuth::new(store);
+    let session = auth.start_device_code().await?;
+
+    println!("🔗 Visit: {}", session.verification_url);
+    println!("📋 Enter code: {}", session.user_code);
+    println!("⏳ Waiting for authorization...");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(session.interval_secs)).await;
+        match auth.poll_device_code(&session).await? {
+            DeviceCodePoll::Authorized { .. } => {
+                println!("✅ GitHub Copilot login successful!");
+                return Ok(());
+            }
+            DeviceCodePoll::Pending { .. } => continue,
+            DeviceCodePoll::SlowDown { interval_secs } => {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                continue;
+            }
+            DeviceCodePoll::AccessDenied => {
+                eprintln!("❌ Authorization denied");
+                std::process::exit(1);
+            }
+            DeviceCodePoll::Expired => {
+                eprintln!("❌ Device code expired, please try again");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+async fn login_codex(
+    store: Arc<FileTokenStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let auth = OpenAiCodexAuth::new(store);
+
+    if let Ok(Some(_token)) = auth.import_codex_auth_json(None) {
+        println!("✅ Imported credentials from ~/.codex/auth.json");
+        return Ok(());
+    }
+
+    let session = auth.start_device_code().await?;
+
+    println!("🔗 Visit: {}", session.verification_url);
+    println!("📋 Enter code: {}", session.user_code);
+    println!("⏳ Waiting for authorization...");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(session.interval_secs)).await;
+        match auth.poll_device_code(&session).await? {
+            DeviceCodePoll::Authorized { .. } => {
+                println!("✅ OpenAI/ChatGPT login successful!");
+                return Ok(());
+            }
+            DeviceCodePoll::Pending { .. } => continue,
+            DeviceCodePoll::SlowDown { interval_secs } => {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                continue;
+            }
+            DeviceCodePoll::AccessDenied => {
+                eprintln!("❌ Authorization denied");
+                std::process::exit(1);
+            }
+            DeviceCodePoll::Expired => {
+                eprintln!("❌ Device code expired, please try again");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+async fn login_claude(
+    store: Arc<FileTokenStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let auth = ClaudeCodeAuth::new(store);
+
+    if let Ok(Some(_token)) = auth.import_cli_credentials(None) {
+        println!("✅ Imported credentials from ~/.claude/.credentials.json");
+        return Ok(());
+    }
+
+    println!("🔗 Claude authentication requires the Claude CLI");
+    println!("   1. Install claude: https://docs.anthropic.com/en/docs/claude-cli");
+    println!("   2. Run: claude auth login");
+    println!("   3. Re-run: roci auth login claude");
+
+    Ok(())
+}
+
+/// Handle `roci auth status`.
+pub async fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(FileTokenStore::new_default());
+
+    println!("🔐 Authentication Status\n");
+
+    for (name, provider_key) in [
+        ("GitHub Copilot", "github-copilot"),
+        ("OpenAI/ChatGPT", "openai-codex"),
+        ("Claude", "claude-code"),
+    ] {
+        match store.load(provider_key, "default") {
+            Ok(Some(token)) => {
+                let status = if let Some(expires) = token.expires_at {
+                    if expires > chrono::Utc::now() {
+                        format!(
+                            "✅ Logged in (expires {})",
+                            expires.format("%Y-%m-%d %H:%M")
+                        )
+                    } else {
+                        "⚠️  Token expired (may auto-refresh)".to_string()
+                    }
+                } else {
+                    "✅ Logged in".to_string()
+                };
+                println!("  {name}: {status}");
+            }
+            Ok(None) => println!("  {name}: ❌ Not logged in"),
+            Err(e) => println!("  {name}: ⚠️  Error: {e}"),
+        }
+    }
+
+    println!("\n📌 Environment Variables:");
+    for (name, env_key) in [
+        ("OPENAI_API_KEY", "OPENAI_API_KEY"),
+        ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+    ] {
+        let status = if std::env::var(env_key).is_ok() {
+            "✅ Set"
+        } else {
+            "❌ Not set"
+        };
+        println!("  {name}: {status}");
+    }
+
+    Ok(())
+}
+
+/// Handle `roci auth logout <provider>`.
+pub async fn handle_logout(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(FileTokenStore::new_default());
+
+    let provider_key = match provider {
+        "copilot" | "github-copilot" | "github" => "github-copilot",
+        "chatgpt" | "codex" | "openai" => "openai-codex",
+        "claude" | "anthropic" => "claude-code",
+        _ => {
+            eprintln!("Unknown provider: {provider}");
+            eprintln!("Supported: copilot, chatgpt, claude");
+            std::process::exit(1);
+        }
+    };
+
+    store.clear(provider_key, "default")?;
+    println!("✅ Logged out from {provider}");
+    Ok(())
+}
