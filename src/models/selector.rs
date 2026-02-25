@@ -91,7 +91,7 @@ impl ModelSelector {
                 )))
             }
             #[cfg(feature = "openai-compatible")]
-            "github-copilot" | "github_copilot" => {
+            "github-copilot" | "github_copilot" | "copilot" => {
                 use super::openai_compatible::OpenAiCompatibleModel;
                 Ok(LanguageModel::GitHubCopilot(OpenAiCompatibleModel::new(
                     model_id, None,

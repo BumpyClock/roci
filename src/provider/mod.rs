@@ -238,15 +238,40 @@ pub fn create_provider(
         }
         #[cfg(feature = "openai-compatible")]
         LanguageModel::GitHubCopilot(m) => {
-            let api_key = config.get_api_key("github-copilot").ok_or_else(|| {
-                RociError::Authentication("Missing GITHUB_COPILOT_API_KEY".into())
-            })?;
-            let base_url = m
-                .base_url
-                .clone()
+            // Try the copilot-api token first (saved by `roci auth login copilot`)
+            let (api_key, base_url) = if let Some(ref store) = config.token_store() {
+                if let Ok(Some(token)) = store.load("github-copilot-api", "default") {
+                    let is_valid = token
+                        .expires_at
+                        .map(|exp| exp > chrono::Utc::now())
+                        .unwrap_or(false);
+                    if is_valid {
+                        let url = token.account_id.unwrap_or_default();
+                        (Some(token.access_token), if url.is_empty() { None } else { Some(url) })
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            let api_key = api_key
+                .or_else(|| config.get_api_key("github-copilot"))
+                .ok_or_else(|| {
+                    RociError::Authentication(
+                        "Missing GitHub Copilot credentials. Run: roci auth login copilot".into(),
+                    )
+                })?;
+            let base_url = base_url
+                .or_else(|| m.base_url.clone())
                 .or_else(|| config.get_base_url("github-copilot"))
                 .ok_or_else(|| {
-                    RociError::Configuration("Missing GITHUB_COPILOT_BASE_URL".into())
+                    RociError::Configuration(
+                        "Missing GITHUB_COPILOT_BASE_URL. Run: roci auth login copilot".into(),
+                    )
                 })?;
             Ok(Box::new(github_copilot::GitHubCopilotProvider::new(
                 m.model_id.clone(),

@@ -58,7 +58,7 @@ anthropic-compatible = ["anthropic"]
 agent = ["dep:tokio-util"]
 audio = ["dep:tokio-tungstenite"]
 mcp = ["dep:tokio-tungstenite", "dep:rmcp"]
-cli = ["dep:clap", "agent"]
+cli = ["dep:clap", "agent", "openai-compatible", "anthropic-compatible"]
 all-providers = ["openai","anthropic","google","grok","groq","mistral","ollama","lmstudio","azure","openrouter","together","replicate","openai-compatible","anthropic-compatible"]
 full = ["all-providers","agent","audio","mcp","cli"]
 

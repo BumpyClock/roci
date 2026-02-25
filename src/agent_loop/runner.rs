@@ -201,6 +201,10 @@ impl RunHandle {
         false
     }
 
+    pub fn take_abort_sender(&mut self) -> Option<oneshot::Sender<()>> {
+        self.abort_tx.take()
+    }
+
     pub fn queue_message(&self, message: ModelMessage) -> bool {
         if let Some(tx) = &self.input_tx {
             return tx.send(message).is_ok();
@@ -211,7 +215,7 @@ impl RunHandle {
     pub async fn wait(self) -> RunResult {
         self.result_rx
             .await
-            .unwrap_or_else(|_| RunResult::canceled())
+            .unwrap_or_else(|_| RunResult::canceled_with_messages(Vec::new()))
     }
 }
 
@@ -493,11 +497,13 @@ impl Runner for LoopRunner {
                 );
             }
 
+            let mut messages = request.messages.clone();
+
             let provider = match provider_factory(&request.model, &config) {
                 Ok(provider) => provider,
                 Err(err) => {
                     agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                    let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
+                    let _ = result_tx.send(emit_failed_result(&emitter, err.to_string(), &messages));
                     return;
                 }
             };
@@ -518,7 +524,6 @@ impl Runner for LoopRunner {
                 )
             };
 
-            let mut messages = request.messages.clone();
             let mut iteration = 0usize;
             let mut consecutive_failed_iterations = 0usize;
             let mut max_iterations = limits.max_iterations;
@@ -538,7 +543,7 @@ impl Runner for LoopRunner {
                             max_iterations, iteration_extensions_used
                         );
                         agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                        let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                        let _ = result_tx.send(emit_failed_result(&emitter, reason, &messages));
                         return;
                     }
 
@@ -576,7 +581,7 @@ impl Runner for LoopRunner {
                                 },
                             );
                             agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                            let _ = result_tx.send(RunResult::canceled());
+                            let _ = result_tx.send(RunResult::canceled_with_messages(messages.clone()));
                             return;
                         }
                         ApprovalDecision::Decline => {
@@ -584,7 +589,7 @@ impl Runner for LoopRunner {
                                 "tool loop exceeded max iterations (max_iterations={max_iterations}); continuation declined"
                             );
                             agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                            let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                            let _ = result_tx.send(emit_failed_result(&emitter, reason, &messages));
                             return;
                         }
                     }
@@ -625,7 +630,8 @@ impl Runner for LoopRunner {
                     Ok(stream) => stream,
                     Err(err) => {
                         agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                        let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
+                        let _ =
+                            result_tx.send(emit_failed_result(&emitter, err.to_string(), &messages));
                         return;
                     }
                 };
@@ -647,12 +653,17 @@ impl Runner for LoopRunner {
                                     },
                                 );
                                 agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                let _ = result_tx.send(RunResult::canceled());
+                                let _ = result_tx
+                                    .send(RunResult::canceled_with_messages(messages.clone()));
                                 return;
                             }
                             _ = sleep.as_mut() => {
                                 agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                let _ = result_tx.send(emit_failed_result(&emitter, "stream idle timeout"));
+                                let _ = result_tx.send(emit_failed_result(
+                                    &emitter,
+                                    "stream idle timeout",
+                                    &messages,
+                                ));
                                 return;
                             }
                             delta = stream.next() => {
@@ -670,7 +681,11 @@ impl Runner for LoopRunner {
                                             &mut stream_done,
                                         ) {
                                             agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                            let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                                            let _ = result_tx.send(emit_failed_result(
+                                                &emitter,
+                                                reason,
+                                                &messages,
+                                            ));
                                             return;
                                         }
                                         if stream_done {
@@ -679,7 +694,11 @@ impl Runner for LoopRunner {
                                     }
                                     Err(err) => {
                                         agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                        let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
+                                        let _ = result_tx.send(emit_failed_result(
+                                            &emitter,
+                                            err.to_string(),
+                                            &messages,
+                                        ));
                                         return;
                                     }
                                 }
@@ -695,7 +714,8 @@ impl Runner for LoopRunner {
                                     },
                                 );
                                 agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                let _ = result_tx.send(RunResult::canceled());
+                                let _ = result_tx
+                                    .send(RunResult::canceled_with_messages(messages.clone()));
                                 return;
                             }
                             delta = stream.next() => {
@@ -710,7 +730,11 @@ impl Runner for LoopRunner {
                                             &mut stream_done,
                                         ) {
                                             agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                            let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                                            let _ = result_tx.send(emit_failed_result(
+                                                &emitter,
+                                                reason,
+                                                &messages,
+                                            ));
                                             return;
                                         }
                                         if stream_done {
@@ -719,7 +743,11 @@ impl Runner for LoopRunner {
                                     }
                                     Err(err) => {
                                         agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                                        let _ = result_tx.send(emit_failed_result(&emitter, err.to_string()));
+                                        let _ = result_tx.send(emit_failed_result(
+                                            &emitter,
+                                            err.to_string(),
+                                            &messages,
+                                        ));
                                         return;
                                     }
                                 }
@@ -791,7 +819,8 @@ impl Runner for LoopRunner {
                             },
                         );
                         agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                        let _ = result_tx.send(RunResult::canceled());
+                        let _ =
+                            result_tx.send(RunResult::canceled_with_messages(messages.clone()));
                         if debug_enabled() {
                             tracing::debug!(run_id = %request.run_id, "roci run canceled");
                         }
@@ -922,7 +951,7 @@ impl Runner for LoopRunner {
                         consecutive_failed_iterations
                     );
                     agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-                    let _ = result_tx.send(emit_failed_result(&emitter, reason));
+                    let _ = result_tx.send(emit_failed_result(&emitter, reason, &messages));
                     return;
                 }
             } // end 'inner
@@ -944,7 +973,7 @@ impl Runner for LoopRunner {
                 },
             );
             agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
-            let _ = result_tx.send(RunResult::completed());
+            let _ = result_tx.send(RunResult::completed_with_messages(messages));
             if debug_enabled() {
                 tracing::debug!(run_id = %request.run_id, "roci run completed");
             }
@@ -956,7 +985,11 @@ impl Runner for LoopRunner {
     }
 }
 
-fn emit_failed_result(emitter: &RunEventEmitter, reason: impl Into<String>) -> RunResult {
+fn emit_failed_result(
+    emitter: &RunEventEmitter,
+    reason: impl Into<String>,
+    messages: &[ModelMessage],
+) -> RunResult {
     let reason = reason.into();
     emitter.emit(
         RunEventStream::Lifecycle,
@@ -966,7 +999,7 @@ fn emit_failed_result(emitter: &RunEventEmitter, reason: impl Into<String>) -> R
             },
         },
     );
-    RunResult::failed(reason)
+    RunResult::failed_with_messages(reason, messages.to_vec())
 }
 
 fn process_stream_delta(

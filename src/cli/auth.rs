@@ -27,7 +27,7 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
 async fn login_copilot(
     store: Arc<FileTokenStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let auth = GitHubCopilotAuth::new(store);
+    let auth = GitHubCopilotAuth::new(store.clone());
     let session = auth.start_device_code().await?;
 
     println!("🔗 Visit: {}", session.verification_url);
@@ -38,7 +38,32 @@ async fn login_copilot(
         tokio::time::sleep(std::time::Duration::from_secs(session.interval_secs)).await;
         match auth.poll_device_code(&session).await? {
             DeviceCodePoll::Authorized { .. } => {
-                println!("✅ GitHub Copilot login successful!");
+                // Exchange GitHub token for Copilot JWT to verify it works
+                match auth.exchange_copilot_token().await {
+                    Ok(copilot_token) => {
+                        // Save the Copilot JWT + base_url so create_provider can read them
+                        let api_token = crate::auth::token::Token {
+                            access_token: copilot_token.token,
+                            refresh_token: None,
+                            id_token: None,
+                            expires_at: Some(copilot_token.expires_at),
+                            last_refresh: Some(chrono::Utc::now()),
+                            scopes: None,
+                            account_id: Some(copilot_token.base_url.clone()),
+                        };
+                        // Store as "github-copilot-api" — the provider reads this
+                        let _ = store.save("github-copilot-api", "default", &api_token);
+                        println!("✅ GitHub Copilot login successful!");
+                        println!(
+                            "   API: {}",
+                            copilot_token.base_url.split('/').take(3).collect::<Vec<_>>().join("/")
+                        );
+                    }
+                    Err(e) => {
+                        println!("⚠️  GitHub token saved but Copilot token exchange failed: {e}");
+                        println!("   You may need a GitHub Copilot subscription.");
+                    }
+                }
                 return Ok(());
             }
             DeviceCodePoll::Pending { .. } => continue,

@@ -12,7 +12,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{oneshot, watch, Mutex, Notify};
 
 use crate::agent_loop::{
     AgentEvent, LoopRunner, RunHandle, RunRequest, RunResult,
@@ -136,7 +136,7 @@ pub struct AgentRuntime {
     messages: Arc<Mutex<Vec<ModelMessage>>>,
     steering_queue: Arc<Mutex<Vec<ModelMessage>>>,
     follow_up_queue: Arc<Mutex<Vec<ModelMessage>>>,
-    active_handle: Arc<Mutex<Option<RunHandle>>>,
+    active_abort_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     idle_notify: Arc<Notify>,
     turn_index: Arc<Mutex<usize>>,
     is_streaming: Arc<Mutex<bool>>,
@@ -167,7 +167,7 @@ impl AgentRuntime {
             messages: Arc::new(Mutex::new(Vec::new())),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
             follow_up_queue: Arc::new(Mutex::new(Vec::new())),
-            active_handle: Arc::new(Mutex::new(None)),
+            active_abort_tx: Arc::new(Mutex::new(None)),
             idle_notify: Arc::new(Notify::new()),
             turn_index: Arc::new(Mutex::new(0)),
             is_streaming: Arc::new(Mutex::new(false)),
@@ -296,9 +296,9 @@ impl AgentRuntime {
         drop(state);
         self.broadcast_snapshot().await;
 
-        let mut handle = self.active_handle.lock().await;
-        if let Some(h) = handle.as_mut() {
-            h.abort()
+        let mut abort_tx = self.active_abort_tx.lock().await;
+        if let Some(tx) = abort_tx.take() {
+            tx.send(()).is_ok()
         } else {
             false
         }
@@ -370,21 +370,28 @@ impl AgentRuntime {
     /// transition back to Idle.
     async fn run_loop(&self, initial_messages: Vec<ModelMessage>) -> Result<RunResult, RociError> {
         *self.is_streaming.lock().await = true;
+        *self.last_error.lock().await = None;
         self.broadcast_snapshot().await;
 
         let steering_queue = self.steering_queue.clone();
         let follow_up_queue = self.follow_up_queue.clone();
 
         let steering_fn: SteeringMessagesFn = Arc::new(move || {
-            let mut queue = steering_queue.blocking_lock();
-            std::mem::take(&mut *queue)
+            if let Ok(mut queue) = steering_queue.try_lock() {
+                std::mem::take(&mut *queue)
+            } else {
+                Vec::new()
+            }
         });
 
         let follow_up_fn: FollowUpMessagesFn = {
             let queue = follow_up_queue.clone();
             Arc::new(move || {
-                let mut q = queue.blocking_lock();
-                std::mem::take(&mut *q)
+                if let Ok(mut q) = queue.try_lock() {
+                    std::mem::take(&mut *q)
+                } else {
+                    Vec::new()
+                }
             })
         };
 
@@ -414,26 +421,37 @@ impl AgentRuntime {
         // checks env vars → credentials.json → OAuth token store, so no
         // extra wiring is needed here for the default case.
 
-        let handle = self.runner.start(request).await?;
+        let run_result = async {
+            if let Some(ref get_key) = self.config.get_api_key {
+                let key = get_key().await?;
+                request.metadata.insert("api_key".to_string(), key);
+            }
 
-        // Store the handle so `abort()` can reach it.
-        self.active_handle.lock().await.replace(handle);
+            let mut handle: RunHandle = self.runner.start(request).await?;
+            let abort_tx = handle.take_abort_sender();
+            *self.active_abort_tx.lock().await = abort_tx;
 
-        // Take the handle back to await the result.
-        // Two separate lock scopes avoid holding the mutex across the `.wait()`.
-        let handle = self.active_handle.lock().await.take();
-        let result = match handle {
-            Some(h) => h.wait().await,
-            None => RunResult::canceled(),
-        };
-
-        // Capture error from failed runs.
-        if result.status == RunStatus::Failed {
-            *self.last_error.lock().await = result.error.clone();
+            Ok::<RunResult, RociError>(handle.wait().await)
         }
+        .await;
+
+        self.active_abort_tx.lock().await.take();
         *self.is_streaming.lock().await = false;
 
-        // Transition back to Idle.
+        match &run_result {
+            Ok(result) => {
+                *self.messages.lock().await = result.messages.clone();
+                if result.status == RunStatus::Failed {
+                    *self.last_error.lock().await = result.error.clone();
+                } else {
+                    *self.last_error.lock().await = None;
+                }
+            }
+            Err(err) => {
+                *self.last_error.lock().await = Some(err.to_string());
+            }
+        }
+
         let mut state = self.state.lock().await;
         *state = AgentState::Idle;
         let _ = self.state_tx.send(AgentState::Idle);
@@ -441,7 +459,7 @@ impl AgentRuntime {
         self.broadcast_snapshot().await;
         self.idle_notify.notify_waiters();
 
-        Ok(result)
+        run_result
     }
 
     /// Build an event sink that intercepts [`AgentEvent`]s to update tracking
@@ -460,13 +478,21 @@ impl AgentRuntime {
                 turn_index: idx, ..
             } = &event
             {
-                *turn_index.blocking_lock() = *idx;
+                if let Ok(mut value) = turn_index.try_lock() {
+                    *value = *idx;
+                }
                 let snapshot = AgentSnapshot {
-                    state: *state.blocking_lock(),
+                    state: state
+                        .try_lock()
+                        .map(|value| *value)
+                        .unwrap_or(AgentState::Running),
                     turn_index: *idx,
-                    message_count: messages.blocking_lock().len(),
-                    is_streaming: *is_streaming.blocking_lock(),
-                    last_error: last_error.blocking_lock().clone(),
+                    message_count: messages.try_lock().map(|value| value.len()).unwrap_or(0),
+                    is_streaming: is_streaming.try_lock().map(|value| *value).unwrap_or(true),
+                    last_error: last_error
+                        .try_lock()
+                        .map(|value| value.clone())
+                        .unwrap_or(None),
                 };
                 let _ = snapshot_tx.send(snapshot);
             }

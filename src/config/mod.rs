@@ -72,6 +72,11 @@ impl RociConfig {
         self
     }
 
+    /// Access the underlying token store (if configured).
+    pub fn token_store(&self) -> Option<&Arc<dyn TokenStore>> {
+        self.token_store.as_ref()
+    }
+
     /// Load from environment variables (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.).
     pub fn from_env() -> Self {
         let _ = dotenvy::dotenv(); // load .env if present, ignore error
