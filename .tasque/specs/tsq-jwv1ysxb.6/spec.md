@@ -9,11 +9,12 @@
 - CLI imports built-in tools from `roci-tools`.
 
 ## API compatibility
-- Prefer keeping an easy import path for SDK users.
-- Decide whether to re-export `roci_tools::builtin` from `roci` (if feasible) or update docs/upgrade notes to new import path.
+- New import path is `roci_tools::builtin`.
+- No compatibility shim in `roci` core.
+- Docs should reflect the final import path.
 
 ## Acceptance criteria
 1) Built-in tool implementations live in `roci-tools`.
 2) CLI uses tools from `roci-tools`.
 3) Tests migrated to `roci-tools`.
-4) Docs/upgrade notes clarify import path and compatibility story.
+4) Docs updated to show the `roci_tools::builtin` import path.

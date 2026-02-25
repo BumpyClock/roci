@@ -7,11 +7,12 @@ Enforce a hard boundary where `roci` is a pure SDK and `roci-cli` is a consumer-
 - Breaking change allowed: remove `roci::cli` module + `cli` feature immediately.
 - Workspace layout: root crate `roci` + member `crates/roci-cli`.
 - CLI crate name: `roci-cli`.
-- Binary name: `roci-agent` (replace `roci`).
+- Binary name: `roci-agent` only (no `roci` alias).
 - Built-in tools extraction: **do now**, new crate `roci-tools`.
+- Built-in tools import path: `roci_tools::builtin` (no compatibility shim).
 - Auth API shape: low-level primitives + `AuthService` facade returning typed states.
 - Error taxonomy: typed missing-credential/config variants; CLI maps to help text.
-- Docs: add architecture doc + read_when entry.
+- Docs: add architecture doc + read_when entry; docs reflect final state (no upgrade notes).
 
 ## Scope
 - Extract CLI into `crates/roci-cli`.
@@ -28,8 +29,8 @@ Enforce a hard boundary where `roci` is a pure SDK and `roci-cli` is a consumer-
 
 ## Definition of Done
 - Core crate exposes only SDK modules (no CLI module, no clap).
-- CLI builds as separate crate and provides `roci-agent` binary.
+- CLI builds as separate crate and provides `roci-agent` binary only.
 - Auth + error flow are UI-agnostic in core.
-- Built-in tools live in `roci-tools`.
-- Documentation and upgrade notes published.
+- Built-in tools live in `roci-tools` and use `roci_tools::builtin` import path.
+- Documentation updated to final state (no upgrade notes).
 - Workspace tests pass for core + CLI + tools.
