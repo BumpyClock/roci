@@ -1,6 +1,7 @@
 //! Model definitions and selection.
 
 pub mod capabilities;
+pub mod provider_key;
 pub mod selector;
 
 #[cfg(feature = "anthropic")]
@@ -23,6 +24,7 @@ pub mod openai;
 pub mod openai_compatible;
 
 pub use capabilities::ModelCapabilities;
+pub use provider_key::ProviderKey;
 pub use selector::ModelSelector;
 
 use serde::{Deserialize, Serialize};
@@ -92,27 +94,27 @@ impl LanguageModel {
     pub fn provider_name(&self) -> &str {
         match self {
             #[cfg(feature = "openai")]
-            Self::OpenAi(_) => "openai",
+            Self::OpenAi(_) => ProviderKey::OpenAi.as_str(),
             #[cfg(feature = "openai")]
-            Self::OpenAiCodex(_) => "codex",
+            Self::OpenAiCodex(_) => ProviderKey::Codex.as_str(),
             #[cfg(feature = "anthropic")]
-            Self::Anthropic(_) => "anthropic",
+            Self::Anthropic(_) => ProviderKey::Anthropic.as_str(),
             #[cfg(feature = "google")]
-            Self::Google(_) => "google",
+            Self::Google(_) => ProviderKey::Google.as_str(),
             #[cfg(feature = "grok")]
-            Self::Grok(_) => "grok",
+            Self::Grok(_) => ProviderKey::Grok.as_str(),
             #[cfg(feature = "groq")]
-            Self::Groq(_) => "groq",
+            Self::Groq(_) => ProviderKey::Groq.as_str(),
             #[cfg(feature = "mistral")]
-            Self::Mistral(_) => "mistral",
+            Self::Mistral(_) => ProviderKey::Mistral.as_str(),
             #[cfg(feature = "ollama")]
-            Self::Ollama(_) => "ollama",
+            Self::Ollama(_) => ProviderKey::Ollama.as_str(),
             #[cfg(feature = "lmstudio")]
-            Self::LmStudio(_) => "lmstudio",
+            Self::LmStudio(_) => ProviderKey::LmStudio.as_str(),
             #[cfg(feature = "openai-compatible")]
-            Self::OpenAiCompatible(_) => "openai-compatible",
+            Self::OpenAiCompatible(_) => ProviderKey::OpenAiCompatible.as_str(),
             #[cfg(feature = "openai-compatible")]
-            Self::GitHubCopilot(_) => "github-copilot",
+            Self::GitHubCopilot(_) => ProviderKey::GitHubCopilot.as_str(),
             Self::Custom { provider, .. } => provider,
         }
     }

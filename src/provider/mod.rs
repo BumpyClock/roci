@@ -46,8 +46,9 @@ pub mod together;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+use crate::config::RociConfig;
 use crate::error::RociError;
-use crate::models::{capabilities::ModelCapabilities, LanguageModel};
+use crate::models::{capabilities::ModelCapabilities, LanguageModel, ProviderKey};
 use crate::types::{
     message::{AgentToolCall, ContentPart},
     FinishReason, GenerationSettings, ModelMessage, TextStreamDelta, Usage,
@@ -132,39 +133,36 @@ pub trait ModelProvider: Send + Sync {
 #[allow(unused_variables)]
 pub fn create_provider(
     model: &LanguageModel,
-    config: &crate::config::RociConfig,
+    config: &RociConfig,
 ) -> Result<Box<dyn ModelProvider>, RociError> {
     match model {
         #[cfg(feature = "openai")]
         LanguageModel::OpenAi(m) => {
-            let api_key = config
-                .get_api_key("openai")
-                .ok_or_else(|| RociError::Authentication("Missing OPENAI_API_KEY".into()))?;
+            let api_key = require_api_key(config, ProviderKey::OpenAi, "Missing OPENAI_API_KEY")?;
             if m.uses_responses_api() {
                 Ok(Box::new(openai_responses::OpenAiResponsesProvider::new(
                     m.clone(),
                     api_key,
-                    config.get_base_url("openai"),
+                    config.get_base_url_for(ProviderKey::OpenAi),
                     None,
                 )))
             } else {
                 Ok(Box::new(openai::OpenAiProvider::new(
                     m.clone(),
                     api_key,
-                    config.get_base_url("openai"),
+                    config.get_base_url_for(ProviderKey::OpenAi),
                     None,
                 )))
             }
         }
         #[cfg(feature = "openai")]
         LanguageModel::OpenAiCodex(m) => {
-            let api_key = config
-                .get_api_key("openai-codex")
-                .ok_or_else(|| RociError::Authentication("Missing OPENAI_CODEX_TOKEN".into()))?;
+            let api_key =
+                require_api_key(config, ProviderKey::Codex, "Missing OPENAI_CODEX_TOKEN")?;
             let base_url = config
-                .get_base_url("openai-codex")
+                .get_base_url_for(ProviderKey::Codex)
                 .or_else(|| Some("https://chatgpt.com/backend-api/codex".to_string()));
-            let account_id = config.get_account_id("openai-codex");
+            let account_id = config.get_account_id_for(ProviderKey::Codex);
             if m.uses_responses_api() {
                 Ok(Box::new(openai_responses::OpenAiResponsesProvider::new(
                     m.clone(),
@@ -183,55 +181,45 @@ pub fn create_provider(
         }
         #[cfg(feature = "anthropic")]
         LanguageModel::Anthropic(m) => {
-            let api_key = config
-                .get_api_key("anthropic")
-                .ok_or_else(|| RociError::Authentication("Missing ANTHROPIC_API_KEY".into()))?;
+            let api_key =
+                require_api_key(config, ProviderKey::Anthropic, "Missing ANTHROPIC_API_KEY")?;
             Ok(Box::new(anthropic::AnthropicProvider::new(
                 m.clone(),
                 api_key,
-                config.get_base_url("anthropic"),
+                config.get_base_url_for(ProviderKey::Anthropic),
             )))
         }
         #[cfg(feature = "google")]
         LanguageModel::Google(m) => {
-            let api_key = config
-                .get_api_key("google")
-                .ok_or_else(|| RociError::Authentication("Missing GOOGLE_API_KEY".into()))?;
+            let api_key = require_api_key(config, ProviderKey::Google, "Missing GOOGLE_API_KEY")?;
             Ok(Box::new(google::GoogleProvider::new(m.clone(), api_key)))
         }
         #[cfg(feature = "grok")]
         LanguageModel::Grok(m) => {
-            let api_key = config
-                .get_api_key("grok")
-                .or_else(|| config.get_api_key("xai"))
-                .ok_or_else(|| RociError::Authentication("Missing XAI_API_KEY".into()))?;
+            let api_key = require_api_key(config, ProviderKey::Grok, "Missing XAI_API_KEY")?;
             Ok(Box::new(grok::GrokProvider::new(m.clone(), api_key)))
         }
         #[cfg(feature = "groq")]
         LanguageModel::Groq(m) => {
-            let api_key = config
-                .get_api_key("groq")
-                .ok_or_else(|| RociError::Authentication("Missing GROQ_API_KEY".into()))?;
+            let api_key = require_api_key(config, ProviderKey::Groq, "Missing GROQ_API_KEY")?;
             Ok(Box::new(groq::GroqProvider::new(m.clone(), api_key)))
         }
         #[cfg(feature = "mistral")]
         LanguageModel::Mistral(m) => {
-            let api_key = config
-                .get_api_key("mistral")
-                .ok_or_else(|| RociError::Authentication("Missing MISTRAL_API_KEY".into()))?;
+            let api_key = require_api_key(config, ProviderKey::Mistral, "Missing MISTRAL_API_KEY")?;
             Ok(Box::new(mistral::MistralProvider::new(m.clone(), api_key)))
         }
         #[cfg(feature = "ollama")]
         LanguageModel::Ollama(m) => {
             let base_url = config
-                .get_base_url("ollama")
+                .get_base_url_for(ProviderKey::Ollama)
                 .unwrap_or_else(|| "http://localhost:11434".to_string());
             Ok(Box::new(ollama::OllamaProvider::new(m.clone(), base_url)))
         }
         #[cfg(feature = "lmstudio")]
         LanguageModel::LmStudio(m) => {
             let base_url = config
-                .get_base_url("lmstudio")
+                .get_base_url_for(ProviderKey::LmStudio)
                 .unwrap_or_else(|| "http://localhost:1234".to_string());
             Ok(Box::new(lmstudio::LmStudioProvider::new(
                 m.clone(),
@@ -241,14 +229,14 @@ pub fn create_provider(
         #[cfg(feature = "openai-compatible")]
         LanguageModel::OpenAiCompatible(m) => {
             let api_key = config
-                .get_api_key("openai-compatible")
-                .or_else(|| config.get_api_key("openai"))
+                .get_api_key_for(ProviderKey::OpenAiCompatible)
+                .or_else(|| config.get_api_key_for(ProviderKey::OpenAi))
                 .ok_or_else(|| RociError::Authentication("Missing OPENAI_COMPAT_API_KEY".into()))?;
             let base_url = m
                 .base_url
                 .clone()
-                .or_else(|| config.get_base_url("openai-compatible"))
-                .or_else(|| config.get_base_url("openai"))
+                .or_else(|| config.get_base_url_for(ProviderKey::OpenAiCompatible))
+                .or_else(|| config.get_base_url_for(ProviderKey::OpenAi))
                 .ok_or_else(|| RociError::Configuration("Missing OPENAI_COMPAT_BASE_URL".into()))?;
             Ok(Box::new(openai_compatible::OpenAiCompatibleProvider::new(
                 m.model_id.clone(),
@@ -282,7 +270,7 @@ pub fn create_provider(
             };
 
             let api_key = api_key
-                .or_else(|| config.get_api_key("github-copilot"))
+                .or_else(|| config.get_api_key_for(ProviderKey::GitHubCopilot))
                 .ok_or_else(|| {
                     RociError::Authentication(
                         "Missing GitHub Copilot credentials. Run: roci auth login copilot".into(),
@@ -290,7 +278,7 @@ pub fn create_provider(
                 })?;
             let base_url = base_url
                 .or_else(|| m.base_url.clone())
-                .or_else(|| config.get_base_url("github-copilot"))
+                .or_else(|| config.get_base_url_for(ProviderKey::GitHubCopilot))
                 .ok_or_else(|| {
                     RociError::Configuration(
                         "Missing GITHUB_COPILOT_BASE_URL. Run: roci auth login copilot".into(),
@@ -311,4 +299,14 @@ pub fn create_provider(
             model
         ))),
     }
+}
+
+fn require_api_key(
+    config: &RociConfig,
+    provider: ProviderKey,
+    missing_message: &'static str,
+) -> Result<String, RociError> {
+    config
+        .get_api_key_for(provider)
+        .ok_or_else(|| RociError::Authentication(missing_message.to_string()))
 }

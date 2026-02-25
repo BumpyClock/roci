@@ -9,6 +9,7 @@ use std::fmt;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::auth::store::TokenStore;
+use crate::models::ProviderKey;
 
 /// Global default config (lazy-initialized from env).
 static DEFAULT_CONFIG: OnceLock<RociConfig> = OnceLock::new();
@@ -43,15 +44,23 @@ impl Default for RociConfig {
     }
 }
 
-/// Map provider names used in `get_api_key` to token store keys used by `roci auth login`.
-fn provider_to_token_store_key(provider: &str) -> Option<&'static str> {
-    match provider {
-        "codex" => Some("openai-codex"),
-        "openai-codex" => Some("openai-codex"),
-        "anthropic" => Some("claude-code"),
-        "github-copilot" => Some("github-copilot"),
-        _ => None,
+fn get_from_map(
+    map: &RwLock<HashMap<String, String>>,
+    provider: &str,
+    provider_key: Option<ProviderKey>,
+) -> Option<String> {
+    let guard = map.read().ok()?;
+    if let Some(value) = guard.get(provider) {
+        return Some(value.clone());
     }
+    if let Some(key) = provider_key {
+        for lookup in key.lookup_keys() {
+            if let Some(value) = guard.get(*lookup) {
+                return Some(value.clone());
+            }
+        }
+    }
+    None
 }
 
 impl RociConfig {
@@ -82,23 +91,29 @@ impl RociConfig {
         let config = Self::new();
 
         let env_mappings = [
-            ("OPENAI_API_KEY", "openai"),
-            ("OPENAI_CODEX_TOKEN", "openai-codex"),
-            ("CHATGPT_TOKEN", "openai-codex"),
-            ("OPENAI_COMPAT_API_KEY", "openai-compatible"),
-            ("ANTHROPIC_API_KEY", "anthropic"),
-            ("GOOGLE_API_KEY", "google"),
-            ("GEMINI_API_KEY", "google"),
-            ("XAI_API_KEY", "grok"),
-            ("GROK_API_KEY", "grok"),
-            ("GROQ_API_KEY", "groq"),
-            ("MISTRAL_API_KEY", "mistral"),
+            ("OPENAI_API_KEY", ProviderKey::OpenAi),
+            ("OPENAI_CODEX_TOKEN", ProviderKey::Codex),
+            ("CHATGPT_TOKEN", ProviderKey::Codex),
+            ("OPENAI_COMPAT_API_KEY", ProviderKey::OpenAiCompatible),
+            ("ANTHROPIC_API_KEY", ProviderKey::Anthropic),
+            ("GOOGLE_API_KEY", ProviderKey::Google),
+            ("GEMINI_API_KEY", ProviderKey::Google),
+            ("XAI_API_KEY", ProviderKey::Grok),
+            ("GROK_API_KEY", ProviderKey::Grok),
+            ("GROQ_API_KEY", ProviderKey::Groq),
+            ("MISTRAL_API_KEY", ProviderKey::Mistral),
+        ];
+
+        for (env_var, provider) in env_mappings {
+            if let Ok(key) = std::env::var(env_var) {
+                config.set_api_key(provider.as_str(), key);
+            }
+        }
+        for (env_var, provider) in [
             ("TOGETHER_API_KEY", "together"),
             ("OPENROUTER_API_KEY", "openrouter"),
             ("REPLICATE_API_TOKEN", "replicate"),
-        ];
-
-        for (env_var, provider) in &env_mappings {
+        ] {
             if let Ok(key) = std::env::var(env_var) {
                 config.set_api_key(provider, key);
             }
@@ -106,18 +121,18 @@ impl RociConfig {
 
         // Base URL overrides
         let url_mappings = [
-            ("OPENAI_BASE_URL", "openai"),
-            ("OPENAI_CODEX_BASE_URL", "openai-codex"),
-            ("CHATGPT_BASE_URL", "openai-codex"),
-            ("OPENAI_COMPAT_BASE_URL", "openai-compatible"),
-            ("ANTHROPIC_BASE_URL", "anthropic"),
-            ("OLLAMA_BASE_URL", "ollama"),
-            ("LMSTUDIO_BASE_URL", "lmstudio"),
+            ("OPENAI_BASE_URL", ProviderKey::OpenAi),
+            ("OPENAI_CODEX_BASE_URL", ProviderKey::Codex),
+            ("CHATGPT_BASE_URL", ProviderKey::Codex),
+            ("OPENAI_COMPAT_BASE_URL", ProviderKey::OpenAiCompatible),
+            ("ANTHROPIC_BASE_URL", ProviderKey::Anthropic),
+            ("OLLAMA_BASE_URL", ProviderKey::Ollama),
+            ("LMSTUDIO_BASE_URL", ProviderKey::LmStudio),
         ];
 
-        for (env_var, provider) in &url_mappings {
+        for (env_var, provider) in url_mappings {
             if let Ok(url) = std::env::var(env_var) {
-                config.set_base_url(provider, url);
+                config.set_base_url(provider.as_str(), url);
             }
         }
 
@@ -141,12 +156,13 @@ impl RociConfig {
     /// Checks explicit keys first, then falls back to the token store
     /// for OAuth tokens saved via `roci auth login`.
     pub fn get_api_key(&self, provider: &str) -> Option<String> {
-        if let Some(key) = self.api_keys.read().ok()?.get(provider).cloned() {
+        let provider_key = ProviderKey::parse(provider);
+        if let Some(key) = get_from_map(&self.api_keys, provider, provider_key) {
             return Some(key);
         }
 
         if let Some(ref store) = self.token_store {
-            if let Some(store_key) = provider_to_token_store_key(provider) {
+            if let Some(store_key) = provider_key.and_then(ProviderKey::token_store_key) {
                 if let Ok(Some(token)) = store.load(store_key, "default") {
                     let is_valid = token
                         .expires_at
@@ -162,6 +178,10 @@ impl RociConfig {
         None
     }
 
+    pub fn get_api_key_for(&self, provider: ProviderKey) -> Option<String> {
+        self.get_api_key(provider.as_str())
+    }
+
     pub fn set_base_url(&self, provider: &str, url: String) {
         self.base_urls
             .write()
@@ -170,7 +190,11 @@ impl RociConfig {
     }
 
     pub fn get_base_url(&self, provider: &str) -> Option<String> {
-        self.base_urls.read().unwrap().get(provider).cloned()
+        get_from_map(&self.base_urls, provider, ProviderKey::parse(provider))
+    }
+
+    pub fn get_base_url_for(&self, provider: ProviderKey) -> Option<String> {
+        self.get_base_url(provider.as_str())
     }
 
     pub fn set_account_id(&self, provider: &str, account_id: String) {
@@ -181,7 +205,11 @@ impl RociConfig {
     }
 
     pub fn get_account_id(&self, provider: &str) -> Option<String> {
-        self.account_ids.read().unwrap().get(provider).cloned()
+        get_from_map(&self.account_ids, provider, ProviderKey::parse(provider))
+    }
+
+    pub fn get_account_id_for(&self, provider: ProviderKey) -> Option<String> {
+        self.get_account_id(provider.as_str())
     }
 
     /// Check if a provider has credentials configured (explicit key or token store).

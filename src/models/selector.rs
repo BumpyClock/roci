@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use super::LanguageModel;
+use super::{LanguageModel, ProviderKey};
 use crate::error::RociError;
 
 /// Parse a "provider:model" string into a LanguageModel.
@@ -19,91 +19,95 @@ impl ModelSelector {
             ))
         })?;
 
-        match provider {
-            #[cfg(feature = "openai")]
-            "openai" => {
-                use super::openai::OpenAiModel;
-                // Keep openai:* on the OpenAI provider path. Do not infer Codex from model-id substrings.
-                let m = OpenAiModel::from_str(model_id)
-                    .unwrap_or(OpenAiModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::OpenAi(m))
+        if let Some(provider_key) = ProviderKey::parse(provider) {
+            match provider_key {
+                #[cfg(feature = "openai")]
+                ProviderKey::OpenAi => {
+                    use super::openai::OpenAiModel;
+                    // Keep openai:* on the OpenAI provider path. Do not infer Codex from model-id substrings.
+                    let m = OpenAiModel::from_str(model_id)
+                        .unwrap_or(OpenAiModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::OpenAi(m));
+                }
+                #[cfg(feature = "openai")]
+                ProviderKey::Codex => {
+                    use super::openai::OpenAiModel;
+                    // Codex routing is explicit and provider-alias based.
+                    let m = OpenAiModel::from_str(model_id)
+                        .unwrap_or(OpenAiModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::OpenAiCodex(m));
+                }
+                #[cfg(feature = "anthropic")]
+                ProviderKey::Anthropic => {
+                    use super::anthropic::AnthropicModel;
+                    let m = AnthropicModel::from_str(model_id)
+                        .unwrap_or(AnthropicModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::Anthropic(m));
+                }
+                #[cfg(feature = "google")]
+                ProviderKey::Google => {
+                    use super::google::GoogleModel;
+                    let m = GoogleModel::from_str(model_id)
+                        .unwrap_or(GoogleModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::Google(m));
+                }
+                #[cfg(feature = "grok")]
+                ProviderKey::Grok => {
+                    use super::grok::GrokModel;
+                    let m = GrokModel::from_str(model_id)
+                        .unwrap_or(GrokModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::Grok(m));
+                }
+                #[cfg(feature = "groq")]
+                ProviderKey::Groq => {
+                    use super::groq::GroqModel;
+                    let m = GroqModel::from_str(model_id)
+                        .unwrap_or(GroqModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::Groq(m));
+                }
+                #[cfg(feature = "mistral")]
+                ProviderKey::Mistral => {
+                    use super::mistral::MistralModel;
+                    let m = MistralModel::from_str(model_id)
+                        .unwrap_or(MistralModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::Mistral(m));
+                }
+                #[cfg(feature = "ollama")]
+                ProviderKey::Ollama => {
+                    use super::ollama::OllamaModel;
+                    let m = OllamaModel::from_str(model_id)
+                        .unwrap_or(OllamaModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::Ollama(m));
+                }
+                #[cfg(feature = "lmstudio")]
+                ProviderKey::LmStudio => {
+                    use super::lmstudio::LmStudioModel;
+                    let m = LmStudioModel::from_str(model_id)
+                        .unwrap_or(LmStudioModel::Custom(model_id.to_string()));
+                    return Ok(LanguageModel::LmStudio(m));
+                }
+                #[cfg(feature = "openai-compatible")]
+                ProviderKey::OpenAiCompatible => {
+                    use super::openai_compatible::OpenAiCompatibleModel;
+                    return Ok(LanguageModel::OpenAiCompatible(OpenAiCompatibleModel::new(
+                        model_id, None,
+                    )));
+                }
+                #[cfg(feature = "openai-compatible")]
+                ProviderKey::GitHubCopilot => {
+                    use super::openai_compatible::OpenAiCompatibleModel;
+                    return Ok(LanguageModel::GitHubCopilot(OpenAiCompatibleModel::new(
+                        model_id, None,
+                    )));
+                }
+                _ => {}
             }
-            #[cfg(feature = "openai")]
-            "openai-codex" | "openai_codex" | "codex" => {
-                use super::openai::OpenAiModel;
-                // Codex routing is explicit and provider-alias based.
-                let m = OpenAiModel::from_str(model_id)
-                    .unwrap_or(OpenAiModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::OpenAiCodex(m))
-            }
-            #[cfg(feature = "anthropic")]
-            "anthropic" => {
-                use super::anthropic::AnthropicModel;
-                let m = AnthropicModel::from_str(model_id)
-                    .unwrap_or(AnthropicModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::Anthropic(m))
-            }
-            #[cfg(feature = "google")]
-            "google" | "gemini" => {
-                use super::google::GoogleModel;
-                let m = GoogleModel::from_str(model_id)
-                    .unwrap_or(GoogleModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::Google(m))
-            }
-            #[cfg(feature = "grok")]
-            "grok" | "xai" => {
-                use super::grok::GrokModel;
-                let m = GrokModel::from_str(model_id)
-                    .unwrap_or(GrokModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::Grok(m))
-            }
-            #[cfg(feature = "groq")]
-            "groq" => {
-                use super::groq::GroqModel;
-                let m = GroqModel::from_str(model_id)
-                    .unwrap_or(GroqModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::Groq(m))
-            }
-            #[cfg(feature = "mistral")]
-            "mistral" => {
-                use super::mistral::MistralModel;
-                let m = MistralModel::from_str(model_id)
-                    .unwrap_or(MistralModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::Mistral(m))
-            }
-            #[cfg(feature = "ollama")]
-            "ollama" => {
-                use super::ollama::OllamaModel;
-                let m = OllamaModel::from_str(model_id)
-                    .unwrap_or(OllamaModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::Ollama(m))
-            }
-            #[cfg(feature = "lmstudio")]
-            "lmstudio" => {
-                use super::lmstudio::LmStudioModel;
-                let m = LmStudioModel::from_str(model_id)
-                    .unwrap_or(LmStudioModel::Custom(model_id.to_string()));
-                Ok(LanguageModel::LmStudio(m))
-            }
-            #[cfg(feature = "openai-compatible")]
-            "openai-compatible" | "openai_compatible" => {
-                use super::openai_compatible::OpenAiCompatibleModel;
-                Ok(LanguageModel::OpenAiCompatible(OpenAiCompatibleModel::new(
-                    model_id, None,
-                )))
-            }
-            #[cfg(feature = "openai-compatible")]
-            "github-copilot" | "github_copilot" | "copilot" => {
-                use super::openai_compatible::OpenAiCompatibleModel;
-                Ok(LanguageModel::GitHubCopilot(OpenAiCompatibleModel::new(
-                    model_id, None,
-                )))
-            }
-            _ => Ok(LanguageModel::Custom {
-                provider: provider.to_string(),
-                model_id: model_id.to_string(),
-            }),
         }
+
+        Ok(LanguageModel::Custom {
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+        })
     }
 }
 
