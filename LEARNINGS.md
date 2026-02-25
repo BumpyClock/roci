@@ -2,7 +2,6 @@
 
 ## Crate setup
 
-- Renamed from TachikomaError → RociError for crate naming consistency.
 - Directory-based modules (`mod.rs` pattern) to support multi-file modules.
 - `thiserror` v2 requires edition 2021+; `rust-version = "1.75"` satisfies.
 - `reqwest` with `default-features = false` + `rustls-tls` avoids native OpenSSL dep.
@@ -43,7 +42,6 @@
 
 ### Tool choice
 - `Required` → `"any"`, `Function(name)` → `{"type": "tool", "name": name}`.
-- `ToolChoice` is wired into `GenerationSettings` and the Anthropic provider (Tachikoma only had it for Realtime API).
 
 ### Types
 - `ProviderResponse` carries `thinking: Vec<ContentPart>` for thinking blocks.

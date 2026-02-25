@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::message::ContentPart;
-use crate::types::{AgentToolCall, AgentToolResult};
+use crate::types::{AgentToolCall, AgentToolResult, ModelMessage, TextStreamDelta};
 
 use super::approvals::ApprovalRequest;
 use super::types::RunId;
@@ -125,13 +125,14 @@ pub enum AgentEvent {
 
     // -- Message streaming --
     MessageStart {
-        role: String,
+        message: ModelMessage,
     },
     MessageUpdate {
-        text: String,
+        message: ModelMessage,
+        assistant_message_event: TextStreamDelta,
     },
     MessageEnd {
-        role: String,
+        message: ModelMessage,
     },
 
     // -- Tool execution (enhanced with streaming) --
@@ -143,6 +144,7 @@ pub enum AgentEvent {
     ToolExecutionUpdate {
         tool_call_id: String,
         tool_name: String,
+        args: serde_json::Value,
         partial_result: ToolUpdatePayload,
     },
     ToolExecutionEnd {

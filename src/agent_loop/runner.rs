@@ -10,6 +10,7 @@ use futures::{future, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::{self, Duration};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::message::AgentMessage;
@@ -17,7 +18,7 @@ use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::{self, ProviderRequest, ToolDefinition};
-use crate::tools::tool::Tool;
+use crate::tools::{tool::Tool, ToolUpdateCallback};
 use crate::types::{
     message::ContentPart, AgentToolCall, AgentToolResult, GenerationSettings, ModelMessage,
     StreamEventType, TextStreamDelta,
@@ -26,7 +27,9 @@ use crate::types::{
 use super::approvals::{
     ApprovalDecision, ApprovalHandler, ApprovalKind, ApprovalPolicy, ApprovalRequest,
 };
-use super::events::{AgentEvent, RunEvent, RunEventPayload, RunEventStream, RunLifecycle};
+use super::events::{
+    AgentEvent, RunEvent, RunEventPayload, RunEventStream, RunLifecycle, ToolUpdatePayload,
+};
 use super::types::{RunId, RunResult};
 
 /// Callback used for streaming run events.
@@ -414,7 +417,101 @@ fn declined_tool_result(call: &AgentToolCall) -> AgentToolResult {
     }
 }
 
-async fn execute_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -> AgentToolResult {
+fn canceled_tool_result(call: &AgentToolCall) -> AgentToolResult {
+    AgentToolResult {
+        tool_call_id: call.id.clone(),
+        result: serde_json::json!({ "error": "canceled" }),
+        is_error: true,
+    }
+}
+
+fn emit_tool_execution_start(agent_emitter: &AgentEventEmitter, call: &AgentToolCall) {
+    agent_emitter.emit(AgentEvent::ToolExecutionStart {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        args: call.arguments.clone(),
+    });
+}
+
+fn emit_tool_execution_end(
+    agent_emitter: &AgentEventEmitter,
+    call: &AgentToolCall,
+    result: &AgentToolResult,
+) {
+    agent_emitter.emit(AgentEvent::ToolExecutionEnd {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        result: result.clone(),
+        is_error: result.is_error,
+    });
+}
+
+fn build_assistant_message(iteration_text: &str, tool_calls: &[AgentToolCall]) -> ModelMessage {
+    let mut content: Vec<ContentPart> = Vec::new();
+    if !iteration_text.is_empty() {
+        content.push(ContentPart::Text {
+            text: iteration_text.to_string(),
+        });
+    }
+    for call in tool_calls {
+        content.push(ContentPart::ToolCall(call.clone()));
+    }
+    if content.is_empty() {
+        content.push(ContentPart::Text {
+            text: String::new(),
+        });
+    }
+    ModelMessage {
+        role: crate::types::Role::Assistant,
+        content,
+        name: None,
+        timestamp: Some(chrono::Utc::now()),
+    }
+}
+
+fn emit_message_start_if_needed(
+    agent_emitter: &AgentEventEmitter,
+    message_open: &mut bool,
+    iteration_text: &str,
+    tool_calls: &[AgentToolCall],
+) {
+    if !*message_open {
+        agent_emitter.emit(AgentEvent::MessageStart {
+            message: build_assistant_message(iteration_text, tool_calls),
+        });
+        *message_open = true;
+    }
+}
+
+fn emit_message_end_if_open(
+    agent_emitter: &AgentEventEmitter,
+    message_open: &mut bool,
+    iteration_text: &str,
+    tool_calls: &[AgentToolCall],
+) {
+    if *message_open {
+        agent_emitter.emit(AgentEvent::MessageEnd {
+            message: build_assistant_message(iteration_text, tool_calls),
+        });
+        *message_open = false;
+    }
+}
+
+fn emit_message_lifecycle(agent_emitter: &AgentEventEmitter, message: &ModelMessage) {
+    agent_emitter.emit(AgentEvent::MessageStart {
+        message: message.clone(),
+    });
+    agent_emitter.emit(AgentEvent::MessageEnd {
+        message: message.clone(),
+    });
+}
+
+async fn execute_tool_call(
+    tools: &[Arc<dyn Tool>],
+    call: &AgentToolCall,
+    agent_emitter: &AgentEventEmitter,
+    cancel: CancellationToken,
+) -> AgentToolResult {
     let tool = tools.iter().find(|t| t.name() == call.name);
     match tool {
         Some(tool) => {
@@ -436,7 +533,20 @@ async fn execute_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -> Age
                 tool_call_id: Some(call.id.clone()),
                 tool_name: Some(call.name.clone()),
             };
-            match tool.execute(&args, &ctx).await {
+            let call_id = call.id.clone();
+            let call_name = call.name.clone();
+            let call_args = call.arguments.clone();
+            let update_emitter = agent_emitter.clone();
+            let on_update: ToolUpdateCallback =
+                Arc::new(move |partial_result: ToolUpdatePayload| {
+                    update_emitter.emit(AgentEvent::ToolExecutionUpdate {
+                        tool_call_id: call_id.clone(),
+                        tool_name: call_name.clone(),
+                        args: call_args.clone(),
+                        partial_result,
+                    });
+                });
+            match tool.execute_ext(&args, &ctx, cancel, Some(on_update)).await {
                 Ok(val) => AgentToolResult {
                     tool_call_id: call.id.clone(),
                     result: val,
@@ -460,14 +570,19 @@ async fn execute_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -> Age
 async fn execute_parallel_tool_calls(
     tools: &[Arc<dyn Tool>],
     calls: &[AgentToolCall],
+    agent_emitter: &AgentEventEmitter,
+    cancel: CancellationToken,
 ) -> Vec<AgentToolResult> {
-    let futures = calls.iter().map(|call| execute_tool_call(tools, call));
+    let futures = calls
+        .iter()
+        .map(|call| execute_tool_call(tools, call, agent_emitter, cancel.child_token()));
     future::join_all(futures).await
 }
 
 fn append_tool_result(
     hooks: &RunHooks,
     emitter: &RunEventEmitter,
+    agent_emitter: &AgentEventEmitter,
     call: &AgentToolCall,
     mut result: AgentToolResult,
     iteration_failures: &mut usize,
@@ -492,11 +607,40 @@ fn append_tool_result(
         RunEventPayload::ToolCallCompleted { call: call.clone() },
     );
 
-    messages.push(ModelMessage::tool_result(
+    let tool_result_message = ModelMessage::tool_result(
         result.tool_call_id.clone(),
         result.result,
         result.is_error,
-    ));
+    );
+    emit_message_lifecycle(agent_emitter, &tool_result_message);
+    messages.push(tool_result_message);
+}
+
+fn append_skipped_tool_call(
+    hooks: &RunHooks,
+    emitter: &RunEventEmitter,
+    agent_emitter: &AgentEventEmitter,
+    call: &AgentToolCall,
+    iteration_failures: &mut usize,
+    messages: &mut Vec<ModelMessage>,
+) -> AgentToolResult {
+    let skipped_result = AgentToolResult {
+        tool_call_id: call.id.clone(),
+        result: serde_json::json!({ "error": "Skipped due to steering message" }),
+        is_error: true,
+    };
+    emit_tool_execution_start(agent_emitter, call);
+    emit_tool_execution_end(agent_emitter, call, &skipped_result);
+    append_tool_result(
+        hooks,
+        emitter,
+        agent_emitter,
+        call,
+        skipped_result.clone(),
+        iteration_failures,
+        messages,
+    );
+    skipped_result
 }
 
 #[async_trait]
@@ -539,6 +683,9 @@ impl Runner for LoopRunner {
             }
 
             let mut messages = request.messages.clone();
+            for message in &messages {
+                emit_message_lifecycle(&agent_emitter, message);
+            }
 
             if let Err(err) = provider::validate_transport_preference(request.transport.as_deref())
             {
@@ -582,6 +729,7 @@ impl Runner for LoopRunner {
             let mut max_iterations = limits.max_iterations;
             let mut iteration_extensions_used = 0usize;
             let mut turn_index = 0usize;
+            let run_cancel_token = CancellationToken::new();
 
             'outer: loop {
                 'inner: loop {
@@ -661,12 +809,14 @@ impl Runner for LoopRunner {
                     }
 
                     while let Ok(message) = input_rx.try_recv() {
+                        emit_message_lifecycle(&agent_emitter, &message);
                         messages.push(message);
                     }
 
                     // Inject steering messages before LLM call
                     if let Some(ref get_steering) = request.get_steering_messages {
                         for msg in get_steering().await {
+                            emit_message_lifecycle(&agent_emitter, &msg);
                             messages.push(msg);
                         }
                     }
@@ -739,6 +889,7 @@ impl Runner for LoopRunner {
                                 }
                                 tokio::select! {
                                     _ = &mut abort_rx => {
+                                        run_cancel_token.cancel();
                                         emitter.emit(
                                             RunEventStream::Lifecycle,
                                             RunEventPayload::Lifecycle {
@@ -770,6 +921,7 @@ impl Runner for LoopRunner {
                     let mut iteration_text = String::new();
                     let mut tool_calls: Vec<AgentToolCall> = Vec::new();
                     let mut stream_done = false;
+                    let mut message_open = false;
                     let idle_timeout_ms =
                         request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
                     let mut idle_sleep = (idle_timeout_ms > 0)
@@ -778,6 +930,13 @@ impl Runner for LoopRunner {
                         if let Some(ref mut sleep) = idle_sleep {
                             tokio::select! {
                                 _ = &mut abort_rx => {
+                                    run_cancel_token.cancel();
+                                    emit_message_end_if_open(
+                                        &agent_emitter,
+                                        &mut message_open,
+                                        &iteration_text,
+                                        &tool_calls,
+                                    );
                                     emitter.emit(
                                         RunEventStream::Lifecycle,
                                         RunEventPayload::Lifecycle {
@@ -790,6 +949,12 @@ impl Runner for LoopRunner {
                                     return;
                                 }
                                 _ = sleep.as_mut() => {
+                                    emit_message_end_if_open(
+                                        &agent_emitter,
+                                        &mut message_open,
+                                        &iteration_text,
+                                        &tool_calls,
+                                    );
                                     agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                     let _ = result_tx.send(emit_failed_result(
                                         &emitter,
@@ -807,11 +972,19 @@ impl Runner for LoopRunner {
                                             );
                                             if let Some(reason) = process_stream_delta(
                                                 &emitter,
+                                                &agent_emitter,
                                                 delta,
                                                 &mut iteration_text,
                                                 &mut tool_calls,
                                                 &mut stream_done,
+                                                &mut message_open,
                                             ) {
+                                                emit_message_end_if_open(
+                                                    &agent_emitter,
+                                                    &mut message_open,
+                                                    &iteration_text,
+                                                    &tool_calls,
+                                                );
                                                 agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                                 let _ = result_tx.send(emit_failed_result(
                                                     &emitter,
@@ -825,6 +998,12 @@ impl Runner for LoopRunner {
                                             }
                                         }
                                         Err(err) => {
+                                            emit_message_end_if_open(
+                                                &agent_emitter,
+                                                &mut message_open,
+                                                &iteration_text,
+                                                &tool_calls,
+                                            );
                                             agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                             let _ = result_tx.send(emit_failed_result(
                                                 &emitter,
@@ -839,6 +1018,13 @@ impl Runner for LoopRunner {
                         } else {
                             tokio::select! {
                                 _ = &mut abort_rx => {
+                                    run_cancel_token.cancel();
+                                    emit_message_end_if_open(
+                                        &agent_emitter,
+                                        &mut message_open,
+                                        &iteration_text,
+                                        &tool_calls,
+                                    );
                                     emitter.emit(
                                         RunEventStream::Lifecycle,
                                         RunEventPayload::Lifecycle {
@@ -856,11 +1042,19 @@ impl Runner for LoopRunner {
                                         Ok(delta) => {
                                             if let Some(reason) = process_stream_delta(
                                                 &emitter,
+                                                &agent_emitter,
                                                 delta,
                                                 &mut iteration_text,
                                                 &mut tool_calls,
                                                 &mut stream_done,
+                                                &mut message_open,
                                             ) {
+                                                emit_message_end_if_open(
+                                                    &agent_emitter,
+                                                    &mut message_open,
+                                                    &iteration_text,
+                                                    &tool_calls,
+                                                );
                                                 agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                                 let _ = result_tx.send(emit_failed_result(
                                                     &emitter,
@@ -874,6 +1068,12 @@ impl Runner for LoopRunner {
                                             }
                                         }
                                         Err(err) => {
+                                            emit_message_end_if_open(
+                                                &agent_emitter,
+                                                &mut message_open,
+                                                &iteration_text,
+                                                &tool_calls,
+                                            );
                                             agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
                                             let _ = result_tx.send(emit_failed_result(
                                                 &emitter,
@@ -887,6 +1087,12 @@ impl Runner for LoopRunner {
                             }
                         }
                     }
+                    emit_message_end_if_open(
+                        &agent_emitter,
+                        &mut message_open,
+                        &iteration_text,
+                        &tool_calls,
+                    );
 
                     if debug_enabled() {
                         let tool_names = tool_calls
@@ -944,6 +1150,7 @@ impl Runner for LoopRunner {
                         .await;
 
                         if matches!(decision, ApprovalDecision::Cancel) {
+                            run_cancel_token.cancel();
                             emitter.emit(
                                 RunEventStream::Lifecycle,
                                 RunEventPayload::Lifecycle {
@@ -968,19 +1175,51 @@ impl Runner for LoopRunner {
                         }
 
                         if !pending_parallel_calls.is_empty() {
-                            let parallel_results = execute_parallel_tool_calls(
-                                &request.tools,
-                                &pending_parallel_calls,
-                            )
-                            .await;
+                            for parallel_call in &pending_parallel_calls {
+                                emit_tool_execution_start(&agent_emitter, parallel_call);
+                            }
+                            let parallel_results = tokio::select! {
+                                _ = &mut abort_rx => {
+                                    run_cancel_token.cancel();
+                                    for parallel_call in &pending_parallel_calls {
+                                        let canceled_result = canceled_tool_result(parallel_call);
+                                        emit_tool_execution_end(&agent_emitter, parallel_call, &canceled_result);
+                                    }
+                                    emitter.emit(
+                                        RunEventStream::Lifecycle,
+                                        RunEventPayload::Lifecycle {
+                                            state: RunLifecycle::Canceled,
+                                        },
+                                    );
+                                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                    let _ = result_tx
+                                        .send(RunResult::canceled_with_messages(messages.clone()));
+                                    if debug_enabled() {
+                                        tracing::debug!(run_id = %request.run_id, "roci run canceled");
+                                    }
+                                    return;
+                                }
+                                results = execute_parallel_tool_calls(
+                                    &request.tools,
+                                    &pending_parallel_calls,
+                                    &agent_emitter,
+                                    run_cancel_token.child_token(),
+                                ) => results,
+                            };
                             for (parallel_call, parallel_result) in pending_parallel_calls
                                 .drain(..)
                                 .zip(parallel_results.into_iter())
                             {
+                                emit_tool_execution_end(
+                                    &agent_emitter,
+                                    &parallel_call,
+                                    &parallel_result,
+                                );
                                 turn_tool_results.push(parallel_result.clone());
                                 append_tool_result(
                                     &request.hooks,
                                     &emitter,
+                                    &agent_emitter,
                                     &parallel_call,
                                     parallel_result,
                                     &mut iteration_failures,
@@ -993,13 +1232,18 @@ impl Runner for LoopRunner {
                                 let steering = get_steering().await;
                                 if !steering.is_empty() {
                                     for remaining_call in &tool_calls[call_idx + 1..] {
-                                        messages.push(ModelMessage::tool_result(
-                                        remaining_call.id.clone(),
-                                        serde_json::json!({ "error": "Skipped due to steering message" }),
-                                        true,
-                                    ));
+                                        let skipped = append_skipped_tool_call(
+                                            &request.hooks,
+                                            &emitter,
+                                            &agent_emitter,
+                                            remaining_call,
+                                            &mut iteration_failures,
+                                            &mut messages,
+                                        );
+                                        turn_tool_results.push(skipped);
                                     }
                                     for msg in steering {
+                                        emit_message_lifecycle(&agent_emitter, &msg);
                                         messages.push(msg);
                                     }
                                     steering_interrupted = true;
@@ -1009,15 +1253,45 @@ impl Runner for LoopRunner {
                         }
 
                         let result = if can_execute {
-                            execute_tool_call(&request.tools, call).await
+                            emit_tool_execution_start(&agent_emitter, call);
+                            tokio::select! {
+                                _ = &mut abort_rx => {
+                                    run_cancel_token.cancel();
+                                    let canceled_result = canceled_tool_result(call);
+                                    emit_tool_execution_end(&agent_emitter, call, &canceled_result);
+                                    emitter.emit(
+                                        RunEventStream::Lifecycle,
+                                        RunEventPayload::Lifecycle {
+                                            state: RunLifecycle::Canceled,
+                                        },
+                                    );
+                                    agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                    let _ = result_tx
+                                        .send(RunResult::canceled_with_messages(messages.clone()));
+                                    if debug_enabled() {
+                                        tracing::debug!(run_id = %request.run_id, "roci run canceled");
+                                    }
+                                    return;
+                                }
+                                result = execute_tool_call(
+                                    &request.tools,
+                                    call,
+                                    &agent_emitter,
+                                    run_cancel_token.child_token(),
+                                ) => result,
+                            }
                         } else {
                             declined_tool_result(call)
                         };
+                        if can_execute {
+                            emit_tool_execution_end(&agent_emitter, call, &result);
+                        }
 
                         turn_tool_results.push(result.clone());
                         append_tool_result(
                             &request.hooks,
                             &emitter,
+                            &agent_emitter,
                             call,
                             result,
                             &mut iteration_failures,
@@ -1029,13 +1303,18 @@ impl Runner for LoopRunner {
                             let steering = get_steering().await;
                             if !steering.is_empty() {
                                 for remaining_call in &tool_calls[call_idx + 1..] {
-                                    messages.push(ModelMessage::tool_result(
-                                    remaining_call.id.clone(),
-                                    serde_json::json!({ "error": "Skipped due to steering message" }),
-                                    true,
-                                ));
+                                    let skipped = append_skipped_tool_call(
+                                        &request.hooks,
+                                        &emitter,
+                                        &agent_emitter,
+                                        remaining_call,
+                                        &mut iteration_failures,
+                                        &mut messages,
+                                    );
+                                    turn_tool_results.push(skipped);
                                 }
                                 for msg in steering {
+                                    emit_message_lifecycle(&agent_emitter, &msg);
                                     messages.push(msg);
                                 }
                                 steering_interrupted = true;
@@ -1054,17 +1333,51 @@ impl Runner for LoopRunner {
                     }
 
                     if !pending_parallel_calls.is_empty() {
-                        let parallel_results =
-                            execute_parallel_tool_calls(&request.tools, &pending_parallel_calls)
-                                .await;
+                        for parallel_call in &pending_parallel_calls {
+                            emit_tool_execution_start(&agent_emitter, parallel_call);
+                        }
+                        let parallel_results = tokio::select! {
+                            _ = &mut abort_rx => {
+                                run_cancel_token.cancel();
+                                for parallel_call in &pending_parallel_calls {
+                                    let canceled_result = canceled_tool_result(parallel_call);
+                                    emit_tool_execution_end(&agent_emitter, parallel_call, &canceled_result);
+                                }
+                                emitter.emit(
+                                    RunEventStream::Lifecycle,
+                                    RunEventPayload::Lifecycle {
+                                        state: RunLifecycle::Canceled,
+                                    },
+                                );
+                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                let _ = result_tx
+                                    .send(RunResult::canceled_with_messages(messages.clone()));
+                                if debug_enabled() {
+                                    tracing::debug!(run_id = %request.run_id, "roci run canceled");
+                                }
+                                return;
+                            }
+                            results = execute_parallel_tool_calls(
+                                &request.tools,
+                                &pending_parallel_calls,
+                                &agent_emitter,
+                                run_cancel_token.child_token(),
+                            ) => results,
+                        };
                         for (parallel_call, parallel_result) in pending_parallel_calls
                             .drain(..)
                             .zip(parallel_results.into_iter())
                         {
+                            emit_tool_execution_end(
+                                &agent_emitter,
+                                &parallel_call,
+                                &parallel_result,
+                            );
                             turn_tool_results.push(parallel_result.clone());
                             append_tool_result(
                                 &request.hooks,
                                 &emitter,
+                                &agent_emitter,
                                 &parallel_call,
                                 parallel_result,
                                 &mut iteration_failures,
@@ -1105,6 +1418,7 @@ impl Runner for LoopRunner {
                     let follow_ups = get_follow_ups().await;
                     if !follow_ups.is_empty() {
                         for msg in follow_ups {
+                            emit_message_lifecycle(&agent_emitter, &msg);
                             messages.push(msg);
                         }
                         continue 'outer;
@@ -1152,11 +1466,14 @@ fn emit_failed_result(
 
 fn process_stream_delta(
     emitter: &RunEventEmitter,
+    agent_emitter: &AgentEventEmitter,
     delta: TextStreamDelta,
     iteration_text: &mut String,
     tool_calls: &mut Vec<AgentToolCall>,
     stream_done: &mut bool,
+    message_open: &mut bool,
 ) -> Option<String> {
+    let assistant_event = delta.clone();
     match delta.event_type {
         StreamEventType::ToolCallDelta => {
             if let Some(tc) = delta.tool_call {
@@ -1170,6 +1487,12 @@ fn process_stream_delta(
                     return None;
                 }
 
+                emit_message_start_if_needed(
+                    agent_emitter,
+                    message_open,
+                    iteration_text,
+                    tool_calls,
+                );
                 if let Some(existing) = tool_calls.iter_mut().find(|call| call.id == tc.id) {
                     *existing = tc.clone();
                     emitter.emit(
@@ -1186,6 +1509,10 @@ fn process_stream_delta(
                         RunEventPayload::ToolCallStarted { call: tc },
                     );
                 }
+                agent_emitter.emit(AgentEvent::MessageUpdate {
+                    message: build_assistant_message(iteration_text, tool_calls),
+                    assistant_message_event: assistant_event,
+                });
             } else {
                 emitter.emit(
                     RunEventStream::System,
@@ -1200,20 +1527,43 @@ fn process_stream_delta(
                 if !reasoning.is_empty() {
                     emitter.emit(
                         RunEventStream::Reasoning,
-                        RunEventPayload::ReasoningDelta { text: reasoning },
+                        RunEventPayload::ReasoningDelta {
+                            text: reasoning.clone(),
+                        },
                     );
+                    emit_message_start_if_needed(
+                        agent_emitter,
+                        message_open,
+                        iteration_text,
+                        tool_calls,
+                    );
+                    agent_emitter.emit(AgentEvent::MessageUpdate {
+                        message: build_assistant_message(iteration_text, tool_calls),
+                        assistant_message_event: assistant_event,
+                    });
+                    agent_emitter.emit(AgentEvent::Reasoning { text: reasoning });
                 }
             }
         }
         StreamEventType::TextDelta => {
             if !delta.text.is_empty() {
                 iteration_text.push_str(&delta.text);
+                emit_message_start_if_needed(
+                    agent_emitter,
+                    message_open,
+                    iteration_text,
+                    tool_calls,
+                );
                 emitter.emit(
                     RunEventStream::Assistant,
                     RunEventPayload::AssistantDelta {
                         text: delta.text.clone(),
                     },
                 );
+                agent_emitter.emit(AgentEvent::MessageUpdate {
+                    message: build_assistant_message(iteration_text, tool_calls),
+                    assistant_message_event: assistant_event,
+                });
             }
         }
         StreamEventType::Error => {
@@ -1222,10 +1572,12 @@ fn process_stream_delta(
             } else {
                 delta.text
             };
+            emit_message_end_if_open(agent_emitter, message_open, iteration_text, tool_calls);
             return Some(message);
         }
         StreamEventType::Done => {
             *stream_done = true;
+            emit_message_end_if_open(agent_emitter, message_open, iteration_text, tool_calls);
         }
         _ => {}
     }
@@ -1262,6 +1614,7 @@ impl RunEventEmitter {
     }
 }
 
+#[derive(Clone)]
 struct AgentEventEmitter {
     sink: Option<AgentEventSink>,
 }
@@ -1379,13 +1732,15 @@ mod tests {
     use crate::agent_loop::RunStatus;
     use crate::models::ModelCapabilities;
     use crate::provider::{ModelProvider, ProviderResponse};
-    use crate::tools::tool::{AgentTool, ToolExecutionContext};
+    use crate::tools::arguments::ToolArguments;
+    use crate::tools::tool::{AgentTool, ToolExecutionContext, ToolUpdateCallback};
     use crate::tools::types::AgentToolParameters;
     use crate::types::{ContentPart, Usage};
 
     #[derive(Clone, Copy)]
     enum ProviderScenario {
         MissingOptionalFields,
+        TextThenStreamError,
         RepeatedToolFailure,
         RateLimitedThenComplete,
         RateLimitedExceedsCap,
@@ -1395,6 +1750,7 @@ mod tests {
         MixedTextAndParallelBatchThenComplete,
         DuplicateToolCallDeltaThenComplete,
         StreamEndsWithoutDoneThenComplete,
+        ToolUpdateThenComplete,
         /// Tool call for "schema_tool" with empty args on call 0, then text "done" on call 1+.
         SchemaToolBadArgs,
         /// Tool call for "schema_tool" with valid args on call 0, then text "done" on call 1+.
@@ -1494,6 +1850,28 @@ mod tests {
                         tool_call: None,
                         finish_reason: None,
                         usage: Some(Usage::default()),
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                ],
+                ProviderScenario::TextThenStreamError => vec![
+                    Ok(TextStreamDelta {
+                        text: "partial".to_string(),
+                        event_type: StreamEventType::TextDelta,
+                        tool_call: None,
+                        finish_reason: None,
+                        usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                    Ok(TextStreamDelta {
+                        text: "upstream stream failure".to_string(),
+                        event_type: StreamEventType::Error,
+                        tool_call: None,
+                        finish_reason: None,
+                        usage: None,
                         reasoning: None,
                         reasoning_signature: None,
                         reasoning_type: None,
@@ -1833,6 +2211,60 @@ mod tests {
                         })]
                     }
                 }
+                ProviderScenario::ToolUpdateThenComplete => {
+                    if call_index == 0 {
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::ToolCallDelta,
+                                tool_call: Some(AgentToolCall {
+                                    id: "update-tool-1".to_string(),
+                                    name: "update_tool".to_string(),
+                                    arguments: serde_json::json!({ "path": "README.md" }),
+                                    recipient: None,
+                                }),
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
+                    } else {
+                        vec![
+                            Ok(TextStreamDelta {
+                                text: "done".to_string(),
+                                event_type: StreamEventType::TextDelta,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: None,
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                        ]
+                    }
+                }
                 ProviderScenario::SchemaToolBadArgs
                 | ProviderScenario::SchemaToolValidArgs
                 | ProviderScenario::SchemaToolTypeMismatch => {
@@ -1937,6 +2369,102 @@ mod tests {
             }
         });
         (sink, events)
+    }
+
+    fn capture_agent_events() -> (AgentEventSink, Arc<std::sync::Mutex<Vec<AgentEvent>>>) {
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let sink_events = events.clone();
+        let sink: AgentEventSink = Arc::new(move |event| {
+            if let Ok(mut guard) = sink_events.lock() {
+                guard.push(event);
+            }
+        });
+        (sink, events)
+    }
+
+    struct UpdateStreamingTool {
+        params: AgentToolParameters,
+        wait_for_cancel: bool,
+    }
+
+    impl UpdateStreamingTool {
+        fn new(wait_for_cancel: bool) -> Self {
+            Self {
+                params: AgentToolParameters::empty(),
+                wait_for_cancel,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for UpdateStreamingTool {
+        fn name(&self) -> &str {
+            "update_tool"
+        }
+
+        fn description(&self) -> &str {
+            "tool that emits partial updates"
+        }
+
+        fn parameters(&self) -> &AgentToolParameters {
+            &self.params
+        }
+
+        async fn execute(
+            &self,
+            _args: &ToolArguments,
+            _ctx: &ToolExecutionContext,
+        ) -> Result<serde_json::Value, RociError> {
+            Ok(serde_json::json!({ "tool": "update_tool", "status": "ok" }))
+        }
+
+        async fn execute_ext(
+            &self,
+            _args: &ToolArguments,
+            _ctx: &ToolExecutionContext,
+            cancel: CancellationToken,
+            on_update: Option<ToolUpdateCallback>,
+        ) -> Result<serde_json::Value, RociError> {
+            if let Some(callback) = on_update.as_ref() {
+                callback(ToolUpdatePayload {
+                    content: vec![ContentPart::Text {
+                        text: "partial-1".to_string(),
+                    }],
+                    details: serde_json::json!({ "step": 1 }),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            if let Some(callback) = on_update.as_ref() {
+                callback(ToolUpdatePayload {
+                    content: vec![ContentPart::Text {
+                        text: "partial-2".to_string(),
+                    }],
+                    details: serde_json::json!({ "step": 2 }),
+                });
+            }
+
+            if self.wait_for_cancel {
+                tokio::select! {
+                    _ = cancel.cancelled() => Err(RociError::ToolExecution {
+                        tool_name: "update_tool".to_string(),
+                        message: "canceled".to_string(),
+                    }),
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => Ok(serde_json::json!({
+                        "tool": "update_tool",
+                        "status": "late_ok",
+                    })),
+                }
+            } else {
+                Ok(serde_json::json!({
+                    "tool": "update_tool",
+                    "status": "ok",
+                }))
+            }
+        }
+    }
+
+    fn update_streaming_tool(wait_for_cancel: bool) -> Arc<dyn Tool> {
+        Arc::new(UpdateStreamingTool::new(wait_for_cancel))
     }
 
     fn failing_tool() -> Arc<dyn Tool> {
@@ -2062,6 +2590,13 @@ mod tests {
             .collect()
     }
 
+    fn tool_result_id_from_message(message: &ModelMessage) -> Option<&str> {
+        message.content.iter().find_map(|part| match part {
+            ContentPart::ToolResult(result) => Some(result.tool_call_id.as_str()),
+            _ => None,
+        })
+    }
+
     #[tokio::test]
     async fn no_panic_when_stream_optional_fields_missing() {
         let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
@@ -2085,6 +2620,358 @@ mod tests {
                 .any(|message| matches!(message.role, crate::types::Role::User)),
             "result should include persisted prompt context"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_message_lifecycle_events_emit_for_text_stream() {
+        let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let (agent_sink, agent_events) = capture_agent_events();
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.agent_event_sink = Some(agent_sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let events = agent_events.lock().expect("agent event lock");
+        let start_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageStart { message }
+                        if message.role == crate::types::Role::Assistant
+                )
+            })
+            .expect("expected assistant MessageStart");
+        let update_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageUpdate {
+                        message,
+                        assistant_message_event,
+                        ..
+                    } if message.role == crate::types::Role::Assistant
+                        && assistant_message_event.event_type == StreamEventType::TextDelta
+                        && assistant_message_event.text == "done"
+                )
+            })
+            .expect("expected MessageUpdate(done)");
+        let end_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message }
+                        if message.role == crate::types::Role::Assistant
+                )
+            })
+            .expect("expected assistant MessageEnd");
+        assert!(start_idx < update_idx);
+        assert!(update_idx < end_idx);
+    }
+
+    #[tokio::test]
+    async fn message_lifecycle_events_cover_prompt_and_tool_results() {
+        let (runner, _requests) = test_runner(ProviderScenario::ToolUpdateThenComplete);
+        let (agent_sink, agent_events) = capture_agent_events();
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("run update tool")]);
+        request.tools = vec![update_streaming_tool(false)];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.agent_event_sink = Some(agent_sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let events = agent_events.lock().expect("agent event lock");
+        let user_start_count = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageStart { message }
+                        if message.role == crate::types::Role::User
+                )
+            })
+            .count();
+        let user_end_count = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message }
+                        if message.role == crate::types::Role::User
+                )
+            })
+            .count();
+        assert_eq!(user_start_count, 1);
+        assert_eq!(user_end_count, 1);
+
+        let tool_start = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageStart { message }
+                    if message.role == crate::types::Role::Tool
+                        && tool_result_id_from_message(message) == Some("update-tool-1")
+            )
+        });
+        let tool_end = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageEnd { message }
+                    if message.role == crate::types::Role::Tool
+                        && tool_result_id_from_message(message) == Some("update-tool-1")
+            )
+        });
+        assert!(tool_start, "expected tool result MessageStart for update-tool-1");
+        assert!(tool_end, "expected tool result MessageEnd for update-tool-1");
+    }
+
+    #[tokio::test]
+    async fn agent_message_end_is_emitted_before_failure_terminal_event() {
+        let (runner, _requests) = test_runner(ProviderScenario::TextThenStreamError);
+        let (agent_sink, agent_events) = capture_agent_events();
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.agent_event_sink = Some(agent_sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("upstream stream failure"));
+
+        let events = agent_events.lock().expect("agent event lock");
+        let start_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageStart { message }
+                        if message.role == crate::types::Role::Assistant
+                )
+            })
+            .expect("expected assistant MessageStart");
+        let update_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageUpdate {
+                        message,
+                        assistant_message_event,
+                        ..
+                    } if message.role == crate::types::Role::Assistant
+                        && assistant_message_event.event_type == StreamEventType::TextDelta
+                        && assistant_message_event.text == "partial"
+                )
+            })
+            .expect("expected MessageUpdate(partial)");
+        let message_end_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message }
+                        if message.role == crate::types::Role::Assistant
+                )
+            })
+            .expect("expected assistant MessageEnd");
+        let agent_end_idx = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+            .expect("expected AgentEnd");
+        assert!(start_idx < update_idx);
+        assert!(update_idx < message_end_idx);
+        assert!(message_end_idx < agent_end_idx);
+    }
+
+    #[tokio::test]
+    async fn tool_execution_updates_stream_with_deterministic_order() {
+        let (runner, _requests) = test_runner(ProviderScenario::ToolUpdateThenComplete);
+        let (agent_sink, agent_events) = capture_agent_events();
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("run update tool")]);
+        request.tools = vec![update_streaming_tool(false)];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.agent_event_sink = Some(agent_sink);
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(
+            tool_result_ids_from_messages(&result.messages),
+            vec!["update-tool-1".to_string()]
+        );
+
+        let events = agent_events.lock().expect("agent event lock");
+        let mut sequence: Vec<String> = Vec::new();
+        for event in events.iter() {
+            match event {
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id,
+                    tool_name,
+                    ..
+                } if tool_call_id == "update-tool-1" && tool_name == "update_tool" => {
+                    sequence.push("start".to_string());
+                }
+                AgentEvent::ToolExecutionUpdate {
+                    tool_call_id,
+                    partial_result,
+                    ..
+                } if tool_call_id == "update-tool-1" => {
+                    let step = partial_result
+                        .details
+                        .get("step")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or_default();
+                    sequence.push(format!("update-{step}"));
+                }
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id,
+                    is_error,
+                    ..
+                } if tool_call_id == "update-tool-1" => {
+                    assert!(!is_error);
+                    sequence.push("end".to_string());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            sequence,
+            vec![
+                "start".to_string(),
+                "update-1".to_string(),
+                "update-2".to_string(),
+                "end".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn canceling_during_tool_execution_emits_error_end_event() {
+        let (runner, _requests) = test_runner(ProviderScenario::ToolUpdateThenComplete);
+        let (agent_sink, agent_events) = capture_agent_events();
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("cancel update tool")]);
+        request.tools = vec![update_streaming_tool(true)];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.agent_event_sink = Some(agent_sink);
+
+        let mut handle = runner.start(request).await.expect("start run");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(handle.abort(), "abort should be accepted");
+
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Canceled);
+
+        let events = agent_events.lock().expect("agent event lock");
+        let end_event = events.iter().find_map(|event| match event {
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                is_error,
+                ..
+            } if tool_call_id == "update-tool-1" => Some(*is_error),
+            _ => None,
+        });
+        assert_eq!(end_event, Some(true));
+    }
+
+    #[tokio::test]
+    async fn steering_skip_emits_tool_and_message_lifecycle_for_skipped_calls() {
+        let (runner, _requests) = test_runner(ProviderScenario::MutatingBatchThenComplete);
+        let (agent_sink, agent_events) = capture_agent_events();
+        let active_calls = Arc::new(AtomicUsize::new(0));
+        let max_active_calls = Arc::new(AtomicUsize::new(0));
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run tools")]);
+        request.tools = vec![
+            tracked_success_tool(
+                "apply_patch",
+                Duration::from_millis(40),
+                active_calls.clone(),
+                max_active_calls.clone(),
+            ),
+            tracked_success_tool("read", Duration::from_millis(40), active_calls, max_active_calls),
+        ];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.agent_event_sink = Some(agent_sink);
+
+        let steering_tick = Arc::new(AtomicUsize::new(0));
+        let steering_tick_clone = steering_tick.clone();
+        request.get_steering_messages = Some(Arc::new(move || {
+            let tick = steering_tick_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                if tick >= 2 {
+                    vec![ModelMessage::user("interrupt")]
+                } else {
+                    Vec::new()
+                }
+            })
+        }));
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(4), handle.wait())
+            .await
+            .expect("run wait timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert!(
+            tool_result_ids_from_messages(&result.messages)
+                .iter()
+                .any(|id| id == "safe-read-2"),
+            "expected skipped tool result for safe-read-2"
+        );
+
+        let events = agent_events.lock().expect("agent event lock");
+        let skipped_tool_start = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "safe-read-2"
+            )
+        });
+        let skipped_tool_end = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolExecutionEnd { tool_call_id, .. } if tool_call_id == "safe-read-2"
+            )
+        });
+        let skipped_msg_start = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageStart { message }
+                    if message.role == crate::types::Role::Tool
+                        && tool_result_id_from_message(message) == Some("safe-read-2")
+            )
+        });
+        let skipped_msg_end = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageEnd { message }
+                    if message.role == crate::types::Role::Tool
+                        && tool_result_id_from_message(message) == Some("safe-read-2")
+            )
+        });
+
+        assert!(skipped_tool_start, "expected ToolExecutionStart for skipped call");
+        assert!(skipped_tool_end, "expected ToolExecutionEnd for skipped call");
+        assert!(skipped_msg_start, "expected MessageStart for skipped tool result");
+        assert!(skipped_msg_end, "expected MessageEnd for skipped tool result");
     }
 
     #[tokio::test]

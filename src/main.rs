@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use clap::Parser;
 use roci::agent_loop::{
-    ApprovalPolicy, LoopRunner, RunEventPayload, RunLifecycle, RunRequest, RunStatus, Runner,
+    AgentEvent, ApprovalPolicy, LoopRunner, RunEventPayload, RunLifecycle, RunRequest, RunStatus,
+    Runner,
 };
 use roci::cli::{AuthCommands, ChatArgs, Cli, Commands};
 use roci::config::RociConfig;
-use roci::types::ModelMessage;
+use roci::types::{ModelMessage, StreamEventType};
 
 #[tokio::main]
 async fn main() {
@@ -62,39 +63,73 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         settings.max_tokens = Some(max);
     }
 
-    // Stream events to terminal
+    // Stream run-level failures to terminal
     let sink = Arc::new(|event: roci::agent_loop::RunEvent| {
-        use std::io::Write;
         match &event.payload {
-            RunEventPayload::AssistantDelta { text } => {
-                print!("{text}");
-                let _ = std::io::stdout().flush();
-            }
-            RunEventPayload::ToolCallStarted { call } => {
-                eprintln!("\n⚡ {} ({})", call.name, call.id);
-            }
-            RunEventPayload::ToolResult { result } => {
-                let output = result.result.to_string();
-                let truncated = if output.len() > 200 {
-                    // Find a valid UTF-8 char boundary at or before 200
-                    let mut end = 200;
-                    while end > 0 && !output.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}...", &output[..end])
-                } else {
-                    output
-                };
-                if result.is_error {
-                    eprintln!("  ❌ {truncated}");
-                } else {
-                    eprintln!("  ✅ {truncated}");
-                }
-            }
             RunEventPayload::Lifecycle {
                 state: RunLifecycle::Failed { error },
             } => {
                 eprintln!("\n❌ {error}");
+            }
+            _ => {}
+        }
+    });
+
+    // Stream richer agent events to terminal
+    let agent_sink = Arc::new(|event: AgentEvent| {
+        use std::io::Write;
+        match event {
+            AgentEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => match assistant_message_event.event_type {
+                StreamEventType::TextDelta => {
+                    if !assistant_message_event.text.is_empty() {
+                        print!("{}", assistant_message_event.text);
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                StreamEventType::Reasoning => {
+                    if let Some(reasoning) = assistant_message_event.reasoning {
+                        if !reasoning.is_empty() {
+                            eprintln!("\n💭 {}", truncate_preview(&reasoning, 120));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            AgentEvent::ToolExecutionStart {
+                tool_name,
+                tool_call_id,
+                ..
+            } => {
+                eprintln!("\n⚡ {tool_name} ({tool_call_id})");
+            }
+            AgentEvent::ToolExecutionUpdate {
+                tool_name,
+                partial_result,
+                ..
+            } => {
+                let preview = if let Some(text) = partial_result.content.iter().find_map(|part| {
+                    if let roci::types::ContentPart::Text { text } = part {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                }) {
+                    truncate_preview(text, 80)
+                } else {
+                    truncate_preview(&partial_result.details.to_string(), 80)
+                };
+                eprintln!("  … {tool_name}: {preview}");
+            }
+            AgentEvent::ToolExecutionEnd { result, .. } => {
+                let preview = truncate_preview(&result.result.to_string(), 200);
+                if result.is_error {
+                    eprintln!("  ❌ {preview}");
+                } else {
+                    eprintln!("  ✅ {preview}");
+                }
             }
             _ => {}
         }
@@ -106,6 +141,7 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut request = RunRequest::new(model, messages);
     request.settings = settings;
     request.event_sink = Some(sink);
+    request.agent_event_sink = Some(agent_sink);
     request.tools = tools;
     request.approval_policy = ApprovalPolicy::Always;
 
@@ -121,4 +157,16 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn truncate_preview(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let end = value
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len());
+    format!("{}...", &value[..end])
 }
