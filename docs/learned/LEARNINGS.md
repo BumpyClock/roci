@@ -7,3 +7,5 @@
 - [OpenAI/Gemini API Shapes](./openai-gemini-api-shapes.md)
 - [OpenAI Responses Options](./openai-responses-options.md)
 - [Ralph Loop Parallel](./ralph-loop-parallel.md)
+- [MCP Protocol + Integration Notes](./mcp.md)
+  - read_when: validate MCP transport parity (stdio/SSE/multi-server) and OpenAI instruction merge behavior.

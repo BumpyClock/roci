@@ -8,7 +8,7 @@ pub mod types;
 pub mod validation;
 
 pub use arguments::ToolArguments;
-pub use dynamic::{DynamicTool, DynamicToolProvider};
+pub use dynamic::{DynamicTool, DynamicToolAdapter, DynamicToolProvider};
 #[cfg(feature = "agent")]
 pub use tool::ToolUpdateCallback;
 pub use tool::{AgentTool, Tool, ToolExecutionContext};

@@ -105,6 +105,15 @@ mod tests {
 
     #[async_trait]
     impl MCPTransport for NoopTransport {
+        async fn connect(
+            &mut self,
+            _client_info: rmcp::model::ClientInfo,
+        ) -> Result<crate::mcp::transport::MCPRunningService, rmcp::service::ClientInitializeError> {
+            Err(rmcp::service::ClientInitializeError::ConnectionClosed(
+                "mock transport is not connected".into(),
+            ))
+        }
+
         async fn send(&mut self, _message: serde_json::Value) -> Result<(), RociError> {
             Ok(())
         }
@@ -184,7 +193,7 @@ mod tests {
             .await
             .expect_err("adapter should fail without rmcp running session");
 
-        assert!(matches!(err, RociError::UnsupportedOperation(_)));
+        assert!(matches!(err, RociError::Stream(_)));
     }
 
     #[tokio::test]

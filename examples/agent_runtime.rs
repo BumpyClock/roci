@@ -69,6 +69,7 @@ async fn main() {
         model,
         system_prompt: Some("You are a helpful assistant with access to an echo tool.".into()),
         tools: vec![echo_tool],
+        dynamic_tool_providers: Vec::new(),
         settings: GenerationSettings::default(),
         transform_context: None,
         convert_to_llm: None,

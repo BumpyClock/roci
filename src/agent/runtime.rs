@@ -26,6 +26,7 @@ use crate::agent_loop::{
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
+use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::types::{GenerationSettings, ModelMessage, Role};
 
@@ -116,6 +117,8 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     /// Tools available for tool-use loops.
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Dynamic tool providers queried at run start.
+    pub dynamic_tool_providers: Vec<Arc<dyn DynamicToolProvider>>,
     /// Generation settings (temperature, max_tokens, etc.).
     pub settings: GenerationSettings,
     /// Optional hook to transform the message context before each LLM call.
@@ -172,6 +175,7 @@ pub struct AgentRuntime {
     model: Arc<Mutex<LanguageModel>>,
     system_prompt: Arc<Mutex<Option<String>>>,
     tools: Arc<Mutex<Vec<Arc<dyn Tool>>>>,
+    dynamic_tool_providers: Arc<Mutex<Vec<Arc<dyn DynamicToolProvider>>>>,
     messages: Arc<Mutex<Vec<ModelMessage>>>,
     steering_queue: Arc<Mutex<Vec<ModelMessage>>>,
     follow_up_queue: Arc<Mutex<Vec<ModelMessage>>>,
@@ -191,6 +195,7 @@ impl AgentRuntime {
         let model = Arc::new(Mutex::new(config.model.clone()));
         let system_prompt = Arc::new(Mutex::new(config.system_prompt.clone()));
         let tools = Arc::new(Mutex::new(config.tools.clone()));
+        let dynamic_tool_providers = Arc::new(Mutex::new(config.dynamic_tool_providers.clone()));
         let (state_tx, state_rx) = watch::channel(AgentState::Idle);
         let initial_snapshot = AgentSnapshot {
             state: AgentState::Idle,
@@ -209,6 +214,7 @@ impl AgentRuntime {
             model,
             system_prompt,
             tools,
+            dynamic_tool_providers,
             messages: Arc::new(Mutex::new(Vec::new())),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
             follow_up_queue: Arc::new(Mutex::new(Vec::new())),
@@ -337,6 +343,32 @@ impl AgentRuntime {
             .map_err(|_| RociError::InvalidState("Agent is busy (tools lock contended)".into()))?;
         *runtime_tools = tools;
         Ok(())
+    }
+
+    /// Replace the dynamic tool providers used for subsequent runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn set_dynamic_tool_providers(
+        &self,
+        providers: Vec<Arc<dyn DynamicToolProvider>>,
+    ) -> Result<(), RociError> {
+        let _state_guard = self.lock_state_for_idle_mutation()?;
+        let mut runtime_providers = self.dynamic_tool_providers.try_lock().map_err(|_| {
+            RociError::InvalidState("Agent is busy (dynamic tool lock contended)".into())
+        })?;
+        *runtime_providers = providers;
+        Ok(())
+    }
+
+    /// Clear all dynamic tool providers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn clear_dynamic_tool_providers(&self) -> Result<(), RociError> {
+        self.set_dynamic_tool_providers(Vec::new()).await
     }
 
     /// Clear all queued steering messages.
@@ -574,6 +606,28 @@ impl AgentRuntime {
         self.idle_notify.notify_waiters();
     }
 
+    async fn resolve_tools_for_run(&self) -> Result<Vec<Arc<dyn Tool>>, RociError> {
+        let static_tools = self.tools.lock().await.clone();
+        let providers = self.dynamic_tool_providers.lock().await.clone();
+        Self::merge_static_and_dynamic_tools(static_tools, providers).await
+    }
+
+    async fn merge_static_and_dynamic_tools(
+        mut static_tools: Vec<Arc<dyn Tool>>,
+        providers: Vec<Arc<dyn DynamicToolProvider>>,
+    ) -> Result<Vec<Arc<dyn Tool>>, RociError> {
+        for provider in providers {
+            let discovered = provider.list_tools().await?;
+            for tool in discovered {
+                static_tools.push(Arc::new(DynamicToolAdapter::new(
+                    Arc::clone(&provider),
+                    tool,
+                )));
+            }
+        }
+        Ok(static_tools)
+    }
+
     /// Build a [`RunRequest`], start the loop, wait for the result, then
     /// transition back to Idle.
     async fn run_loop(&self, initial_messages: Vec<ModelMessage>) -> Result<RunResult, RociError> {
@@ -608,7 +662,13 @@ impl AgentRuntime {
         let intercepting_sink = self.build_intercepting_sink();
 
         let model = self.model.lock().await.clone();
-        let tools = self.tools.lock().await.clone();
+        let tools = match self.resolve_tools_for_run().await {
+            Ok(tools) => tools,
+            Err(err) => {
+                self.restore_idle_after_preflight_error().await;
+                return Err(err);
+            }
+        };
 
         let mut request = RunRequest::new(model, initial_messages)
             .with_tools(tools)
@@ -719,7 +779,12 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::arguments::ToolArguments;
+    use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
+    use crate::tools::tool::ToolExecutionContext;
     use crate::tools::{AgentTool, AgentToolParameters};
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
 
     fn test_config() -> RociConfig {
         RociConfig::new()
@@ -731,6 +796,7 @@ mod tests {
             model,
             system_prompt: None,
             tools: Vec::new(),
+            dynamic_tool_providers: Vec::new(),
             settings: GenerationSettings::default(),
             transform_context: None,
             convert_to_llm: None,
@@ -751,6 +817,38 @@ mod tests {
             AgentToolParameters::empty(),
             |_args, _ctx| async move { Ok(serde_json::json!({ "ok": true })) },
         ))
+    }
+
+    struct MockDynamicToolProvider {
+        tools: Vec<DynamicTool>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockDynamicToolProvider {
+        fn new(tools: Vec<DynamicTool>) -> Self {
+            Self {
+                tools,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DynamicToolProvider for MockDynamicToolProvider {
+        async fn list_tools(&self) -> Result<Vec<DynamicTool>, RociError> {
+            Ok(self.tools.clone())
+        }
+
+        async fn execute_tool(
+            &self,
+            name: &str,
+            _args: &ToolArguments,
+            _ctx: &ToolExecutionContext,
+        ) -> Result<serde_json::Value, RociError> {
+            let mut calls = self.calls.lock().expect("calls lock should not be poisoned");
+            calls.push(name.to_string());
+            Ok(serde_json::json!({ "ok": true }))
+        }
     }
 
     #[tokio::test]
@@ -921,6 +1019,68 @@ mod tests {
             .map(|tool| tool.name().to_string())
             .collect();
         assert_eq!(names, vec!["t1".to_string(), "t2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_tools_for_run_merges_static_and_dynamic_tools() {
+        let provider: Arc<dyn DynamicToolProvider> = Arc::new(MockDynamicToolProvider::new(vec![DynamicTool {
+            name: "dynamic".into(),
+            description: "dynamic tool".into(),
+            parameters: AgentToolParameters::empty(),
+        }]));
+
+        let mut config = test_agent_config();
+        config.tools = vec![dummy_tool("static")];
+        config.dynamic_tool_providers = vec![Arc::clone(&provider)];
+
+        let agent = AgentRuntime::new(test_config(), config);
+
+        let tools = agent
+            .resolve_tools_for_run()
+            .await
+            .expect("tools should resolve");
+        let names = tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"static".to_string()));
+        assert!(names.contains(&"dynamic".to_string()));
+    }
+
+    #[tokio::test]
+    async fn set_dynamic_tool_providers_replaces_runtime_registry() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        let provider: Arc<dyn DynamicToolProvider> =
+            Arc::new(MockDynamicToolProvider::new(Vec::new()));
+
+        agent
+            .set_dynamic_tool_providers(vec![Arc::clone(&provider)])
+            .await
+            .expect("dynamic providers should be replaced");
+
+        let providers = agent.dynamic_tool_providers.lock().await;
+        assert_eq!(providers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_dynamic_tool_providers_empties_registry() {
+        let agent = AgentRuntime::new(test_config(), test_agent_config());
+        let provider: Arc<dyn DynamicToolProvider> =
+            Arc::new(MockDynamicToolProvider::new(Vec::new()));
+
+        agent
+            .set_dynamic_tool_providers(vec![Arc::clone(&provider)])
+            .await
+            .expect("dynamic providers should be set");
+
+        agent
+            .clear_dynamic_tool_providers()
+            .await
+            .expect("dynamic providers should be cleared");
+
+        let providers = agent.dynamic_tool_providers.lock().await;
+        assert!(providers.is_empty());
     }
 
     #[tokio::test]

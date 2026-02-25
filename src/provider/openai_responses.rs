@@ -122,7 +122,12 @@ impl OpenAiResponsesProvider {
         if self.is_codex {
             return self.build_codex_request_body(request, stream);
         }
-        let input = Self::build_input_items(&request.messages);
+        let system_role = if self.capabilities.supports_reasoning {
+            "developer"
+        } else {
+            "system"
+        };
+        let input = Self::build_input_items(&request.messages, system_role);
 
         let mut body = serde_json::json!({
             "model": self.model.as_str(),
@@ -256,7 +261,7 @@ impl OpenAiResponsesProvider {
                 .as_ref()
                 .and_then(|o| o.instructions.as_ref()),
         );
-        let input = Self::build_input_items(&filtered_messages);
+        let input = Self::build_input_items(&filtered_messages, "system");
 
         if debug_enabled() {
             tracing::debug!(
@@ -363,7 +368,7 @@ impl OpenAiResponsesProvider {
         body
     }
 
-    fn build_input_items(messages: &[ModelMessage]) -> Vec<serde_json::Value> {
+    fn build_input_items(messages: &[ModelMessage], system_role: &str) -> Vec<serde_json::Value> {
         let mut input = Vec::new();
         for msg in messages {
             let mut content_parts = Vec::new();
@@ -404,7 +409,7 @@ impl OpenAiResponsesProvider {
                             serde_json::Value::Array(content_parts)
                         };
                         let role = match msg.role {
-                            Role::System => "system",
+                            Role::System => system_role,
                             Role::User => "user",
                             Role::Assistant => "assistant",
                             Role::Tool => "tool",
@@ -1395,6 +1400,26 @@ mod tests {
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["text"]["verbosity"], "low");
         assert_eq!(body["text"]["format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn request_body_maps_system_to_developer_for_reasoning_models() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
+        let request = ProviderRequest {
+            messages: vec![
+                ModelMessage::system("Use this system message"),
+                ModelMessage::user("hello"),
+            ],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            session_id: None,
+            transport: None,
+        };
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"], "Use this system message");
     }
 
     #[test]

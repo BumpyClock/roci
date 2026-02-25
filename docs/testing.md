@@ -1,5 +1,11 @@
 # Roci Testing Guide
 
+## MCP integration tests
+
+- Command: `cargo test --test mcp_integration_tests --features mcp`
+- To inspect request payloads:
+  - `cargo test --test mcp_integration_tests --features mcp -- --nocapture`
+
 ## Default suite (hermetic)
 
 - Command: `cargo test`

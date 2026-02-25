@@ -4,22 +4,33 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use rmcp::{
-    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
-    service::{RxJsonRpcMessage, TxJsonRpcMessage},
+    model::{ClientInfo, ClientJsonRpcMessage, ServerJsonRpcMessage},
+    service::{
+        ClientInitializeError, DynService, RoleClient, RunningService, RxJsonRpcMessage,
+        ServiceExt, TxJsonRpcMessage,
+    },
     transport::{
         common::client_side_sse::ExponentialBackoff,
         streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
         TokioChildProcess, Transport as RmcpTransport,
     },
-    RoleClient,
 };
 use tokio::process::Command;
 
 use crate::error::RociError;
 
+pub type DynClientService = Box<dyn DynService<RoleClient>>;
+pub type MCPRunningService = RunningService<RoleClient, DynClientService>;
+
 /// Transport trait for MCP communication.
 #[async_trait]
 pub trait MCPTransport: Send {
+    /// Create and initialize a new rmcp running service for this transport.
+    async fn connect(
+        &mut self,
+        client_info: ClientInfo,
+    ) -> Result<MCPRunningService, ClientInitializeError>;
+
     /// Send a JSON-RPC message.
     async fn send(&mut self, message: serde_json::Value) -> Result<(), RociError>;
 
@@ -158,6 +169,25 @@ impl StdioTransport {
 
 #[async_trait]
 impl MCPTransport for StdioTransport {
+    async fn connect(
+        &mut self,
+        client_info: ClientInfo,
+    ) -> Result<MCPRunningService, ClientInitializeError> {
+        if self.closed {
+            return Err(ClientInitializeError::ConnectionClosed(
+                "MCP transport closed".into(),
+            ));
+        }
+
+        let mut command = Command::new(&self.command);
+        command.args(&self.args);
+        let transport = TokioChildProcess::new(command).map_err(|error| {
+            ClientInitializeError::transport::<TokioChildProcess>(error, "spawn stdio transport")
+        })?;
+
+        client_info.into_dyn().serve(transport).await
+    }
+
     async fn send(&mut self, message: serde_json::Value) -> Result<(), RociError> {
         self.ensure_connected()?;
         let message: ClientJsonRpcMessage = serde_json::from_value(message)?;
@@ -372,6 +402,23 @@ impl SSETransport {
 
 #[async_trait]
 impl MCPTransport for SSETransport {
+    async fn connect(
+        &mut self,
+        client_info: ClientInfo,
+    ) -> Result<MCPRunningService, ClientInitializeError> {
+        if self.closed {
+            return Err(ClientInitializeError::ConnectionClosed(
+                "MCP transport closed".into(),
+            ));
+        }
+
+        let config = self
+            .build_rmcp_config()
+            .map_err(|error| ClientInitializeError::ConnectionClosed(error.to_string()))?;
+        let transport = StreamableHttpClientTransport::from_config(config);
+        client_info.into_dyn().serve(transport).await
+    }
+
     async fn send(&mut self, message: serde_json::Value) -> Result<(), RociError> {
         let operation_timeout_ms = self.request_timeout_ms.or(self.connect_timeout_ms);
         self.ensure_connected()?;

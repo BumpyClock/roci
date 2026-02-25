@@ -166,7 +166,7 @@ fn config_non_expired_token_is_returned() {
     let store_for_config = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
     let config = RociConfig::new().with_token_store(Some(Arc::new(store_for_config)));
 
-    assert_eq!(config.get_api_key("openai"), Some("fresh-tok".to_string()),);
+    assert_eq!(config.get_api_key("codex"), Some("fresh-tok".to_string()),);
 }
 
 // ---------------------------------------------------------------------------

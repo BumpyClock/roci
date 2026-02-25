@@ -7,11 +7,11 @@
 
 ## Executive Summary
 
-Roci is a functional text-generation SDK with basic tool support. Tachikoma is a comprehensive AI platform with audio, realtime, MCP, embeddings, agent management, and deep provider-specific features. The gap is substantial across advanced features, streaming fidelity, and provider-specific options.
+Roci is a functional text-generation SDK with basic tool support. Tachikoma is a comprehensive AI platform with audio, realtime, MCP, embeddings, agent management, and deep provider-specific features. The gap is substantial across advanced features, streaming fidelity, and provider-specific APIs.
 
 **Roci strengths**: formal `ModelProvider` trait, built-in retry with exponential backoff, cache/reasoning token tracking in `Usage`, per-model capability flags (`supports_json_schema`, `supports_reasoning`, `supports_system_messages`), explicit `max_output_tokens`, OpenAI Responses API options (`service_tier`, `truncation`, `store`).
 
-**Tachikoma strengths**: full MCP protocol, realtime audio, embeddings, extended thinking, prompt caching control, multi-step agent loop, session persistence, rich provider-specific options (6 providers), comprehensive streaming events, OAuth auth.
+**Tachikoma strengths**: full MCP protocol, realtime audio, embeddings, extended thinking, prompt caching control, multi-agent routing, streaming fidelity, and deep provider-specific options.
 
 ---
 
@@ -104,7 +104,7 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 | Feature | Tachikoma | Roci |
 |---------|-----------|------|
 | Tool definitions | Full schema + typed parameters + `ParameterDefinition` enum | JSON Schema via serde_json |
-| **Tool choice** (`auto`/`required`/`none`/specific) | Yes (`OpenAIOptions.toolChoice`) | Implemented in Anthropic; Tachikoma text providers also unimplemented |
+| **Tool choice** (`auto`/`required`/`none`/specific) | Yes | Implemented in Anthropic; Tachikoma text providers also unimplemented |
 | Parallel tool calls | `OpenAIOptions.parallelToolCalls` | Only `OpenAiResponsesOptions` |
 | Tool result handling | Automatic loop with context | Manual or `stream_text_with_tools` |
 | Tool execution context | Full: messages, model, settings, sessionId, stepIndex, metadata | Not provided to tools |
@@ -122,7 +122,7 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 | Feature | Tachikoma | Roci |
 |---------|-----------|------|
 | **Extended thinking** | Full: `ThinkingMode` (enabled/disabled), `budgetTokens`, thinking + redacted_thinking content blocks | Full: `ThinkingMode` enum, `AnthropicOptions.thinking`, thinking/redacted content blocks, streaming deltas |
-| **Prompt caching** | `CacheControl` enum (ephemeral/persistent) in `AnthropicOptions` | Only tracks cache tokens in `Usage` response |
+| **Prompt caching** | `CacheControl` enum (ephemeral/persistent) in `AnthropicOptions` | Only sent in `AnthropicOptions` |
 | **Beta headers** | Configurable with flag merging (`interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14`) | Always sent via `anthropic_headers()` with beta parameter |
 | **Auth flexibility** | API key + Bearer token fallback chain | API key only |
 | **Error parsing** | `AnthropicErrorResponse` structure (type + message extraction) | Generic `status_to_error()` |
@@ -140,7 +140,7 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 | Provider | Option | Impact |
 |----------|--------|--------|
 | **Anthropic** | thinking mode (enabled/disabled + budget) | ✅ Implemented |
-| **Anthropic** | cache_control (ephemeral/persistent) | ✅ Type defined (matches Tachikoma) |
+| **Anthropic** | cache_control (ephemeral/persistent) | ✅ Implemented |
 | **Anthropic** | metadata | Request metadata |
 | **Google** | thinkingConfig (budgetTokens + includeThoughts) | ✅ Implemented |
 | **Google** | safetySettings (strict/moderate/relaxed) | ✅ Implemented |
@@ -173,9 +173,9 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 | presence_penalty | Yes | Yes |
 | stop_sequences | Yes | Yes |
 | seed | Yes | Yes |
-| reasoning_effort | Yes (low/medium/high) | Yes (none/low/medium/high) |
-| text_verbosity | Nested in OpenAIOptions.verbosity | Top-level |
-| response_format | Nested in OpenAIOptions | Top-level |
+| reasoning_effort | Yes | Yes |
+| text_verbosity | GPT-5-specific | Nested in OpenAIOptions.verbosity |
+| response_format | Nested in OpenAIOptions | Nested in OpenAIOptions |
 | **stop_conditions** (programmatic) | Yes (function type) | No |
 | **user** identifier | Not visible | Yes |
 | **openai_responses** (nested options) | No | Yes |
@@ -195,7 +195,7 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 | System prompt updates | Mid-session updates supported | Static only |
 | Step tracking | `GenerationStep` (per-step text, toolCalls, toolResults, usage, finishReason) | Not tracked |
 | Agent response | text, usage, finishReason, steps, conversationLength | Basic text + usage |
-| Conversation builder | Fluent `.system()/.user()/.assistant()` | Manual `ModelMessage::system()` etc. |
+| Conversation builder | Fluent `.system()/.user()/.assistant()` | Manual `ModelMessage::system()` etc |
 
 ---
 
@@ -203,16 +203,19 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 
 | Feature | Tachikoma | Roci |
 |---------|-----------|------|
-| **Status** | Full implementation | **Stub** (all methods throw `UnsupportedOperation`) |
-| Transports | Stdio, SSE, HTTP | Trait architecture only, no concrete implementations |
-| Tool discovery | `tools/list` | Not implemented |
-| Tool execution | `tools/call` | Not implemented |
-| Protocol version fallback | 2025-03-26, 2024-11-05 | None |
-| Auto-reconnect | Yes | No |
-| Server config | Timeouts, headers, env vars | None |
-| Multi-server aggregation | Yes | No |
+| **Status** | Full implementation | **Implemented** |
+| Transports | Stdio, SSE, HTTP | Stdio + SSE transport; streamable HTTP + stdio | 
+| Tool discovery | `tools/list` | Implemented via MCP client + bridge |
+| Tool execution | `tools/call` | Implemented via `call_tool` |
+| Protocol version fallback | 2025-03-26, 2024-11-05 | MCPClient fallback (latest → 2024-11-05) |
+| Auto-reconnect | Yes | MCPClient reconnect on transport close/cancel |
+| Server config | Timeouts, headers, env vars | Builder-style transport configuration |
+| Multi-server aggregation | Yes | Implemented via independent transport/client composition |
+| Server instructions | Yes | Exposed via MCP client + deterministic merge helpers |
 
 ---
+
+MCP parity is considered complete for current scope (stdio + SSE transport wiring, initialize/list/call, protocol fallback paths, multi-server tool aggregation, and instruction merge helpers). Coverage is primarily mock-based; full session persistence and long-running transport resilience are not yet exercised.
 
 ## 10. Audio & Realtime
 
@@ -259,10 +262,10 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 |---------|-----------|------|
 | Error system | `TachikomaError` + `APICallError` + `TachikomaUnifiedError` | Single `RociError` enum |
 | Recovery suggestions | Typed actions + helpURL + metadata | Enum-based suggestions |
-| **Retry logic** | Not built-in | **Built-in** (exponential backoff + jitter, configurable) |
+| Retry logic | Not built-in | **Built-in** (exponential backoff + jitter, configurable) |
 | Provider-specific parsing | Anthropic + OpenAI-specific response parsing | Generic `status_to_error()` |
 | Finish reasons | stop, length, toolCalls, contentFilter, error, **cancelled**, **other** | stop, length, toolCalls, contentFilter, error |
-| Error categories | validation, authentication, rateLimit, model, network, tool, parsing, internal | Similar set |
+| Error categories | validation, authentication, rateLimit, model, network, tool, parsing, internal | similar set |
 
 ---
 
@@ -315,7 +318,7 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 | Feature | Tachikoma | Roci |
 |---------|-----------|------|
 | Test files | 66 Swift test files | 9 Rust test files (~1,766 lines) |
-| Test types | Unit, integration, CLI, audio, auth, mocks, snapshots | Unit, integration (live_providers), wiremock |
+| Test types | Unit, integration, CLI, auth, mocks, snapshots | Unit, integration (live_providers), wiremock |
 | Snapshot testing | CLI output snapshots | None |
 | Test resources | Config fixtures | None |
 
@@ -334,9 +337,9 @@ Roci is a functional text-generation SDK with basic tool support. Tachikoma is a
 
 ### P1 — High (significant functionality gaps)
 
-6. **MCP implementation** — full protocol (Stdio + SSE transports minimum)
+6. **MCP implementation** — full protocol (Stdio + SSE transports minimum) — **Complete**
 7. **Multi-step agent loop** — automatic tool execution with configurable max steps & step tracking
-8. **Prompt caching control** — Anthropic `cache_control` headers in requests — **Closed** (Tachikoma defines CacheControl enum but doesn't wire to API; Roci has matching CacheControl in AnthropicOptions)
+8. **Prompt caching control** — Anthropic `cache_control` headers in requests — **Complete** (Roci has matching CacheControl in AnthropicOptions)
 9. **Google thinking config** — Gemini 2.5+ thinking budget + includeThoughts — **Complete** (`GoogleOptions`, `GoogleThinkingConfig`, `GoogleThinkingLevel`, `GoogleSafetyLevel` types; serialized into `generationConfig.thinkingConfig` and top-level `safetySettings`)
 10. **Beta header support** — Anthropic `interleaved-thinking`, `fine-grained-tool-streaming` — **Complete**
 11. **Missing content parts** — audio, file, refusal, reasoning in `ContentPart` enum — Partially addressed (thinking/redacted_thinking added; audio/file/refusal still missing)
