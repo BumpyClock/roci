@@ -16,26 +16,12 @@ cargo test -p roci-cli        # CLI tests (arg parsing, error formatting)
 cargo test -p roci-tools      # Tool tests (25 tests covering all tools)
 ```
 
-## MCP integration tests
+## Integration and feature-gated tests
 
-- Command: `cargo test --test mcp_integration_tests --features mcp`
-- To inspect request payloads:
-  - `cargo test --test mcp_integration_tests --features mcp -- --nocapture`
-
-## Live provider smoke tests
-
-Tests in `tests/live_providers.rs` are ignored by default.
-
-- Command: `cargo test --test live_providers -- --ignored`
-- With all providers: `cargo test --all-features --test live_providers -- --ignored`
-
-Required environment variables:
-- `OPENAI_API_KEY`
-- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
-- `OPENAI_COMPAT_API_KEY`, `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_MODEL` (for OpenAI-compatible test)
-
-Optional environment variables:
-- `OPENAI_COMPAT_SUPPORTS_JSON_SCHEMA=true` to enable OpenAI-compatible JSON schema live test.
+- Root integration tests: `cargo test --test meta_crate_integration`
+- Core integration tests: `cargo test -p roci-core --test registry_integration`
+- MCP tests (feature-gated in `roci-core`): `cargo test -p roci-core --features mcp`
+- To inspect test output: append `-- --nocapture`
 
 ## Environment
 

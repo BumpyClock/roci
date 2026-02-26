@@ -16,6 +16,12 @@ pub struct FileOperationSet {
     pub modified_files: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchEntryRange {
+    pub start_entry_index: usize,
+    pub end_entry_index: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PreparedCompaction {
     pub messages_to_summarize: Vec<ModelMessage>,
@@ -36,6 +42,9 @@ pub struct PiMonoSummary {
     pub read_files: BTreeSet<String>,
     pub modified_files: BTreeSet<String>,
 }
+
+const BRANCH_SUMMARY_PREFIX: &str = "<branch_summary>";
+const BRANCH_SUMMARY_SUFFIX: &str = "</branch_summary>";
 
 pub fn estimate_text_tokens(text: &str) -> usize {
     if text.is_empty() {
@@ -157,6 +166,52 @@ pub fn prepare_compaction(
             cut_index,
         }
     }
+}
+
+pub fn collect_entries_between_branches(
+    messages: &[ModelMessage],
+    entry_range: BranchEntryRange,
+) -> Vec<ModelMessage> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let start = entry_range
+        .start_entry_index
+        .min(entry_range.end_entry_index);
+    if start >= messages.len() {
+        return Vec::new();
+    }
+
+    let end = entry_range
+        .start_entry_index
+        .max(entry_range.end_entry_index)
+        .min(messages.len() - 1);
+    messages[start..=end].to_vec()
+}
+
+pub fn select_messages_with_token_budget_newest_first(
+    messages: &[ModelMessage],
+    token_budget: usize,
+) -> Vec<ModelMessage> {
+    if token_budget == 0 || messages.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected = Vec::new();
+    let mut used_tokens = 0usize;
+
+    for message in messages.iter().rev() {
+        let message_tokens = estimate_message_tokens(message);
+        if used_tokens + message_tokens > token_budget {
+            break;
+        }
+        used_tokens += message_tokens;
+        selected.push(message.clone());
+    }
+
+    selected.reverse();
+    selected
 }
 
 pub fn serialize_messages_for_summary(messages: &[ModelMessage]) -> String {
@@ -293,6 +348,85 @@ pub fn extract_file_operations(messages: &[ModelMessage]) -> FileOperationSet {
     file_ops
 }
 
+pub fn extract_cumulative_file_operations(
+    prior_summary_messages: &[ModelMessage],
+    messages_to_summarize: &[ModelMessage],
+) -> FileOperationSet {
+    let mut file_ops = extract_file_operations(messages_to_summarize);
+    let historical_ops = extract_file_ops_from_branch_summaries(prior_summary_messages);
+    file_ops.read_files.extend(historical_ops.read_files);
+    file_ops
+        .modified_files
+        .extend(historical_ops.modified_files);
+    file_ops
+}
+
+fn extract_file_ops_from_branch_summaries(messages: &[ModelMessage]) -> FileOperationSet {
+    let mut file_ops = FileOperationSet::default();
+
+    for message in messages {
+        if message.role != Role::User {
+            continue;
+        }
+        let text = message.text();
+        let Some(summary) = unwrap_branch_summary(&text) else {
+            continue;
+        };
+        let summary_ops = parse_pi_mono_summary_file_sections(summary);
+        file_ops.read_files.extend(summary_ops.read_files);
+        file_ops.modified_files.extend(summary_ops.modified_files);
+    }
+
+    file_ops
+}
+
+fn unwrap_branch_summary(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    let inner = trimmed
+        .strip_prefix(BRANCH_SUMMARY_PREFIX)?
+        .strip_suffix(BRANCH_SUMMARY_SUFFIX)?;
+    Some(inner.trim())
+}
+
+fn parse_pi_mono_summary_file_sections(summary: &str) -> FileOperationSet {
+    let mut file_ops = FileOperationSet::default();
+    let mut active_section: Option<&str> = None;
+
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        if trimmed == "### Read Files" {
+            active_section = Some("read");
+            continue;
+        }
+        if trimmed == "### Modified Files" {
+            active_section = Some("modified");
+            continue;
+        }
+        if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+            active_section = None;
+            continue;
+        }
+        let Some(value) = trimmed.strip_prefix("- ").map(str::trim) else {
+            continue;
+        };
+        if value.is_empty() || value == "(none)" {
+            continue;
+        }
+
+        match active_section {
+            Some("read") => {
+                file_ops.read_files.insert(value.to_string());
+            }
+            Some("modified") => {
+                file_ops.modified_files.insert(value.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    file_ops
+}
+
 fn extract_path_argument(arguments: &serde_json::Value) -> Option<String> {
     for key in [
         "path",
@@ -375,6 +509,43 @@ mod tests {
     }
 
     #[test]
+    fn collect_entries_between_branches_reads_inclusive_range() {
+        let messages = vec![
+            ModelMessage::user("m0"),
+            ModelMessage::assistant("m1"),
+            ModelMessage::user("m2"),
+            ModelMessage::assistant("m3"),
+        ];
+
+        let collected = collect_entries_between_branches(
+            &messages,
+            BranchEntryRange {
+                start_entry_index: 1,
+                end_entry_index: 2,
+            },
+        );
+
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[0].text(), "m1");
+        assert_eq!(collected[1].text(), "m2");
+    }
+
+    #[test]
+    fn select_messages_with_token_budget_prefers_newest_messages() {
+        let oldest = ModelMessage::user("oldest");
+        let middle = ModelMessage::assistant("middle");
+        let newest = ModelMessage::user("newest message");
+        let messages = vec![oldest, middle, newest.clone()];
+        let budget = estimate_message_tokens(&newest) + estimate_message_tokens(&messages[1]);
+
+        let selected = select_messages_with_token_budget_newest_first(&messages, budget);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].text(), "middle");
+        assert_eq!(selected[1].text(), "newest message");
+    }
+
+    #[test]
     fn serialize_messages_for_summary_includes_roles_and_tool_data() {
         let messages = vec![
             ModelMessage::user("hello"),
@@ -433,5 +604,29 @@ mod tests {
         assert!(file_ops.read_files.contains("src/main.rs"));
         assert!(file_ops.modified_files.contains("src/lib.rs"));
         assert!(file_ops.modified_files.contains("src/core.rs"));
+    }
+
+    #[test]
+    fn extract_cumulative_file_operations_merges_prior_branch_summary_files() {
+        let prior_summary = PiMonoSummary {
+            read_files: BTreeSet::from(["src/old_read.rs".to_string()]),
+            modified_files: BTreeSet::from(["src/old_mod.rs".to_string()]),
+            ..PiMonoSummary::default()
+        };
+        let prior_message = ModelMessage::user(format!(
+            "{BRANCH_SUMMARY_PREFIX}\n{}\n{BRANCH_SUMMARY_SUFFIX}",
+            serialize_pi_mono_summary(&prior_summary)
+        ));
+        let new_messages = vec![
+            assistant_with_tool_call("read_file", serde_json::json!({"path": "src/new_read.rs"})),
+            assistant_with_tool_call("write_file", serde_json::json!({"path": "src/new_mod.rs"})),
+        ];
+
+        let file_ops = extract_cumulative_file_operations(&[prior_message], &new_messages);
+
+        assert!(file_ops.read_files.contains("src/old_read.rs"));
+        assert!(file_ops.read_files.contains("src/new_read.rs"));
+        assert!(file_ops.modified_files.contains("src/old_mod.rs"));
+        assert!(file_ops.modified_files.contains("src/new_mod.rs"));
     }
 }

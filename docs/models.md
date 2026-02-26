@@ -1,8 +1,13 @@
 # Models
 
-Roci ships with built-in model enums per provider plus custom model IDs.
+`roci-core` exposes a string-based `LanguageModel` API:
 
-## OpenAI (`LanguageModel::OpenAi`)
+- `LanguageModel::Known { provider_key, model_id }`
+- `LanguageModel::Custom { provider, model_id }`
+
+Provider-specific typed enums live in `roci-providers`.
+
+## OpenAI (`OpenAiModel`)
 
 - gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-4, gpt-3.5-turbo
 - gpt-4o-realtime-preview
@@ -21,7 +26,7 @@ Notes:
 - GPT-5 defaults to `text_verbosity = high` and `reasoning_effort = medium` when unset.
 - Reasoning models (o3/o4) default to `truncation = auto` when unset.
 
-## Google (`LanguageModel::Google`)
+## Google (`GoogleModel`)
 
 - gemini-3-flash, gemini-3-flash-preview, gemini-3-pro-preview
 - gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite, gemini-2.0-flash
@@ -30,11 +35,13 @@ Notes:
 Notes:
 - `gemini-3-flash` currently uses the `gemini-3-flash-preview` API id.
 
-## OpenAI compatible (`LanguageModel::OpenAiCompatible`)
+## OpenAI compatible
 
-- `OpenAiCompatibleModel { model_id, base_url }`
-- Uses OpenAI-compatible Chat Completions API.
+- Configure provider key `openai-compatible` with a custom `model_id`.
+- Uses the OpenAI-compatible Chat Completions API.
 
 ## Other providers
 
-See enums under `src/models` for the current catalog.
+See:
+- `crates/roci-core/src/models/mod.rs` for the public `LanguageModel` API
+- `crates/roci-providers/src/models/` for provider-specific model enums

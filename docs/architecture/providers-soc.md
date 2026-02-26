@@ -54,12 +54,12 @@ Everything provider-agnostic that any consumer or third-party provider needs:
 | `config` | `RociConfig`, `AuthManager`, `AuthValue` |
 | `error` | `RociError`, `ErrorCategory`, `ErrorDetails`, `RecoverySuggestion` |
 | `types` | `ModelMessage`, `Usage`, `FinishReason`, `GenerationSettings`, `TextStreamDelta`, `ContentPart`, `AgentToolCall`, `AgentToolResult`, `Role` |
-| `generation` | `generate_text()`, `stream_text()` — operate on `&dyn ModelProvider` |
+| `generation` | `generate_text()`, `stream_text()`, `generate_object()`, `stream_object()` — operate on `&dyn ModelProvider` |
 | `tools` | `Tool` trait, `AgentTool`, `ToolArguments`, `DynamicTool` |
 | `stream_transform` | `StreamTransform` trait + built-in transforms |
 | `stop` | Stop conditions |
 | `util` | `ResponseCache`, `UsageTracker`, `RetryPolicy` |
-| `agent` / `agent_loop` | Agent struct + execution loop (feature: `agent`) |
+| `agent` / `agent_loop` | `AgentRuntime`, evented runner, approvals, and compaction/summary pipeline (feature: `agent`) |
 | `audio` | Realtime audio (feature: `audio`) |
 | `mcp` | MCP transport (feature: `mcp`) |
 | `prelude` | Convenience re-exports |
@@ -72,21 +72,21 @@ All concrete provider implementations and OAuth flows:
 
 | Module | Feature |
 |--------|---------|
-| `openai`, `openai_responses` | `openai` |
-| `anthropic` | `anthropic` |
-| `google` | `google` |
-| `grok` | `grok` |
-| `groq` | `groq` |
-| `mistral` | `mistral` |
-| `ollama` | `ollama` |
-| `lmstudio` | `lmstudio` |
-| `azure` | `azure` (depends on `openai`) |
-| `openrouter` | `openrouter` (depends on `openai`) |
-| `together` | `together` (depends on `openai`) |
-| `replicate` | `replicate` |
-| `openai_compatible` | `openai-compatible` |
-| `anthropic_compatible` | `anthropic-compatible` |
-| `github_copilot` | `openai-compatible` |
+| `provider::openai`, `provider::openai_responses` | `openai` |
+| `provider::anthropic` | `anthropic` |
+| `provider::google` | `google` |
+| `provider::grok` | `grok` |
+| `provider::groq` | `groq` |
+| `provider::mistral` | `mistral` |
+| `provider::ollama` | `ollama` |
+| `provider::lmstudio` | `lmstudio` |
+| `provider::azure` | `azure` (depends on `openai`) |
+| `provider::openrouter` | `openrouter` (depends on `openai`) |
+| `provider::together` | `together` (depends on `openai`) |
+| `provider::replicate` | `replicate` |
+| `provider::openai_compatible` | `openai-compatible` |
+| `provider::anthropic_compatible` | `anthropic-compatible` |
+| `provider::github_copilot` | `openai-compatible` |
 
 **Provider-specific model enums** (behind matching feature flags):
 `OpenAiModel`, `AnthropicModel`, `GoogleModel`, `GrokModel`, `GroqModel`, `MistralModel`, `OllamaModel`, `LmStudioModel`, `OpenAiCompatibleModel`
@@ -281,7 +281,7 @@ The `roci` meta-crate re-exports `roci_core::*`, so most imports are unchanged:
 | `use roci::models::LanguageModel` | Unchanged | `use roci_core::models::LanguageModel` |
 | `create_provider(model, config)` | `roci::default_registry().create_provider(key, id, config)` | Same, build registry manually |
 | `AuthService::new(store)` | `roci::default_auth_service(store)` | `roci_core::auth::AuthService::new(store)` (no built-in backends) |
-| `use roci::provider::openai::OpenAiProvider` | `use roci_providers::openai::OpenAiProvider` | Same |
+| `use roci::provider::openai::OpenAiProvider` | `use roci_providers::provider::openai::OpenAiProvider` | Same |
 | `use roci::auth::providers::claude_code::*` | `use roci_providers::auth::claude_code::*` | Same |
 
 `roci-cli` and `roci-tools` depend on `roci` (meta-crate). Internal wiring changes are invisible.

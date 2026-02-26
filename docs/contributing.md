@@ -31,7 +31,8 @@ cargo test
 3. Register the factory in `register_default_providers()`.
 4. Add the feature flag to `crates/roci-providers/Cargo.toml` and pass it
    through in the root `Cargo.toml`.
-5. Add a live test in `tests/live_providers.rs`.
+5. Add tests in the relevant crate/module (for example, root integration tests in
+   `tests/meta_crate_integration.rs` or provider/kernel tests in crate test files).
 6. Update `docs/ARCHITECTURE.md` provider table.
 
 ## Writing Tests
@@ -42,12 +43,9 @@ cargo test -p roci-core       # Core SDK only
 cargo test -p roci-providers  # Provider transports only
 cargo test -p roci-cli        # CLI tests
 cargo test -p roci-tools      # Tool tests
-```
-
-Live provider tests require API keys and are `#[ignore]`d by default:
-
-```bash
-cargo test --test live_providers -- --ignored --nocapture
+cargo test --test meta_crate_integration     # Root integration tests
+cargo test -p roci-core --test registry_integration  # Core integration tests
+cargo test -p roci-core --features mcp       # MCP feature-gated tests
 ```
 
 ## Code Style

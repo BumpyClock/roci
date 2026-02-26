@@ -112,9 +112,24 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 | `stop` | Stop conditions |
 | `util` | `ResponseCache`, `UsageTracker`, `RetryPolicy` |
 | `prelude` | Convenience re-exports |
-| `agent` / `agent_loop` | Agent struct + execution loop (feature: `agent`) |
+| `agent` / `agent_loop` | `AgentRuntime`, evented loop runner, approvals, and compaction/summary pipeline (feature: `agent`) |
 | `audio` | Realtime audio sessions via WebSocket (feature: `audio`) |
 | `mcp` | MCP client/server transport (feature: `mcp`) |
+
+#### Agent runtime subsystem (`agent` feature)
+
+- `AgentRuntime` is the high-level stateful API (prompt/continue/follow-up/steer/reset/abort, snapshots/watchers).
+- `agent_loop::runner` executes provider turns, streaming, tool execution, approvals, retries, and event emission.
+- Compaction is supported in two modes:
+  - automatic pre-provider compaction in the run loop when reserved context budget would be exceeded
+  - explicit/manual compaction via `AgentRuntime::compact()`
+- Branch summaries are explicit-only via `AgentRuntime::summarize_branch_entries(...)` (not auto-triggered).
+- Summary model selection follows settings fallback:
+  - conversation compaction: `compaction.model` else current run model
+  - branch summary: `branch_summary.model` else current run model
+- Session hook interfaces are available in `AgentConfig`:
+  - `session_before_compact` (continue, cancel, or override summary text)
+  - `session_before_tree` (continue, cancel with error, or override summary text)
 
 ### `roci-providers` -- Built-in Transports + OAuth
 
@@ -155,6 +170,7 @@ Provider-specific model enums (`OpenAiModel`, `AnthropicModel`, etc.) live in
 
 Produces the `roci-agent` binary. Owns all terminal concerns:
 
+- command surface: `roci-agent auth ...` and `roci-agent chat ...`
 - `clap` argument parsing
 - stdout/stderr output, spinners, interactive prompts
 - Exit codes and `process::exit`
@@ -167,6 +183,8 @@ Resource loading behavior used by CLI chat:
 - Discovers context files with per-directory precedence `AGENTS.md` > `CLAUDE.md`.
 - Resolves system prompts from `SYSTEM.md` and `APPEND_SYSTEM.md` with project-over-global precedence.
 - Expands slash prompt templates from `prompts/*.md` with argument substitution.
+- Builds final system prompt as: CLI `--system` (or discovered `SYSTEM.md`) + discovered `APPEND_SYSTEM.md` + rendered project context section.
+- Loads skills from roots in precedence order: `.roci/skills`, `.agents/skills`, `~/.roci/agent/skills`, `~/.agents/skills` (plus explicit paths/roots from CLI flags).
 
 **Dependencies**: `roci` (with `agent` feature), `roci-tools`, `clap`, `tokio`, `chrono`.
 
@@ -213,6 +231,15 @@ Implement `AuthBackend`, then register with an `AuthService`:
 let mut svc = roci::default_auth_service(store);
 svc.register_backend(Arc::new(MyAuthBackend));
 ```
+
+### Agent Session Hooks (feature: `agent`)
+
+Inject pre-summary behavior through `AgentConfig`:
+
+- `session_before_compact`: inspect prepared compaction payload (messages, token counts, file ops, settings) and choose continue/cancel/override-summary.
+- `session_before_tree`: inspect prepared branch-summary payload and choose continue/cancel/override-summary.
+
+This allows policy enforcement and custom summarization without forking core loop logic.
 
 ## Feature Flags
 
@@ -266,11 +293,12 @@ with actionable guidance.
 ## Testing
 
 ```bash
-cargo test -p roci-core      # Core SDK kernel
+cargo test -p roci-core       # Core SDK kernel
+cargo test -p roci-core --features agent  # Agent runtime/loop + compaction/summary
 cargo test -p roci-providers  # Provider transports
 cargo test -p roci            # Meta-crate integration tests
 cargo test -p roci-cli        # CLI tests (arg parsing, error formatting)
-cargo test -p roci-tools      # Tool tests (25 tests covering all tools)
+cargo test -p roci-tools      # Built-in tool tests
 
 # Live provider smoke tests (requires API keys, --ignored)
 cargo test --test live_providers -- --ignored --nocapture

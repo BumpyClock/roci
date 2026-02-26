@@ -13,7 +13,7 @@ read_when: "Working on provider plumbing, authentication, or endpoint wiring"
 ## Azure API Reality Check
 - Endpoint shape: `POST https://{resource}.openai.azure.com/openai/deployments/{deploymentId}/chat/completions?api-version=YYYY-MM-DD[-preview]`.
 - Auth: `api-key` header.
-- Latest documented preview as of 2025-11-16: `2025-04-01-preview`; GA examples still show `2024-06-01`.
+- Current `AzureFactory` default is `api-version=2024-06-01`.
 - Breaking changes around data sources and api-version mismatches are common (e.g., `json_schema` needs `>=2024-08-01-preview`).
 - Some toolchains hit 404s when they call `/responses` instead of `/chat/completions`; always use `/chat/completions` for Azure.
 
@@ -42,12 +42,12 @@ and passes the `api-key` header.
 
 | Variable | Purpose |
 |---|---|
-| `AZURE_OPENAI_API_KEY` | API key for authentication |
-| `AZURE_OPENAI_ENDPOINT` | Full resource URL (`https://{resource}.openai.azure.com`) |
-| `AZURE_OPENAI_DEPLOYMENT` | Deployment name (used as model ID) |
-| `AZURE_OPENAI_API_VERSION` | API version (default `2025-04-01-preview`) |
+| `OPENAI_API_KEY` | Used by `AzureFactory` as the Azure API key |
+| `OPENAI_BASE_URL` | Used by `AzureFactory` as the Azure endpoint |
+| model id (`azure:<deployment>`) | Deployment name passed as `model_id` |
+| `api-version` | Hardcoded to `2024-06-01` in `AzureFactory` |
 
-`RociConfig` does not auto-load Azure env vars; construct the provider directly with values from `std::env::var`.
+`RociConfig::from_env()` currently loads `OPENAI_API_KEY` and `OPENAI_BASE_URL` (not `AZURE_OPENAI_*` keys). `AzureFactory` reads from those OpenAI mappings.
 
 ## Usage Examples
 
@@ -61,11 +61,10 @@ use roci_providers::provider::azure::AzureOpenAiProvider;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let provider = AzureOpenAiProvider::new(
-        std::env::var("AZURE_OPENAI_ENDPOINT")?,
+        std::env::var("OPENAI_BASE_URL")?,
         std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or("gpt-4o".into()),
-        std::env::var("AZURE_OPENAI_API_KEY")?,
-        std::env::var("AZURE_OPENAI_API_VERSION")
-            .unwrap_or("2025-04-01-preview".into()),
+        std::env::var("OPENAI_API_KEY")?,
+        "2024-06-01".into(),
     );
 
     let messages = vec![
@@ -97,10 +96,10 @@ use roci_providers::provider::azure::AzureOpenAiProvider;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let provider = AzureOpenAiProvider::new(
-        std::env::var("AZURE_OPENAI_ENDPOINT")?,
+        std::env::var("OPENAI_BASE_URL")?,
         "gpt-4o".into(),
-        std::env::var("AZURE_OPENAI_API_KEY")?,
-        "2025-04-01-preview".into(),
+        std::env::var("OPENAI_API_KEY")?,
+        "2024-06-01".into(),
     );
 
     let request = ProviderRequest {
@@ -135,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
 
 1. **Provider construction**: `AzureOpenAiProvider::new(endpoint, deployment, api_key, api_version)`.
 2. **Inner delegation**: wraps `OpenAiProvider` with the Azure-specific URL pre-built.
-3. **Config loading**: map env vars above into provider construction; `RociConfig` is not involved for Azure-specific keys.
+3. **Factory wiring**: `AzureFactory` reads API key and base URL via `ProviderKey::OpenAi` config mappings and hardcodes `api_version = "2024-06-01"`.
 
 ## Tests
 

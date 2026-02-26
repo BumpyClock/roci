@@ -23,9 +23,13 @@ Non-CLI consumers (other Rust crates, WASM targets, embedded agents) could not u
 
 Split into three crates with strict ownership boundaries:
 
-1. **`roci`** -- pure SDK/library crate. No `clap`, no terminal I/O, no `process::exit`. Exposes only SDK modules.
+1. **`roci`** -- SDK entry crate (now a thin meta-crate facade). No `clap`, no terminal I/O, no `process::exit`.
 2. **`roci-cli`** -- CLI consumer crate. Owns the `roci-agent` binary, all terminal I/O, exit codes, and user-facing error text.
 3. **`roci-tools`** -- built-in coding tools (shell, read_file, write_file, list_directory, grep). Import path: `roci_tools::builtin`.
+
+> Update (2026-02-26): provider/core separation later introduced `roci-core` and
+> `roci-providers` (see `providers-soc.md`). The CLI boundary decisions in this
+> ADR remain in force; SDK ownership here maps to `roci-core` today.
 
 ### Approved decisions (from tsq-jwv1ysxb.1)
 
@@ -52,7 +56,7 @@ Split into three crates with strict ownership boundaries:
 
 ## Ownership Boundaries
 
-| Concern | `roci` (core) | `roci-cli` | `roci-tools` |
+| Concern | `roci-core` (SDK kernel) | `roci-cli` | `roci-tools` |
 |---------|---------------|------------|---------------|
 | Provider abstractions | Owns | Imports | -- |
 | Agent loop / streaming | Owns | Imports | -- |
@@ -71,3 +75,4 @@ Split into three crates with strict ownership boundaries:
 
 - Parent epic: `tsq-jwv1ysxb` (Strict SoC migration)
 - Decisions spec: `tsq-jwv1ysxb.1`
+- Extended by: `docs/architecture/providers-soc.md`

@@ -4110,7 +4110,7 @@ tags: ['getting-started', 'reasoning']
 
 # Get started with OpenAI GPT-5 mini
 
-OpenAI's GPT-5 family (released August 2025) delivers state-of-the-art reasoning, multimodal understanding, and tool execution. `gpt-5-mini` balances cost and capability, making it the default roci and Peekaboo agent model.
+OpenAI's GPT-5 family (released August 2025) delivers state-of-the-art reasoning, multimodal understanding, and tool execution. `gpt-5-mini` balances cost and capability, while roci CLI currently defaults to `openai:gpt-4o`.
 
 The [AI SDK](/) provides a single API for integrating GPT-5 with frameworks like React, Next.js, Vue, and Svelte. This guide shows how to wire up `gpt-5-mini` using modern AI SDK patterns.
 

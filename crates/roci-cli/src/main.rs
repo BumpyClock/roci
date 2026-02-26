@@ -3,7 +3,6 @@
 mod cli;
 mod errors;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -12,11 +11,8 @@ use roci::agent_loop::{
     Runner,
 };
 use roci::config::RociConfig;
-use roci::resource::{ContextFileResource, ResourceBundle};
-use roci::skills::{
-    default_skill_roots, load_skills, merge_system_prompt_with_skills, LoadSkillsOptions,
-    SkillRoot, SkillSource,
-};
+use roci::resource::{ContextFileResource, ResourceBundle, SkillResourceOptions};
+use roci::skills::merge_system_prompt_with_skills;
 use roci::types::{ModelMessage, StreamEventType};
 
 use cli::{AuthCommands, ChatArgs, Cli, Commands};
@@ -66,22 +62,20 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(roci::default_registry());
     let runner = LoopRunner::with_registry(config, registry);
     let cwd = std::env::current_dir()?;
-    let resources = roci::resource::DefaultResourceLoader::new().load(&cwd)?;
+    let mut skill_options = SkillResourceOptions::default();
+    skill_options.enabled = !args.no_skills;
+    skill_options.explicit_paths = args.skill_path.clone();
+    skill_options.extra_roots = args.skill_root.clone();
+
+    let resources = roci::resource::DefaultResourceLoader::new()
+        .with_skill_options(skill_options)
+        .load(&cwd)?;
     print_resource_diagnostics(&resources);
     let prompt = expand_chat_prompt(&prompt, &resources);
 
     let resource_system_prompt = build_resource_system_prompt(args.system, &resources);
-    let system_prompt = if args.no_skills {
-        resource_system_prompt
-    } else {
-        let options = LoadSkillsOptions {
-            explicit_paths: args.skill_path,
-            roots: build_skill_roots(&args.skill_root),
-            follow_symlinks: true,
-        };
-        let loaded_skills = load_skills(&options);
-        merge_system_prompt_with_skills(resource_system_prompt, &loaded_skills.skills)
-    };
+    let system_prompt =
+        merge_system_prompt_with_skills(resource_system_prompt, &resources.skills.skills);
 
     let mut messages = Vec::new();
     if let Some(system) = system_prompt {
@@ -272,20 +266,19 @@ fn collect_resource_diagnostic_messages(resources: &ResourceBundle) -> Vec<Strin
         messages.push(message);
     }
 
+    for diagnostic in &resources.skills.diagnostics {
+        let mut message = format!(
+            "skill {}: {}",
+            diagnostic.path.display(),
+            diagnostic.message
+        );
+        if let Some(collision) = &diagnostic.collision {
+            message.push_str(&format!(" (collides with {})", collision.winner_path.display()));
+        }
+        messages.push(message);
+    }
+
     messages
-}
-
-fn build_skill_roots(extra_skill_roots: &[PathBuf]) -> Vec<SkillRoot> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut roots = default_skill_roots(&cwd, home.as_deref());
-
-    roots.extend(extra_skill_roots.iter().cloned().map(|root| SkillRoot {
-        path: root,
-        source: SkillSource::Explicit,
-    }));
-
-    roots
 }
 
 fn truncate_preview(value: &str, max_chars: usize) -> String {
@@ -335,6 +328,7 @@ mod tests {
                 diagnostics: Vec::new(),
             },
             prompt_templates: Default::default(),
+            skills: Default::default(),
         };
 
         let assembled = build_resource_system_prompt(Some("cli system".to_string()), &resources)
@@ -358,6 +352,7 @@ mod tests {
                 diagnostics: Vec::new(),
             },
             prompt_templates: Default::default(),
+            skills: Default::default(),
         };
 
         let assembled = build_resource_system_prompt(None, &resources);
@@ -384,6 +379,7 @@ mod tests {
             settings: ResourceSettings::default(),
             context: ContextPromptResources::default(),
             prompt_templates,
+            skills: Default::default(),
         };
 
         assert_eq!(
@@ -425,6 +421,7 @@ mod tests {
                 ..ContextPromptResources::default()
             },
             prompt_templates,
+            skills: Default::default(),
         };
 
         let diagnostics = collect_resource_diagnostic_messages(&resources);

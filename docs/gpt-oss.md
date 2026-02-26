@@ -374,4 +374,4 @@ let result = generate_text(&provider, messages, settings, &[]).await?;
 ## Related Documentation
 
 - [LMStudio Integration](lmstudio.md) - Alternative local hosting
-- [OpenAI Harmony Features](openai-harmony.md) - Multi-channel responses
+- [AI SDK Integration](ai-sdk.md) - Multi-model integration patterns

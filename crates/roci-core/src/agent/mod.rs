@@ -11,5 +11,7 @@ pub use conversation::Conversation;
 pub use message::{convert_to_llm, AgentMessage, AgentMessageExt};
 pub use runtime::{
     AgentConfig, AgentRuntime, AgentSnapshot, AgentState, GetApiKeyFn, QueueDrainMode,
+    SessionBeforeCompactHook, SessionBeforeCompactPayload, SessionBeforeTreeHook,
+    SessionBeforeTreePayload, SessionSummaryHookOutcome, SummaryPreparationData,
 };
 pub use session::AgentSessionManager;

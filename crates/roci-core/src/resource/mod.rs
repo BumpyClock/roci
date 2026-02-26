@@ -15,4 +15,4 @@ pub use settings::{
     ResourceSettingsLoader,
 };
 
-pub use loader::{DefaultResourceLoader, ResourceBundle, ResourceLoader};
+pub use loader::{DefaultResourceLoader, ResourceBundle, ResourceLoader, SkillResourceOptions};

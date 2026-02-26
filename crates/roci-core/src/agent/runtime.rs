@@ -25,8 +25,10 @@ use crate::agent_loop::runner::{
 };
 use crate::agent_loop::{
     compaction::{
-        extract_file_operations, prepare_compaction, serialize_messages_for_summary,
-        serialize_pi_mono_summary, PiMonoSummary,
+        estimate_message_tokens, extract_cumulative_file_operations, extract_file_operations,
+        prepare_compaction, select_messages_with_token_budget_newest_first,
+        serialize_messages_for_summary, serialize_pi_mono_summary, FileOperationSet, PiMonoSummary,
+        PreparedCompaction,
     },
     AgentEvent, LoopRunner, RunHandle, RunRequest, RunResult, RunStatus, Runner,
 };
@@ -34,7 +36,7 @@ use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::{ProviderRegistry, ProviderRequest};
-use crate::resource::CompactionSettings;
+use crate::resource::{BranchSummarySettings, CompactionSettings};
 use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::types::{GenerationSettings, ModelMessage, Role};
@@ -108,6 +110,90 @@ pub struct AgentSnapshot {
 pub type GetApiKeyFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, RociError>> + Send>> + Send + Sync>;
 
+/// Outcome returned by pre-summary session hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSummaryHookOutcome {
+    /// Continue with normal summary generation.
+    Continue,
+    /// Skip summary generation for this operation.
+    Cancel,
+    /// Use the provided summary text instead of model-generated text.
+    OverrideSummary(String),
+}
+
+/// Prepared summary input data exposed to session hooks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryPreparationData {
+    pub messages: Vec<ModelMessage>,
+    pub token_count: usize,
+    pub file_operations: FileOperationSet,
+}
+
+impl SummaryPreparationData {
+    fn from_messages(messages: Vec<ModelMessage>) -> Self {
+        let token_count = messages.iter().map(estimate_message_tokens).sum::<usize>();
+        let file_operations = extract_file_operations(&messages);
+        Self {
+            messages,
+            token_count,
+            file_operations,
+        }
+    }
+}
+
+/// Payload for the `session_before_compact` lifecycle hook.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionBeforeCompactPayload {
+    pub to_summarize: SummaryPreparationData,
+    pub turn_prefix: SummaryPreparationData,
+    pub kept: SummaryPreparationData,
+    pub split_turn: bool,
+    pub settings: CompactionSettings,
+}
+
+impl SessionBeforeCompactPayload {
+    fn from_prepared(prepared: &PreparedCompaction, settings: CompactionSettings) -> Self {
+        Self {
+            to_summarize: SummaryPreparationData::from_messages(
+                prepared.messages_to_summarize.clone(),
+            ),
+            turn_prefix: SummaryPreparationData::from_messages(
+                prepared.turn_prefix_messages.clone(),
+            ),
+            kept: SummaryPreparationData::from_messages(prepared.kept_messages.clone()),
+            split_turn: prepared.split_turn,
+            settings,
+        }
+    }
+}
+
+/// Payload for the `session_before_tree` lifecycle hook.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionBeforeTreePayload {
+    pub to_summarize: SummaryPreparationData,
+    pub settings: BranchSummarySettings,
+}
+
+/// Async hook interface for `session_before_compact`.
+pub type SessionBeforeCompactHook = Arc<
+    dyn Fn(
+            SessionBeforeCompactPayload,
+        )
+            -> Pin<Box<dyn Future<Output = Result<SessionSummaryHookOutcome, RociError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Async hook interface for `session_before_tree`.
+pub type SessionBeforeTreeHook = Arc<
+    dyn Fn(
+            SessionBeforeTreePayload,
+        )
+            -> Pin<Box<dyn Future<Output = Result<SessionSummaryHookOutcome, RociError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Configuration for creating an [`AgentRuntime`].
 ///
 /// # API key resolution
@@ -160,6 +246,10 @@ pub struct AgentConfig {
     pub get_api_key: Option<GetApiKeyFn>,
     /// Compaction policy and summarization model selection.
     pub compaction: CompactionSettings,
+    /// Optional lifecycle hook for `session_before_compact`.
+    pub session_before_compact: Option<SessionBeforeCompactHook>,
+    /// Optional lifecycle hook for `session_before_tree`.
+    pub session_before_tree: Option<SessionBeforeTreeHook>,
 }
 
 /// High-level agent runtime wrapping [`LoopRunner`].
@@ -595,6 +685,7 @@ impl AgentRuntime {
             messages,
             &model,
             &self.config.compaction,
+            self.config.session_before_compact.as_ref(),
             &self.registry,
             &self.roci_config,
         )
@@ -606,6 +697,109 @@ impl AgentRuntime {
         }
 
         Ok(())
+    }
+
+    /// Generate a branch summary message for explicitly selected branch entries
+    ///
+    /// This method is intentionally explicit and does not auto-trigger from
+    /// runtime execution paths
+    pub async fn summarize_branch_entries(
+        &self,
+        entries_between_branches: Vec<ModelMessage>,
+        settings: &BranchSummarySettings,
+    ) -> Result<AgentMessage, RociError> {
+        let state_guard = self.lock_state_for_idle_mutation()?;
+        let model = self
+            .model
+            .try_lock()
+            .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?
+            .clone();
+        let existing_messages = self
+            .messages
+            .try_lock()
+            .map_err(|_| RociError::InvalidState("Agent is busy (messages lock contended)".into()))?
+            .clone();
+        drop(state_guard);
+
+        let selected_entries = select_messages_with_token_budget_newest_first(
+            &entries_between_branches,
+            settings.reserve_tokens,
+        );
+        if selected_entries.is_empty() {
+            return Err(RociError::InvalidState(
+                "branch summary requires at least one entry within token budget".to_string(),
+            ));
+        }
+        let tree_payload = SessionBeforeTreePayload {
+            to_summarize: SummaryPreparationData::from_messages(selected_entries.clone()),
+            settings: settings.clone(),
+        };
+        if let Some(hook) = self.config.session_before_tree.as_ref() {
+            match hook(tree_payload).await? {
+                SessionSummaryHookOutcome::Continue => {}
+                SessionSummaryHookOutcome::Cancel => {
+                    return Err(RociError::InvalidState(
+                        "branch summary canceled by session_before_tree hook".to_string(),
+                    ));
+                }
+                SessionSummaryHookOutcome::OverrideSummary(summary) => {
+                    let summary = summary.trim().to_string();
+                    if summary.is_empty() {
+                        return Err(RociError::InvalidState(
+                            "branch summary text must not be empty".to_string(),
+                        ));
+                    }
+                    return Ok(AgentMessage::branch_summary(summary));
+                }
+            }
+        }
+
+        let summary_model = match settings.model.as_deref() {
+            Some(model) => LanguageModel::from_str(model)?,
+            None => model,
+        };
+        let provider = self.registry.create_provider(
+            summary_model.provider_name(),
+            summary_model.model_id(),
+            &self.roci_config,
+        )?;
+
+        let transcript = serialize_messages_for_summary(&selected_entries);
+        let summary_prompt = format!(
+            "Summarize the branch transition transcript into concise bullets focused on user goals, constraints, progress, decisions, next steps, and critical context.\n\nTranscript:\n{transcript}"
+        );
+        let summary_response = provider
+            .generate_text(&ProviderRequest {
+                messages: vec![
+                    ModelMessage::system("You create precise branch transition summaries"),
+                    ModelMessage::user(summary_prompt),
+                ],
+                settings: GenerationSettings::default(),
+                tools: None,
+                response_format: None,
+                session_id: None,
+                transport: None,
+            })
+            .await?;
+
+        let summary_text = summary_response.text.trim().to_string();
+        if summary_text.is_empty() {
+            return Err(RociError::InvalidState(
+                "branch summary model returned empty output".to_string(),
+            ));
+        }
+
+        let cumulative_file_ops =
+            extract_cumulative_file_operations(&existing_messages, &selected_entries);
+        let summary = PiMonoSummary {
+            progress: vec![summary_text],
+            read_files: cumulative_file_ops.read_files,
+            modified_files: cumulative_file_ops.modified_files,
+            ..PiMonoSummary::default()
+        };
+        Ok(AgentMessage::branch_summary(serialize_pi_mono_summary(
+            &summary,
+        )))
     }
 
     // -- Internal helpers --
@@ -734,11 +928,13 @@ impl AgentRuntime {
 
         if self.config.compaction.enabled {
             let compaction_settings = self.config.compaction.clone();
+            let session_before_compact = self.config.session_before_compact.clone();
             let registry = self.registry.clone();
             let roci_config = self.roci_config.clone();
             let run_model = request.model.clone();
             let compaction_hook: CompactionHandler = Arc::new(move |messages| {
                 let compaction_settings = compaction_settings.clone();
+                let session_before_compact = session_before_compact.clone();
                 let registry = registry.clone();
                 let roci_config = roci_config.clone();
                 let run_model = run_model.clone();
@@ -747,6 +943,7 @@ impl AgentRuntime {
                         messages,
                         &run_model,
                         &compaction_settings,
+                        session_before_compact.as_ref(),
                         &registry,
                         &roci_config,
                     )
@@ -825,6 +1022,7 @@ impl AgentRuntime {
         messages: Vec<ModelMessage>,
         run_model: &LanguageModel,
         compaction: &CompactionSettings,
+        session_before_compact: Option<&SessionBeforeCompactHook>,
         registry: &Arc<ProviderRegistry>,
         roci_config: &RociConfig,
     ) -> Result<Option<Vec<ModelMessage>>, RociError> {
@@ -844,42 +1042,58 @@ impl AgentRuntime {
             return Ok(None);
         }
 
+        let compaction_payload =
+            SessionBeforeCompactPayload::from_prepared(&prepared, compaction.clone());
+        let summary_override = match session_before_compact {
+            Some(hook) => match hook(compaction_payload).await? {
+                SessionSummaryHookOutcome::Continue => None,
+                SessionSummaryHookOutcome::Cancel => return Ok(None),
+                SessionSummaryHookOutcome::OverrideSummary(summary) => Some(summary),
+            },
+            None => None,
+        };
+
+        let file_ops = extract_file_operations(&prepared.messages_to_summarize);
         let summary_model = match compaction.model.as_deref() {
             Some(model) => LanguageModel::from_str(model)?,
             None => run_model.clone(),
         };
-        let provider = registry.create_provider(
-            summary_model.provider_name(),
-            summary_model.model_id(),
-            roci_config,
-        )?;
-
-        let transcript = serialize_messages_for_summary(&prepared.messages_to_summarize);
-        let summary_prompt = format!(
-            "Summarize the conversation transcript into concise bullets focused on user goals, constraints, progress, decisions, next steps, and critical context.\n\nTranscript:\n{transcript}"
-        );
-        let summary_response = provider
-            .generate_text(&ProviderRequest {
-                messages: vec![
-                    ModelMessage::system("You create precise conversation compaction summaries"),
-                    ModelMessage::user(summary_prompt),
-                ],
-                settings: GenerationSettings::default(),
-                tools: None,
-                response_format: None,
-                session_id: None,
-                transport: None,
-            })
-            .await?;
-
-        let summary_text = summary_response.text.trim().to_string();
+        let summary_text = match summary_override {
+            Some(summary) => summary.trim().to_string(),
+            None => {
+                let provider = registry.create_provider(
+                    summary_model.provider_name(),
+                    summary_model.model_id(),
+                    roci_config,
+                )?;
+                let transcript = serialize_messages_for_summary(&prepared.messages_to_summarize);
+                let summary_prompt = format!(
+                    "Summarize the conversation transcript into concise bullets focused on user goals, constraints, progress, decisions, next steps, and critical context.\n\nTranscript:\n{transcript}"
+                );
+                let summary_response = provider
+                    .generate_text(&ProviderRequest {
+                        messages: vec![
+                            ModelMessage::system(
+                                "You create precise conversation compaction summaries",
+                            ),
+                            ModelMessage::user(summary_prompt),
+                        ],
+                        settings: GenerationSettings::default(),
+                        tools: None,
+                        response_format: None,
+                        session_id: None,
+                        transport: None,
+                    })
+                    .await?;
+                summary_response.text.trim().to_string()
+            }
+        };
         if summary_text.is_empty() {
             return Err(RociError::InvalidState(
                 "compaction summary model returned empty output".to_string(),
             ));
         }
 
-        let file_ops = extract_file_operations(&prepared.messages_to_summarize);
         let summary = PiMonoSummary {
             progress: vec![summary_text],
             critical_context: if prepared.split_turn {
@@ -960,8 +1174,10 @@ mod tests {
     use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
     use crate::tools::tool::ToolExecutionContext;
     use crate::tools::{AgentTool, AgentToolParameters};
+    use crate::types::AgentToolCall;
     use async_trait::async_trait;
     use futures::stream::BoxStream;
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
     fn test_registry() -> Arc<ProviderRegistry> {
@@ -1087,6 +1303,8 @@ mod tests {
             max_retry_delay_ms: None,
             get_api_key: None,
             compaction: CompactionSettings::default(),
+            session_before_compact: None,
+            session_before_tree: None,
         }
     }
 
@@ -1111,6 +1329,20 @@ mod tests {
             AgentToolParameters::empty(),
             |_args, _ctx| async move { Ok(serde_json::json!({ "ok": true })) },
         ))
+    }
+
+    fn assistant_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ModelMessage {
+        ModelMessage {
+            role: Role::Assistant,
+            content: vec![crate::types::ContentPart::ToolCall(AgentToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments,
+                recipient: None,
+            })],
+            name: None,
+            timestamp: None,
+        }
     }
 
     struct MockDynamicToolProvider {
@@ -1989,5 +2221,253 @@ mod tests {
 
         let created_models = created_models.lock().expect("created models lock");
         assert_eq!(created_models.as_slice(), ["compact-model"]);
+    }
+
+    #[tokio::test]
+    async fn summarize_branch_entries_uses_branch_summary_model_override_when_present() {
+        let created_models = Arc::new(Mutex::new(Vec::new()));
+        let registry =
+            registry_with_summary_provider("summary", "branch summary", created_models.clone());
+        let mut config = test_agent_config();
+        config.model = "run:run-model".parse().expect("run model should parse");
+        let agent = AgentRuntime::new(registry, test_config(), config);
+
+        let settings = BranchSummarySettings {
+            reserve_tokens: 10_000,
+            model: Some("summary:branch-model".to_string()),
+        };
+
+        agent
+            .summarize_branch_entries(
+                vec![
+                    ModelMessage::user("branch a"),
+                    ModelMessage::assistant("branch b"),
+                ],
+                &settings,
+            )
+            .await
+            .expect("branch summary should succeed");
+
+        let created_models = created_models.lock().expect("created models lock");
+        assert_eq!(created_models.as_slice(), ["branch-model"]);
+    }
+
+    #[tokio::test]
+    async fn summarize_branch_entries_returns_branch_summary_message_with_cumulative_file_tracking()
+    {
+        let created_models = Arc::new(Mutex::new(Vec::new()));
+        let registry = registry_with_summary_provider("stub", "new progress", created_models);
+        let mut config = test_agent_config();
+        config.model = "stub:run-model".parse().expect("run model should parse");
+        let agent = AgentRuntime::new(registry, test_config(), config);
+
+        let prior_summary = PiMonoSummary {
+            read_files: BTreeSet::from(["src/previous_read.rs".to_string()]),
+            modified_files: BTreeSet::from(["src/previous_mod.rs".to_string()]),
+            ..PiMonoSummary::default()
+        };
+        agent
+            .replace_messages(vec![ModelMessage::user(format!(
+                "<branch_summary>\n{}\n</branch_summary>",
+                serialize_pi_mono_summary(&prior_summary)
+            ))])
+            .await
+            .expect("history should be set");
+
+        let settings = BranchSummarySettings {
+            reserve_tokens: 10_000,
+            model: None,
+        };
+        let summary_message = agent
+            .summarize_branch_entries(
+                vec![
+                    assistant_tool_call(
+                        "call_1",
+                        "read_file",
+                        serde_json::json!({"path": "src/new_read.rs"}),
+                    ),
+                    assistant_tool_call(
+                        "call_2",
+                        "write_file",
+                        serde_json::json!({"path": "src/new_mod.rs"}),
+                    ),
+                    ModelMessage::assistant("done"),
+                ],
+                &settings,
+            )
+            .await
+            .expect("branch summary should succeed");
+
+        assert_eq!(summary_message.kind(), "branch_summary");
+
+        let llm = summary_message
+            .to_llm_message()
+            .expect("branch summary should convert to llm message");
+        let text = llm.text();
+        assert!(text.contains("<branch_summary>"));
+        assert!(text.contains("src/previous_read.rs"));
+        assert!(text.contains("src/new_read.rs"));
+        assert!(text.contains("src/previous_mod.rs"));
+        assert!(text.contains("src/new_mod.rs"));
+        assert!(text.contains("</branch_summary>"));
+    }
+
+    #[tokio::test]
+    async fn session_before_compact_can_cancel_compaction() {
+        let mut config = test_agent_config();
+        config.session_before_compact = Some(Arc::new(|_payload| {
+            Box::pin(async { Ok(SessionSummaryHookOutcome::Cancel) })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+        let original_messages = vec![
+            ModelMessage::user("first"),
+            ModelMessage::assistant("second"),
+            ModelMessage::user("third"),
+        ];
+        agent
+            .replace_messages(original_messages.clone())
+            .await
+            .expect("messages should be set");
+
+        agent
+            .compact()
+            .await
+            .expect("compaction cancellation should succeed");
+
+        assert_eq!(agent.messages().await, original_messages);
+    }
+
+    #[tokio::test]
+    async fn session_before_compact_can_override_summary_and_receive_preparation_payload() {
+        let payload_capture = Arc::new(Mutex::new(None));
+        let payload_capture_for_hook = payload_capture.clone();
+        let mut config = test_agent_config();
+        config.compaction.keep_recent_tokens = 1;
+        config.session_before_compact = Some(Arc::new(move |payload| {
+            let payload_capture_for_hook = payload_capture_for_hook.clone();
+            Box::pin(async move {
+                *payload_capture_for_hook
+                    .lock()
+                    .expect("payload capture should lock") = Some(payload);
+                Ok(SessionSummaryHookOutcome::OverrideSummary(
+                    "hooked compaction summary".to_string(),
+                ))
+            })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+        agent
+            .replace_messages(vec![
+                ModelMessage::user("first"),
+                assistant_tool_call(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": "src/a.rs"}),
+                ),
+                ModelMessage::tool_result("call_1", serde_json::json!({"ok": true}), false),
+                ModelMessage::assistant("latest"),
+            ])
+            .await
+            .expect("messages should be set");
+
+        agent
+            .compact()
+            .await
+            .expect("compaction with override should succeed");
+
+        let captured = payload_capture
+            .lock()
+            .expect("payload capture should lock")
+            .clone()
+            .expect("hook payload should be captured");
+        assert_eq!(captured.settings.keep_recent_tokens, 1);
+        assert!(captured.to_summarize.token_count > 0);
+        assert!(captured
+            .to_summarize
+            .file_operations
+            .read_files
+            .contains("src/a.rs"));
+
+        let compacted = agent.messages().await;
+        assert!(
+            compacted
+                .iter()
+                .any(|message| message.text().contains("hooked compaction summary")),
+            "compaction summary should use hook override text"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_before_tree_can_override_branch_summary_and_receive_preparation_payload() {
+        let payload_capture = Arc::new(Mutex::new(None));
+        let payload_capture_for_hook = payload_capture.clone();
+        let mut config = test_agent_config();
+        config.model = "run:run-model".parse().expect("run model should parse");
+        config.session_before_tree = Some(Arc::new(move |payload| {
+            let payload_capture_for_hook = payload_capture_for_hook.clone();
+            Box::pin(async move {
+                *payload_capture_for_hook
+                    .lock()
+                    .expect("payload capture should lock") = Some(payload);
+                Ok(SessionSummaryHookOutcome::OverrideSummary(
+                    "hooked branch summary".to_string(),
+                ))
+            })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+        let settings = BranchSummarySettings {
+            reserve_tokens: 10_000,
+            model: None,
+        };
+
+        let summary = agent
+            .summarize_branch_entries(
+                vec![
+                    assistant_tool_call(
+                        "call_1",
+                        "read_file",
+                        serde_json::json!({"path": "src/t.rs"}),
+                    ),
+                    ModelMessage::assistant("done"),
+                ],
+                &settings,
+            )
+            .await
+            .expect("branch summary with hook override should succeed");
+
+        let captured = payload_capture
+            .lock()
+            .expect("payload capture should lock")
+            .clone()
+            .expect("hook payload should be captured");
+        assert_eq!(captured.settings.reserve_tokens, 10_000);
+        assert!(captured.to_summarize.token_count > 0);
+        assert!(captured
+            .to_summarize
+            .file_operations
+            .read_files
+            .contains("src/t.rs"));
+
+        let summary_text = summary.text().expect("branch summary should have text");
+        assert!(summary_text.contains("hooked branch summary"));
+    }
+
+    #[tokio::test]
+    async fn session_before_tree_can_cancel_branch_summary() {
+        let mut config = test_agent_config();
+        config.model = "run:run-model".parse().expect("run model should parse");
+        config.session_before_tree = Some(Arc::new(|_payload| {
+            Box::pin(async { Ok(SessionSummaryHookOutcome::Cancel) })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+        let settings = BranchSummarySettings {
+            reserve_tokens: 10_000,
+            model: None,
+        };
+
+        let error = agent
+            .summarize_branch_entries(vec![ModelMessage::user("entry")], &settings)
+            .await
+            .expect_err("branch summary should fail when hook cancels");
+        assert!(error.to_string().contains("session_before_tree"));
     }
 }

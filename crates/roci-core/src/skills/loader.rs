@@ -5,43 +5,57 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
+use crate::resource::settings::ResolvedResourceDirectories;
 use crate::skills::diagnostics::{SkillCollision, SkillDiagnostic, SkillDiagnosticLevel};
 use crate::skills::frontmatter::parse_skill_file;
 use crate::skills::model::{Skill, SkillSource};
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 
-/// Build default skill roots using roci's standard directories.
+/// Build default skill roots using resolved resource directories.
 ///
 /// Order (highest to lower precedence during loading):
-/// 1) project `.roci/skills`
-/// 2) project `.agents/skills`
-/// 3) global `~/.roci/agent/skills`
-/// 4) global `~/.agents/skills`
-pub fn default_skill_roots(cwd: &Path, home: Option<&Path>) -> Vec<SkillRoot> {
-    let mut roots = vec![
+/// 1) project `project_dir/skills`
+/// 2) project `.agents/skills` (sibling of `project_dir`)
+/// 3) global `agent_dir/skills`
+/// 4) global `.agents/skills` (derived from `agent_dir`)
+pub fn default_skill_roots(directories: &ResolvedResourceDirectories) -> Vec<SkillRoot> {
+    let roots = vec![
         SkillRoot {
-            path: cwd.join(".roci/skills"),
+            path: directories.project_dir.join("skills"),
             source: SkillSource::ProjectRoci,
         },
         SkillRoot {
-            path: cwd.join(".agents/skills"),
+            path: project_agents_root(&directories.project_dir).join("skills"),
             source: SkillSource::ProjectAgents,
+        },
+        SkillRoot {
+            path: directories.agent_dir.join("skills"),
+            source: SkillSource::GlobalRoci,
+        },
+        SkillRoot {
+            path: global_agents_root(&directories.agent_dir).join("skills"),
+            source: SkillSource::GlobalAgents,
         },
     ];
 
-    if let Some(home) = home {
-        roots.push(SkillRoot {
-            path: home.join(".roci/agent/skills"),
-            source: SkillSource::GlobalRoci,
-        });
-        roots.push(SkillRoot {
-            path: home.join(".agents/skills"),
-            source: SkillSource::GlobalAgents,
-        });
-    }
-
     roots
+}
+
+fn project_agents_root(project_dir: &Path) -> PathBuf {
+    project_dir
+        .parent()
+        .unwrap_or(project_dir)
+        .join(".agents")
+}
+
+fn global_agents_root(agent_dir: &Path) -> PathBuf {
+    let mut base = agent_dir.parent();
+    let agent_name = agent_dir.file_name().and_then(|name| name.to_str());
+    if agent_name == Some("agent") {
+        base = base.and_then(|dir| dir.parent());
+    }
+    base.unwrap_or(agent_dir).join(".agents")
 }
 
 /// A configured skill search root and its source classification.
@@ -75,7 +89,7 @@ impl Default for LoadSkillsOptions {
 }
 
 /// Output of loading and parsing skill definitions.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct LoadSkillsResult {
     /// Loaded skills after precedence and deduplication are applied.
     pub skills: Vec<Skill>,
@@ -323,6 +337,7 @@ fn collision_diagnostic(name: &str, winner_path: &Path, loser_path: &Path) -> Sk
 #[cfg(test)]
 mod tests {
     use super::{default_skill_roots, load_skills, LoadSkillsOptions, SkillRoot};
+    use crate::resource::settings::ResolvedResourceDirectories;
     use crate::skills::diagnostics::SkillDiagnosticLevel;
     use crate::skills::model::SkillSource;
     use std::fs;
@@ -330,26 +345,34 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn default_skill_roots_uses_roci_agent_global_directory() {
-        let cwd = PathBuf::from("/workspace/project");
-        let home = PathBuf::from("/home/tester");
+    fn default_skill_roots_use_resolved_resource_directories() {
+        let directories = ResolvedResourceDirectories {
+            project_dir: PathBuf::from("/workspace/project/.roci"),
+            agent_dir: PathBuf::from("/home/tester/.roci/agent"),
+        };
 
-        let roots = default_skill_roots(&cwd, Some(&home));
+        let roots = default_skill_roots(&directories);
 
-        assert_eq!(roots[0].path, cwd.join(".roci/skills"));
-        assert_eq!(roots[1].path, cwd.join(".agents/skills"));
-        assert_eq!(roots[2].path, home.join(".roci/agent/skills"));
-        assert_eq!(roots[3].path, home.join(".agents/skills"));
+        assert_eq!(roots[0].path, directories.project_dir.join("skills"));
+        assert_eq!(
+            roots[1].path,
+            PathBuf::from("/workspace/project/.agents/skills")
+        );
+        assert_eq!(roots[2].path, directories.agent_dir.join("skills"));
+        assert_eq!(roots[3].path, PathBuf::from("/home/tester/.agents/skills"));
     }
 
     #[test]
-    fn default_skill_roots_without_home_only_returns_project_roots() {
-        let cwd = PathBuf::from("/workspace/project");
-        let roots = default_skill_roots(&cwd, None);
+    fn default_skill_roots_use_parent_of_agent_dir_when_agent_dir_is_not_named_agent() {
+        let directories = ResolvedResourceDirectories {
+            project_dir: PathBuf::from("/workspace/project/.roci"),
+            agent_dir: PathBuf::from("/config/global"),
+        };
 
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0].path, cwd.join(".roci/skills"));
-        assert_eq!(roots[1].path, cwd.join(".agents/skills"));
+        let roots = default_skill_roots(&directories);
+
+        assert_eq!(roots[2].path, PathBuf::from("/config/global/skills"));
+        assert_eq!(roots[3].path, PathBuf::from("/config/.agents/skills"));
     }
 
     fn write_skill_file(

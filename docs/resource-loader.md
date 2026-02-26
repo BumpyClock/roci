@@ -5,6 +5,9 @@ Roci's resource loader composes three core concerns:
 - settings (`~/.roci/agent/settings.json`, `.roci/settings.json`)
 - context files (`AGENTS.md` / `CLAUDE.md`)
 - prompt templates (`prompts/*.md`)
+- skills (`SKILL.md`)
+
+It also loads skill definitions from configured skill roots and injects them into `ResourceBundle`.
 
 Project settings override global settings via deep merge.
 
@@ -50,3 +53,5 @@ Inputs that do not match a known template are passed through unchanged.
 
 Resource loading returns diagnostics for unreadable files and collisions.
 `roci-agent` surfaces these diagnostics to stderr.
+
+`SkillResourceOptions` controls skill wiring for `ResourceLoader`, including explicit skill paths, extra roots, and disabling.

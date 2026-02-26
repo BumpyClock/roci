@@ -82,6 +82,8 @@ async fn main() {
         max_retry_delay_ms: None,
         get_api_key: None,
         compaction: CompactionSettings::default(),
+        session_before_compact: None,
+        session_before_tree: None,
     };
 
     let roci_config = RociConfig::new();
