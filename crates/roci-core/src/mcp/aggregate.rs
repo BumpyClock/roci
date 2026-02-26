@@ -251,21 +251,19 @@ impl MCPToolAggregator {
         _ctx: &ToolExecutionContext,
     ) -> Result<serde_json::Value, RociError> {
         let route = self.route_for(exposed_tool_name).await.ok_or_else(|| {
-            RociError::InvalidArgument(format!(
-                "Unknown aggregated MCP tool '{exposed_tool_name}'"
-            ))
+            RociError::InvalidArgument(format!("Unknown aggregated MCP tool '{exposed_tool_name}'"))
         })?;
 
-        let server_idx =
-            self.server_index_by_id
-                .get(&route.server_id)
-                .copied()
-                .ok_or_else(|| {
-                    RociError::InvalidState(format!(
-                        "Routing points to missing MCP server '{}'",
-                        route.server_id
-                    ))
-                })?;
+        let server_idx = self
+            .server_index_by_id
+            .get(&route.server_id)
+            .copied()
+            .ok_or_else(|| {
+                RociError::InvalidState(format!(
+                    "Routing points to missing MCP server '{}'",
+                    route.server_id
+                ))
+            })?;
 
         let mut client = self.servers[server_idx].client.lock().await;
         self.initialize_client(&mut **client).await?;
@@ -287,9 +285,7 @@ impl MCPToolAggregator {
     }
 
     /// Return instruction sources for all servers.
-    pub async fn list_instruction_sources(
-        &self,
-    ) -> Result<Vec<MCPInstructionSource>, RociError> {
+    pub async fn list_instruction_sources(&self) -> Result<Vec<MCPInstructionSource>, RociError> {
         let mut sources = Vec::new();
         for server in &self.servers {
             let mut client = server.client.lock().await;
@@ -374,7 +370,11 @@ mod tests {
         fn new(
             list_plan: Vec<Result<Vec<MCPToolSchema>, String>>,
             call_results: HashMap<String, serde_json::Value>,
-        ) -> (Self, Arc<StdMutex<Vec<(String, serde_json::Value)>>>, Arc<AtomicUsize>) {
+        ) -> (
+            Self,
+            Arc<StdMutex<Vec<(String, serde_json::Value)>>>,
+            Arc<AtomicUsize>,
+        ) {
             let call_log = Arc::new(StdMutex::new(Vec::new()));
             let list_calls = Arc::new(AtomicUsize::new(0));
             (
@@ -650,8 +650,16 @@ mod tests {
         let beta_client = beta_client.with_instructions("Beta instructions");
 
         let aggregator = MCPToolAggregator::new(vec![
-            MCPAggregateServer::from_client_ops_with_label("beta", "Beta MCP", Box::new(beta_client)),
-            MCPAggregateServer::from_client_ops_with_label("alpha", "Alpha MCP", Box::new(alpha_client)),
+            MCPAggregateServer::from_client_ops_with_label(
+                "beta",
+                "Beta MCP",
+                Box::new(beta_client),
+            ),
+            MCPAggregateServer::from_client_ops_with_label(
+                "alpha",
+                "Alpha MCP",
+                Box::new(alpha_client),
+            ),
         ])
         .expect("aggregator should construct");
 

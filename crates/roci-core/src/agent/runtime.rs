@@ -14,19 +14,27 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex, Notify};
 
+use crate::agent::message::{AgentMessage, AgentMessageExt};
 use crate::agent_loop::runner::{
-    AgentEventSink, ConvertToLlmFn, FollowUpMessagesFn, SteeringMessagesFn, TransformContextFn,
+    AgentEventSink, AutoCompactionConfig, CompactionHandler, ConvertToLlmFn, FollowUpMessagesFn,
+    RunHooks, SteeringMessagesFn, TransformContextFn,
 };
 use crate::agent_loop::{
+    compaction::{
+        extract_file_operations, prepare_compaction, serialize_messages_for_summary,
+        serialize_pi_mono_summary, PiMonoSummary,
+    },
     AgentEvent, LoopRunner, RunHandle, RunRequest, RunResult, RunStatus, Runner,
 };
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
-use crate::provider::ProviderRegistry;
+use crate::provider::{ProviderRegistry, ProviderRequest};
+use crate::resource::CompactionSettings;
 use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::types::{GenerationSettings, ModelMessage, Role};
@@ -150,6 +158,8 @@ pub struct AgentConfig {
     /// No explicit key configuration is needed if any of those sources
     /// has a valid credential for the provider.
     pub get_api_key: Option<GetApiKeyFn>,
+    /// Compaction policy and summarization model selection.
+    pub compaction: CompactionSettings,
 }
 
 /// High-level agent runtime wrapping [`LoopRunner`].
@@ -170,6 +180,8 @@ pub struct AgentConfig {
 pub struct AgentRuntime {
     config: AgentConfig,
     runner: LoopRunner,
+    roci_config: RociConfig,
+    registry: Arc<ProviderRegistry>,
     state: Arc<Mutex<AgentState>>,
     state_tx: watch::Sender<AgentState>,
     state_rx: watch::Receiver<AgentState>,
@@ -191,8 +203,12 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     /// Create a new agent runtime with the given configuration.
-    pub fn new(registry: Arc<ProviderRegistry>, roci_config: RociConfig, config: AgentConfig) -> Self {
-        let runner = LoopRunner::with_registry(roci_config, registry);
+    pub fn new(
+        registry: Arc<ProviderRegistry>,
+        roci_config: RociConfig,
+        config: AgentConfig,
+    ) -> Self {
+        let runner = LoopRunner::with_registry(roci_config.clone(), registry.clone());
         let model = Arc::new(Mutex::new(config.model.clone()));
         let system_prompt = Arc::new(Mutex::new(config.system_prompt.clone()));
         let tools = Arc::new(Mutex::new(config.tools.clone()));
@@ -209,6 +225,8 @@ impl AgentRuntime {
         Self {
             config,
             runner,
+            roci_config,
+            registry,
             state: Arc::new(Mutex::new(AgentState::Idle)),
             state_tx,
             state_rx,
@@ -553,6 +571,43 @@ impl AgentRuntime {
         }
     }
 
+    /// Compact the current conversation history in place using the configured
+    /// compaction policy and summary model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn compact(&self) -> Result<(), RociError> {
+        let state_guard = self.lock_state_for_idle_mutation()?;
+        let model = self
+            .model
+            .try_lock()
+            .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?
+            .clone();
+        let messages = self
+            .messages
+            .try_lock()
+            .map_err(|_| RociError::InvalidState("Agent is busy (messages lock contended)".into()))?
+            .clone();
+        drop(state_guard);
+
+        let compacted = Self::compact_messages_with_model(
+            messages,
+            &model,
+            &self.config.compaction,
+            &self.registry,
+            &self.roci_config,
+        )
+        .await?;
+
+        if let Some(compacted_messages) = compacted {
+            *self.messages.lock().await = compacted_messages;
+            self.broadcast_snapshot().await;
+        }
+
+        Ok(())
+    }
+
     // -- Internal helpers --
 
     /// Broadcast the current snapshot to all watchers.
@@ -677,6 +732,36 @@ impl AgentRuntime {
             .with_follow_up_messages(follow_up_fn)
             .with_agent_event_sink(intercepting_sink);
 
+        if self.config.compaction.enabled {
+            let compaction_settings = self.config.compaction.clone();
+            let registry = self.registry.clone();
+            let roci_config = self.roci_config.clone();
+            let run_model = request.model.clone();
+            let compaction_hook: CompactionHandler = Arc::new(move |messages| {
+                let compaction_settings = compaction_settings.clone();
+                let registry = registry.clone();
+                let roci_config = roci_config.clone();
+                let run_model = run_model.clone();
+                Box::pin(async move {
+                    AgentRuntime::compact_messages_with_model(
+                        messages,
+                        &run_model,
+                        &compaction_settings,
+                        &registry,
+                        &roci_config,
+                    )
+                    .await
+                })
+            });
+            request = request.with_hooks(RunHooks {
+                compaction: Some(compaction_hook),
+                tool_result_persist: None,
+            });
+            request = request.with_auto_compaction(AutoCompactionConfig {
+                reserve_tokens: self.config.compaction.reserve_tokens,
+            });
+        }
+
         request.settings = self.config.settings.clone();
 
         if let Some(ref transform) = self.config.transform_context {
@@ -736,6 +821,95 @@ impl AgentRuntime {
         run_result
     }
 
+    async fn compact_messages_with_model(
+        messages: Vec<ModelMessage>,
+        run_model: &LanguageModel,
+        compaction: &CompactionSettings,
+        registry: &Arc<ProviderRegistry>,
+        roci_config: &RociConfig,
+    ) -> Result<Option<Vec<ModelMessage>>, RociError> {
+        let system_prefix_len = messages
+            .iter()
+            .take_while(|message| message.role == Role::System)
+            .count();
+        let system_prefix = messages[..system_prefix_len].to_vec();
+        let conversation_messages = messages[system_prefix_len..].to_vec();
+
+        if conversation_messages.len() < 2 {
+            return Ok(None);
+        }
+
+        let prepared = prepare_compaction(&conversation_messages, compaction.keep_recent_tokens);
+        if prepared.messages_to_summarize.is_empty() {
+            return Ok(None);
+        }
+
+        let summary_model = match compaction.model.as_deref() {
+            Some(model) => LanguageModel::from_str(model)?,
+            None => run_model.clone(),
+        };
+        let provider = registry.create_provider(
+            summary_model.provider_name(),
+            summary_model.model_id(),
+            roci_config,
+        )?;
+
+        let transcript = serialize_messages_for_summary(&prepared.messages_to_summarize);
+        let summary_prompt = format!(
+            "Summarize the conversation transcript into concise bullets focused on user goals, constraints, progress, decisions, next steps, and critical context.\n\nTranscript:\n{transcript}"
+        );
+        let summary_response = provider
+            .generate_text(&ProviderRequest {
+                messages: vec![
+                    ModelMessage::system("You create precise conversation compaction summaries"),
+                    ModelMessage::user(summary_prompt),
+                ],
+                settings: GenerationSettings::default(),
+                tools: None,
+                response_format: None,
+                session_id: None,
+                transport: None,
+            })
+            .await?;
+
+        let summary_text = summary_response.text.trim().to_string();
+        if summary_text.is_empty() {
+            return Err(RociError::InvalidState(
+                "compaction summary model returned empty output".to_string(),
+            ));
+        }
+
+        let file_ops = extract_file_operations(&prepared.messages_to_summarize);
+        let summary = PiMonoSummary {
+            progress: vec![summary_text],
+            critical_context: if prepared.split_turn {
+                vec!["A turn split was preserved to avoid cutting a user/tool exchange".to_string()]
+            } else {
+                Vec::new()
+            },
+            read_files: file_ops.read_files,
+            modified_files: file_ops.modified_files,
+            ..PiMonoSummary::default()
+        };
+        let summary_message = AgentMessage::compaction_summary(serialize_pi_mono_summary(&summary))
+            .to_llm_message()
+            .ok_or_else(|| {
+                RociError::InvalidState("compaction summary message failed to convert".to_string())
+            })?;
+
+        let mut compacted = Vec::with_capacity(
+            system_prefix.len()
+                + 1
+                + prepared.turn_prefix_messages.len()
+                + prepared.kept_messages.len(),
+        );
+        compacted.extend(system_prefix);
+        compacted.push(summary_message);
+        compacted.extend(prepared.turn_prefix_messages);
+        compacted.extend(prepared.kept_messages);
+        Ok(Some(compacted))
+    }
+
     /// Build an event sink that intercepts [`AgentEvent`]s to update tracking
     /// fields, broadcasts the snapshot, and forwards to the user-provided sink.
     fn build_intercepting_sink(&self) -> AgentEventSink {
@@ -780,11 +954,14 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ModelCapabilities;
+    use crate::provider::{ModelProvider, ProviderFactory, ProviderResponse};
     use crate::tools::arguments::ToolArguments;
     use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
     use crate::tools::tool::ToolExecutionContext;
     use crate::tools::{AgentTool, AgentToolParameters};
     use async_trait::async_trait;
+    use futures::stream::BoxStream;
     use std::sync::{Arc, Mutex};
 
     fn test_registry() -> Arc<ProviderRegistry> {
@@ -793,6 +970,103 @@ mod tests {
 
     fn test_config() -> RociConfig {
         RociConfig::new()
+    }
+
+    struct SummaryFactory {
+        provider_key: &'static str,
+        summary_text: String,
+        created_models: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SummaryFactory {
+        fn new(
+            provider_key: &'static str,
+            summary_text: impl Into<String>,
+            created_models: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                provider_key,
+                summary_text: summary_text.into(),
+                created_models,
+            }
+        }
+    }
+
+    impl ProviderFactory for SummaryFactory {
+        fn provider_keys(&self) -> &[&str] {
+            std::slice::from_ref(&self.provider_key)
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            self.created_models
+                .lock()
+                .expect("created_models lock")
+                .push(model_id.to_string());
+            Ok(Box::new(SummaryProvider {
+                provider_key: self.provider_key.to_string(),
+                model_id: model_id.to_string(),
+                summary_text: self.summary_text.clone(),
+                capabilities: ModelCapabilities::default(),
+            }))
+        }
+
+        fn parse_model(
+            &self,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+            None
+        }
+    }
+
+    struct SummaryProvider {
+        provider_key: String,
+        model_id: String,
+        summary_text: String,
+        capabilities: ModelCapabilities,
+    }
+
+    #[async_trait]
+    impl ModelProvider for SummaryProvider {
+        fn provider_name(&self) -> &str {
+            &self.provider_key
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+
+        fn capabilities(&self) -> &ModelCapabilities {
+            &self.capabilities
+        }
+
+        async fn generate_text(
+            &self,
+            _request: &ProviderRequest,
+        ) -> Result<ProviderResponse, RociError> {
+            Ok(ProviderResponse {
+                text: self.summary_text.clone(),
+                usage: crate::types::Usage::default(),
+                tool_calls: Vec::new(),
+                finish_reason: None,
+                thinking: Vec::new(),
+            })
+        }
+
+        async fn stream_text(
+            &self,
+            _request: &ProviderRequest,
+        ) -> Result<BoxStream<'static, Result<crate::types::TextStreamDelta, RociError>>, RociError>
+        {
+            Err(RociError::UnsupportedOperation(
+                "summary test provider does not stream".to_string(),
+            ))
+        }
     }
 
     fn test_agent_config() -> AgentConfig {
@@ -812,7 +1086,22 @@ mod tests {
             transport: None,
             max_retry_delay_ms: None,
             get_api_key: None,
+            compaction: CompactionSettings::default(),
         }
+    }
+
+    fn registry_with_summary_provider(
+        provider_key: &'static str,
+        summary_text: &str,
+        created_models: Arc<Mutex<Vec<String>>>,
+    ) -> Arc<ProviderRegistry> {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(SummaryFactory::new(
+            provider_key,
+            summary_text,
+            created_models,
+        )));
+        Arc::new(registry)
     }
 
     fn dummy_tool(name: &str) -> Arc<dyn Tool> {
@@ -850,7 +1139,10 @@ mod tests {
             _args: &ToolArguments,
             _ctx: &ToolExecutionContext,
         ) -> Result<serde_json::Value, RociError> {
-            let mut calls = self.calls.lock().expect("calls lock should not be poisoned");
+            let mut calls = self
+                .calls
+                .lock()
+                .expect("calls lock should not be poisoned");
             calls.push(name.to_string());
             Ok(serde_json::json!({ "ok": true }))
         }
@@ -1028,11 +1320,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_tools_for_run_merges_static_and_dynamic_tools() {
-        let provider: Arc<dyn DynamicToolProvider> = Arc::new(MockDynamicToolProvider::new(vec![DynamicTool {
-            name: "dynamic".into(),
-            description: "dynamic tool".into(),
-            parameters: AgentToolParameters::empty(),
-        }]));
+        let provider: Arc<dyn DynamicToolProvider> =
+            Arc::new(MockDynamicToolProvider::new(vec![DynamicTool {
+                name: "dynamic".into(),
+                description: "dynamic tool".into(),
+                parameters: AgentToolParameters::empty(),
+            }]));
 
         let mut config = test_agent_config();
         config.tools = vec![dummy_tool("static")];
@@ -1632,5 +1925,69 @@ mod tests {
         assert_eq!(get_key().await.unwrap(), "sk-key-0");
         assert_eq!(get_key().await.unwrap(), "sk-key-1");
         assert_eq!(get_key().await.unwrap(), "sk-key-2");
+    }
+
+    #[tokio::test]
+    async fn compact_replaces_history_with_summary_and_preserves_system_prompt() {
+        let created_models = Arc::new(Mutex::new(Vec::new()));
+        let registry = registry_with_summary_provider("stub", "summarized context", created_models);
+        let mut config = test_agent_config();
+        config.model = "stub:run-model".parse().expect("stub model should parse");
+        config.compaction.keep_recent_tokens = 1;
+        let agent = AgentRuntime::new(registry, test_config(), config);
+
+        agent
+            .replace_messages(vec![
+                ModelMessage::system("You are precise"),
+                ModelMessage::user("first"),
+                ModelMessage::assistant("answer"),
+                ModelMessage::user("latest"),
+            ])
+            .await
+            .expect("messages should be set");
+
+        agent
+            .compact()
+            .await
+            .expect("manual compaction should succeed");
+        let messages = agent.messages().await;
+
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[0].text(), "You are precise");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.text().contains("<compaction_summary>")),
+            "compacted history should include a summary wrapper"
+        );
+        assert!(
+            messages.len() < 4,
+            "manual compaction should replace part of the history"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_uses_configured_compaction_model_when_present() {
+        let created_models = Arc::new(Mutex::new(Vec::new()));
+        let registry = registry_with_summary_provider("summary", "summary", created_models.clone());
+        let mut config = test_agent_config();
+        config.model = "run:model".parse().expect("run model should parse");
+        config.compaction.model = Some("summary:compact-model".to_string());
+        config.compaction.keep_recent_tokens = 1;
+        let agent = AgentRuntime::new(registry, test_config(), config);
+
+        agent
+            .replace_messages(vec![
+                ModelMessage::user("first"),
+                ModelMessage::assistant("second"),
+                ModelMessage::user("third"),
+            ])
+            .await
+            .expect("messages should be set");
+
+        agent.compact().await.expect("compaction should succeed");
+
+        let created_models = created_models.lock().expect("created models lock");
+        assert_eq!(created_models.as_slice(), ["compact-model"]);
     }
 }

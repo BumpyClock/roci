@@ -27,6 +27,7 @@ use crate::types::{
 use super::approvals::{
     ApprovalDecision, ApprovalHandler, ApprovalKind, ApprovalPolicy, ApprovalRequest,
 };
+use super::compaction::estimate_context_usage;
 use super::events::{
     AgentEvent, RunEvent, RunEventPayload, RunEventStream, RunLifecycle, ToolUpdatePayload,
 };
@@ -35,8 +36,14 @@ use super::types::{RunId, RunResult};
 /// Callback used for streaming run events.
 pub type RunEventSink = Arc<dyn Fn(RunEvent) + Send + Sync>;
 /// Hook to compact/prune a message history before the next provider call.
-pub type CompactionHandler =
-    Arc<dyn Fn(&[ModelMessage]) -> Option<Vec<ModelMessage>> + Send + Sync>;
+pub type CompactionHandler = Arc<
+    dyn Fn(
+            Vec<ModelMessage>,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Option<Vec<ModelMessage>>, RociError>> + Send>>
+        + Send
+        + Sync,
+>;
 /// Hook to redact/transform tool results before persistence or context assembly.
 pub type ToolResultPersistHandler = Arc<dyn Fn(AgentToolResult) -> AgentToolResult + Send + Sync>;
 
@@ -75,6 +82,11 @@ pub struct RunHooks {
     pub tool_result_persist: Option<ToolResultPersistHandler>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoCompactionConfig {
+    pub reserve_tokens: usize,
+}
+
 /// Request payload to start a run.
 #[derive(Clone)]
 pub struct RunRequest {
@@ -88,6 +100,7 @@ pub struct RunRequest {
     pub metadata: HashMap<String, String>,
     pub event_sink: Option<RunEventSink>,
     pub hooks: RunHooks,
+    pub auto_compaction: Option<AutoCompactionConfig>,
     /// Callback to get steering messages (checked between tool batches).
     pub get_steering_messages: Option<SteeringMessagesFn>,
     /// Callback to get follow-up messages (checked after inner loop ends).
@@ -120,6 +133,7 @@ impl RunRequest {
             metadata: HashMap::new(),
             event_sink: None,
             hooks: RunHooks::default(),
+            auto_compaction: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
             transform_context: None,
@@ -153,6 +167,11 @@ impl RunRequest {
 
     pub fn with_hooks(mut self, hooks: RunHooks) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    pub fn with_auto_compaction(mut self, config: AutoCompactionConfig) -> Self {
+        self.auto_compaction = Some(config);
         self
     }
 
@@ -610,11 +629,8 @@ fn append_tool_result(
         RunEventPayload::ToolCallCompleted { call: call.clone() },
     );
 
-    let tool_result_message = ModelMessage::tool_result(
-        result.tool_call_id.clone(),
-        result.result,
-        result.is_error,
-    );
+    let tool_result_message =
+        ModelMessage::tool_result(result.tool_call_id.clone(), result.result, result.is_error);
     emit_message_lifecycle(agent_emitter, &tool_result_message);
     messages.push(tool_result_message);
 }
@@ -824,9 +840,42 @@ impl Runner for LoopRunner {
                         }
                     }
 
-                    if let Some(compact) = request.hooks.compaction.as_ref() {
-                        if let Some(compacted) = compact(&messages) {
-                            messages = compacted;
+                    let should_compact = request.auto_compaction.as_ref().is_some_and(|config| {
+                        let usage = estimate_context_usage(
+                            &messages,
+                            provider.capabilities().context_length,
+                        );
+                        usage.used_tokens
+                            > usage.context_window.saturating_sub(config.reserve_tokens)
+                    });
+                    if should_compact {
+                        let Some(compact) = request.hooks.compaction.as_ref() else {
+                            agent_emitter.emit(AgentEvent::AgentEnd {
+                                run_id: request.run_id,
+                            });
+                            let _ = result_tx.send(emit_failed_result(
+                                &emitter,
+                                "auto-compaction is enabled but no compaction hook is configured",
+                                &messages,
+                            ));
+                            return;
+                        };
+                        match compact(messages.clone()).await {
+                            Ok(Some(compacted)) => {
+                                messages = compacted;
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                agent_emitter.emit(AgentEvent::AgentEnd {
+                                    run_id: request.run_id,
+                                });
+                                let _ = result_tx.send(emit_failed_result(
+                                    &emitter,
+                                    format!("compaction failed: {err}"),
+                                    &messages,
+                                ));
+                                return;
+                            }
                         }
                     }
 
@@ -2734,8 +2783,14 @@ mod tests {
                         && tool_result_id_from_message(message) == Some("update-tool-1")
             )
         });
-        assert!(tool_start, "expected tool result MessageStart for update-tool-1");
-        assert!(tool_end, "expected tool result MessageEnd for update-tool-1");
+        assert!(
+            tool_start,
+            "expected tool result MessageStart for update-tool-1"
+        );
+        assert!(
+            tool_end,
+            "expected tool result MessageEnd for update-tool-1"
+        );
     }
 
     #[tokio::test]
@@ -2911,7 +2966,12 @@ mod tests {
                 active_calls.clone(),
                 max_active_calls.clone(),
             ),
-            tracked_success_tool("read", Duration::from_millis(40), active_calls, max_active_calls),
+            tracked_success_tool(
+                "read",
+                Duration::from_millis(40),
+                active_calls,
+                max_active_calls,
+            ),
         ];
         request.approval_policy = ApprovalPolicy::Always;
         request.agent_event_sink = Some(agent_sink);
@@ -2971,10 +3031,22 @@ mod tests {
             )
         });
 
-        assert!(skipped_tool_start, "expected ToolExecutionStart for skipped call");
-        assert!(skipped_tool_end, "expected ToolExecutionEnd for skipped call");
-        assert!(skipped_msg_start, "expected MessageStart for skipped tool result");
-        assert!(skipped_msg_end, "expected MessageEnd for skipped tool result");
+        assert!(
+            skipped_tool_start,
+            "expected ToolExecutionStart for skipped call"
+        );
+        assert!(
+            skipped_tool_end,
+            "expected ToolExecutionEnd for skipped call"
+        );
+        assert!(
+            skipped_msg_start,
+            "expected MessageStart for skipped tool result"
+        );
+        assert!(
+            skipped_msg_end,
+            "expected MessageEnd for skipped tool result"
+        );
     }
 
     #[tokio::test]
@@ -3560,5 +3632,110 @@ mod tests {
             error_msg.contains("expected type 'string'"),
             "expected type mismatch detail, got: {error_msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_triggers_when_context_exceeds_reserved_window() {
+        let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.hooks = RunHooks {
+            compaction: Some(Arc::new(move |_messages| {
+                let calls_clone = calls_clone.clone();
+                Box::pin(async move {
+                    calls_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                })
+            })),
+            tool_result_persist: None,
+        };
+        request.auto_compaction = Some(AutoCompactionConfig {
+            reserve_tokens: 4096,
+        });
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_replaces_messages_before_provider_call() {
+        let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let mut request = RunRequest::new(
+            test_model(),
+            vec![
+                ModelMessage::system("system must stay"),
+                ModelMessage::user("old context"),
+                ModelMessage::user("new context"),
+            ],
+        );
+        request.hooks = RunHooks {
+            compaction: Some(Arc::new(move |messages| {
+                Box::pin(async move {
+                    Ok(Some(vec![
+                        messages[0].clone(),
+                        ModelMessage::user("<compaction_summary>\nsummary\n</compaction_summary>"),
+                        messages
+                            .last()
+                            .cloned()
+                            .expect("compaction input should have latest message"),
+                    ]))
+                })
+            })),
+            tool_result_persist: None,
+        };
+        request.auto_compaction = Some(AutoCompactionConfig {
+            reserve_tokens: 4096,
+        });
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let recorded = requests.lock().expect("request lock");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].messages.len(), 3);
+        assert_eq!(recorded[0].messages[0].role, crate::types::Role::System);
+        assert_eq!(recorded[0].messages[0].text(), "system must stay");
+        assert!(recorded[0].messages[1]
+            .text()
+            .contains("<compaction_summary>"));
+        assert_eq!(recorded[0].messages[2].text(), "new context");
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_fails_run_and_surfaces_error() {
+        let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.hooks = RunHooks {
+            compaction: Some(Arc::new(move |_messages| {
+                Box::pin(async {
+                    Err(RociError::InvalidState(
+                        "forced compaction failure".to_string(),
+                    ))
+                })
+            })),
+            tool_result_persist: None,
+        };
+        request.auto_compaction = Some(AutoCompactionConfig {
+            reserve_tokens: 4096,
+        });
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+
+        assert_eq!(result.status, RunStatus::Failed);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("compaction failed"));
+        assert!(error.contains("forced compaction failure"));
     }
 }

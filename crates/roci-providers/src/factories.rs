@@ -39,7 +39,8 @@ impl ProviderFactory for OpenAiFactory {
         use std::str::FromStr;
 
         let api_key = require_api_key(config, ProviderKey::OpenAi, "Missing OPENAI_API_KEY")?;
-        let model = OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
+        let model =
+            OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
         if model.uses_responses_api() {
             Ok(Box::new(
                 crate::provider::openai_responses::OpenAiResponsesProvider::new(
@@ -99,7 +100,8 @@ impl ProviderFactory for CodexFactory {
             .get_base_url_for(ProviderKey::Codex)
             .or_else(|| Some("https://chatgpt.com/backend-api/codex".to_string()));
         let account_id = config.get_account_id_for(ProviderKey::Codex);
-        let model = OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
+        let model =
+            OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
         if model.uses_responses_api() {
             Ok(Box::new(
                 crate::provider::openai_responses::OpenAiResponsesProvider::new(
@@ -148,10 +150,9 @@ impl ProviderFactory for AnthropicFactory {
         use crate::models::anthropic::AnthropicModel;
         use std::str::FromStr;
 
-        let api_key =
-            require_api_key(config, ProviderKey::Anthropic, "Missing ANTHROPIC_API_KEY")?;
-        let model =
-            AnthropicModel::from_str(model_id).unwrap_or(AnthropicModel::Custom(model_id.to_string()));
+        let api_key = require_api_key(config, ProviderKey::Anthropic, "Missing ANTHROPIC_API_KEY")?;
+        let model = AnthropicModel::from_str(model_id)
+            .unwrap_or(AnthropicModel::Custom(model_id.to_string()));
         Ok(Box::new(
             crate::provider::anthropic::AnthropicProvider::new(
                 model,
@@ -319,11 +320,11 @@ impl ProviderFactory for MistralFactory {
         use std::str::FromStr;
 
         let api_key = require_api_key(config, ProviderKey::Mistral, "Missing MISTRAL_API_KEY")?;
-        let model = MistralModel::from_str(model_id)
-            .unwrap_or(MistralModel::Custom(model_id.to_string()));
-        Ok(Box::new(
-            crate::provider::mistral::MistralProvider::new(model, api_key),
-        ))
+        let model =
+            MistralModel::from_str(model_id).unwrap_or(MistralModel::Custom(model_id.to_string()));
+        Ok(Box::new(crate::provider::mistral::MistralProvider::new(
+            model, api_key,
+        )))
     }
 
     fn parse_model(&self, _key: &str, model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
@@ -401,9 +402,9 @@ impl ProviderFactory for LmStudioFactory {
             .get_base_url_for(ProviderKey::LmStudio)
             .unwrap_or_else(|| "http://localhost:1234".to_string());
         let model = LmStudioModel::Custom(model_id.to_string());
-        Ok(Box::new(
-            crate::provider::lmstudio::LmStudioProvider::new(model, base_url),
-        ))
+        Ok(Box::new(crate::provider::lmstudio::LmStudioProvider::new(
+            model, base_url,
+        )))
     }
 
     fn parse_model(&self, _key: &str, model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
@@ -448,11 +449,7 @@ impl ProviderFactory for OpenAiCompatibleFactory {
         ))
     }
 
-    fn parse_model(
-        &self,
-        _key: &str,
-        _model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
+    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
         None
     }
 }
@@ -519,11 +516,7 @@ impl ProviderFactory for GitHubCopilotFactory {
         ))
     }
 
-    fn parse_model(
-        &self,
-        _key: &str,
-        _model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
+    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
         None
     }
 }
@@ -549,14 +542,10 @@ impl ProviderFactory for AnthropicCompatibleFactory {
     ) -> Result<Box<dyn ModelProvider>, RociError> {
         let api_key = config
             .get_api_key_for(ProviderKey::Anthropic)
-            .ok_or_else(|| {
-                RociError::Authentication("Missing ANTHROPIC_COMPAT_API_KEY".into())
-            })?;
+            .ok_or_else(|| RociError::Authentication("Missing ANTHROPIC_COMPAT_API_KEY".into()))?;
         let base_url = config
             .get_base_url_for(ProviderKey::Anthropic)
-            .ok_or_else(|| {
-                RociError::Configuration("Missing ANTHROPIC_COMPAT_BASE_URL".into())
-            })?;
+            .ok_or_else(|| RociError::Configuration("Missing ANTHROPIC_COMPAT_BASE_URL".into()))?;
         Ok(Box::new(
             crate::provider::anthropic_compatible::AnthropicCompatibleProvider::new(
                 model_id.to_string(),
@@ -566,11 +555,7 @@ impl ProviderFactory for AnthropicCompatibleFactory {
         ))
     }
 
-    fn parse_model(
-        &self,
-        _key: &str,
-        _model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
+    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
         None
     }
 }
@@ -601,21 +586,15 @@ impl ProviderFactory for AzureFactory {
             .get_base_url_for(ProviderKey::OpenAi)
             .ok_or_else(|| RociError::Configuration("Missing AZURE_OPENAI_ENDPOINT".into()))?;
         let api_version = "2024-06-01".to_string();
-        Ok(Box::new(
-            crate::provider::azure::AzureOpenAiProvider::new(
-                endpoint,
-                model_id.to_string(),
-                api_key,
-                api_version,
-            ),
-        ))
+        Ok(Box::new(crate::provider::azure::AzureOpenAiProvider::new(
+            endpoint,
+            model_id.to_string(),
+            api_key,
+            api_version,
+        )))
     }
 
-    fn parse_model(
-        &self,
-        _key: &str,
-        _model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
+    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
         None
     }
 }
@@ -643,10 +622,7 @@ impl ProviderFactory for OpenRouterFactory {
             .get_api_key_for(ProviderKey::OpenAi)
             .ok_or_else(|| RociError::Authentication("Missing OPENROUTER_API_KEY".into()))?;
         Ok(Box::new(
-            crate::provider::openrouter::OpenRouterProvider::new(
-                model_id.to_string(),
-                api_key,
-            ),
+            crate::provider::openrouter::OpenRouterProvider::new(model_id.to_string(), api_key),
         ))
     }
 
@@ -677,9 +653,10 @@ impl ProviderFactory for TogetherFactory {
         let api_key = config
             .get_api_key_for(ProviderKey::OpenAi)
             .ok_or_else(|| RociError::Authentication("Missing TOGETHER_API_KEY".into()))?;
-        Ok(Box::new(
-            crate::provider::together::TogetherProvider::new(model_id.to_string(), api_key),
-        ))
+        Ok(Box::new(crate::provider::together::TogetherProvider::new(
+            model_id.to_string(),
+            api_key,
+        )))
     }
 
     fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {

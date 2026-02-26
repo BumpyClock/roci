@@ -142,10 +142,7 @@ fn register_default_auth_backends_includes_codex() {
 
     let statuses = svc.all_statuses();
     let names: Vec<&str> = statuses.iter().map(|(name, _, _)| *name).collect();
-    assert!(
-        names.contains(&"Codex"),
-        "expected Codex in {names:?}"
-    );
+    assert!(names.contains(&"Codex"), "expected Codex in {names:?}");
 }
 
 #[test]
@@ -155,10 +152,7 @@ fn register_default_auth_backends_includes_claude() {
 
     let statuses = svc.all_statuses();
     let names: Vec<&str> = statuses.iter().map(|(name, _, _)| *name).collect();
-    assert!(
-        names.contains(&"Claude"),
-        "expected Claude in {names:?}"
-    );
+    assert!(names.contains(&"Claude"), "expected Claude in {names:?}");
 }
 
 #[tokio::test]

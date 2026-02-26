@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use roci_core::models::ModelCapabilities;
 use super::openai::OpenAiModel;
+use roci_core::models::ModelCapabilities;
 
 /// OpenAI-compatible model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

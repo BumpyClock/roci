@@ -41,8 +41,7 @@ fn config_is_accessible_via_roci() {
 
 #[test]
 fn error_type_is_accessible_via_roci() {
-    let _err: roci::error::RociError =
-        roci::error::RociError::ModelNotFound("test".to_string());
+    let _err: roci::error::RociError = roci::error::RociError::ModelNotFound("test".to_string());
 }
 
 #[test]

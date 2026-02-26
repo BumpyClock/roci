@@ -192,15 +192,21 @@ fn register_then_create_provider_round_trip() {
 
     let config = RociConfig::new().with_token_store(None);
 
-    let a = registry.create_provider("mock-a", "model-1", &config).unwrap();
+    let a = registry
+        .create_provider("mock-a", "model-1", &config)
+        .unwrap();
     assert_eq!(a.provider_name(), "mock-provider-a");
     assert_eq!(a.model_id(), "model-1");
 
-    let a_alias = registry.create_provider("a-alias", "model-2", &config).unwrap();
+    let a_alias = registry
+        .create_provider("a-alias", "model-2", &config)
+        .unwrap();
     assert_eq!(a_alias.provider_name(), "mock-provider-a");
     assert_eq!(a_alias.model_id(), "model-2");
 
-    let b = registry.create_provider("mock-b", "model-3", &config).unwrap();
+    let b = registry
+        .create_provider("mock-b", "model-3", &config)
+        .unwrap();
     assert_eq!(b.provider_name(), "mock-provider-b");
 
     let mut keys = registry.provider_keys();

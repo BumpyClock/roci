@@ -4,10 +4,10 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use roci_core::auth::{DeviceCodePoll, DeviceCodeSession};
 use roci_core::auth::AuthError;
-use roci_core::auth::TokenStore;
 use roci_core::auth::Token;
+use roci_core::auth::TokenStore;
+use roci_core::auth::{DeviceCodePoll, DeviceCodeSession};
 
 const DEFAULT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const DEFAULT_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";

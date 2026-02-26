@@ -154,7 +154,10 @@ impl MCPClient {
         self.ensure_initialized()?;
         let arguments = coerce_tool_arguments(arguments)?;
 
-        let result = match self.call_tool_from_active_session(name, arguments.clone()).await {
+        let result = match self
+            .call_tool_from_active_session(name, arguments.clone())
+            .await
+        {
             Ok(result) => result,
             Err(error) if Self::should_reconnect_after_service_error(&error) => {
                 self.reset_for_reconnect()?;
@@ -202,15 +205,16 @@ impl MCPClient {
             .map_err(map_client_initialize_error)
     }
 
-    async fn list_tools_from_active_session(&mut self) -> Result<Vec<rmcp::model::Tool>, ServiceError> {
+    async fn list_tools_from_active_session(
+        &mut self,
+    ) -> Result<Vec<rmcp::model::Tool>, ServiceError> {
         let session = self.session.as_mut().ok_or(ServiceError::TransportClosed)?;
 
         match session.list_all_tools().await {
             Ok(tools) => Ok(tools),
-            Err(ServiceError::UnexpectedResponse) => session
-                .list_tools(None)
-                .await
-                .map(|page| page.tools),
+            Err(ServiceError::UnexpectedResponse) => {
+                session.list_tools(None).await.map(|page| page.tools)
+            }
             Err(error) => Err(error),
         }
     }
@@ -401,9 +405,7 @@ mod tests {
     use async_trait::async_trait;
     use rmcp::{
         model::ServerJsonRpcMessage,
-        service::{
-            serve_directly, RoleClient, RxJsonRpcMessage, ServiceExt, TxJsonRpcMessage,
-        },
+        service::{serve_directly, RoleClient, RxJsonRpcMessage, ServiceExt, TxJsonRpcMessage},
         transport::Transport as RmcpTransport,
     };
     use serde_json::json;
@@ -654,10 +656,9 @@ mod tests {
     #[tokio::test]
     async fn initialize_falls_back_to_legacy_protocol_version() {
         let transport = MockBootstrapTransport::new(vec![
-            Err(ClientInitializeError::JsonRpcError(rmcp::model::ErrorData::invalid_request(
-                "unsupported protocol version",
-                None,
-            ))),
+            Err(ClientInitializeError::JsonRpcError(
+                rmcp::model::ErrorData::invalid_request("unsupported protocol version", None),
+            )),
             Ok(scripted_running_service(MockSessionBehavior::ListTools {
                 tool_name: "weather".into(),
             })),
@@ -685,7 +686,10 @@ mod tests {
         ))]);
         let mut client = MCPClient::new(Box::new(transport));
 
-        client.initialize().await.expect("initialize should succeed");
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
         let tools = client
             .list_tools()
             .await
@@ -702,7 +706,10 @@ mod tests {
         ))]);
         let mut client = MCPClient::new(Box::new(transport));
 
-        client.initialize().await.expect("initialize should succeed");
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
         let result = client
             .call_tool("echo", json!({"message": "hello"}))
             .await
@@ -725,7 +732,10 @@ mod tests {
         let attempted = transport.attempted_protocols();
         let mut client = MCPClient::new(Box::new(transport));
 
-        client.initialize().await.expect("initialize should succeed");
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
         let tools = client
             .list_tools()
             .await
@@ -749,7 +759,10 @@ mod tests {
         let attempted = transport.attempted_protocols();
         let mut client = MCPClient::new(Box::new(transport));
 
-        client.initialize().await.expect("initialize should succeed");
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
         let result = client
             .call_tool("echo", json!({"message": "hello"}))
             .await

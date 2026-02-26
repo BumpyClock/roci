@@ -6,9 +6,9 @@ use futures::StreamExt;
 use serde::Deserialize;
 use tracing::debug;
 
+use crate::models::google::GoogleModel;
 use roci_core::error::RociError;
 use roci_core::models::capabilities::ModelCapabilities;
-use crate::models::google::GoogleModel;
 use roci_core::types::*;
 
 use roci_core::provider::http::shared_client;
@@ -267,7 +267,9 @@ impl ModelProvider for GoogleProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(status, &body_text));
+            return Err(roci_core::provider::http::status_to_error(
+                status, &body_text,
+            ));
         }
 
         let data: GeminiResponse = resp.json().await?;
@@ -348,7 +350,9 @@ impl ModelProvider for GoogleProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(status, &body_text));
+            return Err(roci_core::provider::http::status_to_error(
+                status, &body_text,
+            ));
         }
 
         let byte_stream = resp.bytes_stream();

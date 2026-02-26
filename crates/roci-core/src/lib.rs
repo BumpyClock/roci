@@ -13,6 +13,7 @@ pub mod generation;
 pub mod models;
 pub mod prelude;
 pub mod provider;
+pub mod resource;
 pub mod skills;
 pub mod stop;
 pub mod stream_transform;

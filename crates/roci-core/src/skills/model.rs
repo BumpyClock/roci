@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 /// Represents a parsed and loadable skill definition.
+#[derive(Debug, Clone)]
 pub struct Skill {
     /// Human-readable skill name used for lookup.
     pub name: String,

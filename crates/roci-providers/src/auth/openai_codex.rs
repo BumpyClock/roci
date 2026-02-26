@@ -5,10 +5,10 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use roci_core::auth::{DeviceCodePoll, DeviceCodeSession};
 use roci_core::auth::AuthError;
-use roci_core::auth::TokenStore;
 use roci_core::auth::Token;
+use roci_core::auth::TokenStore;
+use roci_core::auth::{DeviceCodePoll, DeviceCodeSession};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";

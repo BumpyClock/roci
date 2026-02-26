@@ -87,9 +87,7 @@ pub fn merge_mcp_instructions(
 }
 
 /// Render a deterministic MCP instruction block.
-pub fn render_mcp_instruction_block(
-    instructions: &[MCPInstructionSource],
-) -> Option<String> {
+pub fn render_mcp_instruction_block(instructions: &[MCPInstructionSource]) -> Option<String> {
     let normalized = normalize_sources(instructions);
     if normalized.is_empty() {
         return None;
@@ -171,8 +169,12 @@ mod tests {
     #[test]
     fn merge_appends_instruction_block() {
         let sources = vec![source("alpha", None, "Alpha instructions")];
-        let merged = merge_mcp_instructions(Some("System prompt"), &sources, MCPInstructionMergePolicy::AppendBlock)
-            .expect("merged prompt should render");
+        let merged = merge_mcp_instructions(
+            Some("System prompt"),
+            &sources,
+            MCPInstructionMergePolicy::AppendBlock,
+        )
+        .expect("merged prompt should render");
 
         assert!(merged.starts_with("System prompt"));
         assert!(merged.contains("MCP server instructions:"));

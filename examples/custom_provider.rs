@@ -84,10 +84,7 @@ impl ModelProvider for EchoProvider {
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         let echo = collect_user_text(&request.messages);
         // Emit one delta per word, then a final Done delta.
-        let words: Vec<String> = echo
-            .split_whitespace()
-            .map(|w| format!("{w} "))
-            .collect();
+        let words: Vec<String> = echo.split_whitespace().map(|w| format!("{w} ")).collect();
 
         let text_deltas = words.into_iter().map(|word| {
             Ok(TextStreamDelta {
@@ -223,11 +220,9 @@ async fn main() -> roci::error::Result<()> {
 
         // Streaming works too.
         println!("Streaming:");
-        let provider_arc: Arc<dyn ModelProvider> = Arc::from(
-            registry.create_provider("echo", "echo-v2", &config)?,
-        );
-        let mut stream =
-            roci::generation::stream(provider_arc, "Hello streaming world").await?;
+        let provider_arc: Arc<dyn ModelProvider> =
+            Arc::from(registry.create_provider("echo", "echo-v2", &config)?);
+        let mut stream = roci::generation::stream(provider_arc, "Hello streaming world").await?;
         while let Some(delta) = stream.next().await {
             let delta = delta?;
             if !delta.text.is_empty() {

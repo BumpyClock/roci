@@ -4,9 +4,9 @@ use rmcp::service::{ClientInitializeError, ServiceExt};
 use rmcp::transport::TokioChildProcess;
 use tokio::process::Command;
 
-use crate::error::RociError;
-use super::{MCPRunningService, MCPTransport};
 use super::common::{DynRoleClientTransport, ErasedRoleClientTransport};
+use super::{MCPRunningService, MCPTransport};
+use crate::error::RociError;
 
 /// Stdio-based MCP transport (for local MCP servers).
 pub struct StdioTransport {

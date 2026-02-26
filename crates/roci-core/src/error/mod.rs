@@ -210,7 +210,10 @@ mod tests {
             provider: "anthropic".to_string(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("anthropic"), "expected provider in message: {msg}");
+        assert!(
+            msg.contains("anthropic"),
+            "expected provider in message: {msg}"
+        );
     }
 
     #[test]
@@ -221,6 +224,9 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("base_url"), "expected key in message: {msg}");
-        assert!(msg.contains("copilot"), "expected provider in message: {msg}");
+        assert!(
+            msg.contains("copilot"),
+            "expected provider in message: {msg}"
+        );
     }
 }

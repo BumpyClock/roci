@@ -6,8 +6,8 @@ use futures::StreamExt;
 use serde::Deserialize;
 use tracing::debug;
 
-use roci_core::error::RociError;
 use crate::models::anthropic::AnthropicModel;
+use roci_core::error::RociError;
 use roci_core::models::capabilities::ModelCapabilities;
 use roci_core::types::*;
 
@@ -287,7 +287,9 @@ impl ModelProvider for AnthropicProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(status, &body_text));
+            return Err(roci_core::provider::http::status_to_error(
+                status, &body_text,
+            ));
         }
 
         let data: AnthropicResponse = resp.json().await?;
@@ -381,7 +383,9 @@ impl ModelProvider for AnthropicProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(status, &body_text));
+            return Err(roci_core::provider::http::status_to_error(
+                status, &body_text,
+            ));
         }
 
         let byte_stream = resp.bytes_stream();

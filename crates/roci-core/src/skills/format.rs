@@ -23,7 +23,9 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     let mut output = String::new();
     output.push_str("\n\n");
     output.push_str("The following skills provide specialized instructions for specific tasks.\n");
-    output.push_str("Use the read_file tool to load a skill's file when the task matches its description.\n");
+    output.push_str(
+        "Use the read_file tool to load a skill's file when the task matches its description.\n",
+    );
     output.push_str(
         "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md) and use that absolute path in tool commands.\n",
     );

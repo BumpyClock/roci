@@ -2,6 +2,8 @@
 
 pub mod auth;
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 /// Roci AI CLI
@@ -68,6 +70,18 @@ pub struct ChatArgs {
     #[arg(short, long)]
     pub temperature: Option<f64>,
 
+    /// Explicit skill path (file or directory)
+    #[arg(long, value_name = "PATH")]
+    pub skill_path: Vec<PathBuf>,
+
+    /// Additional skill root directory (searched after default roots)
+    #[arg(long, value_name = "PATH")]
+    pub skill_root: Vec<PathBuf>,
+
+    /// Disable skill loading
+    #[arg(long)]
+    pub no_skills: bool,
+
     /// Max tokens
     #[arg(long)]
     pub max_tokens: Option<u32>,
@@ -128,6 +142,9 @@ mod tests {
                 assert_eq!(args.model, "openai:gpt-4o");
                 assert!(args.system.is_none());
                 assert!(args.temperature.is_none());
+                assert!(args.skill_path.is_empty());
+                assert!(args.skill_root.is_empty());
+                assert!(!args.no_skills);
                 assert!(args.max_tokens.is_none());
                 assert!(args.stream);
                 assert!(args.prompt.is_none());
@@ -157,9 +174,75 @@ mod tests {
                 assert_eq!(args.model, "anthropic:claude-4-sonnet");
                 assert_eq!(args.system.as_deref(), Some("You are helpful"));
                 assert!((args.temperature.unwrap() - 0.7).abs() < f64::EPSILON);
+                assert!(args.skill_path.is_empty());
+                assert!(args.skill_root.is_empty());
+                assert!(!args.no_skills);
                 assert_eq!(args.max_tokens, Some(1024));
                 assert!(args.stream);
                 assert_eq!(args.prompt.as_deref(), Some("Hello world"));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_with_no_skills() {
+        let cli = Cli::try_parse_from(["roci-agent", "chat", "--no-skills", "prompt"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                assert!(args.no_skills);
+                assert_eq!(args.prompt.as_deref(), Some("prompt"));
+                assert!(args.skill_path.is_empty());
+                assert!(args.skill_root.is_empty());
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_with_multiple_skill_paths() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--skill-path",
+            "./skills/global",
+            "--skill-path",
+            "./skills/project",
+            "Hi",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(
+                    args.skill_path,
+                    vec![
+                        PathBuf::from("./skills/global"),
+                        PathBuf::from("./skills/project")
+                    ]
+                );
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_with_multiple_skill_roots() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--skill-root",
+            "./root/one",
+            "--skill-root",
+            "./root/two",
+            "Hi",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(
+                    args.skill_root,
+                    vec![PathBuf::from("./root/one"), PathBuf::from("./root/two")]
+                );
             }
             other => panic!("expected Chat, got {other:?}"),
         }

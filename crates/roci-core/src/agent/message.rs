@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::message::{ContentPart, ModelMessage};
 
+pub const COMPACTION_SUMMARY_PREFIX: &str = "<compaction_summary>";
+pub const COMPACTION_SUMMARY_SUFFIX: &str = "</compaction_summary>";
+pub const BRANCH_SUMMARY_PREFIX: &str = "<branch_summary>";
+pub const BRANCH_SUMMARY_SUFFIX: &str = "</branch_summary>";
+
+fn wrap_summary(prefix: &str, summary: &str, suffix: &str) -> String {
+    format!("{prefix}\n{summary}\n{suffix}")
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -17,23 +26,22 @@ use crate::types::message::{ContentPart, ModelMessage};
 /// Trait for messages that can participate in the agent loop.
 ///
 /// Standard LLM messages (`ModelMessage`) implement this trait, returning
-/// themselves from [`as_llm_message`]. Custom message types (UI artifacts,
+/// themselves from [`to_llm_message`]. Custom message types (UI artifacts,
 /// metadata, notifications) should return `None`.
 pub trait AgentMessageExt: Send + Sync + std::fmt::Debug {
-    /// If this message should be sent to the LLM, return a reference to the
-    /// underlying `ModelMessage`. Return `None` for UI-only messages.
-    fn as_llm_message(&self) -> Option<&ModelMessage>;
+    /// Convert this message into an LLM-facing message, if applicable
+    fn to_llm_message(&self) -> Option<ModelMessage>;
 
-    /// Timestamp of the message, if available.
+    /// Timestamp of the message, if available
     fn timestamp(&self) -> Option<DateTime<Utc>>;
 
-    /// Kind identifier for routing and serialization (e.g. `"llm"`, `"artifact"`).
+    /// Kind identifier for routing and serialization (e.g. `"llm"`, `"artifact"`)
     fn kind(&self) -> &str;
 }
 
 impl AgentMessageExt for ModelMessage {
-    fn as_llm_message(&self) -> Option<&ModelMessage> {
-        Some(self)
+    fn to_llm_message(&self) -> Option<ModelMessage> {
+        Some(self.clone())
     }
 
     fn timestamp(&self) -> Option<DateTime<Utc>> {
@@ -52,13 +60,25 @@ impl AgentMessageExt for ModelMessage {
 /// Default message type for the agent loop.
 ///
 /// Wraps standard `ModelMessage` values and supports custom message variants
-/// via the `Custom` arm.
+/// via dedicated summary variants and the `Custom` arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMessage {
-    /// Standard LLM message (user, assistant, system, tool).
+    /// Standard LLM message (user, assistant, system, tool)
     Llm(ModelMessage),
-    /// Custom message that will not be sent to the LLM.
+    /// Compaction summary message converted to a provider-facing user message
+    CompactionSummary {
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
+    },
+    /// Branch summary message converted to a provider-facing user message
+    BranchSummary {
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
+    },
+    /// Custom message that will not be sent to the LLM
     Custom {
         kind: String,
         data: serde_json::Value,
@@ -68,9 +88,21 @@ pub enum AgentMessage {
 }
 
 impl AgentMessageExt for AgentMessage {
-    fn as_llm_message(&self) -> Option<&ModelMessage> {
+    fn to_llm_message(&self) -> Option<ModelMessage> {
         match self {
-            AgentMessage::Llm(msg) => Some(msg),
+            AgentMessage::Llm(msg) => Some(msg.clone()),
+            AgentMessage::CompactionSummary { summary, .. } => {
+                Some(ModelMessage::user(wrap_summary(
+                    COMPACTION_SUMMARY_PREFIX,
+                    summary,
+                    COMPACTION_SUMMARY_SUFFIX,
+                )))
+            }
+            AgentMessage::BranchSummary { summary, .. } => Some(ModelMessage::user(wrap_summary(
+                BRANCH_SUMMARY_PREFIX,
+                summary,
+                BRANCH_SUMMARY_SUFFIX,
+            ))),
             AgentMessage::Custom { .. } => None,
         }
     }
@@ -78,6 +110,8 @@ impl AgentMessageExt for AgentMessage {
     fn timestamp(&self) -> Option<DateTime<Utc>> {
         match self {
             AgentMessage::Llm(msg) => msg.timestamp,
+            AgentMessage::CompactionSummary { timestamp, .. } => *timestamp,
+            AgentMessage::BranchSummary { timestamp, .. } => *timestamp,
             AgentMessage::Custom { timestamp, .. } => *timestamp,
         }
     }
@@ -85,18 +119,36 @@ impl AgentMessageExt for AgentMessage {
     fn kind(&self) -> &str {
         match self {
             AgentMessage::Llm(_) => "llm",
+            AgentMessage::CompactionSummary { .. } => "compaction_summary",
+            AgentMessage::BranchSummary { .. } => "branch_summary",
             AgentMessage::Custom { kind, .. } => kind,
         }
     }
 }
 
 impl AgentMessage {
-    /// Create from a `ModelMessage`.
+    /// Create from a `ModelMessage`
     pub fn from_model(msg: ModelMessage) -> Self {
         AgentMessage::Llm(msg)
     }
 
-    /// Create a custom message.
+    /// Create a compaction summary message
+    pub fn compaction_summary(summary: impl Into<String>) -> Self {
+        AgentMessage::CompactionSummary {
+            summary: summary.into(),
+            timestamp: Some(Utc::now()),
+        }
+    }
+
+    /// Create a branch summary message
+    pub fn branch_summary(summary: impl Into<String>) -> Self {
+        AgentMessage::BranchSummary {
+            summary: summary.into(),
+            timestamp: Some(Utc::now()),
+        }
+    }
+
+    /// Create a custom message
     pub fn custom(kind: impl Into<String>, data: serde_json::Value) -> Self {
         AgentMessage::Custom {
             kind: kind.into(),
@@ -105,24 +157,24 @@ impl AgentMessage {
         }
     }
 
-    /// Shorthand: create a user text message.
+    /// Shorthand: create a user text message
     pub fn user(text: impl Into<String>) -> Self {
         AgentMessage::Llm(ModelMessage::user(text))
     }
 
-    /// Shorthand: create an assistant text message.
+    /// Shorthand: create an assistant text message
     pub fn assistant(text: impl Into<String>) -> Self {
         AgentMessage::Llm(ModelMessage::assistant(text))
     }
 
-    /// Extract text content if this is an LLM message.
+    /// Extract text content if this message converts to an LLM message
     pub fn text(&self) -> Option<String> {
-        self.as_llm_message().map(|m| m.text())
+        self.to_llm_message().map(|m| m.text())
     }
 
-    /// Extract content parts if this is an LLM message.
-    pub fn content(&self) -> Option<&[ContentPart]> {
-        self.as_llm_message().map(|m| m.content.as_slice())
+    /// Extract content parts if this message converts to an LLM message
+    pub fn content(&self) -> Option<Vec<ContentPart>> {
+        self.to_llm_message().map(|m| m.content)
     }
 }
 
@@ -136,15 +188,12 @@ impl From<ModelMessage> for AgentMessage {
 // Conversion helper
 // ---------------------------------------------------------------------------
 
-/// Filter a slice of agent messages down to only LLM-compatible messages.
+/// Filter a slice of agent messages down to only LLM-compatible messages
 ///
 /// This is called before each LLM request to strip out custom messages
-/// (artifacts, notifications, etc.) that the model shouldn't see.
+/// (artifacts, notifications, etc.) that the model shouldn't see
 pub fn convert_to_llm<M: AgentMessageExt>(messages: &[M]) -> Vec<ModelMessage> {
-    messages
-        .iter()
-        .filter_map(|m| m.as_llm_message().cloned())
-        .collect()
+    messages.iter().filter_map(|m| m.to_llm_message()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -159,22 +208,50 @@ mod tests {
     #[test]
     fn model_message_implements_trait() {
         let msg = ModelMessage::user("hello");
-        assert!(msg.as_llm_message().is_some());
+        assert!(msg.to_llm_message().is_some());
         assert_eq!(msg.kind(), "llm");
     }
 
     #[test]
     fn agent_message_llm_variant_converts() {
         let msg = AgentMessage::user("hello");
-        assert!(msg.as_llm_message().is_some());
+        assert!(msg.to_llm_message().is_some());
         assert_eq!(msg.kind(), "llm");
         assert_eq!(msg.text().unwrap(), "hello");
     }
 
     #[test]
+    fn compaction_summary_variant_converts_to_user_with_wrapper() {
+        let msg = AgentMessage::compaction_summary("compact this");
+
+        let llm = msg.to_llm_message().expect("summary should convert");
+
+        assert_eq!(llm.role, Role::User);
+        let text = llm.text();
+        assert!(text.contains(COMPACTION_SUMMARY_PREFIX));
+        assert!(text.contains("compact this"));
+        assert!(text.contains(COMPACTION_SUMMARY_SUFFIX));
+        assert_eq!(msg.kind(), "compaction_summary");
+    }
+
+    #[test]
+    fn branch_summary_variant_converts_to_user_with_wrapper() {
+        let msg = AgentMessage::branch_summary("branch history");
+
+        let llm = msg.to_llm_message().expect("summary should convert");
+
+        assert_eq!(llm.role, Role::User);
+        let text = llm.text();
+        assert!(text.contains(BRANCH_SUMMARY_PREFIX));
+        assert!(text.contains("branch history"));
+        assert!(text.contains(BRANCH_SUMMARY_SUFFIX));
+        assert_eq!(msg.kind(), "branch_summary");
+    }
+
+    #[test]
     fn agent_message_custom_variant_filters() {
         let msg = AgentMessage::custom("artifact", serde_json::json!({"html": "<h1>Hi</h1>"}));
-        assert!(msg.as_llm_message().is_none());
+        assert!(msg.to_llm_message().is_none());
         assert_eq!(msg.kind(), "artifact");
     }
 
@@ -196,6 +273,6 @@ mod tests {
     fn from_model_message() {
         let model_msg = ModelMessage::user("test");
         let agent_msg: AgentMessage = model_msg.into();
-        assert!(agent_msg.as_llm_message().is_some());
+        assert!(agent_msg.to_llm_message().is_some());
     }
 }

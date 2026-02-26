@@ -23,17 +23,14 @@ async fn main() -> roci::error::Result<()> {
             }
         };
 
-        let provider = match registry.create_provider(
-            model.provider_name(),
-            model.model_id(),
-            &config,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Skip {model_str}: {e}");
-                continue;
-            }
-        };
+        let provider =
+            match registry.create_provider(model.provider_name(), model.model_id(), &config) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Skip {model_str}: {e}");
+                    continue;
+                }
+            };
 
         match roci::generation::generate_text(
             provider.as_ref(),

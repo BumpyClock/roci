@@ -2,9 +2,9 @@
 
 use std::any::Any;
 
+use super::ModelProvider;
 use crate::config::RociConfig;
 use crate::error::RociError;
-use super::ModelProvider;
 
 /// Factory for creating ModelProvider instances from a provider key + model ID.
 pub trait ProviderFactory: Send + Sync {
@@ -21,9 +21,6 @@ pub trait ProviderFactory: Send + Sync {
 
     /// Parse a model ID string into provider-specific representation.
     /// Returns None if this factory does not recognize the model ID.
-    fn parse_model(
-        &self,
-        provider_key: &str,
-        model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>>;
+    fn parse_model(&self, provider_key: &str, model_id: &str)
+        -> Option<Box<dyn Any + Send + Sync>>;
 }

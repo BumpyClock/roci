@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::{ModelProvider, ProviderFactory};
 use crate::config::RociConfig;
 use crate::error::RociError;
-use super::{ModelProvider, ProviderFactory};
 
 /// Registry mapping provider keys to their factories.
 ///
@@ -256,9 +256,7 @@ mod tests {
 
         let config = RociConfig::new().with_token_store(None);
 
-        let via_primary = registry
-            .create_provider("stub", "m1", &config)
-            .unwrap();
+        let via_primary = registry.create_provider("stub", "m1", &config).unwrap();
         let via_alias = registry
             .create_provider("stub-alias", "m1", &config)
             .unwrap();

@@ -8,9 +8,9 @@ use rmcp::transport::{
     streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
 };
 
-use crate::error::RociError;
-use super::{MCPRunningService, MCPTransport};
 use super::common::{DynRoleClientTransport, ErasedRoleClientTransport};
+use super::{MCPRunningService, MCPTransport};
+use crate::error::RociError;
 
 /// SSE-based MCP transport (for remote MCP servers).
 pub struct SSETransport {
@@ -153,14 +153,10 @@ impl SSETransport {
         for (name, value) in &self.custom_headers {
             let header_name =
                 reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-                    RociError::Configuration(format!(
-                        "invalid SSE header name '{name}': {error}"
-                    ))
+                    RociError::Configuration(format!("invalid SSE header name '{name}': {error}"))
                 })?;
             let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
-                RociError::Configuration(format!(
-                    "invalid SSE header value for '{name}': {error}"
-                ))
+                RociError::Configuration(format!("invalid SSE header value for '{name}': {error}"))
             })?;
             parsed_headers.insert(header_name, header_value);
         }

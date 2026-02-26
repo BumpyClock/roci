@@ -15,13 +15,8 @@ pub async fn generate(
     prompt: impl Into<String>,
 ) -> Result<String, RociError> {
     let messages = vec![ModelMessage::user(prompt)];
-    let result = super::text::generate_text(
-        provider,
-        messages,
-        GenerationSettings::default(),
-        &[],
-    )
-    .await?;
+    let result =
+        super::text::generate_text(provider, messages, GenerationSettings::default(), &[]).await?;
     Ok(result.text)
 }
 
@@ -47,12 +42,7 @@ pub async fn analyze(
     content: impl Into<String>,
 ) -> Result<String, RociError> {
     let messages = vec![ModelMessage::system(system), ModelMessage::user(content)];
-    let result = super::text::generate_text(
-        provider,
-        messages,
-        GenerationSettings::default(),
-        &[],
-    )
-    .await?;
+    let result =
+        super::text::generate_text(provider, messages, GenerationSettings::default(), &[]).await?;
     Ok(result.text)
 }

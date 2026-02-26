@@ -108,7 +108,8 @@ mod tests {
         async fn connect(
             &mut self,
             _client_info: rmcp::model::ClientInfo,
-        ) -> Result<crate::mcp::transport::MCPRunningService, rmcp::service::ClientInitializeError> {
+        ) -> Result<crate::mcp::transport::MCPRunningService, rmcp::service::ClientInitializeError>
+        {
             Err(rmcp::service::ClientInitializeError::ConnectionClosed(
                 "mock transport is not connected".into(),
             ))

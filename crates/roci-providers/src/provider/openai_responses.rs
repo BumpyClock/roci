@@ -7,9 +7,9 @@ use serde::Deserialize;
 use std::env;
 use tracing::debug;
 
+use crate::models::openai::OpenAiModel;
 use roci_core::error::RociError;
 use roci_core::models::capabilities::ModelCapabilities;
-use crate::models::openai::OpenAiModel;
 use roci_core::types::*;
 
 use roci_core::provider::format::tool_result_to_string;
@@ -620,7 +620,8 @@ impl OpenAiResponsesProvider {
     }
 
     fn normalize_tool_parameters(schema: &serde_json::Value) -> serde_json::Value {
-        let normalized = roci_core::provider::schema::normalize_schema_for_provider(schema, "openai");
+        let normalized =
+            roci_core::provider::schema::normalize_schema_for_provider(schema, "openai");
         if let Some(obj) = normalized.as_object() {
             let mut next = obj.clone();
             if matches!(next.get("type"), Some(serde_json::Value::String(t)) if t == "object") {
@@ -843,7 +844,9 @@ impl ModelProvider for OpenAiResponsesProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(status, &body_text));
+            return Err(roci_core::provider::http::status_to_error(
+                status, &body_text,
+            ));
         }
 
         let data: ResponsesApiResponse = resp.json().await?;
@@ -870,7 +873,9 @@ impl ModelProvider for OpenAiResponsesProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(status, &body_text));
+            return Err(roci_core::provider::http::status_to_error(
+                status, &body_text,
+            ));
         }
 
         let byte_stream = resp.bytes_stream();

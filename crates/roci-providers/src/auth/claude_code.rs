@@ -8,8 +8,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use roci_core::auth::AuthError;
-use roci_core::auth::TokenStore;
 use roci_core::auth::Token;
+use roci_core::auth::TokenStore;
 
 const CLAUDE_CLI_REL_PATH: &str = ".claude/.credentials.json";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";

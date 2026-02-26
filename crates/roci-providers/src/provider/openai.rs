@@ -226,7 +226,9 @@ impl ModelProvider for OpenAiProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(status, &body_text));
+            return Err(roci_core::provider::http::status_to_error(
+                status, &body_text,
+            ));
         }
 
         let data: OpenAiChatResponse = resp.json().await?;
@@ -291,7 +293,9 @@ impl ModelProvider for OpenAiProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(status, &body_text));
+            return Err(roci_core::provider::http::status_to_error(
+                status, &body_text,
+            ));
         }
 
         let byte_stream = resp.bytes_stream();

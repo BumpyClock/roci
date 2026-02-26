@@ -105,6 +105,8 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 | `error` | `RociError` with typed variants, categories, retryability |
 | `types` | `ModelMessage`, `Usage`, `FinishReason`, `GenerationSettings`, `TextStreamDelta`, `ContentPart` |
 | `generation` | `generate_text()`, `stream_text()`, `generate_object()` -- operate on `&dyn ModelProvider` |
+| `skills` | Skill discovery, frontmatter parsing, and prompt formatting |
+| `resource` | Resource loading for settings, context files, prompt templates, and diagnostics |
 | `tools` | `Tool` trait, `AgentTool`, `ToolArguments`, `DynamicTool` |
 | `stream_transform` | `StreamTransform` trait + built-in transforms |
 | `stop` | Stop conditions |
@@ -158,6 +160,13 @@ Produces the `roci-agent` binary. Owns all terminal concerns:
 - Exit codes and `process::exit`
 - User-facing error messages (maps core typed errors to help text)
 - Auth flow orchestration (maps `AuthStep`/`AuthPollResult` to interactive prompts)
+- Resource diagnostics rendering (surfaces loader warnings from `roci-core::resource`)
+
+Resource loading behavior used by CLI chat:
+- Reads settings from `~/.roci/agent/settings.json` and `.roci/settings.json` (project overrides global).
+- Discovers context files with per-directory precedence `AGENTS.md` > `CLAUDE.md`.
+- Resolves system prompts from `SYSTEM.md` and `APPEND_SYSTEM.md` with project-over-global precedence.
+- Expands slash prompt templates from `prompts/*.md` with argument substitution.
 
 **Dependencies**: `roci` (with `agent` feature), `roci-tools`, `clap`, `tokio`, `chrono`.
 

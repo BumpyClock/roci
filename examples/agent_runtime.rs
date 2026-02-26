@@ -16,6 +16,7 @@ use roci::agent::runtime::AgentSnapshot;
 use roci::agent::{AgentConfig, AgentRuntime, AgentState, QueueDrainMode};
 use roci::agent_loop::AgentEvent;
 use roci::config::RociConfig;
+use roci::resource::CompactionSettings;
 use roci::tools::{AgentTool, AgentToolParameters};
 use roci::types::GenerationSettings;
 
@@ -80,6 +81,7 @@ async fn main() {
         transport: None,
         max_retry_delay_ms: None,
         get_api_key: None,
+        compaction: CompactionSettings::default(),
     };
 
     let roci_config = RociConfig::new();

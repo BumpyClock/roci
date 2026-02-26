@@ -25,10 +25,7 @@ pub enum LanguageModel {
         model_id: String,
     },
     /// Unregistered / custom model.
-    Custom {
-        provider: String,
-        model_id: String,
-    },
+    Custom { provider: String, model_id: String },
 }
 
 impl LanguageModel {
