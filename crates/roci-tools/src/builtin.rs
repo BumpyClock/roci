@@ -8,7 +8,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use roci::tools::builtin::all_tools;
+//! use roci_tools::builtin::all_tools;
 //!
 //! let tools = all_tools();
 //! assert_eq!(tools.len(), 5);
@@ -17,9 +17,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::RociError;
-use crate::tools::tool::{AgentTool, Tool, ToolExecutionContext};
-use crate::tools::types::AgentToolParameters;
+use roci::error::RociError;
+use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::types::AgentToolParameters;
 
 const SHELL_OUTPUT_MAX_BYTES: usize = 32_768;
 const READ_FILE_MAX_BYTES: usize = 65_536;
@@ -317,8 +317,8 @@ pub fn all_tools() -> Vec<Arc<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::arguments::ToolArguments;
-    use crate::tools::tool::ToolExecutionContext;
+    use roci::tools::arguments::ToolArguments;
+    use roci::tools::tool::ToolExecutionContext;
 
     fn default_ctx() -> ToolExecutionContext {
         ToolExecutionContext::default()
