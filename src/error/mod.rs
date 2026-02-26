@@ -59,6 +59,12 @@ pub enum RociError {
 
     #[error("Invalid state: {0}")]
     InvalidState(String),
+
+    #[error("missing credential for provider {provider}")]
+    MissingCredential { provider: String },
+
+    #[error("missing configuration key '{key}' for provider {provider}")]
+    MissingConfiguration { key: String, provider: String },
 }
 
 impl RociError {
@@ -102,6 +108,8 @@ impl RociError {
                 _ => ErrorCategory::Api,
             },
             Self::ToolExecution { .. } => ErrorCategory::ToolExecution,
+            Self::MissingCredential { .. } => ErrorCategory::Authentication,
+            Self::MissingConfiguration { .. } => ErrorCategory::Configuration,
             _ => ErrorCategory::Unknown,
         }
     }
@@ -134,3 +142,85 @@ impl RociError {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, RociError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_credential_has_authentication_category() {
+        let err = RociError::MissingCredential {
+            provider: "openai".to_string(),
+        };
+        assert_eq!(err.category(), ErrorCategory::Authentication);
+    }
+
+    #[test]
+    fn missing_credential_is_not_retryable() {
+        let err = RociError::MissingCredential {
+            provider: "openai".to_string(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn missing_credential_suggests_check_credentials() {
+        let err = RociError::MissingCredential {
+            provider: "openai".to_string(),
+        };
+        assert!(matches!(
+            err.recovery_suggestion(),
+            RecoverySuggestion::CheckCredentials
+        ));
+    }
+
+    #[test]
+    fn missing_configuration_has_configuration_category() {
+        let err = RociError::MissingConfiguration {
+            key: "api_key".to_string(),
+            provider: "openai".to_string(),
+        };
+        assert_eq!(err.category(), ErrorCategory::Configuration);
+    }
+
+    #[test]
+    fn missing_configuration_is_not_retryable() {
+        let err = RociError::MissingConfiguration {
+            key: "api_key".to_string(),
+            provider: "openai".to_string(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn missing_configuration_suggests_check_configuration() {
+        let err = RociError::MissingConfiguration {
+            key: "api_key".to_string(),
+            provider: "openai".to_string(),
+        };
+        assert!(matches!(
+            err.recovery_suggestion(),
+            RecoverySuggestion::CheckConfiguration
+        ));
+    }
+
+    #[test]
+    fn missing_credential_display_includes_provider() {
+        let err = RociError::MissingCredential {
+            provider: "anthropic".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("anthropic"), "expected provider in message: {msg}");
+    }
+
+    #[test]
+    fn missing_configuration_display_includes_key_and_provider() {
+        let err = RociError::MissingConfiguration {
+            key: "base_url".to_string(),
+            provider: "copilot".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("base_url"), "expected key in message: {msg}");
+        assert!(msg.contains("copilot"), "expected provider in message: {msg}");
+    }
+}
