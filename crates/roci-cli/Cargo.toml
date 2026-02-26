@@ -1,0 +1,14 @@
+[package]
+name = "roci-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "roci-agent"
+path = "src/main.rs"
+
+[dependencies]
+roci = { path = "../..", features = ["agent"] }
+roci-tools = { path = "../roci-tools" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
