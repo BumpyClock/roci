@@ -76,7 +76,7 @@ Standalone crate for agent coding tools. Import path: `roci_tools::builtin`.
 | `list_directory` | List directory entries with metadata |
 | `grep` | Search file contents with regex |
 
-**Usage**: `roci_tools::builtin::all_tools()` returns `Vec<AgentTool>`.
+**Usage**: `roci_tools::builtin::all_tools()` returns `Vec<Arc<dyn Tool>>`.
 
 ## Providers
 

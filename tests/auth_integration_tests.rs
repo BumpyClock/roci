@@ -169,4 +169,4 @@ fn config_non_expired_token_is_returned() {
     assert_eq!(config.get_api_key("codex"), Some("fresh-tok".to_string()),);
 }
 
-// CLI argument parsing tests live in crates/roci-cli/src/cli/tests.
+// CLI argument parsing tests live in crates/roci-cli/src/cli/mod.rs.
