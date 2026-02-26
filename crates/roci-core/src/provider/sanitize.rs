@@ -92,8 +92,8 @@ fn sanitize_tool_result_pairing(messages: &[ModelMessage]) -> Vec<ModelMessage> 
         let mut remainder: Vec<ModelMessage> = Vec::new();
 
         let mut j = i + 1;
-        for idx in j..messages.len() {
-            let next = &messages[idx];
+        while j < messages.len() {
+            let next = &messages[j];
             if matches!(next.role, Role::Assistant | Role::User | Role::System) {
                 break;
             }

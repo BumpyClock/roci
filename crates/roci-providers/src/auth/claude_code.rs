@@ -96,13 +96,11 @@ impl ClaudeCodeAuth {
             .token_store
             .load("claude-code", &self.profile)?
             .ok_or(AuthError::NotLoggedIn)?;
-        if needs_refresh(&token) {
-            if token.refresh_token.is_some() {
-                let refreshed = self.refresh_token(&token).await?;
-                self.token_store
-                    .save("claude-code", &self.profile, &refreshed)?;
-                token = refreshed;
-            }
+        if needs_refresh(&token) && token.refresh_token.is_some() {
+            let refreshed = self.refresh_token(&token).await?;
+            self.token_store
+                .save("claude-code", &self.profile, &refreshed)?;
+            token = refreshed;
         }
         Ok(token)
     }

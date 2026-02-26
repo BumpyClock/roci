@@ -474,7 +474,7 @@ impl ProviderFactory for GitHubCopilotFactory {
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
         // Try the copilot-api token first (saved by `roci auth login copilot`)
-        let (api_key, base_url) = if let Some(ref store) = config.token_store() {
+        let (api_key, base_url) = if let Some(store) = config.token_store() {
             if let Ok(Some(token)) = store.load("github-copilot-api", "default") {
                 let is_valid = token
                     .expires_at

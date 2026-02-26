@@ -216,7 +216,7 @@ async fn run_active_connection(
                 }
             }
             _ = heartbeat.tick() => {
-                if let Err(error) = socket.send(Message::Ping(Vec::new().into())).await {
+                if let Err(error) = socket.send(Message::Ping(Default::default())).await {
                     let _ = events_tx.send(RealtimeEvent::Error {
                         message: format!("Realtime heartbeat failed: {error}"),
                     });
@@ -364,7 +364,7 @@ async fn send_bootstrap_message(
     payload: &str,
 ) -> Result<(), RociError> {
     socket
-        .send(Message::Text(payload.to_string().into()))
+        .send(Message::Text(payload.into()))
         .await
         .map_err(|error| RociError::Stream(format!("Realtime bootstrap send failed: {error}")))
 }

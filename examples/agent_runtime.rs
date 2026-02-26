@@ -84,6 +84,8 @@ async fn main() {
         compaction: CompactionSettings::default(),
         session_before_compact: None,
         session_before_tree: None,
+        pre_tool_use: None,
+        post_tool_use: None,
     };
 
     let roci_config = RociConfig::new();

@@ -426,13 +426,10 @@ impl ModelProvider for AnthropicProvider {
                                     if let Some(block) = event.get("content_block") {
                                         let btype = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                         current_block_type = Some(btype.to_string());
-                                        match btype {
-                                            "tool_use" => {
-                                                current_tool_id = block.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                                                current_tool_name = block.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-                                                current_tool_input.clear();
-                                            }
-                                            _ => {}
+                                        if btype == "tool_use" {
+                                            current_tool_id = block.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                            current_tool_name = block.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                            current_tool_input.clear();
                                         }
                                     }
                                 }

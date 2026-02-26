@@ -188,8 +188,10 @@ impl MCPClient {
             .as_mut()
             .ok_or_else(|| RociError::Configuration("Missing MCP session".into()))?;
 
-        let mut latest_client_info = rmcp::model::ClientInfo::default();
-        latest_client_info.protocol_version = ProtocolVersion::LATEST;
+        let latest_client_info = rmcp::model::ClientInfo {
+            protocol_version: ProtocolVersion::LATEST,
+            ..Default::default()
+        };
 
         match transport.connect(latest_client_info).await {
             Ok(session) => return Ok(session),
@@ -197,8 +199,10 @@ impl MCPClient {
             Err(error) => return Err(map_client_initialize_error(error)),
         }
 
-        let mut fallback_client_info = rmcp::model::ClientInfo::default();
-        fallback_client_info.protocol_version = ProtocolVersion::V_2024_11_05;
+        let fallback_client_info = rmcp::model::ClientInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            ..Default::default()
+        };
         transport
             .connect(fallback_client_info)
             .await

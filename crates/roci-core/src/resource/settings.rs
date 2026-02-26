@@ -149,7 +149,7 @@ impl ResourceSettingsLoader {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ResourceSettingsSerde {
     #[serde(default)]
     prompts: Vec<String>,
@@ -161,18 +161,6 @@ struct ResourceSettingsSerde {
     compaction: CompactionSettingsSerde,
     #[serde(default)]
     branch_summary: BranchSummarySettingsSerde,
-}
-
-impl Default for ResourceSettingsSerde {
-    fn default() -> Self {
-        Self {
-            prompts: Vec::new(),
-            no_prompt_templates: false,
-            no_context_files: false,
-            compaction: CompactionSettingsSerde::default(),
-            branch_summary: BranchSummarySettingsSerde::default(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -388,10 +388,7 @@ fn parse_slice_substitution(fragment: &str, args: &[&str]) -> Option<(usize, Str
     let mut parts = inner.split(':');
 
     let start = parts.next()?.parse::<usize>().ok()?;
-    let length = parts
-        .next()
-        .map(|part| part.parse::<usize>().ok())
-        .flatten();
+    let length = parts.next().and_then(|part| part.parse::<usize>().ok());
     if parts.next().is_some() {
         return None;
     }
