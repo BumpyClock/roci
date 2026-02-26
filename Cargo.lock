@@ -1568,6 +1568,9 @@ name = "roci-tools"
 version = "0.1.0"
 dependencies = [
  "roci",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

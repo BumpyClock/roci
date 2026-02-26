@@ -1,7 +1,6 @@
 //! Tool system for function calling.
 
 pub mod arguments;
-pub mod builtin;
 pub mod dynamic;
 pub mod tool;
 pub mod types;
