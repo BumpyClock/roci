@@ -913,3 +913,4 @@
 {"id":"01KJDYWGQ6ARHKBVQWMDAD6RQT","event_id":"01KJDYWGQ6ARHKBVQWMDAD6RQT","ts":"2026-02-26T21:50:09.126Z","actor":"Aditya Sharma","type":"task.updated","task_id":"tsq-n5gk3p8d","payload":{"planning_state":"planned"}}
 {"id":"01KJDYWGZ2WDCWTA5HMYBG3YBA","event_id":"01KJDYWGZ2WDCWTA5HMYBG3YBA","ts":"2026-02-26T21:50:09.378Z","actor":"Aditya Sharma","type":"task.claimed","task_id":"tsq-n5gk3p8d","payload":{"assignee":"Aditya Sharma"}}
 {"id":"01KJDYWH4B20XT259EV7VFPB8F","event_id":"01KJDYWH4B20XT259EV7VFPB8F","ts":"2026-02-26T21:50:09.547Z","actor":"Aditya Sharma","type":"task.status_set","task_id":"tsq-n5gk3p8d","payload":{"closed_at":null,"status":"in_progress"}}
+{"id":"01KJDZ1N8ACB9B1KYCTBB34QB4","event_id":"01KJDZ1N8ACB9B1KYCTBB34QB4","ts":"2026-02-26T21:52:57.610Z","actor":"Aditya Sharma","type":"task.status_set","task_id":"tsq-n5gk3p8d","payload":{"closed_at":"2026-02-26T21:52:57.610Z","status":"closed"}}
