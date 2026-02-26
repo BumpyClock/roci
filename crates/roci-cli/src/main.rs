@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use clap::Parser;
 use roci::agent_loop::{
-    AgentEvent, ApprovalPolicy, LoopRunner, RunEventPayload, RunHooks, RunLifecycle, RunRequest,
-    RunStatus, Runner,
+    AgentEvent, ApprovalPolicy, LoopRunner, PreToolUseHookResult, RunEventPayload, RunHooks,
+    RunLifecycle, RunRequest, RunStatus, Runner,
 };
 use roci::config::RociConfig;
 use roci::resource::{ContextFileResource, ResourceBundle, SkillResourceOptions};
@@ -129,7 +129,6 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
                 tool_call_id,
                 ..
             } => {
-                demo_pre_tool_use_hook(&tool_name, &tool_call_id);
                 eprintln!("\n⚡ {tool_name} ({tool_call_id})");
             }
             AgentEvent::ToolExecutionUpdate {
@@ -172,9 +171,13 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     request.tools = tools;
     request.hooks = RunHooks {
         compaction: None,
-        tool_result_persist: Some(Arc::new(|result| {
-            demo_post_tool_use_hook(&result.tool_call_id);
-            result
+        pre_tool_use: Some(Arc::new(|call, _cancel| {
+            demo_pre_tool_use_hook(&call.name, &call.id);
+            Box::pin(async { Ok(PreToolUseHookResult::Continue) })
+        })),
+        post_tool_use: Some(Arc::new(|call, result| {
+            demo_post_tool_use_hook(&call.name, &call.id);
+            Box::pin(async move { Ok(result) })
         })),
     };
     request.approval_policy = ApprovalPolicy::Always;
@@ -201,8 +204,8 @@ fn demo_pre_tool_use_hook(tool_name: &str, tool_call_id: &str) {
     eprintln!("[hook] preToolUse called (tool={tool_name}, id={tool_call_id})");
 }
 
-fn demo_post_tool_use_hook(tool_call_id: &str) {
-    eprintln!("[hook] postToolUse called (id={tool_call_id})");
+fn demo_post_tool_use_hook(tool_name: &str, tool_call_id: &str) {
+    eprintln!("[hook] postToolUse called (tool={tool_name}, id={tool_call_id})");
 }
 
 fn build_resource_system_prompt(

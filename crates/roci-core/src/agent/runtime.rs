@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::message::{AgentMessage, AgentMessageExt};
 use crate::agent_loop::runner::{
     AgentEventSink, AutoCompactionConfig, CompactionHandler, ConvertToLlmFn, FollowUpMessagesFn,
-    RunHooks, SteeringMessagesFn, TransformContextFn,
+    PostToolUseHook, PreToolUseHook, RunHooks, SteeringMessagesFn, TransformContextFn,
 };
 use crate::agent_loop::{
     compaction::{
@@ -268,6 +268,10 @@ pub struct AgentConfig {
     pub session_before_compact: Option<SessionBeforeCompactHook>,
     /// Optional lifecycle hook for `session_before_tree`.
     pub session_before_tree: Option<SessionBeforeTreeHook>,
+    /// Optional hook called before each tool execution.
+    pub pre_tool_use: Option<PreToolUseHook>,
+    /// Optional hook called after each tool execution (including synthetic errors).
+    pub post_tool_use: Option<PostToolUseHook>,
 }
 
 /// High-level agent runtime wrapping [`LoopRunner`].
@@ -950,6 +954,12 @@ impl AgentRuntime {
             .with_follow_up_messages(follow_up_fn)
             .with_agent_event_sink(intercepting_sink);
 
+        let mut run_hooks = RunHooks {
+            compaction: None,
+            pre_tool_use: self.config.pre_tool_use.clone(),
+            post_tool_use: self.config.post_tool_use.clone(),
+        };
+
         if self.config.compaction.enabled {
             let compaction_settings = self.config.compaction.clone();
             let session_before_compact = self.config.session_before_compact.clone();
@@ -974,14 +984,12 @@ impl AgentRuntime {
                     .await
                 })
             });
-            request = request.with_hooks(RunHooks {
-                compaction: Some(compaction_hook),
-                tool_result_persist: None,
-            });
+            run_hooks.compaction = Some(compaction_hook);
             request = request.with_auto_compaction(AutoCompactionConfig {
                 reserve_tokens: self.config.compaction.reserve_tokens,
             });
         }
+        request = request.with_hooks(run_hooks);
 
         request.settings = self.config.settings.clone();
 
@@ -1495,6 +1503,8 @@ mod tests {
             compaction: CompactionSettings::default(),
             session_before_compact: None,
             session_before_tree: None,
+            pre_tool_use: None,
+            post_tool_use: None,
         }
     }
 

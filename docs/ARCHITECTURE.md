@@ -132,6 +132,10 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
   - `session_before_compact` payload now includes cancellation signal/token
   - `session_before_compact` cancel aborts manual compaction with an error; cancel from auto-compaction aborts the run
   - `session_before_tree` supports continue/cancel/override-summary; instruction/label overrides are deferred
+- Tool lifecycle hook interfaces are available in `RunHooks` and surfaced through `AgentConfig`:
+  - `pre_tool_use` supports continue/block/rewrite-args before tool execution
+  - `post_tool_use` can transform tool results (including synthetic error results)
+  - legacy `tool_result_persist` has been replaced by `post_tool_use`
 
 ### `roci-providers` -- Built-in Transports + OAuth
 

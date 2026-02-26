@@ -45,8 +45,33 @@ pub type CompactionHandler = Arc<
         + Send
         + Sync,
 >;
-/// Hook to redact/transform tool results before persistence or context assembly.
-pub type ToolResultPersistHandler = Arc<dyn Fn(AgentToolResult) -> AgentToolResult + Send + Sync>;
+/// Decision returned by pre-tool-use hook.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreToolUseHookResult {
+    Continue,
+    Block { reason: Option<String> },
+    ReplaceArgs { args: serde_json::Value },
+}
+
+/// Hook that can block or rewrite args before tool execution.
+pub type PreToolUseHook = Arc<
+    dyn Fn(
+            AgentToolCall,
+            CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<PreToolUseHookResult, RociError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Hook that can rewrite any tool result before persistence/context assembly.
+pub type PostToolUseHook = Arc<
+    dyn Fn(
+            AgentToolCall,
+            AgentToolResult,
+        ) -> Pin<Box<dyn Future<Output = Result<AgentToolResult, RociError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Async callback to retrieve messages between loop phases.
 pub type MessageBatchFn =
@@ -80,7 +105,8 @@ pub type AgentEventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct RunHooks {
     pub compaction: Option<CompactionHandler>,
-    pub tool_result_persist: Option<ToolResultPersistHandler>,
+    pub pre_tool_use: Option<PreToolUseHook>,
+    pub post_tool_use: Option<PostToolUseHook>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,6 +474,84 @@ fn canceled_tool_result(call: &AgentToolCall) -> AgentToolResult {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ToolExecutionOutcome {
+    call: AgentToolCall,
+    result: AgentToolResult,
+}
+
+fn synthetic_hook_error_result(
+    call: &AgentToolCall,
+    source: &str,
+    error: impl Into<String>,
+) -> AgentToolResult {
+    AgentToolResult {
+        tool_call_id: call.id.clone(),
+        result: serde_json::json!({
+            "error": error.into(),
+            "source": source,
+        }),
+        is_error: true,
+    }
+}
+
+fn pre_tool_use_block_result(call: &AgentToolCall, reason: Option<String>) -> AgentToolResult {
+    let error = reason.unwrap_or_else(|| "tool call blocked by pre_tool_use hook".to_string());
+    synthetic_hook_error_result(call, "pre_tool_use", error)
+}
+
+async fn apply_pre_tool_use_hook(
+    hooks: &RunHooks,
+    call: &AgentToolCall,
+    cancel: CancellationToken,
+) -> Result<AgentToolCall, AgentToolResult> {
+    let Some(hook) = hooks.pre_tool_use.as_ref() else {
+        return Ok(call.clone());
+    };
+    match hook(call.clone(), cancel).await {
+        Ok(PreToolUseHookResult::Continue) => Ok(call.clone()),
+        Ok(PreToolUseHookResult::Block { reason }) => Err(pre_tool_use_block_result(call, reason)),
+        Ok(PreToolUseHookResult::ReplaceArgs { args }) => {
+            let mut replaced = call.clone();
+            replaced.arguments = args;
+            Ok(replaced)
+        }
+        Err(err) => Err(synthetic_hook_error_result(
+            call,
+            "pre_tool_use",
+            format!("pre_tool_use hook failed: {err}"),
+        )),
+    }
+}
+
+async fn apply_post_tool_use_hook(
+    hooks: &RunHooks,
+    call: &AgentToolCall,
+    result: AgentToolResult,
+) -> AgentToolResult {
+    let Some(hook) = hooks.post_tool_use.as_ref() else {
+        return result;
+    };
+    let original_result = result.clone();
+    match hook(call.clone(), result).await {
+        Ok(next) => next,
+        Err(err) => {
+            // Deterministic fail-closed behavior: post-hook failures always become explicit
+            // synthetic errors so downstream callers never see mixed partial state.
+            AgentToolResult {
+                tool_call_id: original_result.tool_call_id.clone(),
+                result: serde_json::json!({
+                    "error": format!("post_tool_use hook failed: {err}"),
+                    "source": "post_tool_use",
+                    "original_result": original_result.result,
+                    "original_is_error": original_result.is_error,
+                }),
+                is_error: true,
+            }
+        }
+    }
+}
+
 fn emit_tool_execution_start(agent_emitter: &AgentEventEmitter, call: &AgentToolCall) {
     agent_emitter.emit(AgentEvent::ToolExecutionStart {
         tool_call_id: call.id.clone(),
@@ -531,10 +635,20 @@ fn emit_message_lifecycle(agent_emitter: &AgentEventEmitter, message: &ModelMess
 
 async fn execute_tool_call(
     tools: &[Arc<dyn Tool>],
+    hooks: &RunHooks,
     call: &AgentToolCall,
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
-) -> AgentToolResult {
+) -> ToolExecutionOutcome {
+    let call = match apply_pre_tool_use_hook(hooks, call, cancel.child_token()).await {
+        Ok(call) => call,
+        Err(result) => {
+            return ToolExecutionOutcome {
+                call: call.clone(),
+                result,
+            };
+        }
+    };
     let tool = tools.iter().find(|t| t.name() == call.name);
     match tool {
         Some(tool) => {
@@ -542,13 +656,14 @@ async fn execute_tool_call(
             if let Err(validation_error) =
                 crate::tools::validation::validate_arguments(&call.arguments, schema)
             {
-                return AgentToolResult {
+                let result = AgentToolResult {
                     tool_call_id: call.id.clone(),
                     result: serde_json::json!({
                         "error": format!("Argument validation failed: {}", validation_error)
                     }),
                     is_error: true,
                 };
+                return ToolExecutionOutcome { call, result };
             }
             let args = crate::tools::arguments::ToolArguments::new(call.arguments.clone());
             let ctx = crate::tools::tool::ToolExecutionContext {
@@ -569,7 +684,7 @@ async fn execute_tool_call(
                         partial_result,
                     });
                 });
-            match tool.execute_ext(&args, &ctx, cancel, Some(on_update)).await {
+            let result = match tool.execute_ext(&args, &ctx, cancel, Some(on_update)).await {
                 Ok(val) => AgentToolResult {
                     tool_call_id: call.id.clone(),
                     result: val,
@@ -580,40 +695,43 @@ async fn execute_tool_call(
                     result: serde_json::json!({ "error": error.to_string() }),
                     is_error: true,
                 },
-            }
+            };
+            ToolExecutionOutcome { call, result }
         }
-        None => AgentToolResult {
-            tool_call_id: call.id.clone(),
-            result: serde_json::json!({ "error": format!("Tool '{}' not found", call.name) }),
-            is_error: true,
+        None => ToolExecutionOutcome {
+            result: AgentToolResult {
+                tool_call_id: call.id.clone(),
+                result: serde_json::json!({ "error": format!("Tool '{}' not found", call.name) }),
+                is_error: true,
+            },
+            call,
         },
     }
 }
 
 async fn execute_parallel_tool_calls(
     tools: &[Arc<dyn Tool>],
+    hooks: &RunHooks,
     calls: &[AgentToolCall],
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
-) -> Vec<AgentToolResult> {
+) -> Vec<ToolExecutionOutcome> {
     let futures = calls
         .iter()
-        .map(|call| execute_tool_call(tools, call, agent_emitter, cancel.child_token()));
+        .map(|call| execute_tool_call(tools, hooks, call, agent_emitter, cancel.child_token()));
     future::join_all(futures).await
 }
 
-fn append_tool_result(
+async fn append_tool_result(
     hooks: &RunHooks,
     emitter: &RunEventEmitter,
     agent_emitter: &AgentEventEmitter,
     call: &AgentToolCall,
-    mut result: AgentToolResult,
+    result: AgentToolResult,
     iteration_failures: &mut usize,
     messages: &mut Vec<ModelMessage>,
-) {
-    if let Some(handler) = hooks.tool_result_persist.as_ref() {
-        result = handler(result);
-    }
+) -> AgentToolResult {
+    let result = apply_post_tool_use_hook(hooks, call, result).await;
 
     if result.is_error {
         *iteration_failures = iteration_failures.saturating_add(1);
@@ -630,13 +748,17 @@ fn append_tool_result(
         RunEventPayload::ToolCallCompleted { call: call.clone() },
     );
 
-    let tool_result_message =
-        ModelMessage::tool_result(result.tool_call_id.clone(), result.result, result.is_error);
+    let tool_result_message = ModelMessage::tool_result(
+        result.tool_call_id.clone(),
+        result.result.clone(),
+        result.is_error,
+    );
     emit_message_lifecycle(agent_emitter, &tool_result_message);
     messages.push(tool_result_message);
+    result
 }
 
-fn append_skipped_tool_call(
+async fn append_skipped_tool_call(
     hooks: &RunHooks,
     emitter: &RunEventEmitter,
     agent_emitter: &AgentEventEmitter,
@@ -659,8 +781,8 @@ fn append_skipped_tool_call(
         skipped_result.clone(),
         iteration_failures,
         messages,
-    );
-    skipped_result
+    )
+    .await
 }
 
 #[async_trait]
@@ -1256,7 +1378,12 @@ impl Runner for LoopRunner {
                                 _ = &mut abort_rx => {
                                     run_cancel_token.cancel();
                                     for parallel_call in &pending_parallel_calls {
-                                        let canceled_result = canceled_tool_result(parallel_call);
+                                        let canceled_result = apply_post_tool_use_hook(
+                                            &request.hooks,
+                                            parallel_call,
+                                            canceled_tool_result(parallel_call),
+                                        )
+                                        .await;
                                         emit_tool_execution_end(&agent_emitter, parallel_call, &canceled_result);
                                     }
                                     emitter.emit(
@@ -1275,30 +1402,30 @@ impl Runner for LoopRunner {
                                 }
                                 results = execute_parallel_tool_calls(
                                     &request.tools,
+                                    &request.hooks,
                                     &pending_parallel_calls,
                                     &agent_emitter,
                                     run_cancel_token.child_token(),
                                 ) => results,
                             };
-                            for (parallel_call, parallel_result) in pending_parallel_calls
-                                .drain(..)
-                                .zip(parallel_results.into_iter())
-                            {
+                            pending_parallel_calls.clear();
+                            for parallel_outcome in parallel_results {
                                 emit_tool_execution_end(
                                     &agent_emitter,
-                                    &parallel_call,
-                                    &parallel_result,
+                                    &parallel_outcome.call,
+                                    &parallel_outcome.result,
                                 );
-                                turn_tool_results.push(parallel_result.clone());
-                                append_tool_result(
+                                let final_result = append_tool_result(
                                     &request.hooks,
                                     &emitter,
                                     &agent_emitter,
-                                    &parallel_call,
-                                    parallel_result,
+                                    &parallel_outcome.call,
+                                    parallel_outcome.result,
                                     &mut iteration_failures,
                                     &mut messages,
-                                );
+                                )
+                                .await;
+                                turn_tool_results.push(final_result);
                             }
 
                             // Check for steering after parallel batch flush
@@ -1313,7 +1440,8 @@ impl Runner for LoopRunner {
                                             remaining_call,
                                             &mut iteration_failures,
                                             &mut messages,
-                                        );
+                                        )
+                                        .await;
                                         turn_tool_results.push(skipped);
                                     }
                                     for msg in steering {
@@ -1326,12 +1454,17 @@ impl Runner for LoopRunner {
                             }
                         }
 
-                        let result = if can_execute {
+                        let outcome = if can_execute {
                             emit_tool_execution_start(&agent_emitter, call);
                             tokio::select! {
                                 _ = &mut abort_rx => {
                                     run_cancel_token.cancel();
-                                    let canceled_result = canceled_tool_result(call);
+                                    let canceled_result = apply_post_tool_use_hook(
+                                        &request.hooks,
+                                        call,
+                                        canceled_tool_result(call),
+                                    )
+                                    .await;
                                     emit_tool_execution_end(&agent_emitter, call, &canceled_result);
                                     emitter.emit(
                                         RunEventStream::Lifecycle,
@@ -1347,30 +1480,35 @@ impl Runner for LoopRunner {
                                     }
                                     return;
                                 }
-                                result = execute_tool_call(
+                                outcome = execute_tool_call(
                                     &request.tools,
+                                    &request.hooks,
                                     call,
                                     &agent_emitter,
                                     run_cancel_token.child_token(),
-                                ) => result,
+                                ) => outcome,
                             }
                         } else {
-                            declined_tool_result(call)
+                            ToolExecutionOutcome {
+                                call: call.clone(),
+                                result: declined_tool_result(call),
+                            }
                         };
                         if can_execute {
-                            emit_tool_execution_end(&agent_emitter, call, &result);
+                            emit_tool_execution_end(&agent_emitter, &outcome.call, &outcome.result);
                         }
 
-                        turn_tool_results.push(result.clone());
-                        append_tool_result(
+                        let final_result = append_tool_result(
                             &request.hooks,
                             &emitter,
                             &agent_emitter,
-                            call,
-                            result,
+                            &outcome.call,
+                            outcome.result,
                             &mut iteration_failures,
                             &mut messages,
-                        );
+                        )
+                        .await;
+                        turn_tool_results.push(final_result);
 
                         // Check for steering after sequential tool execution
                         if let Some(ref get_steering) = request.get_steering_messages {
@@ -1384,7 +1522,8 @@ impl Runner for LoopRunner {
                                         remaining_call,
                                         &mut iteration_failures,
                                         &mut messages,
-                                    );
+                                    )
+                                    .await;
                                     turn_tool_results.push(skipped);
                                 }
                                 for msg in steering {
@@ -1414,7 +1553,12 @@ impl Runner for LoopRunner {
                             _ = &mut abort_rx => {
                                 run_cancel_token.cancel();
                                 for parallel_call in &pending_parallel_calls {
-                                    let canceled_result = canceled_tool_result(parallel_call);
+                                    let canceled_result = apply_post_tool_use_hook(
+                                        &request.hooks,
+                                        parallel_call,
+                                        canceled_tool_result(parallel_call),
+                                    )
+                                    .await;
                                     emit_tool_execution_end(&agent_emitter, parallel_call, &canceled_result);
                                 }
                                 emitter.emit(
@@ -1433,30 +1577,30 @@ impl Runner for LoopRunner {
                             }
                             results = execute_parallel_tool_calls(
                                 &request.tools,
+                                &request.hooks,
                                 &pending_parallel_calls,
                                 &agent_emitter,
                                 run_cancel_token.child_token(),
                             ) => results,
                         };
-                        for (parallel_call, parallel_result) in pending_parallel_calls
-                            .drain(..)
-                            .zip(parallel_results.into_iter())
-                        {
+                        pending_parallel_calls.clear();
+                        for parallel_outcome in parallel_results {
                             emit_tool_execution_end(
                                 &agent_emitter,
-                                &parallel_call,
-                                &parallel_result,
+                                &parallel_outcome.call,
+                                &parallel_outcome.result,
                             );
-                            turn_tool_results.push(parallel_result.clone());
-                            append_tool_result(
+                            let final_result = append_tool_result(
                                 &request.hooks,
                                 &emitter,
                                 &agent_emitter,
-                                &parallel_call,
-                                parallel_result,
+                                &parallel_outcome.call,
+                                parallel_outcome.result,
                                 &mut iteration_failures,
                                 &mut messages,
-                            );
+                            )
+                            .await;
+                            turn_tool_results.push(final_result);
                         }
                     }
 
@@ -3543,6 +3687,25 @@ mod tests {
         ))
     }
 
+    fn tracked_schema_path_tool(executions: Arc<AtomicUsize>) -> Arc<dyn Tool> {
+        Arc::new(AgentTool::new(
+            "schema_tool",
+            "tool with required path param",
+            AgentToolParameters::object()
+                .string("path", "file path", true)
+                .build(),
+            move |args, _ctx: ToolExecutionContext| {
+                let executions = executions.clone();
+                async move {
+                    executions.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({
+                        "path": args.get_str("path")?,
+                    }))
+                }
+            },
+        ))
+    }
+
     /// Extract `(tool_call_id, result_json, is_error)` triples from ToolResult events.
     fn tool_results_from_events(events: &[RunEvent]) -> Vec<(String, serde_json::Value, bool)> {
         events
@@ -3657,6 +3820,290 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_tool_use_hook_can_block_and_skip_tool_execution() {
+        let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+        let (sink, events) = capture_events();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+        request.tools = vec![tracked_schema_path_tool(executions.clone())];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+        request.hooks = RunHooks {
+            compaction: None,
+            pre_tool_use: Some(Arc::new(|_call, _cancel| {
+                Box::pin(async {
+                    Ok(PreToolUseHookResult::Block {
+                        reason: Some("blocked-by-test".to_string()),
+                    })
+                })
+            })),
+            post_tool_use: None,
+        };
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+        let (_call_id, result_json, is_error) = &tool_results[0];
+        assert!(*is_error, "blocked call must be an error");
+        assert_eq!(result_json["source"], serde_json::json!("pre_tool_use"));
+        assert!(
+            result_json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("blocked-by-test"),
+            "blocked reason should be surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_hook_replace_args_are_used_by_tool() {
+        let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+        let (sink, events) = capture_events();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+        request.tools = vec![tracked_schema_path_tool(executions.clone())];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+        request.hooks = RunHooks {
+            compaction: None,
+            pre_tool_use: Some(Arc::new(|_call, _cancel| {
+                Box::pin(async {
+                    Ok(PreToolUseHookResult::ReplaceArgs {
+                        args: serde_json::json!({ "path": "/tmp/replaced-by-hook" }),
+                    })
+                })
+            })),
+            post_tool_use: None,
+        };
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+        let (_call_id, result_json, is_error) = &tool_results[0];
+        assert!(!is_error, "hook-rewritten args should still be valid");
+        assert_eq!(
+            result_json["path"],
+            serde_json::json!("/tmp/replaced-by-hook")
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_hook_error_returns_synthetic_tool_error() {
+        let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+        let (sink, events) = capture_events();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+        request.tools = vec![tracked_schema_path_tool(executions.clone())];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+        request.hooks = RunHooks {
+            compaction: None,
+            pre_tool_use: Some(Arc::new(|_call, _cancel| {
+                Box::pin(async {
+                    Err(RociError::InvalidState(
+                        "forced pre hook failure".to_string(),
+                    ))
+                })
+            })),
+            post_tool_use: None,
+        };
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+        let (_call_id, result_json, is_error) = &tool_results[0];
+        assert!(*is_error, "pre-hook errors must become tool errors");
+        assert_eq!(result_json["source"], serde_json::json!("pre_tool_use"));
+        assert!(result_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("forced pre hook failure"));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_can_mutate_tool_result() {
+        let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+        let (sink, events) = capture_events();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+        request.tools = vec![tracked_schema_path_tool(executions.clone())];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+        request.hooks = RunHooks {
+            compaction: None,
+            pre_tool_use: None,
+            post_tool_use: Some(Arc::new(|_call, mut result| {
+                Box::pin(async move {
+                    if let Some(map) = result.result.as_object_mut() {
+                        map.insert("post_mutated".to_string(), serde_json::json!(true));
+                    }
+                    Ok(result)
+                })
+            })),
+        };
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+        let (_call_id, result_json, is_error) = &tool_results[0];
+        assert!(!is_error);
+        assert_eq!(result_json["post_mutated"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_runs_for_skipped_synthetic_errors() {
+        let (runner, _requests) = test_runner(ProviderScenario::MutatingBatchThenComplete);
+        let (sink, events) = capture_events();
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run tools")]);
+        request.tools = vec![
+            tracked_success_tool(
+                "apply_patch",
+                Duration::from_millis(40),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            tracked_success_tool(
+                "read",
+                Duration::from_millis(40),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        ];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+        let seen_calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_calls_for_hook = seen_calls.clone();
+        request.hooks = RunHooks {
+            compaction: None,
+            pre_tool_use: None,
+            post_tool_use: Some(Arc::new(move |call, mut result| {
+                let seen_calls_for_hook = seen_calls_for_hook.clone();
+                Box::pin(async move {
+                    seen_calls_for_hook
+                        .lock()
+                        .expect("seen calls lock")
+                        .push(call.id.clone());
+                    if let Some(map) = result.result.as_object_mut() {
+                        map.insert("post_seen".to_string(), serde_json::json!(true));
+                    }
+                    Ok(result)
+                })
+            })),
+        };
+        let steering_tick = Arc::new(AtomicUsize::new(0));
+        let steering_tick_clone = steering_tick.clone();
+        request.get_steering_messages = Some(Arc::new(move || {
+            let tick = steering_tick_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                if tick >= 2 {
+                    vec![ModelMessage::user("interrupt")]
+                } else {
+                    Vec::new()
+                }
+            })
+        }));
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(4), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        let seen_calls = seen_calls.lock().expect("seen calls lock");
+        assert!(
+            seen_calls.iter().any(|id| id == "safe-read-2"),
+            "post hook should run for skipped synthetic result"
+        );
+        drop(seen_calls);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        let (_call_id, result_json, is_error) = tool_results
+            .iter()
+            .find(|(call_id, _, _)| call_id == "safe-read-2")
+            .expect("expected skipped safe-read-2 result");
+        assert!(*is_error);
+        assert_eq!(result_json["post_seen"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_error_returns_deterministic_synthetic_error() {
+        let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+        let (sink, events) = capture_events();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut request =
+            RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+        request.tools = vec![tracked_schema_path_tool(executions.clone())];
+        request.approval_policy = ApprovalPolicy::Always;
+        request.event_sink = Some(sink);
+        request.hooks = RunHooks {
+            compaction: None,
+            pre_tool_use: None,
+            post_tool_use: Some(Arc::new(|_call, _result| {
+                Box::pin(async {
+                    Err(RociError::InvalidState(
+                        "forced post hook failure".to_string(),
+                    ))
+                })
+            })),
+        };
+
+        let handle = runner.start(request).await.expect("start run");
+        let result = timeout(Duration::from_secs(3), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+        let events = events.lock().expect("event lock");
+        let tool_results = tool_results_from_events(&events);
+        assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+        let (_call_id, result_json, is_error) = &tool_results[0];
+        assert!(*is_error);
+        assert_eq!(result_json["source"], serde_json::json!("post_tool_use"));
+        assert_eq!(
+            result_json["original_result"]["path"],
+            serde_json::json!("/tmp/test")
+        );
+        assert!(result_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("forced post hook failure"));
+    }
+
+    #[tokio::test]
     async fn auto_compaction_triggers_when_context_exceeds_reserved_window() {
         let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3670,7 +4117,8 @@ mod tests {
                     Ok(None)
                 })
             })),
-            tool_result_persist: None,
+            pre_tool_use: None,
+            post_tool_use: None,
         };
         request.auto_compaction = Some(AutoCompactionConfig {
             reserve_tokens: 4096,
@@ -3709,7 +4157,8 @@ mod tests {
                     ]))
                 })
             })),
-            tool_result_persist: None,
+            pre_tool_use: None,
+            post_tool_use: None,
         };
         request.auto_compaction = Some(AutoCompactionConfig {
             reserve_tokens: 4096,
@@ -3744,7 +4193,8 @@ mod tests {
                     ))
                 })
             })),
-            tool_result_persist: None,
+            pre_tool_use: None,
+            post_tool_use: None,
         };
         request.auto_compaction = Some(AutoCompactionConfig {
             reserve_tokens: 4096,
@@ -3785,7 +4235,8 @@ mod tests {
                     std::future::pending::<Result<Option<Vec<ModelMessage>>, RociError>>().await
                 })
             })),
-            tool_result_persist: None,
+            pre_tool_use: None,
+            post_tool_use: None,
         };
         request.auto_compaction = Some(AutoCompactionConfig {
             reserve_tokens: 4096,
