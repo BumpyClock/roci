@@ -2535,13 +2535,12 @@ mod tests {
         config.compaction.keep_recent_tokens = 1;
         config.session_before_compact = Some(Arc::new(|payload| {
             Box::pin(async move {
-                let first_kept_entry_id =
-                    payload.to_summarize.messages.len() + payload.turn_prefix.messages.len();
-                let tokens_before = payload
-                    .to_summarize
-                    .messages
+                let mut all_messages = payload.to_summarize.messages.clone();
+                all_messages.extend(payload.turn_prefix.messages.clone());
+                all_messages.extend(payload.kept.messages.clone());
+                let first_kept_entry_id = all_messages.len() - 1;
+                let tokens_before = all_messages[..first_kept_entry_id]
                     .iter()
-                    .chain(payload.turn_prefix.messages.iter())
                     .map(estimate_message_tokens)
                     .sum::<usize>();
                 Ok(SessionSummaryHookOutcome::OverrideCompaction(
