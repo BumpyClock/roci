@@ -271,18 +271,15 @@ pub fn create_provider(
 
             let api_key = api_key
                 .or_else(|| config.get_api_key_for(ProviderKey::GitHubCopilot))
-                .ok_or_else(|| {
-                    RociError::Authentication(
-                        "Missing GitHub Copilot credentials. Run: roci auth login copilot".into(),
-                    )
+                .ok_or_else(|| RociError::MissingCredential {
+                    provider: "github-copilot".to_string(),
                 })?;
             let base_url = base_url
                 .or_else(|| m.base_url.clone())
                 .or_else(|| config.get_base_url_for(ProviderKey::GitHubCopilot))
-                .ok_or_else(|| {
-                    RociError::Configuration(
-                        "Missing GITHUB_COPILOT_BASE_URL. Run: roci auth login copilot".into(),
-                    )
+                .ok_or_else(|| RociError::MissingConfiguration {
+                    key: "base_url".to_string(),
+                    provider: "github-copilot".to_string(),
                 })?;
             Ok(Box::new(github_copilot::GitHubCopilotProvider::new(
                 m.model_id.clone(),
