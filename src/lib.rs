@@ -1,45 +1,27 @@
-//! Roci — Rust AI SDK
+//! Roci -- batteries-included AI agent SDK.
 //!
-//! Spiritual port of Tachikoma (Swift) to Rust. Provides a unified interface
-//! for multiple AI providers with support for text generation, streaming,
-//! structured output, tool calling, and agents.
+//! Re-exports `roci-core` (provider-agnostic abstractions) and `roci-providers`
+//! (built-in transports + OAuth flows) with default wiring.
 //!
-//! # Quick Start
-//!
-//! ```no_run
-//! use roci::prelude::*;
-//! use roci::models::LanguageModel;
-//!
-//! # async fn example() -> roci::error::Result<()> {
-//! let model: LanguageModel = "openai:gpt-4o".parse()?;
-//! let response = roci::generation::generate(&model, "Hello!").await?;
-//! println!("{response}");
-//! # Ok(())
-//! # }
-//! ```
+//! For explicit control, depend on `roci-core` + `roci-providers` directly.
 
-pub mod auth;
-pub mod config;
-pub mod error;
-pub mod generation;
-pub mod models;
-pub mod prelude;
-pub mod provider;
-pub mod stop;
-pub mod stream_transform;
-pub mod tools;
-pub mod types;
-pub mod util;
+pub use roci_core::*;
+pub use roci_providers;
 
-#[cfg(feature = "agent")]
-pub mod agent;
+use std::sync::Arc;
 
-#[cfg(feature = "agent")]
-pub mod agent_loop;
+/// Create a default provider registry with all enabled built-in providers.
+pub fn default_registry() -> roci_core::provider::ProviderRegistry {
+    let mut registry = roci_core::provider::ProviderRegistry::new();
+    roci_providers::register_default_providers(&mut registry);
+    registry
+}
 
-#[cfg(feature = "audio")]
-pub mod audio;
-
-#[cfg(feature = "mcp")]
-pub mod mcp;
-
+/// Create a default AuthService with all built-in auth backends registered.
+pub fn default_auth_service(
+    store: Arc<dyn roci_core::auth::TokenStore>,
+) -> roci_core::auth::AuthService {
+    let mut svc = roci_core::auth::AuthService::new(store);
+    roci_providers::register_default_auth_backends(&mut svc);
+    svc
+}

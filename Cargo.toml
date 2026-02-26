@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/roci-cli", "crates/roci-tools"]
+members = [".", "crates/roci-cli", "crates/roci-tools", "crates/roci-core", "crates/roci-providers"]
 
 [package]
 name = "roci"
@@ -9,60 +9,45 @@ description = "Rust AI SDK — spiritual port of Tachikoma"
 license = "MIT"
 rust-version = "1.75"
 
-
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-async-trait = "0.1"
-futures = "0.3"
-async-stream = "0.3"
-tokio-stream = "0.1"
-reqwest-eventsource = "0.6"
-tracing = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-base64 = "0.22"
-sha2 = "0.10"
-bon = "3"
-strum = { version = "0.27", features = ["derive"] }
-regex = "1"
-dotenvy = "0.15"
-toml = "0.9"
-directories = "6"
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
-tokio-util = { version = "0.7", optional = true }
-rmcp = { version = "0.16", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
+roci-core = { path = "crates/roci-core" }
+roci-providers = { path = "crates/roci-providers" }
 
 [dev-dependencies]
-wiremock = "0.6"
-pretty_assertions = "1"
-tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+async-trait = "0.1"
+tempfile = "3"
 
 [features]
 default = ["openai", "anthropic", "google"]
-openai = []
-anthropic = []
-google = []
-grok = []
-groq = []
-mistral = []
-ollama = []
-lmstudio = []
-azure = ["openai"]
-openrouter = ["openai"]
-together = ["openai"]
-replicate = []
-openai-compatible = ["openai"]
-anthropic-compatible = ["anthropic"]
-agent = ["dep:tokio-util"]
-audio = ["dep:tokio-tungstenite"]
-mcp = ["dep:tokio-tungstenite", "dep:rmcp"]
-all-providers = ["openai","anthropic","google","grok","groq","mistral","ollama","lmstudio","azure","openrouter","together","replicate","openai-compatible","anthropic-compatible"]
-full = ["all-providers","agent","audio","mcp"]
+
+# Provider features (pass through to roci-providers)
+openai = ["roci-providers/openai"]
+anthropic = ["roci-providers/anthropic"]
+google = ["roci-providers/google"]
+grok = ["roci-providers/grok"]
+groq = ["roci-providers/groq"]
+mistral = ["roci-providers/mistral"]
+ollama = ["roci-providers/ollama"]
+lmstudio = ["roci-providers/lmstudio"]
+azure = ["roci-providers/azure"]
+openrouter = ["roci-providers/openrouter"]
+together = ["roci-providers/together"]
+replicate = ["roci-providers/replicate"]
+openai-compatible = ["roci-providers/openai-compatible"]
+anthropic-compatible = ["roci-providers/anthropic-compatible"]
+all-providers = ["roci-providers/all-providers"]
+
+# Capability features (pass through to roci-core)
+agent = ["roci-core/agent"]
+audio = ["roci-core/audio"]
+mcp = ["roci-core/mcp"]
+
+# Everything
+full = ["all-providers", "agent", "audio", "mcp"]
 
 [[example]]
 name = "agent"

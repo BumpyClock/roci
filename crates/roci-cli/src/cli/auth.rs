@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use roci::auth::service::{AuthPollResult, AuthService, AuthStep};
+use roci::auth::service::{AuthPollResult, AuthStep};
 use roci::auth::store::FileTokenStore;
 
 /// Handle `roci-agent auth login <provider>`.
 pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(FileTokenStore::new_default());
-    let svc = AuthService::new(store);
+    let svc = roci::default_auth_service(store);
 
     match svc.start_login(provider).await? {
         AuthStep::Imported { .. } => {
@@ -27,7 +27,7 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
 
             loop {
                 tokio::time::sleep(interval).await;
-                match svc.poll_device_code(&session).await? {
+                match svc.poll_device_code(provider, &session).await? {
                     AuthPollResult::Authorized { .. } => {
                         println!("{provider} login successful!");
                         return Ok(());
@@ -50,7 +50,7 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
         }
         AuthStep::Pkce {
             authorize_url,
-            session,
+            state,
             ..
         } => {
             println!("Visit: {authorize_url}");
@@ -68,7 +68,7 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
                 std::process::exit(1);
             }
 
-            svc.complete_pkce(&session, response).await?;
+            svc.complete_pkce(provider, response, &state).await?;
             println!("{provider} login successful!");
         }
     }
@@ -79,7 +79,7 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
 /// Handle `roci-agent auth status`.
 pub async fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(FileTokenStore::new_default());
-    let svc = AuthService::new(store);
+    let svc = roci::default_auth_service(store);
 
     println!("Authentication Status\n");
 
@@ -121,7 +121,7 @@ pub async fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
 /// Handle `roci-agent auth logout <provider>`.
 pub async fn handle_logout(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(FileTokenStore::new_default());
-    let svc = AuthService::new(store);
+    let svc = roci::default_auth_service(store);
 
     svc.logout(provider)?;
     println!("Logged out from {provider}");

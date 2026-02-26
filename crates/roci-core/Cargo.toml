@@ -1,0 +1,45 @@
+[package]
+name = "roci-core"
+version = "0.1.0"
+edition = "2021"
+description = "Provider-agnostic SDK kernel for Roci"
+license = "MIT"
+rust-version = "1.75"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+tokio-stream = "0.1"
+reqwest-eventsource = "0.6"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+sha2 = "0.10"
+bon = "3"
+strum = { version = "0.27", features = ["derive"] }
+regex = "1"
+dotenvy = "0.15"
+toml = "0.9"
+directories = "6"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+rmcp = { version = "0.16", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+pretty_assertions = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+default = []
+agent = ["dep:tokio-util"]
+audio = ["dep:tokio-tungstenite"]
+mcp = ["dep:tokio-tungstenite", "dep:rmcp"]

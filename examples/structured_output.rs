@@ -15,7 +15,12 @@ struct Recipe {
 async fn main() -> roci::error::Result<()> {
     let model: LanguageModel = "openai:gpt-4o".parse()?;
     let config = RociConfig::from_env();
-    let provider = roci::provider::create_provider(&model, &config)?;
+    let registry = roci::default_registry();
+    let provider = registry.create_provider(
+        model.provider_name(),
+        model.model_id(),
+        &config,
+    )?;
 
     let schema = serde_json::json!({
         "type": "object",

@@ -1,10 +1,13 @@
 //! Agent example with conversation and tools.
 
+use std::sync::Arc;
+
 use roci::prelude::*;
 
 #[tokio::main]
 async fn main() -> roci::error::Result<()> {
     let model: LanguageModel = "openai:gpt-4o".parse()?;
+    let registry = Arc::new(roci::default_registry());
 
     let calc_tool: Box<dyn Tool> = Box::new(AgentTool::new(
         "calculate",
@@ -19,7 +22,7 @@ async fn main() -> roci::error::Result<()> {
         },
     ));
 
-    let mut agent = roci::agent::Agent::new(model)
+    let mut agent = roci::agent::Agent::new(model, registry)
         .with_system_prompt("You are a helpful math assistant.")
         .with_tool(calc_tool);
 

@@ -1524,6 +1524,31 @@ dependencies = [
 name = "roci"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures",
+ "roci-core",
+ "roci-providers",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "roci-cli"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "roci",
+ "roci-tools",
+ "tokio",
+]
+
+[[package]]
+name = "roci-core"
+version = "0.1.0"
+dependencies = [
  "async-stream",
  "async-trait",
  "base64",
@@ -1554,14 +1579,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "roci-cli"
+name = "roci-providers"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64",
  "chrono",
- "clap",
- "roci",
- "roci-tools",
+ "directories",
+ "futures",
+ "pretty_assertions",
+ "reqwest 0.12.28",
+ "reqwest-eventsource",
+ "roci-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "strum",
+ "tempfile",
  "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

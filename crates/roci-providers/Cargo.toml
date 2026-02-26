@@ -1,0 +1,54 @@
+[package]
+name = "roci-providers"
+version = "0.1.0"
+edition = "2021"
+description = "Built-in provider transports and OAuth flows for Roci"
+license = "MIT"
+rust-version = "1.75"
+
+[dependencies]
+roci-core = { path = "../roci-core" }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+tokio-stream = "0.1"
+reqwest-eventsource = "0.6"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+sha2 = "0.10"
+strum = { version = "0.27", features = ["derive"] }
+directories = "6"
+
+[dev-dependencies]
+wiremock = "0.6"
+pretty_assertions = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+default = ["openai", "anthropic", "google"]
+openai = []
+anthropic = []
+google = []
+grok = ["openai"]
+groq = ["openai"]
+mistral = ["openai"]
+ollama = ["openai"]
+lmstudio = ["openai"]
+azure = ["openai"]
+openrouter = ["openai"]
+together = ["openai"]
+replicate = []
+openai-compatible = ["openai"]
+anthropic-compatible = ["anthropic"]
+all-providers = [
+    "openai", "anthropic", "google", "grok", "groq", "mistral",
+    "ollama", "lmstudio", "azure", "openrouter", "together",
+    "replicate", "openai-compatible", "anthropic-compatible",
+]

@@ -57,7 +57,8 @@ async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let config = RociConfig::from_env();
-    let runner = LoopRunner::new(config);
+    let registry = Arc::new(roci::default_registry());
+    let runner = LoopRunner::with_registry(config, registry);
 
     let mut messages = Vec::new();
     if let Some(system) = args.system {

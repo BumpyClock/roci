@@ -11,6 +11,7 @@ async fn main() -> roci::error::Result<()> {
     ];
 
     let config = RociConfig::from_env();
+    let registry = roci::default_registry();
     let prompt = "In one sentence, what makes Rust unique?";
 
     for model_str in models {
@@ -22,7 +23,11 @@ async fn main() -> roci::error::Result<()> {
             }
         };
 
-        let provider = match roci::provider::create_provider(&model, &config) {
+        let provider = match registry.create_provider(
+            model.provider_name(),
+            model.model_id(),
+            &config,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Skip {model_str}: {e}");
