@@ -1,4 +1,4 @@
-//! CLI entry point for Roci.
+//! CLI argument definitions for Roci.
 
 pub mod auth;
 
@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 /// Roci AI CLI
 #[derive(Parser, Debug)]
-#[command(name = "roci", version, about = "Roci — Rust AI SDK CLI")]
+#[command(name = "roci-agent", version, about = "Roci — Rust AI SDK CLI")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -39,14 +39,14 @@ pub enum AuthCommands {
     Logout(LogoutArgs),
 }
 
-/// Arguments for `roci auth login`.
+/// Arguments for `roci-agent auth login`.
 #[derive(Parser, Debug)]
 pub struct LoginArgs {
     /// Provider to login to (copilot, codex, claude)
     pub provider: String,
 }
 
-/// Arguments for `roci auth logout`.
+/// Arguments for `roci-agent auth logout`.
 #[derive(Parser, Debug)]
 pub struct LogoutArgs {
     /// Provider to logout from (copilot, codex, claude)
@@ -80,13 +80,6 @@ pub struct ChatArgs {
     pub prompt: Option<String>,
 }
 
-impl Cli {
-    /// Parse CLI arguments.
-    pub fn parse_args() -> Self {
-        Self::parse()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,7 +87,7 @@ mod tests {
 
     #[test]
     fn parse_auth_login_copilot() {
-        let cli = Cli::try_parse_from(["roci", "auth", "login", "copilot"]).unwrap();
+        let cli = Cli::try_parse_from(["roci-agent", "auth", "login", "copilot"]).unwrap();
         match cli.command {
             Commands::Auth(auth) => match auth.command {
                 AuthCommands::Login(args) => assert_eq!(args.provider, "copilot"),
@@ -106,7 +99,7 @@ mod tests {
 
     #[test]
     fn parse_auth_status() {
-        let cli = Cli::try_parse_from(["roci", "auth", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["roci-agent", "auth", "status"]).unwrap();
         match cli.command {
             Commands::Auth(auth) => {
                 assert!(matches!(auth.command, AuthCommands::Status));
@@ -117,7 +110,7 @@ mod tests {
 
     #[test]
     fn parse_auth_logout_claude() {
-        let cli = Cli::try_parse_from(["roci", "auth", "logout", "claude"]).unwrap();
+        let cli = Cli::try_parse_from(["roci-agent", "auth", "logout", "claude"]).unwrap();
         match cli.command {
             Commands::Auth(auth) => match auth.command {
                 AuthCommands::Logout(args) => assert_eq!(args.provider, "claude"),
@@ -129,7 +122,7 @@ mod tests {
 
     #[test]
     fn parse_chat_with_defaults() {
-        let cli = Cli::try_parse_from(["roci", "chat"]).unwrap();
+        let cli = Cli::try_parse_from(["roci-agent", "chat"]).unwrap();
         match cli.command {
             Commands::Chat(args) => {
                 assert_eq!(args.model, "openai:gpt-4o");
@@ -146,7 +139,7 @@ mod tests {
     #[test]
     fn parse_chat_with_all_options() {
         let cli = Cli::try_parse_from([
-            "roci",
+            "roci-agent",
             "chat",
             "-m",
             "anthropic:claude-4-sonnet",
@@ -174,11 +167,11 @@ mod tests {
 
     #[test]
     fn parse_missing_subcommand_is_error() {
-        assert!(Cli::try_parse_from(["roci"]).is_err());
+        assert!(Cli::try_parse_from(["roci-agent"]).is_err());
     }
 
     #[test]
     fn parse_auth_login_missing_provider_is_error() {
-        assert!(Cli::try_parse_from(["roci", "auth", "login"]).is_err());
+        assert!(Cli::try_parse_from(["roci-agent", "auth", "login"]).is_err());
     }
 }

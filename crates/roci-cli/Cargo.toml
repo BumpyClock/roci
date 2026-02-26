@@ -12,3 +12,4 @@ roci = { path = "../..", features = ["agent"] }
 roci-tools = { path = "../roci-tools" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }

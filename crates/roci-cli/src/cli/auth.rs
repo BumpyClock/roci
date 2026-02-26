@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use crate::auth::service::{AuthPollResult, AuthService, AuthStep};
-use crate::auth::store::FileTokenStore;
+use roci::auth::service::{AuthPollResult, AuthService, AuthStep};
+use roci::auth::store::FileTokenStore;
 
-/// Handle `roci auth login <provider>`.
+/// Handle `roci-agent auth login <provider>`.
 pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(FileTokenStore::new_default());
     let svc = AuthService::new(store);
@@ -76,7 +76,7 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Handle `roci auth status`.
+/// Handle `roci-agent auth status`.
 pub async fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(FileTokenStore::new_default());
     let svc = AuthService::new(store);
@@ -118,7 +118,7 @@ pub async fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Handle `roci auth logout <provider>`.
+/// Handle `roci-agent auth logout <provider>`.
 pub async fn handle_logout(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(FileTokenStore::new_default());
     let svc = AuthService::new(store);

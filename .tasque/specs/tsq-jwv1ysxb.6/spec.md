@@ -11,7 +11,9 @@
 ## API compatibility
 - New import path is `roci_tools::builtin`.
 - No compatibility shim in `roci` core.
-- Docs should reflect the final import path.
+
+## Dependencies
+- Must run after `.2` (workspace + roci-tools scaffold).
 
 ## Acceptance criteria
 1) Built-in tool implementations live in `roci-tools`.

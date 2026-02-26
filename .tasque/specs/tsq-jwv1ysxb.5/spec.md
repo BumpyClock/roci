@@ -1,17 +1,15 @@
 # Make core provider errors CLI-agnostic + add CLI error mapping
 
 ## Scope
-- Remove CLI command strings from core errors.
-- Introduce typed missing-credential/config errors that CLI can map.
+- Add typed error variants for missing credentials/config so CLI can map help text.
+- Ensure provider errors remain UI-agnostic (no CLI-specific instructions in core).
 
 ## Implementation notes
-- Add new `RociError` variants or structured error payloads:
-  - `MissingCredential { provider: ProviderKey, hint: Option<&'static str> }`
-  - `MissingConfiguration { key: &'static str, provider: ProviderKey }`
-- Update providers (e.g., GitHub Copilot) to use typed errors.
-- CLI converts typed errors to help text referencing **`roci-agent`**.
+- Add `RociError::MissingCredential { provider }` and `RociError::MissingConfiguration { key, provider }` (or equivalent).
+- Map these in CLI layer to user-facing guidance referencing `roci-agent`.
 
 ## Acceptance criteria
-1) Core errors avoid CLI-specific guidance.
-2) CLI maps typed errors to user-friendly instructions.
-3) Provider tests updated for new error types.
+1) Core errors avoid CLI-specific guidance strings.
+2) Missing credential/config errors are typed and machine-mappable.
+3) CLI maps typed errors to actionable help text.
+4) Provider tests updated for new error types.

@@ -1,4 +1,4 @@
-# SoC decisions + ADR for CLI/core boundary migration
+# SoC decisions + downstream task alignment
 
 ## Decisions (approved)
 1) **Breaking change policy**: remove `roci::cli` + `cli` feature immediately.
@@ -9,16 +9,12 @@
 6) **Builtin tools import path**: `roci_tools::builtin` (no compatibility shim).
 7) **Auth API shape**: low-level primitives + `AuthService` facade.
 8) **Error taxonomy**: typed missing-credential/config variants; CLI maps help text.
-9) **Docs**: add architecture doc + read_when entry; docs reflect final state (no upgrade notes).
+9) **Docs**: final-state docs, no upgrade notes.
 
-## ADR requirement (new subtask)
-- Create ADR at `docs/architecture/cli-soc.md` describing SoC boundary and crate responsibilities.
-- Add `read_when` entry in `docs/learned/LEARNINGS.md`.
-
-## Output
-- ADR-style note recording the above decisions + rationale.
-- Update downstream task specs to align with these decisions.
+## Scope
+- Ensure all downstream task specs reflect the above decisions.
+- Document any decision clarifications needed for implementation (but **ADR is owned by `tsq-jwv1ysxb.8`**).
 
 ## Acceptance criteria
-- ADR committed and linked from docs index.
-- All downstream tasks updated with decision references.
+1) Downstream task specs updated to match the decisions above.
+2) No ADR creation steps remain in this task (handled by `tsq-jwv1ysxb.8`).

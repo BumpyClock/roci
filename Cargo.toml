@@ -8,7 +8,7 @@ edition = "2021"
 description = "Rust AI SDK — spiritual port of Tachikoma"
 license = "MIT"
 rust-version = "1.75"
-autobins = false
+
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
