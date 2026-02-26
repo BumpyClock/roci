@@ -9,3 +9,7 @@
 - [Ralph Loop Parallel](./ralph-loop-parallel.md)
 - [MCP Protocol + Integration Notes](./mcp.md)
   - read_when: validate MCP transport parity (stdio/SSE/multi-server) and OpenAI instruction merge behavior.
+
+## Architecture Decisions
+- `read_when`: modifying crate boundaries, adding new crates, or changing public API surface
+- See: `docs/architecture/cli-soc.md` -- CLI/core separation of concerns
