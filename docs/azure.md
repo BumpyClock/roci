@@ -1,72 +1,157 @@
 ---
-summary: "Implementation plan for first-class Azure OpenAI support in Tachikoma"
+summary: "Azure OpenAI provider support in roci"
 read_when: "Working on provider plumbing, authentication, or endpoint wiring"
 ---
 
-# Azure OpenAI Support — Implementation Plan
+# Azure OpenAI Support
 
 ## Goals
-- Interoperate with Azure OpenAI chat/completions and responses endpoints without requiring an external proxy.
+- Interoperate with Azure OpenAI chat/completions endpoints without requiring an external proxy.
 - Match the ergonomics of LangChain/OpenAI SDK Azure helpers: env-var defaults, deployment-centric model identifiers, and automatic header/query shaping.
-- Preserve existing `.openaiCompatible` behavior for true OpenAI-clone gateways.
+- Preserve existing OpenAI-compatible behavior for true OpenAI-clone gateways.
 
 ## Azure API Reality Check
-- Endpoint shape: `POST https://{resource}.openai.azure.com/openai/deployments/{deploymentId}/chat/completions?api-version=YYYY-MM-DD[-preview]`. citeturn0search3
-- Auth: supports either `api-key` header or `Authorization: Bearer <token>` (Entra ID). citeturn0search1turn0search3
-- Latest documented preview as of 2025‑11‑16: `2025-04-01-preview`; GA examples still show `2024-06-01`. citeturn0search5
-- Breaking changes around data sources and api-version mismatches are common (e.g., json_schema needs ≥2024‑08‑01-preview). citeturn0search6
-- Some toolchains hit 404s when they call `/responses` instead of `/chat/completions`; we must pick the right path for Azure. citeturn0search7
+- Endpoint shape: `POST https://{resource}.openai.azure.com/openai/deployments/{deploymentId}/chat/completions?api-version=YYYY-MM-DD[-preview]`.
+- Auth: `api-key` header.
+- Latest documented preview as of 2025-11-16: `2025-04-01-preview`; GA examples still show `2024-06-01`.
+- Breaking changes around data sources and api-version mismatches are common (e.g., `json_schema` needs `>=2024-08-01-preview`).
+- Some toolchains hit 404s when they call `/responses` instead of `/chat/completions`; always use `/chat/completions` for Azure.
 
-## Proposed API Surface
-- Add `LanguageModel.azureOpenAI(deployment: String, resource: String? = nil, apiVersion: String? = nil, auth: AzureAuth = .environment)`.
-- `AzureAuth` enum: `.apiKey`, `.bearerToken`, `.auto` (prefer bearer if present, fall back to api-key).
-- Configuration fallbacks:
-  - `AZURE_OPENAI_API_KEY`
-  - `AZURE_OPENAI_BEARER_TOKEN` (or `AZURE_OPENAI_TOKEN`)
-  - `AZURE_OPENAI_ENDPOINT` (full `https://{resource}.openai.azure.com`)
-  - `AZURE_OPENAI_RESOURCE` (resource name; combine with default `https://{resource}.openai.azure.com`)
-  - `AZURE_OPENAI_DEPLOYMENT`
-  - `AZURE_OPENAI_API_VERSION` (default `2025-04-01-preview` until GA catches up)
+## Provider API
+
+`AzureOpenAiProvider` lives in `crates/roci-providers/src/provider/azure.rs`.
+
+```rust
+use roci_providers::provider::azure::AzureOpenAiProvider;
+
+let provider = AzureOpenAiProvider::new(
+    "https://my-resource.openai.azure.com".to_string(), // endpoint
+    "gpt-4o".to_string(),                               // deployment
+    std::env::var("AZURE_OPENAI_API_KEY").unwrap(),
+    "2025-04-01-preview".to_string(),                   // api_version
+);
+```
+
+Internally the provider builds:
+```
+{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}
+```
+and passes the `api-key` header.
+
+## Configuration Env Vars
+
+| Variable | Purpose |
+|---|---|
+| `AZURE_OPENAI_API_KEY` | API key for authentication |
+| `AZURE_OPENAI_ENDPOINT` | Full resource URL (`https://{resource}.openai.azure.com`) |
+| `AZURE_OPENAI_DEPLOYMENT` | Deployment name (used as model ID) |
+| `AZURE_OPENAI_API_VERSION` | API version (default `2025-04-01-preview`) |
+
+`RociConfig` does not auto-load Azure env vars; construct the provider directly with values from `std::env::var`.
+
+## Usage Examples
+
+### Basic text generation
+
+```rust
+use roci_core::generation::text::generate_text;
+use roci_core::types::{ModelMessage, GenerationSettings};
+use roci_providers::provider::azure::AzureOpenAiProvider;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let provider = AzureOpenAiProvider::new(
+        std::env::var("AZURE_OPENAI_ENDPOINT")?,
+        std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or("gpt-4o".into()),
+        std::env::var("AZURE_OPENAI_API_KEY")?,
+        std::env::var("AZURE_OPENAI_API_VERSION")
+            .unwrap_or("2025-04-01-preview".into()),
+    );
+
+    let messages = vec![
+        ModelMessage::system("You are a helpful assistant."),
+        ModelMessage::user("Summarize CCPA in bullet points"),
+    ];
+
+    let result = generate_text(
+        &provider,
+        messages,
+        GenerationSettings::default(),
+        &[],
+    )
+    .await?;
+
+    println!("{}", result.text);
+    Ok(())
+}
+```
+
+### Streaming
+
+```rust
+use futures::StreamExt;
+use roci_core::provider::{ModelProvider, ProviderRequest};
+use roci_core::types::{ModelMessage, GenerationSettings};
+use roci_providers::provider::azure::AzureOpenAiProvider;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let provider = AzureOpenAiProvider::new(
+        std::env::var("AZURE_OPENAI_ENDPOINT")?,
+        "gpt-4o".into(),
+        std::env::var("AZURE_OPENAI_API_KEY")?,
+        "2025-04-01-preview".into(),
+    );
+
+    let request = ProviderRequest {
+        messages: vec![ModelMessage::user("Explain quantum computing")],
+        settings: GenerationSettings::default(),
+        tools: None,
+        response_format: None,
+        session_id: None,
+        transport: None,
+    };
+
+    let mut stream = provider.stream_text(&request).await?;
+    while let Some(delta) = stream.next().await {
+        match delta? {
+            d if !d.text.is_empty() => print!("{}", d.text),
+            _ => {}
+        }
+    }
+    println!();
+    Ok(())
+}
+```
 
 ## Wire Construction Rules
-- Build base URL:
-  - If `endpoint` provided, use it verbatim (supports sovereign clouds / APIM custom domains).
-  - Else assemble `https://\(resource).openai.azure.com`.
-- Path template:
-  - Chat: `/openai/deployments/{deployment}/chat/completions`
-  - Responses (optional future toggle): `/openai/deployments/{deployment}/responses`
-- Query: always append `api-version`.
-- Headers:
-  - If bearer token available -> `Authorization: Bearer <token>`.
-  - Else `api-key: <key>`.
-  - `Content-Type: application/json`.
+
+- Base URL: provider takes the full endpoint (`https://{resource}.openai.azure.com`).
+- Path template: `/openai/deployments/{deployment}/chat/completions?api-version={api_version}`.
+- Auth: `api-key` header.
+- `Content-Type: application/json` set automatically.
 
 ## Integration Points
-1) **Model enum**: add `.azureOpenAI(deployment: String, resource: String? = nil, apiVersion: String? = nil)` to `LanguageModel`.
-2) **Provider factory**: add `AzureOpenAIProvider` under `Providers/Compatible` (or extend `OpenAICompatibleProvider` with an Azure mode flag).
-3) **Helper**: factor Azure-specific URL/header builder into `OpenAICompatibleHelper` (minimal code duplication).
-4) **Configuration loading**: map env vars above into `TachikomaConfiguration` with precedence: explicit config → env → credentials file.
-5) **Usage tracking**: add Azure to token accounting with same multiplier as OpenAI-compatible.
+
+1. **Provider construction**: `AzureOpenAiProvider::new(endpoint, deployment, api_key, api_version)`.
+2. **Inner delegation**: wraps `OpenAiProvider` with the Azure-specific URL pre-built.
+3. **Config loading**: map env vars above into provider construction; `RociConfig` is not involved for Azure-specific keys.
 
 ## Tests
-- Unit: URL + header construction with permutations (api-key vs bearer, endpoint vs resource, custom api-version).
-- Integration (mock server): assert requests hit `/chat/completions` with `api-version` query and correct auth header; return canned 200 to validate decode.
-- Regression: ensure `.openaiCompatible` remains unchanged (no Azure defaults leak).
 
-## Docs & Samples
-- README: new “Azure OpenAI” section with env setup snippets and Swift usage:
-  ```swift
-  let text = try await generate(
-      "Summarize CCPA in bullet points",
-      using: .azureOpenAI(
-          deployment: "gpt-4o",
-          resource: "my-aoai",
-          apiVersion: "2025-04-01-preview"
-      )
-  )
-  ```
-- Troubleshooting table: 401 (wrong header), 404 (wrong path or deployment), 400 (api-version too old for feature).
+- Unit: URL construction with permutations (endpoint, deployment, api-version).
+- Integration (live): `cargo test --test live_providers -- --ignored --nocapture`.
+- Regression: ensure OpenAI-compatible providers remain unchanged (no Azure defaults leak).
+
+## Troubleshooting
+
+| Error | Likely cause |
+|---|---|
+| 401 Unauthorized | Wrong `api-key` header value |
+| 404 Not Found | Wrong deployment name or wrong path (should be `/chat/completions`) |
+| 400 Bad Request | `api-version` too old for the feature (e.g., `json_schema` needs `>=2024-08-01-preview`) |
 
 ## Rollout
+
 - Ship behind a minor version bump; no breaking changes to existing providers.
 - Announce deprecation date for proxy-based Azure guidance once native provider is stable.

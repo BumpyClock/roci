@@ -45,6 +45,17 @@ impl ProviderFactory for MockFactory {
         Ok(Box::new(MockProvider {
             name: self.name.to_string(),
             model_id: model_id.to_string(),
+            caps: ModelCapabilities {
+                supports_vision: false,
+                supports_tools: false,
+                supports_streaming: false,
+                supports_json_mode: false,
+                supports_json_schema: false,
+                supports_reasoning: false,
+                supports_system_messages: true,
+                context_length: 4096,
+                max_output_tokens: None,
+            },
         }))
     }
 
@@ -60,6 +71,7 @@ impl ProviderFactory for MockFactory {
 struct MockProvider {
     name: String,
     model_id: String,
+    caps: ModelCapabilities,
 }
 
 #[async_trait]
@@ -73,17 +85,7 @@ impl ModelProvider for MockProvider {
     }
 
     fn capabilities(&self) -> &ModelCapabilities {
-        &ModelCapabilities {
-            supports_vision: false,
-            supports_tools: false,
-            supports_streaming: false,
-            supports_json_mode: false,
-            supports_json_schema: false,
-            supports_reasoning: false,
-            supports_system_messages: true,
-            context_length: 4096,
-            max_output_tokens: None,
-        }
+        &self.caps
     }
 
     async fn generate_text(

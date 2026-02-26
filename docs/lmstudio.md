@@ -1,11 +1,11 @@
 # LMStudio Provider Documentation
 
-LMStudio is a cross-platform desktop application for running large language models locally with a user-friendly interface. Tachikoma provides native integration with LMStudio's OpenAI-compatible API server.
+LMStudio is a cross-platform desktop application for running large language models locally with a user-friendly interface. roci provides native integration with LMStudio's OpenAI-compatible API server.
 
 ## Overview
 
 LMStudio offers:
-- **Cross-platform support** on macOS and Linux (Windows builds exist upstream but aren’t supported in Tachikoma)
+- **Cross-platform support** on macOS and Linux (Windows builds exist upstream)
 - **GUI for model management** with easy downloads
 - **OpenAI-compatible API** at `http://localhost:1234/v1`
 - **Hardware acceleration** (Metal, CUDA, ROCm)
@@ -32,7 +32,7 @@ chmod +x LMStudio.AppImage
 
 1. Open LMStudio
 2. Navigate to "Discover" tab
-3. Search for models (e.g., "gpt-oss-120b", "llama", "mistral")
+3. Search for models (e.g., "llama3", "mistral", "codellama")
 4. Select quantization and click "Download"
 
 ### Step 3: Start Server
@@ -51,16 +51,7 @@ chmod +x LMStudio.AppImage
   "host": "localhost",
   "port": 1234,
   "cors": true,
-  "verbose": true,
-  "models": {
-    "gpt-oss-120b": {
-      "path": "~/.cache/lm-studio/models/openai/gpt-oss-120b-q4_k_m.gguf",
-      "context_length": 16384,
-      "gpu_layers": -1,
-      "use_mlock": true,
-      "batch_size": 512
-    }
-  }
+  "verbose": true
 }
 ```
 
@@ -82,190 +73,161 @@ temperature: 0.7
 top_p: 0.95
 top_k: 40
 repeat_penalty: 1.1
-presence_penalty: 0.0
-frequency_penalty: 0.0
-mirostat: 0               # 0=disabled, 1=Mirostat, 2=Mirostat 2.0
 ```
 
-## Usage with Tachikoma
+## Usage with roci
 
-### Basic Setup
+### Provider API
 
-```swift
-import Tachikoma
+`LmStudioProvider` lives in `crates/roci-providers/src/provider/lmstudio.rs`.
 
-// Initialize LMStudio provider
-let provider = LMStudioProvider(
-    baseURL: "http://localhost:1234/v1",  // Default LMStudio URL
-    apiKey: nil  // No API key needed for local
-)
+```rust
+use roci_providers::provider::lmstudio::LmStudioProvider;
+use roci_providers::models::lmstudio::LmStudioModel;
 
-// Use with Tachikoma's generation functions
-let response = try await generateText(
-    model: .lmstudio("gpt-oss-120b"),
-    messages: [.user("Hello, how are you?")],
-    provider: provider
-)
+let provider = LmStudioProvider::new(
+    LmStudioModel::Custom("llama3.3".into()),
+    "http://localhost:1234".into(),  // base URL (without /v1)
+);
 ```
 
-### Auto-Detection
+The provider appends `/v1` to the base URL automatically. No API key is required for local LMStudio.
 
-```swift
-// Automatically detect if LMStudio is running
-if let provider = try await LMStudioProvider.autoDetect() {
-    print("LMStudio found at: \(provider.baseURL)")
-    print("Available models: \(provider.availableModels)")
-} else {
-    print("LMStudio not running. Please start the server.")
-}
-```
+### Basic Generation
 
-### Model Management
+```rust
+use roci_core::generation::text::generate_text;
+use roci_core::types::{ModelMessage, GenerationSettings};
+use roci_providers::provider::lmstudio::LmStudioProvider;
+use roci_providers::models::lmstudio::LmStudioModel;
 
-```swift
-// List available models
-let models = try await provider.listModels()
-for model in models {
-    print("\(model.id): \(model.sizeGB)GB, \(model.quantization)")
-}
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let provider = LmStudioProvider::new(
+        LmStudioModel::Custom("llama3.3".into()),
+        "http://localhost:1234".into(),
+    );
 
-// Load a specific model
-try await provider.loadModel("gpt-oss-120b-q4_k_m")
+    let messages = vec![ModelMessage::user("Hello, how are you?")];
 
-// Check model status
-let status = try await provider.modelStatus("gpt-oss-120b")
-print("Loaded: \(status.isLoaded)")
-print("Memory: \(status.memoryUsageGB)GB")
-print("GPU: \(status.gpuLayers)/\(status.totalLayers) layers")
-```
-
-### Advanced Generation
-
-```swift
-// With custom parameters
-let response = try await provider.generateText(
-    request: ProviderRequest(
-        messages: [
-            .system("You are a helpful coding assistant."),
-            .user("Write a Swift function to sort an array.")
-        ],
-        tools: nil,
-        settings: GenerationSettings(
-            maxTokens: 2048,
-            temperature: 0.7,
-            topP: 0.95,
-            stopSequences: ["```", "// End"],
-            reasoningEffort: .medium
-        )
+    let result = generate_text(
+        &provider,
+        messages,
+        GenerationSettings::default(),
+        &[],
     )
-)
+    .await?;
 
-// Access multi-channel responses
-if let thinking = response.channels[.thinking] {
-    print("Reasoning: \(thinking)")
+    println!("{}", result.text);
+    Ok(())
 }
-print("Code: \(response.text)")
+```
+
+### ModelSelector String Syntax
+
+roci's `ModelSelector` supports a `"provider:model_id"` string syntax:
+
+```rust
+use roci_core::models::LanguageModel;
+
+// Parse from string
+let model: LanguageModel = "lmstudio:llama3.3".parse()?;
+assert_eq!(model.provider_name(), "lmstudio");
+assert_eq!(model.model_id(), "llama3.3");
+
+// Explicit construction
+let model = LanguageModel::Known {
+    provider_key: "lmstudio".into(),
+    model_id: "mistral".into(),
+};
 ```
 
 ### Streaming
 
-```swift
-// Stream responses for better UX
-for try await delta in provider.streamText(
-    request: ProviderRequest(
-        messages: [.user("Explain quantum computing")],
-        settings: GenerationSettings(streamingBufferSize: 5)
-    )
-) {
-    switch delta.type {
-    case .textDelta(let text):
-        print(text, terminator: "")
-    case .channelStart(let channel):
-        print("\n[\(channel)]", terminator: " ")
-    case .usage(let usage):
-        print("\n\nTokens: \(usage.totalTokens)")
-    default:
-        break
+```rust
+use futures::StreamExt;
+use roci_core::provider::{ModelProvider, ProviderRequest};
+use roci_core::types::{ModelMessage, GenerationSettings};
+use roci_providers::provider::lmstudio::LmStudioProvider;
+use roci_providers::models::lmstudio::LmStudioModel;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let provider = LmStudioProvider::new(
+        LmStudioModel::Custom("llama3.3".into()),
+        "http://localhost:1234".into(),
+    );
+
+    let request = ProviderRequest {
+        messages: vec![ModelMessage::user("Explain quantum computing")],
+        settings: GenerationSettings::default(),
+        tools: None,
+        response_format: None,
+        session_id: None,
+        transport: None,
+    };
+
+    let mut stream = provider.stream_text(&request).await?;
+    while let Some(delta) = stream.next().await {
+        match delta? {
+            d if !d.text.is_empty() => print!("{}", d.text),
+            _ => {}
+        }
     }
+    println!();
+    Ok(())
 }
 ```
 
-### Function Calling
+### Advanced Generation with Settings
 
-```swift
-// LMStudio supports OpenAI-style function calling
-@ToolKit
-struct Tools {
-    func getCurrentWeather(location: String) -> String {
-        return "Sunny, 22°C"
-    }
-    
-    func searchWeb(query: String) -> [String] {
-        return ["Result 1", "Result 2"]
-    }
-}
+```rust
+use roci_core::generation::text::generate_text;
+use roci_core::types::{ModelMessage, GenerationSettings};
+use roci_providers::provider::lmstudio::LmStudioProvider;
+use roci_providers::models::lmstudio::LmStudioModel;
 
-let response = try await generateText(
-    model: .lmstudio("gpt-oss-120b"),
-    messages: [.user("What's the weather in Tokyo?")],
-    tools: Tools(),
-    provider: provider
-)
+let provider = LmStudioProvider::new(
+    LmStudioModel::Custom("codellama".into()),
+    "http://localhost:1234".into(),
+);
 
-// Tool calls are automatically executed
-print(response.text)  // "The weather in Tokyo is sunny with 22°C"
+let messages = vec![
+    ModelMessage::system("You are an expert Rust developer. Generate clean, efficient code."),
+    ModelMessage::user("Write a function to sort a vector of structs by a field."),
+];
+
+let settings = GenerationSettings {
+    max_tokens: Some(2048),
+    temperature: Some(0.3),  // lower temperature for code
+    top_p: Some(0.95),
+    stop_sequences: Some(vec!["```".into()]),
+    ..Default::default()
+};
+
+let result = generate_text(&provider, messages, settings, &[]).await?;
+println!("{}", result.text);
 ```
 
-## Performance Optimization
+### Remote LMStudio Instance
 
-### GPU Acceleration
-
-```swift
-// Configure GPU usage
-let config = LMStudioConfig(
-    gpuLayers: .all,           // Use all layers on GPU
-    gpuSplitMode: .layer,      // Split by layers, not rows
-    mainGPU: 0,                // Primary GPU index
-    tensorSplit: [1.0]         // Single GPU (or [0.5, 0.5] for dual)
-)
-
-let provider = LMStudioProvider(config: config)
+```rust
+// Point to LMStudio running on a different machine
+let provider = LmStudioProvider::new(
+    LmStudioModel::Custom("llama3.3".into()),
+    "http://192.168.1.100:1234".into(),
+);
 ```
 
-### Memory Management
+## Env Var Override
 
-```swift
-// Optimize memory usage
-let memoryConfig = LMStudioMemoryConfig(
-    useMlock: true,            // Lock model in RAM
-    useMmap: true,             // Memory-map files
-    offloadKQV: true,          // Offload KQV to GPU
-    flashAttention: true,      // Use Flash Attention
-    contextSizeReduction: 0.5  // Reduce context if low on memory
-)
+roci's `RociConfig::from_env()` reads `LMSTUDIO_BASE_URL` to override the default base URL:
+
+```bash
+export LMSTUDIO_BASE_URL="http://192.168.1.100:1234"
 ```
 
-### Batch Processing
-
-```swift
-// Process multiple requests efficiently
-let requests = [
-    "Summarize this text: ...",
-    "Translate to Spanish: ...",
-    "Answer this question: ..."
-]
-
-let responses = try await provider.batchGenerate(
-    requests: requests.map { text in
-        ProviderRequest(
-            messages: [.user(text)],
-            settings: GenerationSettings(maxTokens: 500)
-        )
-    },
-    batchSize: 3,  // Process 3 at a time
-    parallel: true  // Use parallel processing
-)
-```
+The factory will use this URL when constructing `LmStudioProvider` via the registry.
 
 ## Model Library
 
@@ -273,237 +235,49 @@ let responses = try await provider.batchGenerate(
 
 | Model | Size | Use Case | Quantization |
 |-------|------|----------|--------------|
-| GPT-OSS-120B | 65GB | General purpose, reasoning | Q4_K_M |
-| Llama-3-70B | 35GB | Chat, coding | Q4_K_M |
-| Mixtral-8x7B | 24GB | Fast, versatile | Q4_K_S |
-| CodeLlama-34B | 20GB | Code generation | Q5_K_M |
+| Llama-3.3-70B | 35GB | Chat, reasoning | Q4_K_M |
 | Mistral-7B | 4GB | Lightweight, fast | Q8_0 |
-| Phi-3-mini | 2GB | Ultra-light, mobile | Q4_K_M |
+| CodeLlama-34B | 20GB | Code generation | Q5_K_M |
+| Mixtral-8x7B | 24GB | Fast, versatile | Q4_K_S |
+| DeepSeek-R1 | varies | Reasoning | Q4_K_M |
+| Phi-3-mini | 2GB | Ultra-light | Q4_K_M |
 
-### Model Selection
+## Capabilities
 
-```swift
-// Choose model based on available resources
-let selector = ModelSelector(
-    maxRAM: ProcessInfo.processInfo.physicalMemory,
-    maxVRAM: Metal.Device.default?.recommendedMaxMemory,
-    preferredSpeed: .balanced  // .fast, .balanced, .quality
-)
+`LmStudioModel` reports the following capabilities (all custom models):
 
-let bestModel = try await selector.recommendModel(
-    task: .general,  // .chat, .code, .reasoning, .creative
-    provider: provider
-)
-
-print("Recommended: \(bestModel.name)")
-print("Reason: \(bestModel.recommendation)")
-```
-
-## Integration Examples
-
-### Chat Interface
-
-```swift
-class LMStudioChat {
-    let provider = LMStudioProvider()
-    var conversation: [ModelMessage] = []
-    
-    func chat(_ message: String) async throws -> String {
-        conversation.append(.user(message))
-        
-        let response = try await generateText(
-            model: .lmstudio("current"),  // Uses currently loaded model
-            messages: conversation,
-            provider: provider,
-            settings: GenerationSettings(
-                maxTokens: 1000,
-                temperature: 0.7
-            )
-        )
-        
-        conversation.append(.assistant(response.text))
-        return response.text
-    }
-    
-    func reset() {
-        conversation = []
-    }
-}
-```
-
-### Code Assistant
-
-```swift
-struct LMStudioCodeAssistant {
-    let provider = LMStudioProvider()
-    
-    func generateCode(
-        prompt: String,
-        language: String = "swift"
-    ) async throws -> String {
-        let response = try await generateText(
-            model: .lmstudio("codellama-34b"),
-            messages: [
-                .system("You are an expert \(language) developer. Generate clean, efficient code with comments."),
-                .user(prompt)
-            ],
-            provider: provider,
-            settings: GenerationSettings(
-                temperature: 0.3,  // Lower temperature for code
-                stopSequences: ["```", "// End of code"]
-            )
-        )
-        
-        return response.text
-    }
-    
-    func explainCode(_ code: String) async throws -> String {
-        let response = try await generateText(
-            model: .lmstudio("current"),
-            messages: [
-                .system("Explain the following code clearly and concisely."),
-                .user(code)
-            ],
-            provider: provider
-        )
-        
-        return response.text
-    }
-}
-```
-
-### Document Analysis
-
-```swift
-struct DocumentAnalyzer {
-    let provider = LMStudioProvider()
-    
-    func analyze(document: String) async throws -> Analysis {
-        let response = try await generateText(
-            model: .lmstudio("mixtral-8x7b"),
-            messages: [
-                .system("Analyze the document and provide: summary, key points, sentiment, and recommendations."),
-                .user(document)
-            ],
-            provider: provider,
-            settings: GenerationSettings(
-                reasoningEffort: .high,
-                maxTokens: 2000
-            )
-        )
-        
-        // Parse structured response
-        return Analysis(
-            summary: response.channels[.final] ?? response.text,
-            reasoning: response.channels[.thinking],
-            keyPoints: extractKeyPoints(response.text)
-        )
-    }
-}
-```
+| Capability | Supported |
+|---|---|
+| Tool calling | Yes |
+| Streaming | Yes |
+| JSON mode | Yes |
+| JSON schema | No |
+| Vision | No |
+| Reasoning | No |
+| System messages | Yes |
+| Context length | 32,768 tokens |
 
 ## Troubleshooting
 
 ### Connection Issues
 
-```swift
-// Check if LMStudio is running
-do {
-    let health = try await provider.healthCheck()
-    print("Server status: \(health.status)")
-} catch {
-    print("LMStudio not reachable. Please ensure:")
-    print("1. LMStudio is running")
-    print("2. Server is started (Local Server tab)")
-    print("3. Port 1234 is not blocked")
-}
+Ensure LMStudio is running and the server is started:
+
+```bash
+# Verify server is responding
+curl http://localhost:1234/v1/models
 ```
 
-### Performance Issues
+Common causes of connection failures:
+1. LMStudio is not running
+2. Server is not started (check "Local Server" tab)
+3. Port 1234 is blocked by firewall
+4. Wrong base URL passed to `LmStudioProvider::new`
 
-```swift
-// Diagnose performance problems
-let diagnostics = try await provider.runDiagnostics()
+### Model Not Responding
 
-print("Model: \(diagnostics.model)")
-print("Context: \(diagnostics.contextSize)")
-print("GPU Layers: \(diagnostics.gpuLayers)/\(diagnostics.totalLayers)")
-print("Inference Speed: \(diagnostics.tokensPerSecond) tok/s")
-print("Memory Used: \(diagnostics.memoryGB)GB")
-
-if diagnostics.tokensPerSecond < 10 {
-    print("Suggestions:")
-    print("- Reduce context size")
-    print("- Enable GPU acceleration")
-    print("- Use smaller quantization")
-    print("- Close other applications")
-}
-```
-
-### Model Loading Errors
-
-```swift
-// Handle model loading issues
-do {
-    try await provider.loadModel("model-name")
-} catch LMStudioError.insufficientMemory(required: let req, available: let avail) {
-    print("Not enough memory: need \(req)GB, have \(avail)GB")
-    print("Try: smaller quantization or reduced context")
-} catch LMStudioError.modelNotFound(let name) {
-    print("Model '\(name)' not found")
-    print("Available models:", try await provider.listModels())
-} catch {
-    print("Loading error: \(error)")
-}
-```
-
-## Advanced Features
-
-### Custom Server Endpoints
-
-```swift
-// Use custom LMStudio installations
-let customProvider = LMStudioProvider(
-    baseURL: "http://192.168.1.100:1234/v1",  // Remote LMStudio
-    headers: ["X-Custom-Auth": "token"]         // Custom headers
-)
-```
-
-### Model Switching
-
-```swift
-// Switch between models dynamically
-let chatbot = MultiModelChat(provider: provider)
-
-// Use fast model for simple queries
-chatbot.useModel("mistral-7b")
-let quick = try await chatbot.chat("What's 2+2?")
-
-// Switch to powerful model for complex tasks
-chatbot.useModel("gpt-oss-120b")
-let complex = try await chatbot.chat("Explain quantum entanglement")
-```
-
-### Monitoring & Metrics
-
-```swift
-// Track usage and performance
-let monitor = LMStudioMonitor(provider: provider)
-
-monitor.onGeneration = { metrics in
-    print("Model: \(metrics.model)")
-    print("Prompt tokens: \(metrics.promptTokens)")
-    print("Generation tokens: \(metrics.generationTokens)")
-    print("Time: \(metrics.totalTime)s")
-    print("Speed: \(metrics.tokensPerSecond) tok/s")
-}
-
-// Get aggregated stats
-let stats = monitor.getStatistics()
-print("Total requests: \(stats.totalRequests)")
-print("Average speed: \(stats.averageTokensPerSecond) tok/s")
-print("Total tokens: \(stats.totalTokens)")
-```
+- Verify the model ID matches exactly what LMStudio reports at `/v1/models`
+- LMStudio serves the currently loaded model; if no model is loaded, requests will fail
 
 ## Best Practices
 
@@ -512,29 +286,23 @@ print("Total tokens: \(stats.totalTokens)")
 3. **Monitor memory usage**: Keep 20% RAM free for stability
 4. **Enable GPU acceleration**: Dramatically improves performance
 5. **Use streaming for UX**: Better perceived responsiveness
-6. **Cache responses**: Avoid regenerating identical queries
-7. **Handle errors gracefully**: Network and memory issues can occur
-8. **Test model switching**: Different models for different tasks
+6. **Handle errors gracefully**: Network and memory issues can occur
 
 ## FAQ
 
 **Q: Can I use multiple models simultaneously?**
-A: LMStudio loads one model at a time, but you can switch models programmatically.
+A: LMStudio loads one model at a time, but you can switch models by changing the model ID.
 
 **Q: How do I use LMStudio on a different machine?**
-A: Change the baseURL to the remote machine's IP: `http://192.168.1.100:1234/v1`
+A: Change the base URL: `LmStudioProvider::new(model, "http://192.168.1.100:1234".into())`
 
 **Q: Can I fine-tune models in LMStudio?**
 A: LMStudio is for inference only. Use other tools for fine-tuning, then import the GGUF.
 
 **Q: What's the maximum context size?**
-A: Depends on model and available RAM. Start with 4K-8K and increase gradually.
-
-**Q: How do I enable Flash Attention?**
-A: It's automatically enabled on supported hardware (recent NVIDIA GPUs).
+A: Depends on model and available RAM. The default capability reports 32K; configure LMStudio for more.
 
 ## Related Documentation
 
-- [GPT-OSS-120B Guide](gpt-oss.md) - Detailed setup for GPT-OSS
-- [Local Model Optimization](performance.md) - Performance tuning
+- [GPT-OSS-120B Guide](gpt-oss.md) - Detailed setup for open-source large models
 - [OpenAI Harmony Features](openai-harmony.md) - Advanced features
