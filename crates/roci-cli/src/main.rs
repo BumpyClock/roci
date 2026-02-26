@@ -273,7 +273,10 @@ fn collect_resource_diagnostic_messages(resources: &ResourceBundle) -> Vec<Strin
             diagnostic.message
         );
         if let Some(collision) = &diagnostic.collision {
-            message.push_str(&format!(" (collides with {})", collision.winner_path.display()));
+            message.push_str(&format!(
+                " (collides with {})",
+                collision.winner_path.display()
+            ));
         }
         messages.push(message);
     }

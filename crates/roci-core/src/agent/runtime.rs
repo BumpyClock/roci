@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex, Notify};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::message::{AgentMessage, AgentMessageExt};
 use crate::agent_loop::runner::{
@@ -119,6 +120,17 @@ pub enum SessionSummaryHookOutcome {
     Cancel,
     /// Use the provided summary text instead of model-generated text.
     OverrideSummary(String),
+    /// Override compaction summary and kept-boundary metadata.
+    OverrideCompaction(SessionCompactionOverride),
+}
+
+/// Full compaction override returned by `session_before_compact`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCompactionOverride {
+    pub summary: String,
+    pub first_kept_entry_id: usize,
+    pub tokens_before: usize,
+    pub details: Option<String>,
 }
 
 /// Prepared summary input data exposed to session hooks.
@@ -142,17 +154,22 @@ impl SummaryPreparationData {
 }
 
 /// Payload for the `session_before_compact` lifecycle hook.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SessionBeforeCompactPayload {
     pub to_summarize: SummaryPreparationData,
     pub turn_prefix: SummaryPreparationData,
     pub kept: SummaryPreparationData,
     pub split_turn: bool,
     pub settings: CompactionSettings,
+    pub cancellation_token: CancellationToken,
 }
 
 impl SessionBeforeCompactPayload {
-    fn from_prepared(prepared: &PreparedCompaction, settings: CompactionSettings) -> Self {
+    fn from_prepared(
+        prepared: &PreparedCompaction,
+        settings: CompactionSettings,
+        cancellation_token: CancellationToken,
+    ) -> Self {
         Self {
             to_summarize: SummaryPreparationData::from_messages(
                 prepared.messages_to_summarize.clone(),
@@ -163,6 +180,7 @@ impl SessionBeforeCompactPayload {
             kept: SummaryPreparationData::from_messages(prepared.kept_messages.clone()),
             split_turn: prepared.split_turn,
             settings,
+            cancellation_token,
         }
     }
 }
@@ -751,6 +769,12 @@ impl AgentRuntime {
                     }
                     return Ok(AgentMessage::branch_summary(summary));
                 }
+                SessionSummaryHookOutcome::OverrideCompaction(_) => {
+                    return Err(RociError::InvalidState(
+                        "branch summary hook does not accept compaction override object"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -932,7 +956,7 @@ impl AgentRuntime {
             let registry = self.registry.clone();
             let roci_config = self.roci_config.clone();
             let run_model = request.model.clone();
-            let compaction_hook: CompactionHandler = Arc::new(move |messages| {
+            let compaction_hook: CompactionHandler = Arc::new(move |messages, _cancel| {
                 let compaction_settings = compaction_settings.clone();
                 let session_before_compact = session_before_compact.clone();
                 let registry = registry.clone();
@@ -1018,6 +1042,126 @@ impl AgentRuntime {
         run_result
     }
 
+    fn split_messages_for_compaction(
+        conversation_messages: &[ModelMessage],
+        first_kept_entry_id: usize,
+    ) -> (
+        Vec<ModelMessage>,
+        Vec<ModelMessage>,
+        Vec<ModelMessage>,
+        bool,
+    ) {
+        if first_kept_entry_id >= conversation_messages.len() {
+            return (
+                conversation_messages[..first_kept_entry_id].to_vec(),
+                Vec::new(),
+                conversation_messages[first_kept_entry_id..].to_vec(),
+                false,
+            );
+        }
+
+        let turn_start = conversation_messages[..first_kept_entry_id]
+            .iter()
+            .rposition(|message| message.role == Role::User)
+            .unwrap_or(first_kept_entry_id);
+        let split_turn = turn_start < first_kept_entry_id;
+
+        if split_turn {
+            (
+                conversation_messages[..turn_start].to_vec(),
+                conversation_messages[turn_start..first_kept_entry_id].to_vec(),
+                conversation_messages[first_kept_entry_id..].to_vec(),
+                true,
+            )
+        } else {
+            (
+                conversation_messages[..first_kept_entry_id].to_vec(),
+                Vec::new(),
+                conversation_messages[first_kept_entry_id..].to_vec(),
+                false,
+            )
+        }
+    }
+
+    fn count_tokens_before_entry(
+        conversation_messages: &[ModelMessage],
+        first_kept_entry_id: usize,
+    ) -> usize {
+        conversation_messages[..first_kept_entry_id]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<usize>()
+    }
+
+    fn legacy_summary_override(
+        summary: String,
+        prepared: &PreparedCompaction,
+        conversation_messages: &[ModelMessage],
+    ) -> SessionCompactionOverride {
+        let first_kept_entry_id = prepared.cut_index.min(conversation_messages.len());
+        SessionCompactionOverride {
+            summary,
+            first_kept_entry_id,
+            tokens_before: Self::count_tokens_before_entry(
+                conversation_messages,
+                first_kept_entry_id,
+            ),
+            details: None,
+        }
+    }
+
+    fn validate_compaction_override(
+        override_data: SessionCompactionOverride,
+        conversation_messages: &[ModelMessage],
+    ) -> Result<SessionCompactionOverride, RociError> {
+        let summary = override_data.summary.trim().to_string();
+        if summary.is_empty() {
+            return Err(RociError::InvalidState(
+                "compaction override summary must not be empty".to_string(),
+            ));
+        }
+
+        let first_kept_entry_id = override_data.first_kept_entry_id;
+        if first_kept_entry_id == 0 || first_kept_entry_id > conversation_messages.len() {
+            return Err(RociError::InvalidState(format!(
+                "compaction override first_kept_entry_id must be within 1..={} (got {})",
+                conversation_messages.len(),
+                first_kept_entry_id
+            )));
+        }
+        if first_kept_entry_id < conversation_messages.len()
+            && conversation_messages[first_kept_entry_id].role == Role::Tool
+        {
+            return Err(RociError::InvalidState(format!(
+                "compaction override first_kept_entry_id={} cannot point to a tool result entry",
+                first_kept_entry_id
+            )));
+        }
+
+        let expected_tokens_before =
+            Self::count_tokens_before_entry(conversation_messages, first_kept_entry_id);
+        if override_data.tokens_before != expected_tokens_before {
+            return Err(RociError::InvalidState(format!(
+                "compaction override tokens_before={} does not match expected {} for first_kept_entry_id={}",
+                override_data.tokens_before, expected_tokens_before, first_kept_entry_id
+            )));
+        }
+
+        Ok(SessionCompactionOverride {
+            summary,
+            first_kept_entry_id,
+            tokens_before: override_data.tokens_before,
+            details: override_data.details.and_then(|value| {
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }),
+        })
+    }
+
     async fn compact_messages_with_model(
         messages: Vec<ModelMessage>,
         run_model: &LanguageModel,
@@ -1042,31 +1186,76 @@ impl AgentRuntime {
             return Ok(None);
         }
 
-        let compaction_payload =
-            SessionBeforeCompactPayload::from_prepared(&prepared, compaction.clone());
-        let summary_override = match session_before_compact {
+        let cancellation_token = CancellationToken::new();
+        let compaction_payload = SessionBeforeCompactPayload::from_prepared(
+            &prepared,
+            compaction.clone(),
+            cancellation_token.child_token(),
+        );
+        let compaction_override = match session_before_compact {
             Some(hook) => match hook(compaction_payload).await? {
                 SessionSummaryHookOutcome::Continue => None,
-                SessionSummaryHookOutcome::Cancel => return Ok(None),
-                SessionSummaryHookOutcome::OverrideSummary(summary) => Some(summary),
+                SessionSummaryHookOutcome::Cancel => {
+                    cancellation_token.cancel();
+                    return Err(RociError::InvalidState(
+                        "compaction canceled by session_before_compact hook".to_string(),
+                    ));
+                }
+                SessionSummaryHookOutcome::OverrideSummary(summary) => Some(
+                    Self::legacy_summary_override(summary, &prepared, &conversation_messages),
+                ),
+                SessionSummaryHookOutcome::OverrideCompaction(override_data) => Some(override_data),
             },
             None => None,
         };
 
-        let file_ops = extract_file_operations(&prepared.messages_to_summarize);
+        let mut messages_to_summarize = prepared.messages_to_summarize.clone();
+        let mut turn_prefix_messages = prepared.turn_prefix_messages.clone();
+        let mut kept_messages = prepared.kept_messages.clone();
+        let mut split_turn = prepared.split_turn;
+        let mut summary_override = None;
+        let mut override_details = None;
+
+        if let Some(override_data) = compaction_override {
+            let override_data =
+                Self::validate_compaction_override(override_data, &conversation_messages)?;
+            let (
+                override_messages_to_summarize,
+                override_turn_prefix,
+                override_kept,
+                override_split_turn,
+            ) = Self::split_messages_for_compaction(
+                &conversation_messages,
+                override_data.first_kept_entry_id,
+            );
+            if override_messages_to_summarize.is_empty() {
+                return Err(RociError::InvalidState(format!(
+                    "compaction override first_kept_entry_id={} leaves no entries to summarize",
+                    override_data.first_kept_entry_id
+                )));
+            }
+            messages_to_summarize = override_messages_to_summarize;
+            turn_prefix_messages = override_turn_prefix;
+            kept_messages = override_kept;
+            split_turn = override_split_turn;
+            summary_override = Some(override_data.summary);
+            override_details = override_data.details;
+        }
+
+        let file_ops = extract_file_operations(&messages_to_summarize);
         let summary_model = match compaction.model.as_deref() {
             Some(model) => LanguageModel::from_str(model)?,
             None => run_model.clone(),
         };
         let summary_text = match summary_override {
-            Some(summary) => summary.trim().to_string(),
+            Some(summary) => summary,
             None => {
                 let provider = registry.create_provider(
                     summary_model.provider_name(),
                     summary_model.model_id(),
                     roci_config,
                 )?;
-                let transcript = serialize_messages_for_summary(&prepared.messages_to_summarize);
+                let transcript = serialize_messages_for_summary(&messages_to_summarize);
                 let summary_prompt = format!(
                     "Summarize the conversation transcript into concise bullets focused on user goals, constraints, progress, decisions, next steps, and critical context.\n\nTranscript:\n{transcript}"
                 );
@@ -1094,13 +1283,17 @@ impl AgentRuntime {
             ));
         }
 
+        let mut critical_context = if split_turn {
+            vec!["A turn split was preserved to avoid cutting a user/tool exchange".to_string()]
+        } else {
+            Vec::new()
+        };
+        if let Some(details) = override_details {
+            critical_context.push(format!("Compaction override details: {details}"));
+        }
         let summary = PiMonoSummary {
             progress: vec![summary_text],
-            critical_context: if prepared.split_turn {
-                vec!["A turn split was preserved to avoid cutting a user/tool exchange".to_string()]
-            } else {
-                Vec::new()
-            },
+            critical_context,
             read_files: file_ops.read_files,
             modified_files: file_ops.modified_files,
             ..PiMonoSummary::default()
@@ -1112,15 +1305,12 @@ impl AgentRuntime {
             })?;
 
         let mut compacted = Vec::with_capacity(
-            system_prefix.len()
-                + 1
-                + prepared.turn_prefix_messages.len()
-                + prepared.kept_messages.len(),
+            system_prefix.len() + 1 + turn_prefix_messages.len() + kept_messages.len(),
         );
         compacted.extend(system_prefix);
         compacted.push(summary_message);
-        compacted.extend(prepared.turn_prefix_messages);
-        compacted.extend(prepared.kept_messages);
+        compacted.extend(turn_prefix_messages);
+        compacted.extend(kept_messages);
         Ok(Some(compacted))
     }
 
@@ -2315,6 +2505,7 @@ mod tests {
     #[tokio::test]
     async fn session_before_compact_can_cancel_compaction() {
         let mut config = test_agent_config();
+        config.compaction.keep_recent_tokens = 1;
         config.session_before_compact = Some(Arc::new(|_payload| {
             Box::pin(async { Ok(SessionSummaryHookOutcome::Cancel) })
         }));
@@ -2329,12 +2520,147 @@ mod tests {
             .await
             .expect("messages should be set");
 
+        let error = agent
+            .compact()
+            .await
+            .expect_err("compaction cancel should return an explicit error");
+
+        assert!(error.to_string().contains("session_before_compact"));
+        assert_eq!(agent.messages().await, original_messages);
+    }
+
+    #[tokio::test]
+    async fn session_before_compact_accepts_full_override_contract() {
+        let mut config = test_agent_config();
+        config.compaction.keep_recent_tokens = 1;
+        config.session_before_compact = Some(Arc::new(|payload| {
+            Box::pin(async move {
+                let first_kept_entry_id =
+                    payload.to_summarize.messages.len() + payload.turn_prefix.messages.len();
+                let tokens_before = payload
+                    .to_summarize
+                    .messages
+                    .iter()
+                    .chain(payload.turn_prefix.messages.iter())
+                    .map(estimate_message_tokens)
+                    .sum::<usize>();
+                Ok(SessionSummaryHookOutcome::OverrideCompaction(
+                    SessionCompactionOverride {
+                        summary: "hooked full override summary".to_string(),
+                        first_kept_entry_id,
+                        tokens_before,
+                        details: Some("keep trailing context verbatim".to_string()),
+                    },
+                ))
+            })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+        agent
+            .replace_messages(vec![
+                ModelMessage::user("first"),
+                ModelMessage::assistant("second"),
+                ModelMessage::user("latest request"),
+                ModelMessage::assistant("latest answer"),
+            ])
+            .await
+            .expect("messages should be set");
+
         agent
             .compact()
             .await
-            .expect("compaction cancellation should succeed");
+            .expect("compaction with full override should succeed");
 
-        assert_eq!(agent.messages().await, original_messages);
+        let compacted = agent.messages().await;
+        assert!(
+            compacted
+                .iter()
+                .any(|message| message.text().contains("hooked full override summary")),
+            "compaction summary should use full override summary"
+        );
+        assert!(
+            compacted
+                .iter()
+                .any(|message| message.text().contains("Compaction override details")),
+            "compaction summary should include override details"
+        );
+        assert!(
+            compacted
+                .iter()
+                .any(|message| message.text().contains("latest answer")),
+            "latest messages should remain after override compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_before_compact_rejects_invalid_override() {
+        let mut config = test_agent_config();
+        config.compaction.keep_recent_tokens = 1;
+        config.session_before_compact = Some(Arc::new(|_payload| {
+            Box::pin(async {
+                Ok(SessionSummaryHookOutcome::OverrideCompaction(
+                    SessionCompactionOverride {
+                        summary: "invalid boundary".to_string(),
+                        first_kept_entry_id: 0,
+                        tokens_before: 0,
+                        details: None,
+                    },
+                ))
+            })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+        agent
+            .replace_messages(vec![
+                ModelMessage::user("first"),
+                ModelMessage::assistant("second"),
+                ModelMessage::user("third"),
+            ])
+            .await
+            .expect("messages should be set");
+
+        let error = agent
+            .compact()
+            .await
+            .expect_err("invalid override should fail compaction");
+        assert!(error.to_string().contains("first_kept_entry_id"));
+    }
+
+    #[tokio::test]
+    async fn session_before_compact_payload_exposes_cancellation_token() {
+        let is_canceled = Arc::new(Mutex::new(None));
+        let is_canceled_for_hook = is_canceled.clone();
+        let mut config = test_agent_config();
+        config.compaction.keep_recent_tokens = 1;
+        config.session_before_compact = Some(Arc::new(move |payload| {
+            let is_canceled_for_hook = is_canceled_for_hook.clone();
+            Box::pin(async move {
+                *is_canceled_for_hook
+                    .lock()
+                    .expect("capture lock should not fail") =
+                    Some(payload.cancellation_token.is_cancelled());
+                Ok(SessionSummaryHookOutcome::OverrideSummary(
+                    "cancellation token capture".to_string(),
+                ))
+            })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+        agent
+            .replace_messages(vec![
+                ModelMessage::user("first"),
+                ModelMessage::assistant("second"),
+                ModelMessage::user("third"),
+            ])
+            .await
+            .expect("messages should be set");
+
+        agent
+            .compact()
+            .await
+            .expect("compaction should succeed with summary override");
+
+        assert_eq!(
+            *is_canceled.lock().expect("capture lock should not fail"),
+            Some(false)
+        );
     }
 
     #[tokio::test]
@@ -2386,6 +2712,7 @@ mod tests {
             .file_operations
             .read_files
             .contains("src/a.rs"));
+        assert!(!captured.cancellation_token.is_cancelled());
 
         let compacted = agent.messages().await;
         assert!(

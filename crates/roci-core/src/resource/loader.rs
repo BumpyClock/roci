@@ -98,31 +98,28 @@ impl ResourceLoader {
             context.context_files.clear();
         }
 
-        let skills = if self.skill_options.enabled {
-            let resolved = self
-                .settings_loader
-                .directories()
-                .resolve_with_home(cwd, home_dir)?;
-            let mut roots = default_skill_roots(&resolved);
-            roots.extend(
-                self.skill_options
-                    .extra_roots
-                    .iter()
-                    .cloned()
-                    .map(|path| SkillRoot {
+        let skills =
+            if self.skill_options.enabled {
+                let resolved = self
+                    .settings_loader
+                    .directories()
+                    .resolve_with_home(cwd, home_dir)?;
+                let mut roots = default_skill_roots(&resolved);
+                roots.extend(self.skill_options.extra_roots.iter().cloned().map(|path| {
+                    SkillRoot {
                         path,
                         source: SkillSource::Explicit,
-                    }),
-            );
-            let options = LoadSkillsOptions {
-                roots,
-                explicit_paths: self.skill_options.explicit_paths.clone(),
-                follow_symlinks: true,
+                    }
+                }));
+                let options = LoadSkillsOptions {
+                    roots,
+                    explicit_paths: self.skill_options.explicit_paths.clone(),
+                    follow_symlinks: true,
+                };
+                load_skills(&options)
+            } else {
+                LoadSkillsResult::default()
             };
-            load_skills(&options)
-        } else {
-            LoadSkillsResult::default()
-        };
 
         Ok(ResourceBundle {
             settings,

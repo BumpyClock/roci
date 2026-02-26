@@ -12,5 +12,5 @@ Implement pi-mono style compaction and branch summarization in roci core:
 - Settings for compaction/branch summary
 
 ## Dependencies
-- Branch summarization depends on session tree epic (tsq-jhvzt78z)
-- Hook integration depends on extension system epic (tsq-pb2dxvaa)
+- Hook integration tracked in hooks epic (tsq-z6nvyqfh)
+- Session tree/fork integration is deferred and not a blocker for this epic

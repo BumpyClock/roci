@@ -43,10 +43,7 @@ pub fn default_skill_roots(directories: &ResolvedResourceDirectories) -> Vec<Ski
 }
 
 fn project_agents_root(project_dir: &Path) -> PathBuf {
-    project_dir
-        .parent()
-        .unwrap_or(project_dir)
-        .join(".agents")
+    project_dir.parent().unwrap_or(project_dir).join(".agents")
 }
 
 fn global_agents_root(agent_dir: &Path) -> PathBuf {

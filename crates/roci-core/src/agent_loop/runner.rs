@@ -39,6 +39,7 @@ pub type RunEventSink = Arc<dyn Fn(RunEvent) + Send + Sync>;
 pub type CompactionHandler = Arc<
     dyn Fn(
             Vec<ModelMessage>,
+            CancellationToken,
         )
             -> Pin<Box<dyn Future<Output = Result<Option<Vec<ModelMessage>>, RociError>> + Send>>
         + Send
@@ -860,7 +861,28 @@ impl Runner for LoopRunner {
                             ));
                             return;
                         };
-                        match compact(messages.clone()).await {
+                        let compaction_cancel_token = run_cancel_token.child_token();
+                        let compaction_future =
+                            compact(messages.clone(), compaction_cancel_token.clone());
+                        tokio::pin!(compaction_future);
+                        let compaction_result = tokio::select! {
+                            _ = &mut abort_rx => {
+                                run_cancel_token.cancel();
+                                compaction_cancel_token.cancel();
+                                emitter.emit(
+                                    RunEventStream::Lifecycle,
+                                    RunEventPayload::Lifecycle {
+                                        state: RunLifecycle::Canceled,
+                                    },
+                                );
+                                agent_emitter.emit(AgentEvent::AgentEnd { run_id: request.run_id });
+                                let _ = result_tx
+                                    .send(RunResult::canceled_with_messages(messages.clone()));
+                                return;
+                            }
+                            result = &mut compaction_future => result,
+                        };
+                        match compaction_result {
                             Ok(Some(compacted)) => {
                                 messages = compacted;
                             }
@@ -1777,7 +1799,7 @@ mod tests {
     use super::*;
 
     use futures::stream::{self, BoxStream};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::{timeout, Duration};
 
     use crate::agent::message::{convert_to_llm, AgentMessage};
@@ -3641,7 +3663,7 @@ mod tests {
         let calls_clone = calls.clone();
         let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
         request.hooks = RunHooks {
-            compaction: Some(Arc::new(move |_messages| {
+            compaction: Some(Arc::new(move |_messages, _cancel| {
                 let calls_clone = calls_clone.clone();
                 Box::pin(async move {
                     calls_clone.fetch_add(1, Ordering::SeqCst);
@@ -3675,7 +3697,7 @@ mod tests {
             ],
         );
         request.hooks = RunHooks {
-            compaction: Some(Arc::new(move |messages| {
+            compaction: Some(Arc::new(move |messages, _cancel| {
                 Box::pin(async move {
                     Ok(Some(vec![
                         messages[0].clone(),
@@ -3715,7 +3737,7 @@ mod tests {
         let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
         let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
         request.hooks = RunHooks {
-            compaction: Some(Arc::new(move |_messages| {
+            compaction: Some(Arc::new(move |_messages, _cancel| {
                 Box::pin(async {
                     Err(RociError::InvalidState(
                         "forced compaction failure".to_string(),
@@ -3737,5 +3759,56 @@ mod tests {
         let error = result.error.unwrap_or_default();
         assert!(error.contains("compaction failed"));
         assert!(error.contains("forced compaction failure"));
+    }
+
+    #[tokio::test]
+    async fn abort_during_auto_compaction_cancels_compaction_token_and_run() {
+        let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let compaction_cancel_observed = Arc::new(AtomicBool::new(false));
+        let compaction_cancel_observed_for_hook = compaction_cancel_observed.clone();
+
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.hooks = RunHooks {
+            compaction: Some(Arc::new(move |_messages, cancel| {
+                let started_tx = started_tx.clone();
+                let compaction_cancel_observed = compaction_cancel_observed_for_hook.clone();
+                Box::pin(async move {
+                    if let Some(tx) = started_tx.lock().expect("start signal lock").take() {
+                        let _ = tx.send(());
+                    }
+                    tokio::spawn(async move {
+                        cancel.cancelled().await;
+                        compaction_cancel_observed.store(true, Ordering::SeqCst);
+                    });
+                    std::future::pending::<Result<Option<Vec<ModelMessage>>, RociError>>().await
+                })
+            })),
+            tool_result_persist: None,
+        };
+        request.auto_compaction = Some(AutoCompactionConfig {
+            reserve_tokens: 4096,
+        });
+
+        let mut handle = runner.start(request).await.expect("start run");
+        timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("compaction hook should start")
+            .expect("compaction hook start signal should send");
+        assert!(handle.abort(), "abort should be accepted");
+
+        let result = timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("run should complete without timeout");
+
+        assert_eq!(result.status, RunStatus::Canceled);
+        timeout(Duration::from_secs(1), async {
+            while !compaction_cancel_observed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compaction cancel token should be canceled");
     }
 }
