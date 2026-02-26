@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::models::ModelCapabilities;
-use crate::provider::{ModelProvider, ProviderResponse};
+use crate::provider::{ModelProvider, ProviderRequest, ProviderResponse};
 use crate::types::{StreamEventType, TextStreamDelta, Usage};
 use futures::stream::{self, BoxStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
