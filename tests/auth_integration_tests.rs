@@ -1,5 +1,5 @@
-//! Integration tests for auth subsystem: token store round-trips,
-//! config fallback resolution, and CLI argument parsing.
+//! Integration tests for auth subsystem: token store round-trips
+//! and config fallback resolution.
 
 use std::sync::Arc;
 
@@ -169,80 +169,4 @@ fn config_non_expired_token_is_returned() {
     assert_eq!(config.get_api_key("codex"), Some("fresh-tok".to_string()),);
 }
 
-// ---------------------------------------------------------------------------
-// 3. CLI argument parsing
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "cli")]
-mod cli_parse {
-    use clap::Parser;
-    use roci::cli::{AuthCommands, Cli, Commands};
-
-    #[test]
-    fn parse_auth_login_claude() {
-        let cli =
-            Cli::try_parse_from(["roci", "auth", "login", "claude"]).expect("parse should succeed");
-        match cli.command {
-            Commands::Auth(auth) => match auth.command {
-                AuthCommands::Login(args) => assert_eq!(args.provider, "claude"),
-                other => panic!("expected Login, got {other:?}"),
-            },
-            other => panic!("expected Auth, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_auth_status() {
-        let cli = Cli::try_parse_from(["roci", "auth", "status"]).expect("parse should succeed");
-        match cli.command {
-            Commands::Auth(auth) => {
-                assert!(matches!(auth.command, AuthCommands::Status));
-            }
-            other => panic!("expected Auth, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_auth_logout_claude() {
-        let cli = Cli::try_parse_from(["roci", "auth", "logout", "claude"])
-            .expect("parse should succeed");
-        match cli.command {
-            Commands::Auth(auth) => match auth.command {
-                AuthCommands::Logout(args) => assert_eq!(args.provider, "claude"),
-                other => panic!("expected Logout, got {other:?}"),
-            },
-            other => panic!("expected Auth, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_auth_login_copilot() {
-        let cli = Cli::try_parse_from(["roci", "auth", "login", "copilot"])
-            .expect("parse should succeed");
-        match cli.command {
-            Commands::Auth(auth) => match auth.command {
-                AuthCommands::Login(args) => assert_eq!(args.provider, "copilot"),
-                other => panic!("expected Login, got {other:?}"),
-            },
-            other => panic!("expected Auth, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_auth_login_chatgpt() {
-        let cli = Cli::try_parse_from(["roci", "auth", "login", "chatgpt"])
-            .expect("parse should succeed");
-        match cli.command {
-            Commands::Auth(auth) => match auth.command {
-                AuthCommands::Login(args) => assert_eq!(args.provider, "chatgpt"),
-                other => panic!("expected Login, got {other:?}"),
-            },
-            other => panic!("expected Auth, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_auth_login_missing_provider_is_error() {
-        assert!(Cli::try_parse_from(["roci", "auth", "login"]).is_err());
-    }
-}
+// CLI argument parsing tests live in crates/roci-cli/src/cli/tests.
