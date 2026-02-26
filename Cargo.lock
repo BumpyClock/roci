@@ -1529,7 +1529,6 @@ dependencies = [
  "base64",
  "bon",
  "chrono",
- "clap",
  "directories",
  "dotenvy",
  "futures",
@@ -1552,6 +1551,23 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "roci-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "roci",
+ "roci-tools",
+ "tokio",
+]
+
+[[package]]
+name = "roci-tools"
+version = "0.1.0"
+dependencies = [
+ "roci",
 ]
 
 [[package]]

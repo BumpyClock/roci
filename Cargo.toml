@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/roci-cli", "crates/roci-tools"]
+
 [package]
 name = "roci"
 version = "0.1.0"
@@ -5,6 +8,7 @@ edition = "2021"
 description = "Rust AI SDK — spiritual port of Tachikoma"
 license = "MIT"
 rust-version = "1.75"
+autobins = false
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -30,7 +34,6 @@ toml = "0.9"
 directories = "6"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
 tokio-util = { version = "0.7", optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
 rmcp = { version = "0.16", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
 
 [dev-dependencies]
@@ -58,13 +61,8 @@ anthropic-compatible = ["anthropic"]
 agent = ["dep:tokio-util"]
 audio = ["dep:tokio-tungstenite"]
 mcp = ["dep:tokio-tungstenite", "dep:rmcp"]
-cli = ["dep:clap", "agent", "openai-compatible", "anthropic-compatible"]
 all-providers = ["openai","anthropic","google","grok","groq","mistral","ollama","lmstudio","azure","openrouter","together","replicate","openai-compatible","anthropic-compatible"]
-full = ["all-providers","agent","audio","mcp","cli"]
-
-[[bin]]
-name = "roci"
-required-features = ["cli"]
+full = ["all-providers","agent","audio","mcp"]
 
 [[example]]
 name = "agent"
