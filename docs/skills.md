@@ -43,6 +43,31 @@ Validation rules:
 - `--skill-root <PATH>`: additional root directory (repeatable)
 - `--no-skills`: disable skill loading
 
+## Skill management commands
+
+`roci-agent` also exposes managed skill lifecycle commands:
+
+- `roci-agent skills install <source> [--local]`
+- `roci-agent skills remove <name> [--local]`
+- `roci-agent skills update [name] [--local]`
+- `roci-agent skills list`
+
+`<source>` accepts:
+
+- Local path (directory or file path that exists)
+- Git URL (`https://`, `ssh://`, `git://`, `git@...`, `file://...`)
+
+Scope behavior:
+
+- default: global scope (`<agent_dir>/skills`)
+- `--local`: project scope (`<project_dir>/skills`)
+
+Managed metadata:
+
+- Each scope stores `.managed-skills.json` under its `skills` root.
+- Manifest entries persist `name`, installed `directory`, and source metadata.
+- `update` re-materializes from persisted source metadata; `update` without a name updates all managed skills in the selected scope.
+
 ## Library API
 
 `project_dir` and `agent_dir` come from the resource directory configuration (`ResourceDirectories`), so embedding applications can override them while keeping the same ordering. The derived `.agents` root uses the parent of `project_dir`, and for `agent_dir` it uses the parent-of-parent when `agent_dir` ends with `agent`, otherwise the parent.

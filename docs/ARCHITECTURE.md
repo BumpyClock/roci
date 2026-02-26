@@ -176,7 +176,7 @@ Provider-specific model enums (`OpenAiModel`, `AnthropicModel`, etc.) live in
 
 Produces the `roci-agent` binary. Owns all terminal concerns:
 
-- command surface: `roci-agent auth ...` and `roci-agent chat ...`
+- command surface: `roci-agent auth ...`, `roci-agent chat ...`, and `roci-agent skills ...`
 - `clap` argument parsing
 - stdout/stderr output, spinners, interactive prompts
 - Exit codes and `process::exit`
