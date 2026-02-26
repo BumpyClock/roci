@@ -21,6 +21,8 @@ pub enum Commands {
     Auth(AuthArgs),
     /// Chat with an AI model
     Chat(ChatArgs),
+    /// Manage installed skills
+    Skills(SkillsArgs),
 }
 
 /// Arguments for the `auth` subcommand group.
@@ -92,6 +94,59 @@ pub struct ChatArgs {
 
     /// User prompt (positional)
     pub prompt: Option<String>,
+}
+
+/// Arguments for the `skills` subcommand group.
+#[derive(Parser, Debug)]
+pub struct SkillsArgs {
+    #[command(subcommand)]
+    pub command: SkillsCommands,
+}
+
+/// Skill management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SkillsCommands {
+    /// Install one or more skills from a source
+    Install(InstallSkillArgs),
+    /// Remove one managed skill
+    Remove(RemoveSkillArgs),
+    /// Update one or all managed skills
+    Update(UpdateSkillsArgs),
+    /// List discovered and managed skills
+    List,
+}
+
+/// Arguments for `roci-agent skills install`.
+#[derive(Parser, Debug)]
+pub struct InstallSkillArgs {
+    /// Skill source (local path or git URL)
+    pub source: String,
+
+    /// Use project-local scope (.roci/skills) instead of global scope
+    #[arg(long)]
+    pub local: bool,
+}
+
+/// Arguments for `roci-agent skills remove`.
+#[derive(Parser, Debug)]
+pub struct RemoveSkillArgs {
+    /// Managed skill name
+    pub name: String,
+
+    /// Use project-local scope (.roci/skills) instead of global scope
+    #[arg(long)]
+    pub local: bool,
+}
+
+/// Arguments for `roci-agent skills update`.
+#[derive(Parser, Debug)]
+pub struct UpdateSkillsArgs {
+    /// Optional managed skill name; omit to update all managed skills in scope
+    pub name: Option<String>,
+
+    /// Use project-local scope (.roci/skills) instead of global scope
+    #[arg(long)]
+    pub local: bool,
 }
 
 #[cfg(test)]
@@ -256,5 +311,83 @@ mod tests {
     #[test]
     fn parse_auth_login_missing_provider_is_error() {
         assert!(Cli::try_parse_from(["roci-agent", "auth", "login"]).is_err());
+    }
+
+    #[test]
+    fn parse_skills_install_with_local_scope() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "skills",
+            "install",
+            "https://example.com/repo.git",
+            "--local",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Skills(skills) => match skills.command {
+                SkillsCommands::Install(args) => {
+                    assert_eq!(args.source, "https://example.com/repo.git");
+                    assert!(args.local);
+                }
+                other => panic!("expected Install, got {other:?}"),
+            },
+            other => panic!("expected Skills, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_remove_global_scope_by_default() {
+        let cli = Cli::try_parse_from(["roci-agent", "skills", "remove", "my-skill"]).unwrap();
+        match cli.command {
+            Commands::Skills(skills) => match skills.command {
+                SkillsCommands::Remove(args) => {
+                    assert_eq!(args.name, "my-skill");
+                    assert!(!args.local);
+                }
+                other => panic!("expected Remove, got {other:?}"),
+            },
+            other => panic!("expected Skills, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_update_without_name() {
+        let cli = Cli::try_parse_from(["roci-agent", "skills", "update", "--local"]).unwrap();
+        match cli.command {
+            Commands::Skills(skills) => match skills.command {
+                SkillsCommands::Update(args) => {
+                    assert!(args.name.is_none());
+                    assert!(args.local);
+                }
+                other => panic!("expected Update, got {other:?}"),
+            },
+            other => panic!("expected Skills, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_update_with_name() {
+        let cli = Cli::try_parse_from(["roci-agent", "skills", "update", "alpha"]).unwrap();
+        match cli.command {
+            Commands::Skills(skills) => match skills.command {
+                SkillsCommands::Update(args) => {
+                    assert_eq!(args.name.as_deref(), Some("alpha"));
+                    assert!(!args.local);
+                }
+                other => panic!("expected Update, got {other:?}"),
+            },
+            other => panic!("expected Skills, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_list() {
+        let cli = Cli::try_parse_from(["roci-agent", "skills", "list"]).unwrap();
+        match cli.command {
+            Commands::Skills(skills) => {
+                assert!(matches!(skills.command, SkillsCommands::List));
+            }
+            other => panic!("expected Skills, got {other:?}"),
+        }
     }
 }
