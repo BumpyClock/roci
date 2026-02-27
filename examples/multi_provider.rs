@@ -3,6 +3,7 @@
 use roci::prelude::*;
 
 #[tokio::main]
+#[allow(clippy::result_large_err)]
 async fn main() -> roci::error::Result<()> {
     let models = vec![
         "openai:gpt-4o",

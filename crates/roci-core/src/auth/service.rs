@@ -62,6 +62,8 @@ pub struct AuthService {
     backends: Vec<Arc<dyn AuthBackend>>,
 }
 
+pub type BackendStatus<'a> = (&'a str, &'a str, Result<Option<Token>, AuthError>);
+
 impl AuthService {
     pub fn new(store: Arc<dyn TokenStore>) -> Self {
         Self {
@@ -123,7 +125,7 @@ impl AuthService {
     }
 
     /// List all registered backends and their stored tokens.
-    pub fn all_statuses(&self) -> Vec<(&str, &str, Result<Option<Token>, AuthError>)> {
+    pub fn all_statuses(&self) -> Vec<BackendStatus<'_>> {
         self.backends
             .iter()
             .map(|b| {

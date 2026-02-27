@@ -172,6 +172,7 @@ impl ProviderFactory for EchoFactory {
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
+#[allow(clippy::result_large_err)]
 async fn main() -> roci::error::Result<()> {
     let config = RociConfig::new().with_token_store(None);
 

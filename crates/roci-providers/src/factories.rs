@@ -8,6 +8,7 @@ use roci_core::models::ProviderKey;
 use roci_core::provider::{ModelProvider, ProviderFactory};
 
 /// Resolve an API key from config for the given provider.
+#[allow(clippy::result_large_err)]
 fn require_api_key(
     config: &RociConfig,
     provider: ProviderKey,

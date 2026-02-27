@@ -1,6 +1,6 @@
 //! Frontmatter parsing for markdown-like skill files.
 
-use std::{fs, path::Path, sync::LazyLock};
+use std::{fs, path::Path, sync::OnceLock};
 
 use crate::skills::diagnostics::{SkillDiagnostic, SkillDiagnosticLevel};
 use regex::Regex;
@@ -24,9 +24,13 @@ pub(crate) struct ParsedSkill {
     pub disable_model_invocation: bool,
 }
 
-static SKILL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[a-z0-9-]+$").expect("skill name validation regex must compile")
-});
+static SKILL_NAME_RE: OnceLock<Regex> = OnceLock::new();
+
+fn skill_name_re() -> &'static Regex {
+    SKILL_NAME_RE.get_or_init(|| {
+        Regex::new(r"^[a-z0-9-]+$").expect("skill name validation regex must compile")
+    })
+}
 
 fn warning(path: &Path, message: impl Into<String>) -> SkillDiagnostic {
     SkillDiagnostic {
@@ -59,7 +63,7 @@ fn valid_skill_name(name: &str) -> bool {
         return false;
     }
 
-    if !SKILL_NAME_RE.is_match(name) {
+    if !skill_name_re().is_match(name) {
         return false;
     }
 

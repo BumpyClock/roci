@@ -48,6 +48,7 @@ impl OpenAiResponsesProvider {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn build_headers(&self) -> Result<reqwest::header::HeaderMap, RociError> {
         let mut headers = bearer_headers(&self.api_key);
         if self.is_codex {
@@ -98,6 +99,7 @@ impl OpenAiResponsesProvider {
         Ok(headers)
     }
 
+    #[allow(clippy::result_large_err)]
     fn validate_settings(&self, settings: &GenerationSettings) -> Result<(), RociError> {
         if (settings.temperature.is_some() || settings.top_p.is_some())
             && !self
@@ -482,6 +484,7 @@ impl OpenAiResponsesProvider {
     }
 
     /// Convert a Responses API payload into a provider response.
+    #[allow(clippy::result_large_err)]
     fn parse_response(data: ResponsesApiResponse) -> Result<ProviderResponse, RociError> {
         if let Some(outputs) = data.output {
             let mut text = String::new();
@@ -783,6 +786,7 @@ fn debug_enabled() -> bool {
     ) || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
 }
 
+#[allow(clippy::result_large_err)]
 fn extract_codex_account_id(token: &str) -> Result<String, RociError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;

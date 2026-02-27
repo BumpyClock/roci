@@ -16,8 +16,8 @@ use super::{RunLifecycle, RunRequest, RunResult, Runner};
 mod llm_phase;
 mod tool_phase;
 
-use llm_phase::{run_llm_phase, LlmPhaseOutcome};
-use tool_phase::{run_tool_phase, ToolPhaseOutcome};
+use llm_phase::{run_llm_phase, LlmPhaseArgs, LlmPhaseOutcome};
+use tool_phase::{run_tool_phase, ToolPhaseArgs, ToolPhaseOutcome};
 
 fn canceled_result(
     request: &RunRequest,
@@ -223,18 +223,18 @@ impl Runner for LoopRunner {
                         }
                     }
 
-                    let (iteration_text, tool_calls) = match run_llm_phase(
-                        &request,
-                        provider.as_ref(),
-                        &tool_defs,
-                        &mut messages,
-                        &emitter,
-                        &agent_emitter,
-                        &mut input_rx,
-                        &mut abort_rx,
-                        &run_cancel_token,
+                    let (iteration_text, tool_calls) = match run_llm_phase(LlmPhaseArgs {
+                        request: &request,
+                        provider: provider.as_ref(),
+                        tool_defs: &tool_defs,
+                        messages: &mut messages,
+                        emitter: &emitter,
+                        agent_emitter: &agent_emitter,
+                        input_rx: &mut input_rx,
+                        abort_rx: &mut abort_rx,
+                        run_cancel_token: &run_cancel_token,
                         iteration,
-                    )
+                    })
                     .await
                     {
                         LlmPhaseOutcome::Ready {
@@ -262,19 +262,19 @@ impl Runner for LoopRunner {
                         }
                     };
 
-                    match run_tool_phase(
-                        &request,
+                    match run_tool_phase(ToolPhaseArgs {
+                        request: &request,
                         limits,
-                        &mut messages,
-                        &emitter,
-                        &agent_emitter,
-                        &mut abort_rx,
-                        &run_cancel_token,
+                        messages: &mut messages,
+                        emitter: &emitter,
+                        agent_emitter: &agent_emitter,
+                        abort_rx: &mut abort_rx,
+                        run_cancel_token: &run_cancel_token,
                         turn_index,
-                        &tool_calls,
+                        tool_calls: &tool_calls,
                         iteration_text,
-                        &mut consecutive_failed_iterations,
-                    )
+                        consecutive_failed_iterations: &mut consecutive_failed_iterations,
+                    })
                     .await
                     {
                         ToolPhaseOutcome::ContinueInner => continue 'inner,

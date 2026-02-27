@@ -22,19 +22,35 @@ pub(super) enum ToolPhaseOutcome {
     Failed(String),
 }
 
-pub(super) async fn run_tool_phase(
-    request: &RunRequest,
-    limits: RunnerLimits,
-    messages: &mut Vec<ModelMessage>,
-    emitter: &RunEventEmitter,
-    agent_emitter: &AgentEventEmitter,
-    abort_rx: &mut oneshot::Receiver<()>,
-    run_cancel_token: &CancellationToken,
-    turn_index: usize,
-    tool_calls: &[AgentToolCall],
-    iteration_text: String,
-    consecutive_failed_iterations: &mut usize,
-) -> ToolPhaseOutcome {
+pub(super) struct ToolPhaseArgs<'a> {
+    pub(super) request: &'a RunRequest,
+    pub(super) limits: RunnerLimits,
+    pub(super) messages: &'a mut Vec<ModelMessage>,
+    pub(super) emitter: &'a RunEventEmitter,
+    pub(super) agent_emitter: &'a AgentEventEmitter,
+    pub(super) abort_rx: &'a mut oneshot::Receiver<()>,
+    pub(super) run_cancel_token: &'a CancellationToken,
+    pub(super) turn_index: usize,
+    pub(super) tool_calls: &'a [AgentToolCall],
+    pub(super) iteration_text: String,
+    pub(super) consecutive_failed_iterations: &'a mut usize,
+}
+
+pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome {
+    let ToolPhaseArgs {
+        request,
+        limits,
+        messages,
+        emitter,
+        agent_emitter,
+        abort_rx,
+        run_cancel_token,
+        turn_index,
+        tool_calls,
+        iteration_text,
+        consecutive_failed_iterations,
+    } = args;
+
     if tool_calls.is_empty() {
         agent_emitter.emit(AgentEvent::TurnEnd {
             run_id: request.run_id,

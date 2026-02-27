@@ -5,6 +5,7 @@ use std::sync::Arc;
 use roci::prelude::*;
 
 #[tokio::main]
+#[allow(clippy::result_large_err)]
 async fn main() -> roci::error::Result<()> {
     let model: LanguageModel = "openai:gpt-4o".parse()?;
     let registry = Arc::new(roci::default_registry());

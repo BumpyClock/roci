@@ -23,18 +23,33 @@ pub(super) enum LlmPhaseOutcome {
     Failed(String),
 }
 
-pub(super) async fn run_llm_phase(
-    request: &RunRequest,
-    provider: &dyn provider::ModelProvider,
-    tool_defs: &Option<Vec<ToolDefinition>>,
-    messages: &mut Vec<ModelMessage>,
-    emitter: &RunEventEmitter,
-    agent_emitter: &AgentEventEmitter,
-    input_rx: &mut mpsc::UnboundedReceiver<ModelMessage>,
-    abort_rx: &mut oneshot::Receiver<()>,
-    run_cancel_token: &CancellationToken,
-    iteration: usize,
-) -> LlmPhaseOutcome {
+pub(super) struct LlmPhaseArgs<'a> {
+    pub(super) request: &'a RunRequest,
+    pub(super) provider: &'a dyn provider::ModelProvider,
+    pub(super) tool_defs: &'a Option<Vec<ToolDefinition>>,
+    pub(super) messages: &'a mut Vec<ModelMessage>,
+    pub(super) emitter: &'a RunEventEmitter,
+    pub(super) agent_emitter: &'a AgentEventEmitter,
+    pub(super) input_rx: &'a mut mpsc::UnboundedReceiver<ModelMessage>,
+    pub(super) abort_rx: &'a mut oneshot::Receiver<()>,
+    pub(super) run_cancel_token: &'a CancellationToken,
+    pub(super) iteration: usize,
+}
+
+pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
+    let LlmPhaseArgs {
+        request,
+        provider,
+        tool_defs,
+        messages,
+        emitter,
+        agent_emitter,
+        input_rx,
+        abort_rx,
+        run_cancel_token,
+        iteration,
+    } = args;
+
     while let Ok(message) = input_rx.try_recv() {
         emit_message_lifecycle(agent_emitter, &message);
         messages.push(message);
