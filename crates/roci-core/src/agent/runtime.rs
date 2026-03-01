@@ -520,7 +520,6 @@ impl AgentRuntime {
         self.broadcast_snapshot().await;
         self.idle_notify.notify_waiters();
     }
-
 }
 
 #[cfg(test)]
