@@ -13,25 +13,32 @@
 //! - Fine-grained queue controls (`clear_*_queue`, `clear_all_queues`, `has_queued_messages`)
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+mod config;
+mod types;
+
+pub use self::config::AgentConfig;
+use self::types::drain_queue;
+pub use self::types::{
+    AgentSnapshot, AgentState, GetApiKeyFn, QueueDrainMode, SessionBeforeCompactHook,
+    SessionBeforeCompactPayload, SessionBeforeTreeHook, SessionBeforeTreePayload,
+    SessionCompactionOverride, SessionSummaryHookOutcome, SummaryPreparationData,
+};
+
 use crate::agent::message::{AgentMessage, AgentMessageExt};
 use crate::agent_loop::runner::{
-    AgentEventSink, AutoCompactionConfig, BeforeAgentStartHook, BeforeAgentStartHookPayload,
-    BeforeAgentStartHookResult, CompactionHandler, ConvertToLlmFn, FollowUpMessagesFn,
-    PostToolUseHook, PreToolUseHook, RetryBackoffPolicy, RunHooks, SteeringMessagesFn,
-    TransformContextFn,
+    AgentEventSink, AutoCompactionConfig, BeforeAgentStartHookPayload, BeforeAgentStartHookResult,
+    CompactionHandler, FollowUpMessagesFn, RunHooks, SteeringMessagesFn,
 };
 use crate::agent_loop::{
     compaction::{
         estimate_message_tokens, extract_cumulative_file_operations, extract_file_operations,
         prepare_compaction, select_messages_with_token_budget_newest_first,
-        serialize_messages_for_summary, serialize_pi_mono_summary, FileOperationSet, PiMonoSummary,
+        serialize_messages_for_summary, serialize_pi_mono_summary, PiMonoSummary,
         PreparedCompaction,
     },
     AgentEvent, LoopRunner, RunHandle, RunRequest, RunResult, RunStatus, Runner,
@@ -39,254 +46,11 @@ use crate::agent_loop::{
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
-use crate::provider::{ProviderPayloadCallback, ProviderRegistry, ProviderRequest};
+use crate::provider::{ProviderRegistry, ProviderRequest};
 use crate::resource::{BranchSummarySettings, CompactionSettings};
 use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::types::{GenerationSettings, ModelMessage, Role};
-
-/// Agent runtime state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentState {
-    /// No run in progress; ready to accept prompts.
-    Idle,
-    /// A run is actively executing.
-    Running,
-    /// An abort has been requested; waiting for the run to wind down.
-    Aborting,
-}
-
-/// Queue drain behavior for steering/follow-up messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueueDrainMode {
-    /// Drain all queued messages at once.
-    All,
-    /// Drain at most one message per turn/phase.
-    OneAtATime,
-}
-
-fn drain_queue(queue: &mut Vec<ModelMessage>, mode: QueueDrainMode) -> Vec<ModelMessage> {
-    match mode {
-        QueueDrainMode::All => std::mem::take(queue),
-        QueueDrainMode::OneAtATime => {
-            if queue.is_empty() {
-                Vec::new()
-            } else {
-                vec![queue.remove(0)]
-            }
-        }
-    }
-}
-
-/// Point-in-time snapshot of agent observable state.
-///
-/// Captures all externally observable dimensions of an [`AgentRuntime`] at a
-/// single instant. Subscribe to changes via [`AgentRuntime::watch_snapshot`].
-///
-/// # Example
-///
-/// ```ignore
-/// let snap = agent.snapshot().await;
-/// println!("turn {}, {} messages", snap.turn_index, snap.message_count);
-/// ```
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentSnapshot {
-    pub state: AgentState,
-    pub turn_index: usize,
-    pub message_count: usize,
-    pub is_streaming: bool,
-    pub last_error: Option<String>,
-}
-
-/// Async callback that resolves an API key at request time.
-///
-/// Enables token rotation and dynamic key resolution without rebuilding the
-/// agent. The callback is invoked once per run, before the [`RunRequest`] is
-/// dispatched to the inner loop.
-///
-/// # Example
-///
-/// ```ignore
-/// let get_key: GetApiKeyFn = Arc::new(|| {
-///     Box::pin(async { Ok("sk-live-rotated-key".to_string()) })
-/// });
-/// ```
-pub type GetApiKeyFn =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, RociError>> + Send>> + Send + Sync>;
-
-/// Outcome returned by pre-summary session hooks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionSummaryHookOutcome {
-    /// Continue with normal summary generation.
-    Continue,
-    /// Skip summary generation for this operation.
-    Cancel,
-    /// Use the provided summary text instead of model-generated text.
-    OverrideSummary(String),
-    /// Override compaction summary and kept-boundary metadata.
-    OverrideCompaction(SessionCompactionOverride),
-}
-
-/// Full compaction override returned by `session_before_compact`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionCompactionOverride {
-    pub summary: String,
-    pub first_kept_entry_id: usize,
-    pub tokens_before: usize,
-    pub details: Option<String>,
-}
-
-/// Prepared summary input data exposed to session hooks.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SummaryPreparationData {
-    pub messages: Vec<ModelMessage>,
-    pub token_count: usize,
-    pub file_operations: FileOperationSet,
-}
-
-impl SummaryPreparationData {
-    fn from_messages(messages: Vec<ModelMessage>) -> Self {
-        let token_count = messages.iter().map(estimate_message_tokens).sum::<usize>();
-        let file_operations = extract_file_operations(&messages);
-        Self {
-            messages,
-            token_count,
-            file_operations,
-        }
-    }
-}
-
-/// Payload for the `session_before_compact` lifecycle hook.
-#[derive(Debug, Clone)]
-pub struct SessionBeforeCompactPayload {
-    pub to_summarize: SummaryPreparationData,
-    pub turn_prefix: SummaryPreparationData,
-    pub kept: SummaryPreparationData,
-    pub split_turn: bool,
-    pub settings: CompactionSettings,
-    pub cancellation_token: CancellationToken,
-}
-
-impl SessionBeforeCompactPayload {
-    fn from_prepared(
-        prepared: &PreparedCompaction,
-        settings: CompactionSettings,
-        cancellation_token: CancellationToken,
-    ) -> Self {
-        Self {
-            to_summarize: SummaryPreparationData::from_messages(
-                prepared.messages_to_summarize.clone(),
-            ),
-            turn_prefix: SummaryPreparationData::from_messages(
-                prepared.turn_prefix_messages.clone(),
-            ),
-            kept: SummaryPreparationData::from_messages(prepared.kept_messages.clone()),
-            split_turn: prepared.split_turn,
-            settings,
-            cancellation_token,
-        }
-    }
-}
-
-/// Payload for the `session_before_tree` lifecycle hook.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SessionBeforeTreePayload {
-    pub to_summarize: SummaryPreparationData,
-    pub settings: BranchSummarySettings,
-}
-
-/// Async hook interface for `session_before_compact`.
-pub type SessionBeforeCompactHook = Arc<
-    dyn Fn(
-            SessionBeforeCompactPayload,
-        )
-            -> Pin<Box<dyn Future<Output = Result<SessionSummaryHookOutcome, RociError>> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Async hook interface for `session_before_tree`.
-pub type SessionBeforeTreeHook = Arc<
-    dyn Fn(
-            SessionBeforeTreePayload,
-        )
-            -> Pin<Box<dyn Future<Output = Result<SessionSummaryHookOutcome, RociError>> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Configuration for creating an [`AgentRuntime`].
-///
-/// # API key resolution
-///
-/// By default, the agent resolves API keys automatically through the
-/// [`RociConfig`] passed to [`AgentRuntime::new`]. `RociConfig` checks
-/// (in order): environment variables → `credentials.json` → OAuth token
-/// store (from `roci auth login`).
-///
-/// Set [`get_api_key`](Self::get_api_key) only when you need per-request
-/// dynamic keys (e.g., token rotation or multi-tenant key injection).
-pub struct AgentConfig {
-    /// The language model to use for generation.
-    pub model: LanguageModel,
-    /// Optional system prompt prepended to the first turn.
-    pub system_prompt: Option<String>,
-    /// Tools available for tool-use loops.
-    pub tools: Vec<Arc<dyn Tool>>,
-    /// Dynamic tool providers queried at run start.
-    pub dynamic_tool_providers: Vec<Arc<dyn DynamicToolProvider>>,
-    /// Generation settings (temperature, max_tokens, etc.).
-    pub settings: GenerationSettings,
-    /// Optional hook to transform the message context before each LLM call.
-    pub transform_context: Option<TransformContextFn>,
-    /// Optional hook to convert/filter agent-level messages before provider requests.
-    pub convert_to_llm: Option<ConvertToLlmFn>,
-    /// Optional lifecycle hook called before starting the runner.
-    pub before_agent_start: Option<BeforeAgentStartHook>,
-    /// Optional sink for high-level [`AgentEvent`](crate::agent_loop::AgentEvent) emission.
-    pub event_sink: Option<AgentEventSink>,
-    /// Optional session ID for provider-side prompt caching.
-    pub session_id: Option<String>,
-    /// Drain mode for steering queue retrieval.
-    pub steering_mode: QueueDrainMode,
-    /// Drain mode for follow-up queue retrieval.
-    pub follow_up_mode: QueueDrainMode,
-    /// Optional provider transport preference.
-    pub transport: Option<String>,
-    /// Optional cap for server-requested retry delays in milliseconds.
-    /// `Some(0)` disables the cap.
-    pub max_retry_delay_ms: Option<u64>,
-    /// Retry/backoff policy for transient provider failures.
-    pub retry_backoff: RetryBackoffPolicy,
-    /// Optional per-run provider API key override.
-    pub api_key_override: Option<String>,
-    /// Optional per-run provider header overrides.
-    pub provider_headers: reqwest::header::HeaderMap,
-    /// Optional per-run provider metadata.
-    pub provider_metadata: HashMap<String, String>,
-    /// Optional callback for inspecting provider request payloads.
-    pub provider_payload_callback: Option<ProviderPayloadCallback>,
-    /// Optional async callback to resolve an API key per run.
-    ///
-    /// Precedence is: request override -> provider/config key -> this callback.
-    ///
-    /// When `None` (the default), the agent resolves keys automatically
-    /// through [`RociConfig`] which checks: environment variables →
-    /// `credentials.json` → OAuth token store (from `roci auth login`).
-    /// No explicit key configuration is needed if any of those sources
-    /// has a valid credential for the provider.
-    pub get_api_key: Option<GetApiKeyFn>,
-    /// Compaction policy and summarization model selection.
-    pub compaction: CompactionSettings,
-    /// Optional lifecycle hook for `session_before_compact`.
-    pub session_before_compact: Option<SessionBeforeCompactHook>,
-    /// Optional lifecycle hook for `session_before_tree`.
-    pub session_before_tree: Option<SessionBeforeTreeHook>,
-    /// Optional hook called before each tool execution.
-    pub pre_tool_use: Option<PreToolUseHook>,
-    /// Optional hook called after each tool execution (including synthetic errors).
-    pub post_tool_use: Option<PostToolUseHook>,
-}
 
 /// High-level agent runtime wrapping [`LoopRunner`].
 ///
