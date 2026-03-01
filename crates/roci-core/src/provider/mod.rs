@@ -9,6 +9,8 @@ pub mod schema;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::RociError;
 use crate::models::capabilities::ModelCapabilities;
@@ -24,14 +26,24 @@ pub use sanitize::sanitize_messages_for_provider;
 pub const TRANSPORT_DIRECT: &str = "direct";
 pub const TRANSPORT_PROXY: &str = "proxy";
 pub const SUPPORTED_TRANSPORTS: [&str; 2] = [TRANSPORT_DIRECT, TRANSPORT_PROXY];
+/// Callback invoked with provider request payloads before transport send.
+pub type ProviderPayloadCallback = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 
 /// A request sent to a model provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderRequest {
     pub messages: Vec<ModelMessage>,
     pub settings: GenerationSettings,
     pub tools: Option<Vec<ToolDefinition>>,
     pub response_format: Option<crate::types::generation::ResponseFormat>,
+    /// Optional per-request API key override.
+    pub api_key_override: Option<String>,
+    /// Optional per-request HTTP header overrides.
+    pub headers: reqwest::header::HeaderMap,
+    /// Optional per-request metadata passed through to provider adapters.
+    pub metadata: HashMap<String, String>,
+    /// Optional callback to inspect serialized provider request payloads.
+    pub payload_callback: Option<ProviderPayloadCallback>,
     /// Optional session ID for provider-side prompt caching and session affinity.
     pub session_id: Option<String>,
     /// Optional transport preference supplied by runtime/loop orchestration.
@@ -39,6 +51,26 @@ pub struct ProviderRequest {
     /// Supported values are `"direct"` and `"proxy"`.
     /// Unsupported values are rejected by the runner before provider execution.
     pub transport: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRequest")
+            .field("messages", &self.messages)
+            .field("settings", &self.settings)
+            .field("tools", &self.tools)
+            .field("response_format", &self.response_format)
+            .field("api_key_override", &self.api_key_override)
+            .field("headers", &self.headers)
+            .field("metadata", &self.metadata)
+            .field(
+                "payload_callback",
+                &self.payload_callback.as_ref().map(|_| "<callback>"),
+            )
+            .field("session_id", &self.session_id)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 pub fn validate_transport_preference(transport: Option<&str>) -> Result<(), RociError> {

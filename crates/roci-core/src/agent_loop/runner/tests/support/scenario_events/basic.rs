@@ -1,6 +1,20 @@
 use super::super::ProviderScenario;
 use crate::error::RociError;
+use crate::error::{ErrorCode, ErrorDetails};
 use crate::types::{AgentToolCall, StreamEventType, TextStreamDelta, Usage};
+
+fn typed_overflow_error() -> RociError {
+    RociError::api_with_details(
+        400,
+        "context length exceeded",
+        ErrorDetails {
+            code: Some(ErrorCode::ContextLengthExceeded),
+            provider_code: Some("context_length_exceeded".to_string()),
+            param: None,
+            request_id: None,
+        },
+    )
+}
 
 pub(super) fn events_for_scenario(
     scenario: ProviderScenario,
@@ -121,6 +135,41 @@ pub(super) fn events_for_scenario(
         ProviderScenario::RateLimitedWithoutRetryHint => Err(RociError::RateLimited {
             retry_after_ms: None,
         }),
+        ProviderScenario::RetryableTimeoutThenComplete => {
+            if call_index == 0 {
+                return Err(RociError::Timeout(10));
+            }
+            Ok(vec![Ok(TextStreamDelta {
+                text: "done".to_string(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            })])
+        }
+        ProviderScenario::RetryableTimeoutExhausted => Err(RociError::Timeout(10)),
+        ProviderScenario::ContextOverflowThenComplete => {
+            if call_index == 0 {
+                return Err(typed_overflow_error());
+            }
+            Ok(vec![Ok(TextStreamDelta {
+                text: "done".to_string(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            })])
+        }
+        ProviderScenario::ContextOverflowAlways => Err(typed_overflow_error()),
+        ProviderScenario::UntypedOverflowError => {
+            Err(RociError::api(400, "context length exceeded"))
+        }
         _ => unreachable!(),
     }
 }

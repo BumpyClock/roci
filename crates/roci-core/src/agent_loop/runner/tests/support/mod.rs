@@ -3,8 +3,10 @@ use super::*;
 use crate::models::ModelCapabilities;
 use crate::provider::{ModelProvider, ProviderRequest, ProviderResponse};
 use crate::types::TextStreamDelta;
+use crate::types::{StreamEventType, Usage};
 use futures::stream::{self, BoxStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::time::Duration;
 
 mod scenario_events;
 
@@ -16,6 +18,11 @@ pub(super) enum ProviderScenario {
     RateLimitedThenComplete,
     RateLimitedExceedsCap,
     RateLimitedWithoutRetryHint,
+    RetryableTimeoutThenComplete,
+    RetryableTimeoutExhausted,
+    ContextOverflowThenComplete,
+    ContextOverflowAlways,
+    UntypedOverflowError,
     ParallelSafeBatchThenComplete,
     MutatingBatchThenComplete,
     MixedTextAndParallelBatchThenComplete,
@@ -28,6 +35,8 @@ pub(super) enum ProviderScenario {
     SchemaToolValidArgs,
     /// Tool call for "schema_tool" with type-mismatched args on call 0, then text "done" on call 1+.
     SchemaToolTypeMismatch,
+    /// Emits partial assistant text then idles; used to exercise run abort path.
+    PartialTextThenIdle,
 }
 
 struct StubProvider {
@@ -83,6 +92,43 @@ impl ModelProvider for StubProvider {
             .expect("request lock")
             .push(request.clone());
         let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.scenario, ProviderScenario::PartialTextThenIdle) {
+            let stream = futures::stream::unfold(0u8, |state| async move {
+                match state {
+                    0 => Some((
+                        Ok(TextStreamDelta {
+                            text: "partial".to_string(),
+                            event_type: StreamEventType::TextDelta,
+                            tool_call: None,
+                            finish_reason: None,
+                            usage: None,
+                            reasoning: None,
+                            reasoning_signature: None,
+                            reasoning_type: None,
+                        }),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        Some((
+                            Ok(TextStreamDelta {
+                                text: String::new(),
+                                event_type: StreamEventType::Done,
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: Some(Usage::default()),
+                                reasoning: None,
+                                reasoning_signature: None,
+                                reasoning_type: None,
+                            }),
+                            2,
+                        ))
+                    }
+                    _ => None,
+                }
+            });
+            return Ok(Box::pin(stream));
+        }
         let events = scenario_events::events_for_scenario(self.scenario, call_index)?;
         Ok(Box::pin(stream::iter(events)))
     }

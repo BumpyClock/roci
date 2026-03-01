@@ -4,11 +4,13 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
+use std::sync::{Mutex, OnceLock};
 use tracing::debug;
 
 use crate::models::openai::OpenAiModel;
-use roci_core::error::RociError;
+use roci_core::error::{ErrorCode, ErrorDetails, RociError};
 use roci_core::models::capabilities::ModelCapabilities;
 use roci_core::types::*;
 
@@ -18,6 +20,10 @@ use roci_core::provider::{ModelProvider, ProviderRequest, ProviderResponse};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Homie, a helpful assistant.";
+const RESPONSES_PROXY_BASE_URL_ENV: &str = "ROCI_OPENAI_RESPONSES_PROXY_BASE_URL";
+const METADATA_SESSION_KEY: &str = "roci_session_id";
+
+static SESSION_RESPONSE_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 pub struct OpenAiResponsesProvider {
     model: OpenAiModel,
@@ -49,10 +55,53 @@ impl OpenAiResponsesProvider {
     }
 
     #[allow(clippy::result_large_err)]
-    fn build_headers(&self) -> Result<reqwest::header::HeaderMap, RociError> {
-        let mut headers = bearer_headers(&self.api_key);
+    fn session_cache() -> &'static Mutex<HashMap<String, String>> {
+        SESSION_RESPONSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn session_cache_key(&self, request: &ProviderRequest) -> Option<String> {
+        request
+            .session_id
+            .as_ref()
+            .map(|session_id| format!("{}:{}:{session_id}", self.base_url, self.model.as_str()))
+    }
+
+    fn read_cached_previous_response_id(&self, request: &ProviderRequest) -> Option<String> {
+        let key = self.session_cache_key(request)?;
+        Self::session_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).cloned())
+    }
+
+    fn cache_response_id_for_session(&self, request: &ProviderRequest, response_id: Option<&str>) {
+        let Some(response_id) = response_id else {
+            return;
+        };
+        let Some(cache_key) = self.session_cache_key(request) else {
+            return;
+        };
+        if let Ok(mut cache) = Self::session_cache().lock() {
+            cache.insert(cache_key, response_id.to_string());
+        }
+    }
+
+    fn resolved_api_key<'a>(&'a self, request: &'a ProviderRequest) -> &'a str {
+        request
+            .api_key_override
+            .as_deref()
+            .unwrap_or(self.api_key.as_str())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn build_headers(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<reqwest::header::HeaderMap, RociError> {
+        let resolved_api_key = self.resolved_api_key(request);
+        let mut headers = bearer_headers(resolved_api_key);
         if self.is_codex {
-            let account_id = match (&self.account_id, extract_codex_account_id(&self.api_key)) {
+            let account_id = match (&self.account_id, extract_codex_account_id(resolved_api_key)) {
                 (Some(id), _) => Some(id.clone()),
                 (None, Ok(id)) => Some(id),
                 (None, Err(err)) => {
@@ -87,11 +136,21 @@ impl OpenAiResponsesProvider {
                 headers.insert("ChatGPT-Account-ID", value);
             }
         }
+        if let Some(ref transport) = request.transport {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(transport) {
+                headers.insert("x-roci-transport", value);
+            }
+        }
+        for (name, value) in request.headers.iter() {
+            headers.insert(name, value.clone());
+        }
         if debug_enabled() {
             tracing::debug!(
                 model = self.model.as_str(),
                 base_url = %self.base_url,
                 account_id_present = self.account_id.is_some(),
+                api_key_overridden = request.api_key_override.is_some(),
+                request_header_overrides = request.headers.len(),
                 codex_headers = self.is_codex,
                 "OpenAI Responses headers prepared"
             );
@@ -118,6 +177,57 @@ impl OpenAiResponsesProvider {
             )));
         }
         Ok(())
+    }
+
+    fn resolve_previous_response_id(&self, request: &ProviderRequest) -> Option<String> {
+        request
+            .settings
+            .openai_responses
+            .as_ref()
+            .and_then(|options| options.previous_response_id.clone())
+            .or_else(|| self.read_cached_previous_response_id(request))
+    }
+
+    fn merged_metadata(&self, request: &ProviderRequest) -> Option<HashMap<String, String>> {
+        let mut metadata = request
+            .settings
+            .openai_responses
+            .as_ref()
+            .and_then(|options| options.metadata.clone())
+            .unwrap_or_default();
+
+        for (key, value) in &request.metadata {
+            metadata.insert(key.clone(), value.clone());
+        }
+
+        if let Some(session_id) = request.session_id.as_ref() {
+            metadata
+                .entry(METADATA_SESSION_KEY.to_string())
+                .or_insert_with(|| session_id.clone());
+        }
+
+        if metadata.is_empty() {
+            None
+        } else {
+            Some(metadata)
+        }
+    }
+
+    fn responses_url(&self, request: &ProviderRequest) -> String {
+        let base_url = match request.transport.as_deref() {
+            Some(roci_core::provider::TRANSPORT_PROXY) => env::var(RESPONSES_PROXY_BASE_URL_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| self.base_url.clone()),
+            _ => self.base_url.clone(),
+        };
+        format!("{}/responses", base_url.trim_end_matches('/'))
+    }
+
+    fn emit_payload_callback(&self, request: &ProviderRequest, body: &serde_json::Value) {
+        if let Some(callback) = request.payload_callback.as_ref() {
+            callback(body.clone());
+        }
     }
 
     fn build_request_body(&self, request: &ProviderRequest, stream: bool) -> serde_json::Value {
@@ -218,17 +328,8 @@ impl OpenAiResponsesProvider {
             if let Some(parallel_tool_calls) = options.parallel_tool_calls {
                 obj.insert("parallel_tool_calls".into(), parallel_tool_calls.into());
             }
-            if let Some(ref previous_response_id) = options.previous_response_id {
-                obj.insert(
-                    "previous_response_id".into(),
-                    previous_response_id.clone().into(),
-                );
-            }
             if let Some(ref instructions) = options.instructions {
                 obj.insert("instructions".into(), instructions.clone().into());
-            }
-            if let Some(ref metadata) = options.metadata {
-                obj.insert("metadata".into(), serde_json::json!(metadata));
             }
             if let Some(service_tier) = options.service_tier {
                 obj.insert("service_tier".into(), service_tier.to_string().into());
@@ -239,6 +340,12 @@ impl OpenAiResponsesProvider {
             if let Some(store) = options.store {
                 obj.insert("store".into(), store.into());
             }
+        }
+        if let Some(previous_response_id) = self.resolve_previous_response_id(request) {
+            obj.insert("previous_response_id".into(), previous_response_id.into());
+        }
+        if let Some(metadata) = self.merged_metadata(request) {
+            obj.insert("metadata".into(), serde_json::json!(metadata));
         }
         if obj.get("truncation").is_none() && self.model.is_reasoning() {
             obj.insert(
@@ -341,15 +448,6 @@ impl OpenAiResponsesProvider {
             if let Some(parallel_tool_calls) = options.parallel_tool_calls {
                 obj.insert("parallel_tool_calls".into(), parallel_tool_calls.into());
             }
-            if let Some(ref previous_response_id) = options.previous_response_id {
-                obj.insert(
-                    "previous_response_id".into(),
-                    previous_response_id.clone().into(),
-                );
-            }
-            if let Some(ref metadata) = options.metadata {
-                obj.insert("metadata".into(), serde_json::json!(metadata));
-            }
             if let Some(service_tier) = options.service_tier {
                 obj.insert("service_tier".into(), service_tier.to_string().into());
             }
@@ -359,6 +457,12 @@ impl OpenAiResponsesProvider {
             if let Some(store) = options.store {
                 obj.insert("store".into(), store.into());
             }
+        }
+        if let Some(previous_response_id) = self.resolve_previous_response_id(request) {
+            obj.insert("previous_response_id".into(), previous_response_id.into());
+        }
+        if let Some(metadata) = self.merged_metadata(request) {
+            obj.insert("metadata".into(), serde_json::json!(metadata));
         }
         if obj.get("truncation").is_none() && self.model.is_reasoning() {
             obj.insert(
@@ -811,6 +915,64 @@ fn extract_codex_account_id(token: &str) -> Result<String, RociError> {
     Ok(account_id.to_string())
 }
 
+fn map_openai_error_code(code: &str) -> ErrorCode {
+    match code {
+        "invalid_api_key" => ErrorCode::InvalidApiKey,
+        "insufficient_quota" => ErrorCode::InsufficientQuota,
+        "rate_limit_exceeded" => ErrorCode::RateLimitExceeded,
+        "model_not_found" => ErrorCode::ModelNotFound,
+        "invalid_request_error" => ErrorCode::InvalidRequest,
+        "context_length_exceeded" => ErrorCode::ContextLengthExceeded,
+        "content_filter" => ErrorCode::ContentFiltered,
+        "server_error" => ErrorCode::ServerError,
+        "service_unavailable" => ErrorCode::ServiceUnavailable,
+        "timeout" => ErrorCode::Timeout,
+        _ => ErrorCode::Unknown,
+    }
+}
+
+fn parse_openai_error_details(body: &str) -> Option<(String, ErrorDetails)> {
+    let payload = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let error = payload.get("error")?;
+    let provider_code = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let code = provider_code.as_deref().map(map_openai_error_code);
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(body)
+        .to_string();
+    let param = error
+        .get("param")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let request_id = payload
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Some((
+        message,
+        ErrorDetails {
+            code,
+            provider_code,
+            param,
+            request_id,
+        },
+    ))
+}
+
+fn status_to_openai_error(status: u16, body: &str) -> RociError {
+    if status == 429 {
+        return roci_core::provider::http::status_to_error(status, body);
+    }
+    if let Some((message, details)) = parse_openai_error_details(body) {
+        return RociError::api_with_details(status, message, details);
+    }
+    roci_core::provider::http::status_to_error(status, body)
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiResponsesProvider {
     fn provider_name(&self) -> &str {
@@ -831,7 +993,8 @@ impl ModelProvider for OpenAiResponsesProvider {
     ) -> Result<ProviderResponse, RociError> {
         self.validate_settings(&request.settings)?;
         let body = self.build_request_body(request, false);
-        let url = format!("{}/responses", self.base_url);
+        self.emit_payload_callback(request, &body);
+        let url = self.responses_url(request);
 
         debug!(
             model = self.model.as_str(),
@@ -840,7 +1003,7 @@ impl ModelProvider for OpenAiResponsesProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(self.build_headers()?)
+            .headers(self.build_headers(request)?)
             .json(&body)
             .send()
             .await?;
@@ -848,12 +1011,16 @@ impl ModelProvider for OpenAiResponsesProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(
-                status, &body_text,
-            ));
+            return Err(status_to_openai_error(status, &body_text));
         }
 
-        let data: ResponsesApiResponse = resp.json().await?;
+        let payload: serde_json::Value = resp.json().await?;
+        let response_id = payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let data: ResponsesApiResponse = serde_json::from_value(payload)?;
+        self.cache_response_id_for_session(request, response_id.as_deref());
         Self::parse_response(data)
     }
 
@@ -863,13 +1030,15 @@ impl ModelProvider for OpenAiResponsesProvider {
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         self.validate_settings(&request.settings)?;
         let body = self.build_request_body(request, true);
-        let url = format!("{}/responses", self.base_url);
+        self.emit_payload_callback(request, &body);
+        let url = self.responses_url(request);
+        let session_cache_key = self.session_cache_key(request);
 
         debug!(model = self.model.as_str(), "OpenAI Responses stream_text");
 
         let resp = shared_client()
             .post(&url)
-            .headers(self.build_headers()?)
+            .headers(self.build_headers(request)?)
             .json(&body)
             .send()
             .await?;
@@ -877,9 +1046,7 @@ impl ModelProvider for OpenAiResponsesProvider {
         let status = resp.status().as_u16();
         if status != 200 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(roci_core::provider::http::status_to_error(
-                status, &body_text,
-            ));
+            return Err(status_to_openai_error(status, &body_text));
         }
 
         let byte_stream = resp.bytes_stream();
@@ -892,6 +1059,7 @@ impl ModelProvider for OpenAiResponsesProvider {
             let mut pending_data: Vec<String> = Vec::new();
             let mut saw_done = false;
             let mut debug_event_count = 0usize;
+            let session_cache_key = session_cache_key;
             futures::pin_mut!(byte_stream);
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -1100,6 +1268,16 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             yield Err(RociError::api(400, message));
                                             saw_done = true;
                                             break;
+                                        }
+                                        if let (Some(cache_key), Some(response_id)) = (
+                                            session_cache_key.as_deref(),
+                                            event.get("response")
+                                                .and_then(|r| r.get("id"))
+                                                .and_then(|v| v.as_str()),
+                                        ) {
+                                            if let Ok(mut cache) = OpenAiResponsesProvider::session_cache().lock() {
+                                                cache.insert(cache_key.to_string(), response_id.to_string());
+                                            }
                                         }
                                         if let Some(response) = event.get("response") {
                                             if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
@@ -1403,6 +1581,10 @@ mod tests {
             },
             tools: None,
             response_format: Some(ResponseFormat::JsonObject),
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };
@@ -1423,6 +1605,10 @@ mod tests {
             settings: settings(),
             tools: None,
             response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };
@@ -1440,6 +1626,10 @@ mod tests {
             settings: settings(),
             tools: None,
             response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };
@@ -1459,6 +1649,10 @@ mod tests {
             settings: settings(),
             tools: None,
             response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };
@@ -1493,6 +1687,10 @@ mod tests {
             settings,
             tools: None,
             response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };
@@ -1505,6 +1703,154 @@ mod tests {
         assert_eq!(body["service_tier"], "flex");
         assert_eq!(body["truncation"], "auto");
         assert_eq!(body["store"], true);
+    }
+
+    #[test]
+    fn request_body_merges_request_metadata_and_session_cache() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
+        OpenAiResponsesProvider::session_cache()
+            .lock()
+            .expect("session cache lock")
+            .clear();
+
+        let mut options_metadata = std::collections::HashMap::new();
+        options_metadata.insert("tag".to_string(), "settings".to_string());
+        let mut request_metadata = std::collections::HashMap::new();
+        request_metadata.insert("tag".to_string(), "request".to_string());
+        request_metadata.insert("trace_id".to_string(), "trace-1".to_string());
+        let session_id = "session-abc";
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                openai_responses: Some(OpenAiResponsesOptions {
+                    metadata: Some(options_metadata),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: request_metadata,
+            payload_callback: None,
+            session_id: Some(session_id.to_string()),
+            transport: None,
+        };
+        provider.cache_response_id_for_session(&request, Some("resp_cached"));
+
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["previous_response_id"], "resp_cached");
+        assert_eq!(body["metadata"]["tag"], "request");
+        assert_eq!(body["metadata"]["trace_id"], "trace-1");
+        assert_eq!(body["metadata"][METADATA_SESSION_KEY], session_id);
+    }
+
+    #[test]
+    fn headers_merge_request_overrides_and_api_key_override() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "base-key".to_string(), None, None);
+        let mut request_headers = reqwest::header::HeaderMap::new();
+        request_headers.insert(
+            "x-request-header",
+            reqwest::header::HeaderValue::from_static("value"),
+        );
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: Some("override-key".to_string()),
+            headers: request_headers,
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: Some(roci_core::provider::TRANSPORT_PROXY.to_string()),
+        };
+
+        let headers = provider
+            .build_headers(&request)
+            .expect("headers should build");
+        assert_eq!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer override-key")
+        );
+        assert_eq!(
+            headers
+                .get("x-request-header")
+                .and_then(|value| value.to_str().ok()),
+            Some("value")
+        );
+        assert_eq!(
+            headers
+                .get("x-roci-transport")
+                .and_then(|value| value.to_str().ok()),
+            Some(roci_core::provider::TRANSPORT_PROXY)
+        );
+    }
+
+    #[test]
+    fn payload_callback_receives_request_payload() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
+        let captured_model = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_model_for_hook = captured_model.clone();
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: Some(std::sync::Arc::new(move |payload| {
+                *captured_model_for_hook.lock().expect("capture lock") = payload
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            })),
+            session_id: None,
+            transport: None,
+        };
+        let body = provider.build_request_body(&request, false);
+        provider.emit_payload_callback(&request, &body);
+
+        assert_eq!(
+            captured_model.lock().expect("capture lock").as_deref(),
+            Some("gpt-5-nano")
+        );
+    }
+
+    #[test]
+    fn status_error_maps_context_length_to_typed_code() {
+        let body = serde_json::json!({
+            "error": {
+                "message": "This model's maximum context length is 128000 tokens.",
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+                "param": "input"
+            }
+        })
+        .to_string();
+
+        let error = status_to_openai_error(400, &body);
+        match error {
+            RociError::Api {
+                details: Some(details),
+                ..
+            } => {
+                assert_eq!(details.code, Some(ErrorCode::ContextLengthExceeded));
+                assert_eq!(
+                    details.provider_code.as_deref(),
+                    Some("context_length_exceeded")
+                );
+                assert_eq!(details.param.as_deref(), Some("input"));
+            }
+            other => panic!("expected typed API error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1525,6 +1871,10 @@ mod tests {
                 }),
             }]),
             response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };
@@ -1706,6 +2056,10 @@ mod tests {
             settings: settings(),
             tools: None,
             response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };

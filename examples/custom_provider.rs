@@ -194,6 +194,10 @@ async fn main() -> roci::error::Result<()> {
                 settings: Default::default(),
                 tools: None,
                 response_format: None,
+                api_key_override: None,
+                headers: Default::default(),
+                metadata: Default::default(),
+                payload_callback: None,
                 session_id: None,
                 transport: None,
             })

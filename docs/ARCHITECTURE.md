@@ -136,6 +136,10 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
   - `pre_tool_use` supports continue/block/rewrite-args before tool execution
   - `post_tool_use` can transform tool results (including synthetic error results)
   - legacy `tool_result_persist` has been replaced by `post_tool_use`
+- Core run lifecycle hooks are surfaced through `AgentConfig`:
+  - `before_agent_start` supports continue/cancel/replace-initial-messages before runner startup
+  - `transform_context` runs before `convert_to_llm`, with typed payload and continue/cancel/replace semantics
+  - `convert_to_llm` receives transformed agent messages, with typed payload and continue/cancel/replace semantics
 
 ### `roci-providers` -- Built-in Transports + OAuth
 

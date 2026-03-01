@@ -92,6 +92,18 @@ pub struct ChatArgs {
     #[arg(long, default_value = "true")]
     pub stream: bool,
 
+    /// MCP stdio server spec (repeatable). Format: `key=value` pairs separated by commas.
+    /// Keys: `id`, `label`, `command`, `arg` (repeat for multiple args).
+    /// Example: `--mcp-stdio 'id=local,label=Local Files,command=npx,arg=-y,arg=@modelcontextprotocol/server-filesystem,arg=.'`
+    #[arg(long = "mcp-stdio", value_name = "SPEC")]
+    pub mcp_stdio: Vec<String>,
+
+    /// MCP SSE server spec (repeatable). Format: `key=value` pairs separated by commas.
+    /// Keys: `id`, `label`, `url`, `auth_token`, `header` (`header` value uses `Name:Value`; repeatable).
+    /// Example: `--mcp-sse 'id=remote,label=Remote Docs,url=http://localhost:3000/mcp,header=x-env:dev'`
+    #[arg(long = "mcp-sse", value_name = "SPEC")]
+    pub mcp_sse: Vec<String>,
+
     /// User prompt (positional)
     pub prompt: Option<String>,
 }
@@ -202,6 +214,8 @@ mod tests {
                 assert!(!args.no_skills);
                 assert!(args.max_tokens.is_none());
                 assert!(args.stream);
+                assert!(args.mcp_stdio.is_empty());
+                assert!(args.mcp_sse.is_empty());
                 assert!(args.prompt.is_none());
             }
             other => panic!("expected Chat, got {other:?}"),
@@ -234,6 +248,8 @@ mod tests {
                 assert!(!args.no_skills);
                 assert_eq!(args.max_tokens, Some(1024));
                 assert!(args.stream);
+                assert!(args.mcp_stdio.is_empty());
+                assert!(args.mcp_sse.is_empty());
                 assert_eq!(args.prompt.as_deref(), Some("Hello world"));
             }
             other => panic!("expected Chat, got {other:?}"),
@@ -249,6 +265,8 @@ mod tests {
                 assert_eq!(args.prompt.as_deref(), Some("prompt"));
                 assert!(args.skill_path.is_empty());
                 assert!(args.skill_root.is_empty());
+                assert!(args.mcp_stdio.is_empty());
+                assert!(args.mcp_sse.is_empty());
             }
             other => panic!("expected Chat, got {other:?}"),
         }
@@ -275,6 +293,46 @@ mod tests {
                         PathBuf::from("./skills/project")
                     ]
                 );
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_with_repeatable_mcp_specs() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--mcp-stdio",
+            "id=local,command=npx,arg=-y,arg=@modelcontextprotocol/server-filesystem",
+            "--mcp-stdio",
+            "command=uvx,arg=echo",
+            "--mcp-sse",
+            "id=docs,url=http://localhost:3000/mcp,header=x-env:dev",
+            "--mcp-sse",
+            "url=https://example.com/mcp,auth_token=secret",
+            "Hi",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(
+                    args.mcp_stdio,
+                    vec![
+                        "id=local,command=npx,arg=-y,arg=@modelcontextprotocol/server-filesystem"
+                            .to_string(),
+                        "command=uvx,arg=echo".to_string()
+                    ]
+                );
+                assert_eq!(
+                    args.mcp_sse,
+                    vec![
+                        "id=docs,url=http://localhost:3000/mcp,header=x-env:dev".to_string(),
+                        "url=https://example.com/mcp,auth_token=secret".to_string()
+                    ]
+                );
+                assert_eq!(args.prompt.as_deref(), Some("Hi"));
             }
             other => panic!("expected Chat, got {other:?}"),
         }

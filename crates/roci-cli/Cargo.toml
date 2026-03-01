@@ -8,7 +8,7 @@ name = "roci-agent"
 path = "src/main.rs"
 
 [dependencies]
-roci = { path = "../..", features = ["agent"] }
+roci = { path = "../..", features = ["agent", "mcp"] }
 roci-tools = { path = "../roci-tools" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

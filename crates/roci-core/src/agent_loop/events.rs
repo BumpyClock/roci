@@ -110,6 +110,7 @@ pub enum AgentEvent {
     },
     AgentEnd {
         run_id: RunId,
+        messages: Vec<ModelMessage>,
     },
 
     // -- Turn boundaries --
@@ -120,6 +121,7 @@ pub enum AgentEvent {
     TurnEnd {
         run_id: RunId,
         turn_index: usize,
+        assistant_message: Option<ModelMessage>,
         tool_results: Vec<AgentToolResult>,
     },
 

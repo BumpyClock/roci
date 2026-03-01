@@ -1,12 +1,13 @@
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{message::ContentPart, AgentToolCall, AgentToolResult, ModelMessage};
+use crate::types::{AgentToolCall, AgentToolResult, ModelMessage};
 
 use super::super::control::{
     approval_allows_execution, resolve_approval, AgentEventEmitter, RunEventEmitter,
 };
 use super::super::limits::{is_parallel_safe_tool, RunnerLimits};
+use super::super::message_events::assistant_message_snapshot;
 use super::super::message_events::emit_message_lifecycle;
 use super::super::tooling::{
     append_skipped_tool_call, append_tool_result, apply_post_tool_use_hook, canceled_tool_result,
@@ -51,30 +52,24 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         consecutive_failed_iterations,
     } = args;
 
+    let assistant_message = if iteration_text.is_empty() && tool_calls.is_empty() {
+        None
+    } else {
+        Some(assistant_message_snapshot(&iteration_text, tool_calls))
+    };
+    if let Some(message) = assistant_message.as_ref() {
+        messages.push(message.clone());
+    }
+
     if tool_calls.is_empty() {
         agent_emitter.emit(AgentEvent::TurnEnd {
             run_id: request.run_id,
             turn_index,
+            assistant_message,
             tool_results: vec![],
         });
         return ToolPhaseOutcome::BreakInner;
     }
-
-    let mut assistant_content: Vec<ContentPart> = Vec::new();
-    if !iteration_text.is_empty() {
-        assistant_content.push(ContentPart::Text {
-            text: iteration_text,
-        });
-    }
-    for call in tool_calls {
-        assistant_content.push(ContentPart::ToolCall(call.clone()));
-    }
-    messages.push(ModelMessage {
-        role: crate::types::Role::Assistant,
-        content: assistant_content,
-        name: None,
-        timestamp: Some(chrono::Utc::now()),
-    });
 
     let mut iteration_failures = 0usize;
     let mut turn_tool_results: Vec<AgentToolResult> = Vec::new();
@@ -245,6 +240,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         agent_emitter.emit(AgentEvent::TurnEnd {
             run_id: request.run_id,
             turn_index,
+            assistant_message: assistant_message.clone(),
             tool_results: turn_tool_results,
         });
         return ToolPhaseOutcome::ContinueInner;
@@ -300,6 +296,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
     agent_emitter.emit(AgentEvent::TurnEnd {
         run_id: request.run_id,
         turn_index,
+        assistant_message,
         tool_results: turn_tool_results,
     });
 

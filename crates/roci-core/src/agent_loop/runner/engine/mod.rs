@@ -33,6 +33,7 @@ fn canceled_result(
     );
     agent_emitter.emit(AgentEvent::AgentEnd {
         run_id: request.run_id,
+        messages: messages.to_vec(),
     });
     if debug_enabled() {
         tracing::debug!(run_id = %request.run_id, "roci run canceled");
@@ -49,6 +50,7 @@ fn failed_result(
 ) -> RunResult {
     agent_emitter.emit(AgentEvent::AgentEnd {
         run_id: request.run_id,
+        messages: messages.to_vec(),
     });
     emit_failed_result(emitter, reason, messages)
 }
@@ -241,7 +243,10 @@ impl Runner for LoopRunner {
                             iteration_text,
                             tool_calls,
                         } => (iteration_text, tool_calls),
-                        LlmPhaseOutcome::Canceled => {
+                        LlmPhaseOutcome::Canceled { assistant_message } => {
+                            if let Some(message) = assistant_message {
+                                messages.push(message);
+                            }
                             let _ = result_tx.send(canceled_result(
                                 &request,
                                 &emitter,
@@ -250,7 +255,13 @@ impl Runner for LoopRunner {
                             ));
                             return;
                         }
-                        LlmPhaseOutcome::Failed(reason) => {
+                        LlmPhaseOutcome::Failed {
+                            reason,
+                            assistant_message,
+                        } => {
+                            if let Some(message) = assistant_message {
+                                messages.push(message);
+                            }
                             let _ = result_tx.send(failed_result(
                                 &request,
                                 &emitter,
@@ -320,6 +331,7 @@ impl Runner for LoopRunner {
                 );
                 agent_emitter.emit(AgentEvent::AgentEnd {
                     run_id: request.run_id,
+                    messages: messages.clone(),
                 });
                 let _ = result_tx.send(RunResult::completed_with_messages(messages));
                 if debug_enabled() {

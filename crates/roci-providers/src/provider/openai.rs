@@ -649,6 +649,10 @@ mod tests {
             settings: settings(Some(128), Some(0.4), Some(0.5), Some(0.1), Some(0.2)),
             tools: None,
             response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };
@@ -676,6 +680,10 @@ mod tests {
             settings: settings(None, None, None, None, None),
             tools: None,
             response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
             session_id: None,
             transport: None,
         };

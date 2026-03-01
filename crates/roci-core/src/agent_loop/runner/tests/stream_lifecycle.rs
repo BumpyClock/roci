@@ -133,6 +133,16 @@ async fn agent_message_end_is_emitted_before_failure_terminal_event() {
         .as_deref()
         .unwrap_or_default()
         .contains("upstream stream failure"));
+    assert!(
+        result.messages.iter().any(|message| {
+            matches!(message.role, crate::types::Role::Assistant)
+                && message
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::Text { text } if text == "partial"))
+        }),
+        "failed stream should preserve latest assistant snapshot"
+    );
 
     let events = agent_events.lock().expect("agent event lock");
     let start_idx = events
@@ -174,9 +184,17 @@ async fn agent_message_end_is_emitted_before_failure_terminal_event() {
         .iter()
         .position(|event| matches!(event, AgentEvent::AgentEnd { .. }))
         .expect("expected AgentEnd");
+    let agent_end_messages = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::AgentEnd { messages, .. } => Some(messages.clone()),
+            _ => None,
+        })
+        .expect("expected AgentEnd messages snapshot");
     assert!(start_idx < update_idx);
     assert!(update_idx < message_end_idx);
     assert!(message_end_idx < agent_end_idx);
+    assert_eq!(agent_end_messages, result.messages);
 }
 
 #[tokio::test]
@@ -241,6 +259,38 @@ async fn tool_execution_updates_stream_with_deterministic_order() {
             "end".to_string(),
         ]
     );
+
+    let (assistant_message, tool_results) = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnEnd {
+                assistant_message,
+                tool_results,
+                ..
+            } if !tool_results.is_empty() => {
+                Some((assistant_message.clone(), tool_results.clone()))
+            }
+            _ => None,
+        })
+        .expect("expected TurnEnd for tool iteration");
+    let assistant_message = assistant_message.expect("tool turn should include assistant message");
+    assert_eq!(assistant_message.role, crate::types::Role::Assistant);
+    assert!(
+        assistant_message.content.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::ToolCall(call) if call.id == "update-tool-1"
+            )
+        }),
+        "assistant snapshot should include tool call update-tool-1"
+    );
+    assert_eq!(
+        tool_results
+            .iter()
+            .map(|result| result.tool_call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["update-tool-1"]
+    );
 }
 
 #[tokio::test]
@@ -271,4 +321,35 @@ async fn canceling_during_tool_execution_emits_error_end_event() {
         _ => None,
     });
     assert_eq!(end_event, Some(true));
+}
+
+#[tokio::test]
+async fn turn_end_includes_assistant_message_for_text_only_turn() {
+    let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
+    let (agent_sink, agent_events) = capture_agent_events();
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+    request.agent_event_sink = Some(agent_sink);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let events = agent_events.lock().expect("agent event lock");
+    let (assistant_message, tool_results) = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnEnd {
+                assistant_message,
+                tool_results,
+                ..
+            } => Some((assistant_message.clone(), tool_results.clone())),
+            _ => None,
+        })
+        .expect("expected TurnEnd");
+    let assistant_message = assistant_message.expect("text turn should include assistant message");
+    assert_eq!(assistant_message.role, crate::types::Role::Assistant);
+    assert_eq!(assistant_message.text(), "done");
+    assert!(tool_results.is_empty());
 }

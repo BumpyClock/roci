@@ -12,6 +12,7 @@
 //! - Runtime mutators (`set/clear` system prompt, `replace_messages`, `set_tools`) while idle
 //! - Fine-grained queue controls (`clear_*_queue`, `clear_all_queues`, `has_queued_messages`)
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -21,8 +22,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::message::{AgentMessage, AgentMessageExt};
 use crate::agent_loop::runner::{
-    AgentEventSink, AutoCompactionConfig, CompactionHandler, ConvertToLlmFn, FollowUpMessagesFn,
-    PostToolUseHook, PreToolUseHook, RunHooks, SteeringMessagesFn, TransformContextFn,
+    AgentEventSink, AutoCompactionConfig, BeforeAgentStartHook, BeforeAgentStartHookPayload,
+    BeforeAgentStartHookResult, CompactionHandler, ConvertToLlmFn, FollowUpMessagesFn,
+    PostToolUseHook, PreToolUseHook, RetryBackoffPolicy, RunHooks, SteeringMessagesFn,
+    TransformContextFn,
 };
 use crate::agent_loop::{
     compaction::{
@@ -36,7 +39,7 @@ use crate::agent_loop::{
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
-use crate::provider::{ProviderRegistry, ProviderRequest};
+use crate::provider::{ProviderPayloadCallback, ProviderRegistry, ProviderRequest};
 use crate::resource::{BranchSummarySettings, CompactionSettings};
 use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
@@ -238,6 +241,8 @@ pub struct AgentConfig {
     pub transform_context: Option<TransformContextFn>,
     /// Optional hook to convert/filter agent-level messages before provider requests.
     pub convert_to_llm: Option<ConvertToLlmFn>,
+    /// Optional lifecycle hook called before starting the runner.
+    pub before_agent_start: Option<BeforeAgentStartHook>,
     /// Optional sink for high-level [`AgentEvent`](crate::agent_loop::AgentEvent) emission.
     pub event_sink: Option<AgentEventSink>,
     /// Optional session ID for provider-side prompt caching.
@@ -251,10 +256,19 @@ pub struct AgentConfig {
     /// Optional cap for server-requested retry delays in milliseconds.
     /// `Some(0)` disables the cap.
     pub max_retry_delay_ms: Option<u64>,
+    /// Retry/backoff policy for transient provider failures.
+    pub retry_backoff: RetryBackoffPolicy,
+    /// Optional per-run provider API key override.
+    pub api_key_override: Option<String>,
+    /// Optional per-run provider header overrides.
+    pub provider_headers: reqwest::header::HeaderMap,
+    /// Optional per-run provider metadata.
+    pub provider_metadata: HashMap<String, String>,
+    /// Optional callback for inspecting provider request payloads.
+    pub provider_payload_callback: Option<ProviderPayloadCallback>,
     /// Optional async callback to resolve an API key per run.
     ///
-    /// When set, called at the start of each run. The resolved key is
-    /// inserted into [`RunRequest::metadata`] under `"api_key"`.
+    /// Precedence is: request override -> provider/config key -> this callback.
     ///
     /// When `None` (the default), the agent resolves keys automatically
     /// through [`RociConfig`] which checks: environment variables →
@@ -805,6 +819,10 @@ impl AgentRuntime {
                 settings: GenerationSettings::default(),
                 tools: None,
                 response_format: None,
+                api_key_override: None,
+                headers: reqwest::header::HeaderMap::new(),
+                metadata: HashMap::new(),
+                payload_callback: None,
                 session_id: None,
                 transport: None,
             })
@@ -940,6 +958,7 @@ impl AgentRuntime {
         let intercepting_sink = self.build_intercepting_sink();
 
         let model = self.model.lock().await.clone();
+
         let tools = match self.resolve_tools_for_run().await {
             Ok(tools) => tools,
             Err(err) => {
@@ -953,6 +972,33 @@ impl AgentRuntime {
             .with_steering_messages(steering_fn)
             .with_follow_up_messages(follow_up_fn)
             .with_agent_event_sink(intercepting_sink);
+
+        if let Some(hook) = self.config.before_agent_start.clone() {
+            let hook_cancel_token = CancellationToken::new();
+            let hook_payload = BeforeAgentStartHookPayload {
+                run_id: request.run_id,
+                model: request.model.clone(),
+                messages: request.messages.clone(),
+                cancellation_token: hook_cancel_token.clone(),
+            };
+            match hook(hook_payload).await {
+                Ok(BeforeAgentStartHookResult::Continue) => {}
+                Ok(BeforeAgentStartHookResult::ReplaceMessages { messages }) => {
+                    request.messages = messages;
+                }
+                Ok(BeforeAgentStartHookResult::Cancel { .. }) => {
+                    self.restore_idle_after_preflight_error().await;
+                    return Ok(RunResult::canceled_with_messages(request.messages.clone()));
+                }
+                Err(err) => {
+                    self.restore_idle_after_preflight_error().await;
+                    return Err(RociError::InvalidState(format!(
+                        "before_agent_start hook failed: {err}"
+                    )));
+                }
+            }
+            hook_cancel_token.cancel();
+        }
 
         let mut run_hooks = RunHooks {
             compaction: None,
@@ -1008,11 +1054,30 @@ impl AgentRuntime {
         if let Some(max_retry_delay_ms) = self.config.max_retry_delay_ms {
             request = request.with_max_retry_delay_ms(max_retry_delay_ms);
         }
+        request = request.with_retry_backoff(self.config.retry_backoff);
+        if let Some(ref api_key_override) = self.config.api_key_override {
+            request = request.with_api_key_override(api_key_override.clone());
+        }
+        if !self.config.provider_headers.is_empty() {
+            request = request.with_provider_headers(self.config.provider_headers.clone());
+        }
+        if !self.config.provider_metadata.is_empty() {
+            request = request.with_provider_metadata(self.config.provider_metadata.clone());
+        }
+        if let Some(ref callback) = self.config.provider_payload_callback {
+            request = request.with_provider_payload_callback(callback.clone());
+        }
 
         let run_result = async {
-            if let Some(ref get_key) = self.config.get_api_key {
-                let key = get_key().await?;
-                request.metadata.insert("api_key".to_string(), key);
+            let provider_has_config_key = self
+                .roci_config
+                .get_api_key(request.model.provider_name())
+                .is_some();
+            if request.api_key_override.is_none() && !provider_has_config_key {
+                if let Some(ref get_key) = self.config.get_api_key {
+                    let key = get_key().await?;
+                    request = request.with_api_key_override(key);
+                }
             }
 
             let mut handle: RunHandle = self.runner.start(request).await?;
@@ -1278,6 +1343,10 @@ impl AgentRuntime {
                         settings: GenerationSettings::default(),
                         tools: None,
                         response_format: None,
+                        api_key_override: None,
+                        headers: reqwest::header::HeaderMap::new(),
+                        metadata: HashMap::new(),
+                        payload_callback: None,
                         session_id: None,
                         transport: None,
                     })
@@ -1493,12 +1562,18 @@ mod tests {
             settings: GenerationSettings::default(),
             transform_context: None,
             convert_to_llm: None,
+            before_agent_start: None,
             event_sink: None,
             session_id: None,
             steering_mode: QueueDrainMode::All,
             follow_up_mode: QueueDrainMode::All,
             transport: None,
             max_retry_delay_ms: None,
+            retry_backoff: RetryBackoffPolicy::default(),
+            api_key_override: None,
+            provider_headers: reqwest::header::HeaderMap::new(),
+            provider_metadata: HashMap::new(),
+            provider_payload_callback: None,
             get_api_key: None,
             compaction: CompactionSettings::default(),
             session_before_compact: None,
@@ -2330,6 +2405,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_agent_start_hook_can_replace_initial_messages() {
+        let created_models = Arc::new(Mutex::new(Vec::new()));
+        let registry = registry_with_summary_provider("stub", "summary", created_models);
+        let mut config = test_agent_config();
+        config.model = "stub:run-model".parse().expect("stub model should parse");
+        config.before_agent_start = Some(Arc::new(|payload| {
+            Box::pin(async move {
+                assert!(!payload.cancellation_token.is_cancelled());
+                Ok(BeforeAgentStartHookResult::ReplaceMessages {
+                    messages: vec![
+                        ModelMessage::system("hooked-system"),
+                        ModelMessage::user("hooked-user"),
+                    ],
+                })
+            })
+        }));
+        let agent = AgentRuntime::new(registry, test_config(), config);
+
+        let result = agent
+            .prompt("original-user")
+            .await
+            .expect("run should produce a failed RunResult, not runtime error");
+
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|message| message.text() == "hooked-system"),
+            "before_agent_start should be able to replace system context"
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|message| message.text() == "hooked-user"),
+            "before_agent_start should be able to replace user context"
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .all(|message| message.text() != "original-user"),
+            "original input should be replaced when hook returns replacement messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_hook_cancel_returns_canceled_result_and_restores_idle() {
+        let mut config = test_agent_config();
+        config.before_agent_start = Some(Arc::new(|payload| {
+            Box::pin(async move {
+                assert!(!payload.cancellation_token.is_cancelled());
+                Ok(BeforeAgentStartHookResult::Cancel {
+                    reason: Some("blocked".to_string()),
+                })
+            })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+
+        let result = agent
+            .prompt("hello")
+            .await
+            .expect("hook cancel should return canceled run result");
+        assert_eq!(result.status, RunStatus::Canceled);
+        assert_eq!(agent.state().await, AgentState::Idle);
+        agent.wait_for_idle().await;
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_hook_error_restores_idle_and_returns_runtime_error() {
+        let mut config = test_agent_config();
+        config.before_agent_start = Some(Arc::new(|_payload| {
+            Box::pin(async { Err(RociError::InvalidArgument("boom".to_string())) })
+        }));
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+
+        let err = agent
+            .prompt("hello")
+            .await
+            .expect_err("hook error should fail prompt");
+        assert!(
+            err.to_string().contains("before_agent_start hook failed"),
+            "expected before_agent_start hook error prefix, got: {err}"
+        );
+        assert_eq!(agent.state().await, AgentState::Idle);
+        agent.wait_for_idle().await;
+    }
+
+    #[tokio::test]
     async fn agent_runtime_uses_config_api_key_by_default() {
         let roci_config = RociConfig::new().with_token_store(None);
         roci_config.set_api_key("openai", "sk-from-config".to_string());
@@ -2342,6 +2507,67 @@ mod tests {
 
         assert!(agent.config.get_api_key.is_none());
         assert_eq!(agent.state().await, AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn get_api_key_callback_is_skipped_when_config_key_exists() {
+        let roci_config = RociConfig::new().with_token_store(None);
+        roci_config.set_api_key("openai", "sk-from-config".to_string());
+        let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_calls_for_hook = callback_calls.clone();
+        let get_key: GetApiKeyFn = Arc::new(move || {
+            let callback_calls_for_hook = callback_calls_for_hook.clone();
+            Box::pin(async move {
+                callback_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("sk-from-callback".to_string())
+            })
+        });
+
+        let agent = AgentRuntime::new(
+            test_registry(),
+            roci_config,
+            AgentConfig {
+                get_api_key: Some(get_key),
+                ..test_agent_config()
+            },
+        );
+
+        let _ = agent.prompt("hello").await;
+        assert_eq!(
+            callback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "config key should take precedence over callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_api_key_callback_is_skipped_when_request_override_exists() {
+        let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_calls_for_hook = callback_calls.clone();
+        let get_key: GetApiKeyFn = Arc::new(move || {
+            let callback_calls_for_hook = callback_calls_for_hook.clone();
+            Box::pin(async move {
+                callback_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("sk-from-callback".to_string())
+            })
+        });
+
+        let agent = AgentRuntime::new(
+            test_registry(),
+            test_config(),
+            AgentConfig {
+                api_key_override: Some("sk-request-override".to_string()),
+                get_api_key: Some(get_key),
+                ..test_agent_config()
+            },
+        );
+
+        let _ = agent.prompt("hello").await;
+        assert_eq!(
+            callback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "request override should take precedence over callback"
+        );
     }
 
     #[tokio::test]

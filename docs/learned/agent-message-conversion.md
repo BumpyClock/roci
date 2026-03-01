@@ -8,16 +8,17 @@ read_when:
 - Added `convert_to_llm` as an explicit pre-provider hook in `RunRequest` and `AgentConfig`.
 - Execution order in runner:
 1. Build loop context (`Vec<ModelMessage>`)
-2. Optional `convert_to_llm(Vec<AgentMessage>) -> Vec<ModelMessage>`
-3. Optional `transform_context(Vec<ModelMessage>) -> Vec<ModelMessage>`
+2. Optional `transform_context(TransformContextHookPayload) -> Result<TransformContextHookResult, RociError>`
+3. Optional `convert_to_llm(ConvertToLlmHookPayload) -> Result<ConvertToLlmHookResult, RociError>`
 4. Provider sanitize + request
 
 ## Rationale
 - Keeps backward compatibility (`convert_to_llm` unset preserves existing behavior).
 - Separates concerns:
-  - `convert_to_llm`: message-type filtering/translation boundary.
-  - `transform_context`: last-mile LLM context rewrite.
+  - `transform_context`: pre-conversion context mutation/cancellation boundary.
+  - `convert_to_llm`: post-transform message-type filtering/translation boundary.
 - Enables custom-message filtering by using existing `agent::message::{AgentMessage, convert_to_llm}` utilities.
+- Both hooks receive typed payloads (run/model/context + cancellation token) and support `Continue` / `Cancel` / `ReplaceMessages`.
 
 ## Notes
 - Current runtime loop still stores canonical LLM messages (`ModelMessage`) for persistence and tool-loop stability.

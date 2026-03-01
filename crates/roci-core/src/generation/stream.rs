@@ -74,6 +74,10 @@ pub async fn stream_text_with_tools(
                 settings: settings.clone(),
                 tools: tool_defs.clone(),
                 response_format: settings.response_format.clone(),
+                api_key_override: None,
+                headers: reqwest::header::HeaderMap::new(),
+                metadata: std::collections::HashMap::new(),
+                payload_callback: None,
                 session_id: None,
                 transport: None,
             };

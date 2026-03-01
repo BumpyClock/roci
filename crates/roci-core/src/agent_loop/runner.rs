@@ -73,18 +73,85 @@ pub type SteeringMessagesFn = MessageBatchFn;
 /// Callback to retrieve follow-up messages after the inner loop completes.
 pub type FollowUpMessagesFn = MessageBatchFn;
 
-/// Hook to transform the message context before each LLM call.
-pub type TransformContextFn = Arc<
-    dyn Fn(Vec<ModelMessage>) -> Pin<Box<dyn Future<Output = Vec<ModelMessage>> + Send>>
+/// Payload for the `before_agent_start` lifecycle hook.
+#[derive(Debug, Clone)]
+pub struct BeforeAgentStartHookPayload {
+    pub run_id: RunId,
+    pub model: LanguageModel,
+    pub messages: Vec<ModelMessage>,
+    pub cancellation_token: CancellationToken,
+}
+
+/// Decision returned by `before_agent_start`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BeforeAgentStartHookResult {
+    Continue,
+    Cancel { reason: Option<String> },
+    ReplaceMessages { messages: Vec<ModelMessage> },
+}
+
+/// Hook called before runner startup to mutate/cancel initial run context.
+pub type BeforeAgentStartHook = Arc<
+    dyn Fn(
+            BeforeAgentStartHookPayload,
+        )
+            -> Pin<Box<dyn Future<Output = Result<BeforeAgentStartHookResult, RociError>> + Send>>
         + Send
         + Sync,
 >;
 
+/// Payload for the `transform_context` hook.
+#[derive(Debug, Clone)]
+pub struct TransformContextHookPayload {
+    pub run_id: RunId,
+    pub model: LanguageModel,
+    pub messages: Vec<ModelMessage>,
+    pub cancellation_token: CancellationToken,
+}
+
+/// Decision returned by `transform_context`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransformContextHookResult {
+    Continue,
+    Cancel { reason: Option<String> },
+    ReplaceMessages { messages: Vec<ModelMessage> },
+}
+
+/// Hook to transform message context before `convert_to_llm` and provider sanitize.
+pub type TransformContextFn = Arc<
+    dyn Fn(
+            TransformContextHookPayload,
+        )
+            -> Pin<Box<dyn Future<Output = Result<TransformContextHookResult, RociError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Payload for the `convert_to_llm` hook.
+#[derive(Debug, Clone)]
+pub struct ConvertToLlmHookPayload {
+    pub run_id: RunId,
+    pub model: LanguageModel,
+    pub messages: Vec<AgentMessage>,
+    pub cancellation_token: CancellationToken,
+}
+
+/// Decision returned by `convert_to_llm`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConvertToLlmHookResult {
+    Continue,
+    Cancel { reason: Option<String> },
+    ReplaceMessages { messages: Vec<ModelMessage> },
+}
+
 /// Hook to convert/filter agent-level messages into provider-facing LLM messages.
 ///
-/// This runs before `transform_context` and provider sanitization.
+/// This runs after `transform_context` and before provider sanitization.
 pub type ConvertToLlmFn = Arc<
-    dyn Fn(Vec<AgentMessage>) -> Pin<Box<dyn Future<Output = Vec<ModelMessage>> + Send>>
+    dyn Fn(
+            ConvertToLlmHookPayload,
+        )
+            -> Pin<Box<dyn Future<Output = Result<ConvertToLlmHookResult, RociError>> + Send>>
         + Send
         + Sync,
 >;
@@ -104,6 +171,33 @@ pub struct AutoCompactionConfig {
     pub reserve_tokens: usize,
 }
 
+/// Retry/backoff policy for retryable provider request failures.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RetryBackoffPolicy {
+    /// Maximum attempts including the first provider call.
+    pub max_attempts: u32,
+    /// Initial backoff delay in milliseconds.
+    pub initial_delay_ms: u64,
+    /// Exponential multiplier applied after each failed attempt.
+    pub multiplier: f64,
+    /// Symmetric jitter ratio applied around each computed delay (e.g. 0.2 => +/-20%).
+    pub jitter_ratio: f64,
+    /// Maximum bounded delay in milliseconds.
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryBackoffPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_delay_ms: 250,
+            multiplier: 2.0,
+            jitter_ratio: 0.2,
+            max_delay_ms: 2_000,
+        }
+    }
+}
+
 /// Request payload to start a run.
 #[derive(Clone)]
 pub struct RunRequest {
@@ -118,6 +212,8 @@ pub struct RunRequest {
     pub event_sink: Option<RunEventSink>,
     pub hooks: RunHooks,
     pub auto_compaction: Option<AutoCompactionConfig>,
+    /// Per-run retry/backoff policy for retryable provider failures.
+    pub retry_backoff: RetryBackoffPolicy,
     /// Callback to get steering messages (checked between tool batches).
     pub get_steering_messages: Option<SteeringMessagesFn>,
     /// Callback to get follow-up messages (checked after inner loop ends).
@@ -135,6 +231,14 @@ pub struct RunRequest {
     /// Optional cap for server-requested retry delays in milliseconds.
     /// `Some(0)` disables the cap.
     pub max_retry_delay_ms: Option<u64>,
+    /// Optional per-request provider API key override.
+    pub api_key_override: Option<String>,
+    /// Optional per-request provider header overrides.
+    pub provider_headers: reqwest::header::HeaderMap,
+    /// Optional per-request metadata passed to providers.
+    pub provider_metadata: HashMap<String, String>,
+    /// Optional per-request payload inspection callback.
+    pub provider_payload_callback: Option<provider::ProviderPayloadCallback>,
 }
 
 impl RunRequest {
@@ -151,6 +255,7 @@ impl RunRequest {
             event_sink: None,
             hooks: RunHooks::default(),
             auto_compaction: None,
+            retry_backoff: RetryBackoffPolicy::default(),
             get_steering_messages: None,
             get_follow_up_messages: None,
             transform_context: None,
@@ -159,6 +264,10 @@ impl RunRequest {
             session_id: None,
             transport: None,
             max_retry_delay_ms: None,
+            api_key_override: None,
+            provider_headers: reqwest::header::HeaderMap::new(),
+            provider_metadata: HashMap::new(),
+            provider_payload_callback: None,
         }
     }
 
@@ -229,6 +338,34 @@ impl RunRequest {
 
     pub fn with_max_retry_delay_ms(mut self, max_retry_delay_ms: u64) -> Self {
         self.max_retry_delay_ms = Some(max_retry_delay_ms);
+        self
+    }
+
+    pub fn with_retry_backoff(mut self, retry_backoff: RetryBackoffPolicy) -> Self {
+        self.retry_backoff = retry_backoff;
+        self
+    }
+
+    pub fn with_api_key_override(mut self, key: impl Into<String>) -> Self {
+        self.api_key_override = Some(key.into());
+        self
+    }
+
+    pub fn with_provider_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
+        self.provider_headers = headers;
+        self
+    }
+
+    pub fn with_provider_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+        self.provider_metadata = metadata;
+        self
+    }
+
+    pub fn with_provider_payload_callback(
+        mut self,
+        callback: provider::ProviderPayloadCallback,
+    ) -> Self {
+        self.provider_payload_callback = Some(callback);
         self
     }
 }

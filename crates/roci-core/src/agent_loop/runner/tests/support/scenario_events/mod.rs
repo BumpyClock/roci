@@ -16,7 +16,12 @@ pub(super) fn events_for_scenario(
         | ProviderScenario::RepeatedToolFailure
         | ProviderScenario::RateLimitedThenComplete
         | ProviderScenario::RateLimitedExceedsCap
-        | ProviderScenario::RateLimitedWithoutRetryHint => {
+        | ProviderScenario::RateLimitedWithoutRetryHint
+        | ProviderScenario::RetryableTimeoutThenComplete
+        | ProviderScenario::RetryableTimeoutExhausted
+        | ProviderScenario::ContextOverflowThenComplete
+        | ProviderScenario::ContextOverflowAlways
+        | ProviderScenario::UntypedOverflowError => {
             basic::events_for_scenario(scenario, call_index)
         }
         ProviderScenario::ParallelSafeBatchThenComplete
@@ -32,5 +37,8 @@ pub(super) fn events_for_scenario(
         | ProviderScenario::SchemaToolTypeMismatch => {
             schema::events_for_scenario(scenario, call_index)
         }
+        ProviderScenario::PartialTextThenIdle => Err(RociError::InvalidState(
+            "PartialTextThenIdle is generated directly by the stub stream".to_string(),
+        )),
     }
 }
