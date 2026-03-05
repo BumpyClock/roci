@@ -56,3 +56,7 @@ required-features = ["agent"]
 [[example]]
 name = "agent_runtime"
 required-features = ["agent"]
+
+[[example]]
+name = "subagent_supervisor"
+required-features = ["agent"]

@@ -229,6 +229,111 @@ The `ask_user` tool enables blocking user input from the agent:
 
 See `docs/architecture/ask-user-v1-peer-bus-seam.md` for full architecture details.
 
+## Sub-Agent Supervisor
+
+Module: `crates/roci-core/src/agent/subagents/`
+
+The sub-agent system enables a parent `AgentRuntime` to spawn, observe, and
+orchestrate child agent runtimes. Each child is a full `AgentRuntime` instance
+with its own model, tools, and conversation state.
+
+### Design rationale: supervisor-first, not bus-first
+
+The supervisor pattern was chosen over a generic peer message bus because:
+
+- roci already had a working `ask_user` path (`UserInputCoordinator` + `AgentEvent::UserInputRequested`). A bus rewrite would have disrupted it without a second real inter-agent message type to justify the abstraction.
+- The supervisor keeps parent-to-child lifecycle and event routing in one place, making it easier to reason about concurrency and cleanup.
+- Seams for a future peer bus are preserved (stable child identity, event wrapper, launcher abstraction) without paying for the bus now.
+
+### Named profiles
+
+Sub-agent behavior is driven by named profiles (`SubagentProfile`), not ad-hoc prompt strings.
+
+**Sources (in precedence order, last wins):**
+1. Built-in profiles: `builtin:developer`, `builtin:planner`, `builtin:explorer`
+2. TOML-defined profiles loaded from `subagents/*.toml` in config roots (global, then project)
+3. Per-spawn `SubagentOverrides` applied at `spawn()` time
+
+**Inheritance:** single-parent only (`inherits` field). Child scalar fields replace parent. `models` replaces wholesale. `tools` uses `ToolPolicy` semantics (`Inherit`, `Replace`, `InheritWithOverrides`).
+
+**TOML format:** Both single-file (top-level fields) and multi-profile (`[[profiles]]`) formats are supported via `TomlProfileFile`.
+
+### Model fallback
+
+Each profile defines an ordered list of `ModelCandidate`s. At launch time, `resolve_model()` picks the first candidate whose provider is registered (`has_provider()`) and has credentials configured (`has_credentials()`).
+
+- Fallback is launch-time only. No mid-run model switching.
+- The selected model is surfaced in `SubagentEvent::Spawned` and `SubagentSnapshot`.
+
+### Input modes
+
+The parent specifies how to provide context to a child via `SubagentInput`:
+
+| Variant | Behavior |
+|---------|----------|
+| `Prompt { task }` | Task text only, no parent context |
+| `Snapshot { mode }` | Parent context snapshot only |
+| `PromptWithSnapshot { task, mode }` | Both (default helper mode) |
+
+`SnapshotMode` controls snapshot granularity: `SummaryOnly`, `SelectedMessages` (explicit, not heuristic), or `FullReadonlySnapshot` (all non-tool messages cloned).
+
+Context is always read-only. Children cannot mutate parent conversation state.
+
+### Event forwarding
+
+Child `AgentEvent`s are wrapped in `SubagentEvent::AgentEvent { subagent_id, label, event }` and forwarded through the supervisor's `broadcast::channel`. The supervisor also emits lifecycle events: `Spawned`, `StatusChanged`, `Completed`, `Failed`, `Aborted`.
+
+Parent subscribes via `supervisor.subscribe()`. Handle provides `watch_snapshot()` for per-child progress observation.
+
+### ask_user reuse
+
+The supervisor shares a `UserInputCoordinator` (from `AgentConfig` or a fresh one) with all children. When a child calls `ask_user`:
+
+1. Child runtime emits `AgentEvent::UserInputRequested { request }`
+2. Supervisor forwards as `SubagentEvent::AgentEvent { subagent_id, ... }`
+3. Parent host renders the question and calls `supervisor.submit_user_input(response)`
+4. Coordinator routes the response by `request_id` to the correct child
+
+No generic bus required -- `request_id` correlation handles multi-child routing.
+
+### Orchestration
+
+| Method | Behavior |
+|--------|----------|
+| `spawn(spec)` | Returns `SubagentHandle` immediately; child runs in background task |
+| `wait(id)` | Block until a specific child completes |
+| `wait_any()` | Block until the next child completes (any child) |
+| `wait_all()` | Fan-out/fan-in: wait for all active children |
+| `shutdown()` | Abort all active children, then `wait_all()` |
+| `abort(id)` | Cancel a specific child |
+| `list_active()` | Snapshot of all Pending/Running children |
+
+Concurrency is bounded by a `Semaphore` (`max_concurrent`, default 4). An optional `max_active_children` hard cap rejects spawns beyond the limit.
+
+### CancellationToken-based abort
+
+Abort uses `tokio_util::CancellationToken` (not `oneshot`). Benefits:
+
+- Idempotent: multiple cancel calls are safe
+- Shareable: both handle and supervisor hold clones of the same token
+- `abort_on_drop` (default `true`) cancels all children when the supervisor is dropped
+
+### Launcher seam
+
+Child runtime construction is behind a `SubagentLauncher` trait (crate-internal). V1 ships `InProcessLauncher` which creates an `AgentRuntime` in the same process.
+
+The trait exists for testability and future extensibility (out-of-process, remote). The public API does not expose the launcher abstraction.
+
+### Deferred
+
+Not implemented in v1 (seams preserved for future):
+
+- Generic peer message bus
+- Child-to-child messaging
+- Persistent child state / session DB
+- Session tree/fork integration
+- Out-of-process child launching as primary path
+
 ## Extension Points
 
 ### Custom Providers

@@ -16,6 +16,21 @@
 - `read_when`: splitting provider transports from core, designing ProviderFactory/AuthBackend traits, adding new providers
 - See: `docs/architecture/providers-soc.md` -- Provider/core separation of concerns
 
+## Sub-Agent Supervisor
+
+- `read_when`: implementing sub-agent features or extending supervisor
+- Sub-agent supervisor uses `CancellationToken` (not oneshot) for abort -- idempotent and shareable between handle and supervisor. Both hold clones of the same token.
+- `AgentRuntime` is not `Clone` -- child runtimes are owned by background tokio tasks. Handles communicate via channels (oneshot for completion, watch for snapshots, broadcast for events).
+- Model fallback is launch-time only via `has_provider()` + `has_credentials()` -- no mid-run failover. If no candidate is viable, spawn returns an error immediately.
+- Profile inheritance is single-parent only. Child scalars replace parent scalars. `models` replaces wholesale (no merge). `tools` uses `ToolPolicy` (Inherit / Replace / InheritWithOverrides).
+- TOML profiles support both single-file (top-level fields) and multi-profile (`[[profiles]]`) formats. `TomlProfileFile::parse()` tries multi first, falls back to single.
+- `ask_user` routing across multiple children uses the same `UserInputCoordinator` -- `request_id` correlation already handles multi-child dispatch without a generic bus.
+- Supervisor concurrency is bounded by `Semaphore` (max_concurrent, default 4). `max_active_children` is a separate hard cap that rejects spawns.
+- `abort_on_drop` (default true) cancels all children via `CancellationToken` in the `Drop` impl. Uses `try_lock()` since `Drop` is synchronous.
+- Launcher seam (`SubagentLauncher` trait) is `pub(super)` -- not part of the public API. Exists for testability and future out-of-process extensibility.
+- `wait()` on a handle consumes the oneshot receiver. Second call returns a synthetic error, not a panic.
+- Event forwarding uses `broadcast::channel(256)`. Lagged receivers trigger a status check fallback to avoid missing terminal events.
+
 ## Provider / Core Split
 
 - `read_when`: adding custom providers, understanding crate boundaries, or debugging trait registration
