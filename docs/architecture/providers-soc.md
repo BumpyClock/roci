@@ -59,7 +59,7 @@ Everything provider-agnostic that any consumer or third-party provider needs:
 | `stream_transform` | `StreamTransform` trait + built-in transforms |
 | `stop` | Stop conditions |
 | `util` | `ResponseCache`, `UsageTracker`, `RetryPolicy` |
-| `agent` / `agent_loop` | `AgentRuntime`, evented runner, approvals, and compaction/summary pipeline (feature: `agent`) |
+| `agent` / `agent_loop` | `AgentRuntime` split into `types`, `config`, `state`, `lifecycle`, `mutations`, `run_loop`, `events`, and `summary`; evented runner, approvals, and compaction/summary pipeline. Runtime tests live under `crates/roci-core/src/agent/runtime_tests/` (feature: `agent`) |
 | `audio` | Realtime audio (feature: `audio`) |
 | `mcp` | MCP transport (feature: `mcp`) |
 | `prelude` | Convenience re-exports |

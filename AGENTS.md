@@ -9,6 +9,7 @@ roci notes:
 - Docs are under `docs/`; read & update as needed.
 - Use `.env` for sensitive keys; refer to `.env.example` for structure. Keep `.env.example` updated as needed.
 - Tests validate new features and implementations against real endpoints using ` cargo test --test live_providers -- --ignored --nocapture`.
+- Use parallel-subagents and agent-teams for all tasks.
 
 # Core
 - use `tasque` for persistent task management

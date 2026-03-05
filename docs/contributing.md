@@ -40,6 +40,7 @@ cargo test
 ```bash
 cargo test                    # Full workspace (hermetic)
 cargo test -p roci-core       # Core SDK only
+cargo test -p roci-core --features agent "agent::runtime::tests::"  # AgentRuntime module tests (runtime_tests/*)
 cargo test -p roci-providers  # Provider transports only
 cargo test -p roci-cli        # CLI tests
 cargo test -p roci-tools      # Tool tests

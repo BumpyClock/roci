@@ -112,13 +112,17 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 | `stop` | Stop conditions |
 | `util` | `ResponseCache`, `UsageTracker`, `RetryPolicy` |
 | `prelude` | Convenience re-exports |
-| `agent` / `agent_loop` | `AgentRuntime`, evented loop runner, approvals, and compaction/summary pipeline (feature: `agent`) |
+| `agent` / `agent_loop` | `AgentRuntime` split into `types`, `config`, `state`, `lifecycle`, `mutations`, `run_loop`, `events`, and `summary`; evented loop runner, approvals, and compaction/summary pipeline. Runtime tests live under `crates/roci-core/src/agent/runtime_tests/` (feature: `agent`) |
 | `audio` | Realtime audio sessions via WebSocket (feature: `audio`) |
 | `mcp` | MCP client/server transport (feature: `mcp`) |
 
 #### Agent runtime subsystem (`agent` feature)
 
 - `AgentRuntime` is the high-level stateful API (prompt/continue/follow-up/steer/reset/abort, snapshots/watchers).
+- Runtime module layout:
+  - `crates/roci-core/src/agent/runtime.rs` is the runtime module root/wiring layer.
+  - `crates/roci-core/src/agent/runtime/{types,config,state,lifecycle,mutations,run_loop,events,summary}.rs` contains runtime internals by concern.
+  - `crates/roci-core/src/agent/runtime_tests/` contains `agent::runtime::tests::*` (support + domain test modules).
 - `agent_loop::runner` executes provider turns, streaming, tool execution, approvals, retries, and event emission.
 - Compaction is supported in two modes:
   - automatic pre-provider compaction in the run loop when reserved context budget would be exceeded
@@ -305,6 +309,7 @@ with actionable guidance.
 ```bash
 cargo test -p roci-core       # Core SDK kernel
 cargo test -p roci-core --features agent  # Agent runtime/loop + compaction/summary
+cargo test -p roci-core --features agent "agent::runtime::tests::"  # AgentRuntime tests (runtime_tests/*)
 cargo test -p roci-providers  # Provider transports
 cargo test -p roci            # Meta-crate integration tests
 cargo test -p roci-cli        # CLI tests (arg parsing, error formatting)

@@ -10,6 +10,7 @@
 
 ```bash
 cargo test -p roci-core       # Core SDK kernel (traits, types, config, auth)
+cargo test -p roci-core --features agent "agent::runtime::tests::"  # AgentRuntime tests in crates/roci-core/src/agent/runtime_tests
 cargo test -p roci-providers  # Provider transports
 cargo test -p roci            # Meta-crate integration tests
 cargo test -p roci-cli        # CLI tests (arg parsing, error formatting)
@@ -21,6 +22,7 @@ cargo test -p roci-tools      # Tool tests (25 tests covering all tools)
 - Root integration tests: `cargo test --test meta_crate_integration`
 - Core integration tests: `cargo test -p roci-core --test registry_integration`
 - MCP tests (feature-gated in `roci-core`): `cargo test -p roci-core --features mcp`
+- Runtime namespace inventory: `cargo test -p roci-core --features agent "agent::runtime::tests::" -- --list`
 - To inspect test output: append `-- --nocapture`
 
 ## Environment
