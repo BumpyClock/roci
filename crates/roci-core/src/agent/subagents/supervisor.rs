@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, oneshot, watch, Mutex, Semaphore};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::runtime::AgentConfig;
@@ -22,8 +23,8 @@ use super::launcher::{InProcessLauncher, SubagentLauncher};
 use super::profiles::SubagentProfileRegistry;
 use super::prompt::SubagentPromptPolicy;
 use super::types::{
-    SubagentContext, SubagentEvent, SubagentId, SubagentRunResult, SubagentSnapshot, SubagentSpec,
-    SubagentStatus, SubagentSummary, SubagentSupervisorConfig,
+    SubagentCompletion, SubagentContext, SubagentEvent, SubagentId, SubagentRunResult,
+    SubagentSnapshot, SubagentSpec, SubagentStatus, SubagentSummary, SubagentSupervisorConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,7 @@ struct ChildEntry {
     profile: String,
     model: Option<LanguageModel>,
     status: Arc<Mutex<SubagentStatus>>,
+    cancel_token: CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -48,7 +50,7 @@ struct ChildEntry {
 /// - Profile resolution and model selection
 /// - Concurrency limiting via semaphore
 /// - Event forwarding from children to parent
-/// - Abort and status queries
+/// - Abort, wait, and shutdown orchestration
 pub struct SubagentSupervisor {
     registry: Arc<ProviderRegistry>,
     roci_config: RociConfig,
@@ -189,7 +191,10 @@ impl SubagentSupervisor {
         };
         let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
 
-        // 10. Register child entry
+        // 10. Create shared cancellation token
+        let cancel_token = CancellationToken::new();
+
+        // 11. Register child entry
         {
             let entry = ChildEntry {
                 id,
@@ -197,11 +202,12 @@ impl SubagentSupervisor {
                 profile: spec.profile.clone(),
                 model: Some(model.clone()),
                 status: status.clone(),
+                cancel_token: cancel_token.clone(),
             };
             self.children.lock().await.insert(id, entry);
         }
 
-        // 11. Emit spawned event
+        // 12. Emit spawned event
         let _ = self.event_tx.send(SubagentEvent::Spawned {
             subagent_id: id,
             label: spec.label.clone(),
@@ -209,11 +215,10 @@ impl SubagentSupervisor {
             model: Some(model.clone()),
         });
 
-        // 12. Channels for handle <-> task communication
+        // 13. Channels for handle <-> task communication
         let (completion_tx, completion_rx) = oneshot::channel::<SubagentRunResult>();
-        let (abort_tx, abort_rx) = oneshot::channel::<()>();
 
-        // 13. Spawn background task
+        // 14. Spawn background task
         {
             let semaphore = self.concurrency_semaphore.clone();
             let event_tx = self.event_tx.clone();
@@ -224,6 +229,7 @@ impl SubagentSupervisor {
             let label = spec.label.clone();
             let model_clone = model.clone();
             let runtime = launched.runtime;
+            let task_cancel_token = cancel_token.clone();
 
             tokio::spawn(async move {
                 // Acquire semaphore permit (blocks if at capacity)
@@ -250,17 +256,13 @@ impl SubagentSupervisor {
                     last_error: None,
                 });
 
-                // Run child: prompt with task, racing against abort signal
+                // Run child: prompt with task, racing against cancellation
                 let run_result = if let Some(task) = task {
                     tokio::select! {
                         result = runtime.prompt(task) => result,
-                        _ = async {
-                            let _ = abort_rx.await;
+                        _ = task_cancel_token.cancelled() => {
                             runtime.abort().await;
-                            // Wait for the runtime to actually finish
                             runtime.wait_for_idle().await;
-                        } => {
-                            // Aborted
                             Err(RociError::InvalidState("aborted".into()))
                         }
                     }
@@ -353,7 +355,7 @@ impl SubagentSupervisor {
             });
         }
 
-        // 14. Build and return handle
+        // 15. Build and return handle
         let handle = SubagentHandle::new(
             id,
             spec.label,
@@ -361,7 +363,7 @@ impl SubagentSupervisor {
             Some(model),
             status,
             snapshot_rx,
-            abort_tx,
+            cancel_token,
             completion_rx,
         );
 
@@ -370,7 +372,7 @@ impl SubagentSupervisor {
 
     /// Abort a specific child by ID.
     ///
-    /// Returns `true` if the child was found and an abort signal was sent.
+    /// Returns `true` if the child was found and a cancellation signal was sent.
     pub async fn abort(&self, id: SubagentId) -> Result<bool, RociError> {
         let children = self.children.lock().await;
         let entry = children
@@ -380,11 +382,211 @@ impl SubagentSupervisor {
         if status != SubagentStatus::Running && status != SubagentStatus::Pending {
             return Ok(false);
         }
-        // We cannot directly abort from here since the runtime is owned by
-        // the background task. The handle's abort_tx is the mechanism.
-        // For supervisor-level abort, emit a status change; the caller should
-        // use the handle's abort() method.
-        Ok(false)
+        if entry.cancel_token.is_cancelled() {
+            return Ok(false);
+        }
+        entry.cancel_token.cancel();
+        Ok(true)
+    }
+
+    /// Wait for a specific child to complete.
+    ///
+    /// Returns the child's run result. Returns an error if the child ID is
+    /// unknown.
+    pub async fn wait(&self, id: SubagentId) -> Result<SubagentRunResult, RociError> {
+        // Check the child exists and whether it's already finished.
+        {
+            let children = self.children.lock().await;
+            let entry = children
+                .get(&id)
+                .ok_or_else(|| RociError::Configuration(format!("subagent {id} not found")))?;
+            let status = *entry.status.lock().await;
+            if is_terminal(status) {
+                return Ok(SubagentRunResult {
+                    subagent_id: id,
+                    status,
+                    messages: Vec::new(),
+                    error: None,
+                });
+            }
+        }
+
+        // Subscribe and wait for a terminal event for this child.
+        let mut rx = self.event_tx.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(SubagentEvent::Completed {
+                    subagent_id,
+                    result,
+                }) if subagent_id == id => return Ok(result),
+                Ok(SubagentEvent::Failed { subagent_id, error }) if subagent_id == id => {
+                    return Ok(SubagentRunResult {
+                        subagent_id: id,
+                        status: SubagentStatus::Failed,
+                        messages: Vec::new(),
+                        error: Some(error),
+                    });
+                }
+                Ok(SubagentEvent::Aborted { subagent_id }) if subagent_id == id => {
+                    return Ok(SubagentRunResult {
+                        subagent_id: id,
+                        status: SubagentStatus::Aborted,
+                        messages: Vec::new(),
+                        error: None,
+                    });
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(RociError::InvalidState(
+                        "event channel closed while waiting".into(),
+                    ));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Missed some events; check status directly.
+                    let children = self.children.lock().await;
+                    if let Some(entry) = children.get(&id) {
+                        let status = *entry.status.lock().await;
+                        if is_terminal(status) {
+                            return Ok(SubagentRunResult {
+                                subagent_id: id,
+                                status,
+                                messages: Vec::new(),
+                                error: None,
+                            });
+                        }
+                    }
+                    // Continue listening
+                }
+                _ => {
+                    // Not our event, keep waiting
+                }
+            }
+        }
+    }
+
+    /// Wait for the next child to complete (any child).
+    ///
+    /// Returns `None` if there are no active children.
+    pub async fn wait_any(&self) -> Option<SubagentCompletion> {
+        // Collect active child IDs
+        let active_ids: Vec<SubagentId> = {
+            let children = self.children.lock().await;
+            let mut ids = Vec::new();
+            for entry in children.values() {
+                let status = *entry.status.lock().await;
+                if !is_terminal(status) {
+                    ids.push(entry.id);
+                }
+            }
+            ids
+        };
+
+        if active_ids.is_empty() {
+            return None;
+        }
+
+        let mut rx = self.event_tx.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(SubagentEvent::Completed {
+                    subagent_id,
+                    result,
+                }) if active_ids.contains(&subagent_id) => {
+                    let children = self.children.lock().await;
+                    let entry = children.get(&subagent_id);
+                    return Some(SubagentCompletion {
+                        subagent_id,
+                        label: entry.and_then(|e| e.label.clone()),
+                        profile: entry.map(|e| e.profile.clone()).unwrap_or_default(),
+                        result,
+                    });
+                }
+                Ok(SubagentEvent::Failed { subagent_id, error })
+                    if active_ids.contains(&subagent_id) =>
+                {
+                    let children = self.children.lock().await;
+                    let entry = children.get(&subagent_id);
+                    return Some(SubagentCompletion {
+                        subagent_id,
+                        label: entry.and_then(|e| e.label.clone()),
+                        profile: entry.map(|e| e.profile.clone()).unwrap_or_default(),
+                        result: SubagentRunResult {
+                            subagent_id,
+                            status: SubagentStatus::Failed,
+                            messages: Vec::new(),
+                            error: Some(error),
+                        },
+                    });
+                }
+                Ok(SubagentEvent::Aborted { subagent_id }) if active_ids.contains(&subagent_id) => {
+                    let children = self.children.lock().await;
+                    let entry = children.get(&subagent_id);
+                    return Some(SubagentCompletion {
+                        subagent_id,
+                        label: entry.and_then(|e| e.label.clone()),
+                        profile: entry.map(|e| e.profile.clone()).unwrap_or_default(),
+                        result: SubagentRunResult {
+                            subagent_id,
+                            status: SubagentStatus::Aborted,
+                            messages: Vec::new(),
+                            error: None,
+                        },
+                    });
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Check if any active child finished while we lagged
+                    let children = self.children.lock().await;
+                    for &id in &active_ids {
+                        if let Some(entry) = children.get(&id) {
+                            let status = *entry.status.lock().await;
+                            if is_terminal(status) {
+                                return Some(SubagentCompletion {
+                                    subagent_id: id,
+                                    label: entry.label.clone(),
+                                    profile: entry.profile.clone(),
+                                    result: SubagentRunResult {
+                                        subagent_id: id,
+                                        status,
+                                        messages: Vec::new(),
+                                        error: None,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Not a terminal event for our children
+                }
+            }
+        }
+    }
+
+    /// Wait for all active children to complete.
+    ///
+    /// Returns a completion record for each child. Order is completion order.
+    pub async fn wait_all(&self) -> Vec<SubagentCompletion> {
+        let mut results = Vec::new();
+        while let Some(completion) = self.wait_any().await {
+            results.push(completion);
+        }
+        results
+    }
+
+    /// Abort all active children and wait for them to finish.
+    pub async fn shutdown(&self) {
+        // Cancel all active children
+        {
+            let children = self.children.lock().await;
+            for entry in children.values() {
+                let status = *entry.status.lock().await;
+                if !is_terminal(status) {
+                    entry.cancel_token.cancel();
+                }
+            }
+        }
+        // Wait for all to finish
+        self.wait_all().await;
     }
 
     /// List all active (Pending or Running) children.
@@ -424,9 +626,29 @@ impl SubagentSupervisor {
     }
 }
 
+impl Drop for SubagentSupervisor {
+    fn drop(&mut self) {
+        if self.config.abort_on_drop {
+            if let Ok(children) = self.children.try_lock() {
+                for entry in children.values() {
+                    entry.cancel_token.cancel();
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Check whether a status is terminal.
+fn is_terminal(status: SubagentStatus) -> bool {
+    matches!(
+        status,
+        SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Aborted
+    )
+}
 
 /// Extract the task prompt from the initial message list.
 ///
@@ -494,41 +716,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn supervisor_construction_with_builtins() {
+    fn make_supervisor() -> SubagentSupervisor {
         let registry = Arc::new(ProviderRegistry::new());
         let roci_config = RociConfig::default();
         let base_config = make_base_config();
         let sup_config = SubagentSupervisorConfig::default();
         let profile_registry = SubagentProfileRegistry::with_builtins();
-
-        let supervisor = SubagentSupervisor::new(
+        SubagentSupervisor::new(
             registry,
             roci_config,
             base_config,
             sup_config,
             profile_registry,
-        );
+        )
+    }
 
+    #[test]
+    fn supervisor_construction_with_builtins() {
+        let supervisor = make_supervisor();
         assert_eq!(supervisor.config.max_concurrent, 4);
     }
 
     #[tokio::test]
     async fn list_active_empty_on_fresh_supervisor() {
-        let registry = Arc::new(ProviderRegistry::new());
-        let roci_config = RociConfig::default();
-        let base_config = make_base_config();
-        let sup_config = SubagentSupervisorConfig::default();
-        let profile_registry = SubagentProfileRegistry::with_builtins();
-
-        let supervisor = SubagentSupervisor::new(
-            registry,
-            roci_config,
-            base_config,
-            sup_config,
-            profile_registry,
-        );
-
+        let supervisor = make_supervisor();
         let active = supervisor.list_active().await;
         assert!(active.is_empty());
     }
@@ -556,20 +767,7 @@ mod tests {
 
     #[test]
     fn subscribe_returns_receiver() {
-        let registry = Arc::new(ProviderRegistry::new());
-        let roci_config = RociConfig::default();
-        let base_config = make_base_config();
-        let sup_config = SubagentSupervisorConfig::default();
-        let profile_registry = SubagentProfileRegistry::with_builtins();
-
-        let supervisor = SubagentSupervisor::new(
-            registry,
-            roci_config,
-            base_config,
-            sup_config,
-            profile_registry,
-        );
-
+        let supervisor = make_supervisor();
         let _rx = supervisor.subscribe();
     }
 
@@ -577,19 +775,7 @@ mod tests {
     async fn submit_user_input_delegates_to_coordinator() {
         use crate::tools::UserInputResponse;
 
-        let registry = Arc::new(ProviderRegistry::new());
-        let roci_config = RociConfig::default();
-        let base_config = make_base_config();
-        let sup_config = SubagentSupervisorConfig::default();
-        let profile_registry = SubagentProfileRegistry::with_builtins();
-
-        let supervisor = SubagentSupervisor::new(
-            registry,
-            roci_config,
-            base_config,
-            sup_config,
-            profile_registry,
-        );
+        let supervisor = make_supervisor();
 
         // Unknown request should error
         let response = UserInputResponse {
@@ -599,5 +785,113 @@ mod tests {
         };
         let result = supervisor.submit_user_input(response).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_terminal_identifies_terminal_statuses() {
+        assert!(is_terminal(SubagentStatus::Completed));
+        assert!(is_terminal(SubagentStatus::Failed));
+        assert!(is_terminal(SubagentStatus::Aborted));
+        assert!(!is_terminal(SubagentStatus::Pending));
+        assert!(!is_terminal(SubagentStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn abort_returns_error_for_unknown_child() {
+        let supervisor = make_supervisor();
+        let result = supervisor.abort(Uuid::new_v4()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_returns_error_for_unknown_child() {
+        let supervisor = make_supervisor();
+        let result = supervisor.wait(Uuid::new_v4()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_any_returns_none_when_no_children() {
+        let supervisor = make_supervisor();
+        assert!(supervisor.wait_any().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_all_returns_empty_when_no_children() {
+        let supervisor = make_supervisor();
+        let results = supervisor.wait_all().await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_when_no_children() {
+        let supervisor = make_supervisor();
+        supervisor.shutdown().await;
+        // Should not hang or panic
+    }
+
+    #[test]
+    fn drop_cancels_tokens_when_abort_on_drop() {
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        {
+            let supervisor = make_supervisor();
+            // Manually insert a child entry with our token
+            let entry = ChildEntry {
+                id: Uuid::new_v4(),
+                label: None,
+                profile: "test".into(),
+                model: None,
+                status: Arc::new(Mutex::new(SubagentStatus::Running)),
+                cancel_token: token_clone,
+            };
+            // We need to insert without async; use try_lock since no contention
+            supervisor
+                .children
+                .try_lock()
+                .unwrap()
+                .insert(entry.id, entry);
+            // supervisor drops here
+        }
+
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn drop_does_not_cancel_when_abort_on_drop_false() {
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        {
+            let registry = Arc::new(ProviderRegistry::new());
+            let roci_config = RociConfig::default();
+            let base_config = make_base_config();
+            let mut sup_config = SubagentSupervisorConfig::default();
+            sup_config.abort_on_drop = false;
+            let profile_registry = SubagentProfileRegistry::with_builtins();
+            let supervisor = SubagentSupervisor::new(
+                registry,
+                roci_config,
+                base_config,
+                sup_config,
+                profile_registry,
+            );
+            let entry = ChildEntry {
+                id: Uuid::new_v4(),
+                label: None,
+                profile: "test".into(),
+                model: None,
+                status: Arc::new(Mutex::new(SubagentStatus::Running)),
+                cancel_token: token_clone,
+            };
+            supervisor
+                .children
+                .try_lock()
+                .unwrap()
+                .insert(entry.id, entry);
+        }
+
+        assert!(!token.is_cancelled());
     }
 }

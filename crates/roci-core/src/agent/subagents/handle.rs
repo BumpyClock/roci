@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, watch, Mutex};
+use tokio_util::sync::CancellationToken;
 
 use crate::models::LanguageModel;
 
@@ -23,7 +24,7 @@ pub struct SubagentHandle {
     model: Option<LanguageModel>,
     status: Arc<Mutex<SubagentStatus>>,
     snapshot_rx: watch::Receiver<SubagentSnapshot>,
-    abort_tx: Mutex<Option<oneshot::Sender<()>>>,
+    cancel_token: CancellationToken,
     completion_rx: Mutex<Option<oneshot::Receiver<SubagentRunResult>>>,
 }
 
@@ -37,7 +38,7 @@ impl SubagentHandle {
         model: Option<LanguageModel>,
         status: Arc<Mutex<SubagentStatus>>,
         snapshot_rx: watch::Receiver<SubagentSnapshot>,
-        abort_tx: oneshot::Sender<()>,
+        cancel_token: CancellationToken,
         completion_rx: oneshot::Receiver<SubagentRunResult>,
     ) -> Self {
         Self {
@@ -47,7 +48,7 @@ impl SubagentHandle {
             model,
             status,
             snapshot_rx,
-            abort_tx: Mutex::new(Some(abort_tx)),
+            cancel_token,
             completion_rx: Mutex::new(Some(completion_rx)),
         }
     }
@@ -84,15 +85,14 @@ impl SubagentHandle {
 
     /// Request abort of this sub-agent's run.
     ///
-    /// Returns `true` if the abort signal was sent, `false` if the abort
-    /// was already consumed or the child finished.
+    /// Returns `true` if the abort signal was sent, `false` if the child
+    /// was already cancelled or finished.
     pub async fn abort(&self) -> bool {
-        let mut guard = self.abort_tx.lock().await;
-        if let Some(tx) = guard.take() {
-            tx.send(()).is_ok()
-        } else {
-            false
+        if self.cancel_token.is_cancelled() {
+            return false;
         }
+        self.cancel_token.cancel();
+        true
     }
 
     /// Wait for this sub-agent to complete and return its result.
