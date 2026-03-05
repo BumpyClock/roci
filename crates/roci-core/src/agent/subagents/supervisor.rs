@@ -9,8 +9,7 @@ use uuid::Uuid;
 use crate::agent::runtime::AgentConfig;
 #[cfg(feature = "agent")]
 use crate::agent::runtime::UserInputCoordinator;
-use crate::agent_loop::runner::AgentEventSink;
-use crate::agent_loop::{AgentEvent, RunStatus};
+use crate::agent_loop::RunStatus;
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
@@ -156,18 +155,8 @@ impl SubagentSupervisor {
         let id: SubagentId = Uuid::new_v4();
 
         // 6. Build child event sink wrapping events as SubagentEvent::AgentEvent
-        let child_event_sink: AgentEventSink = {
-            let event_tx = self.event_tx.clone();
-            let child_id = id;
-            let child_label = spec.label.clone();
-            Arc::new(move |event: AgentEvent| {
-                let _ = event_tx.send(SubagentEvent::AgentEvent {
-                    subagent_id: child_id,
-                    label: child_label.clone(),
-                    event: Box::new(event),
-                });
-            })
-        };
+        let child_event_sink =
+            super::events::build_child_event_sink(id, spec.label.clone(), self.event_tx.clone());
 
         // 7. Launch child runtime
         let launched = self
@@ -421,6 +410,18 @@ impl SubagentSupervisor {
     pub fn subscribe(&self) -> broadcast::Receiver<SubagentEvent> {
         self.event_tx.subscribe()
     }
+
+    /// Submit a user input response for a child's `ask_user` request.
+    ///
+    /// Delegates to the shared [`UserInputCoordinator`]. The response is
+    /// routed by `request_id` to the correct child.
+    #[cfg(feature = "agent")]
+    pub async fn submit_user_input(
+        &self,
+        response: crate::tools::UserInputResponse,
+    ) -> Result<(), crate::tools::UnknownUserInputRequest> {
+        self.coordinator.submit_response(response).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,5 +571,33 @@ mod tests {
         );
 
         let _rx = supervisor.subscribe();
+    }
+
+    #[tokio::test]
+    async fn submit_user_input_delegates_to_coordinator() {
+        use crate::tools::UserInputResponse;
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let roci_config = RociConfig::default();
+        let base_config = make_base_config();
+        let sup_config = SubagentSupervisorConfig::default();
+        let profile_registry = SubagentProfileRegistry::with_builtins();
+
+        let supervisor = SubagentSupervisor::new(
+            registry,
+            roci_config,
+            base_config,
+            sup_config,
+            profile_registry,
+        );
+
+        // Unknown request should error
+        let response = UserInputResponse {
+            request_id: uuid::Uuid::nil(),
+            answers: vec![],
+            canceled: false,
+        };
+        let result = supervisor.submit_user_input(response).await;
+        assert!(result.is_err());
     }
 }

@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod context;
+pub mod events;
 pub mod handle;
 pub(crate) mod launcher;
 pub mod profiles;
