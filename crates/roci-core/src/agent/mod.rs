@@ -5,6 +5,8 @@ mod core;
 pub mod message;
 pub mod runtime;
 pub mod session;
+#[cfg(feature = "agent")]
+pub mod subagents;
 
 pub use conversation::Conversation;
 pub use core::Agent;
