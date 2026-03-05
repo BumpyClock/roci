@@ -73,6 +73,27 @@ impl AgentRuntime {
 
         let intercepting_sink = self.build_intercepting_sink();
 
+        #[cfg(feature = "agent")]
+        let user_input_callback = {
+            let coordinator = self.user_input_coordinator.clone();
+            let ui_event_sink = intercepting_sink.clone();
+            let config_timeout = self.config.user_input_timeout_ms;
+            let cb: crate::tools::user_input::RequestUserInputFn =
+                Arc::new(move |request: crate::tools::UserInputRequest| {
+                    let coordinator = coordinator.clone();
+                    let sink = ui_event_sink.clone();
+                    Box::pin(async move {
+                        let rx = coordinator.create_request(request.clone()).await?;
+                        sink(crate::agent_loop::AgentEvent::UserInputRequested {
+                            request: request.clone(),
+                        });
+                        let effective_timeout = request.timeout_ms.or(config_timeout);
+                        super::user_input::wait_for_response(rx, effective_timeout).await
+                    })
+                });
+            cb
+        };
+
         let model = self.model.lock().await.clone();
 
         let tools = match self.resolve_tools_for_run().await {
@@ -88,6 +109,11 @@ impl AgentRuntime {
             .with_steering_messages(steering_fn)
             .with_follow_up_messages(follow_up_fn)
             .with_agent_event_sink(intercepting_sink);
+
+        #[cfg(feature = "agent")]
+        {
+            request = request.with_user_input_callback(user_input_callback);
+        }
 
         if let Some(hook) = self.config.before_agent_start.clone() {
             let hook_cancel_token = CancellationToken::new();

@@ -85,4 +85,13 @@ pub struct AgentConfig {
     pub pre_tool_use: Option<PreToolUseHook>,
     /// Optional hook called after each tool execution (including synthetic errors).
     pub post_tool_use: Option<PostToolUseHook>,
+    /// Default timeout for user input requests in milliseconds.
+    pub user_input_timeout_ms: Option<u64>,
+    /// Optional shared coordinator for user input requests.
+    ///
+    /// When provided, the runtime uses this coordinator instead of creating
+    /// its own. This allows the CLI/host to share the coordinator and submit
+    /// responses directly.
+    #[cfg(feature = "agent")]
+    pub user_input_coordinator: Option<std::sync::Arc<super::UserInputCoordinator>>,
 }

@@ -239,6 +239,9 @@ pub struct RunRequest {
     pub provider_metadata: HashMap<String, String>,
     /// Optional per-request payload inspection callback.
     pub provider_payload_callback: Option<provider::ProviderPayloadCallback>,
+    /// Optional callback for requesting user input from tools.
+    #[cfg(feature = "agent")]
+    pub user_input_callback: Option<crate::tools::user_input::RequestUserInputFn>,
 }
 
 impl RunRequest {
@@ -268,6 +271,8 @@ impl RunRequest {
             provider_headers: reqwest::header::HeaderMap::new(),
             provider_metadata: HashMap::new(),
             provider_payload_callback: None,
+            #[cfg(feature = "agent")]
+            user_input_callback: None,
         }
     }
 
@@ -366,6 +371,15 @@ impl RunRequest {
         callback: provider::ProviderPayloadCallback,
     ) -> Self {
         self.provider_payload_callback = Some(callback);
+        self
+    }
+
+    #[cfg(feature = "agent")]
+    pub fn with_user_input_callback(
+        mut self,
+        cb: crate::tools::user_input::RequestUserInputFn,
+    ) -> Self {
+        self.user_input_callback = Some(cb);
         self
     }
 }

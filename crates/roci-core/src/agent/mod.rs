@@ -9,6 +9,8 @@ pub mod session;
 pub use conversation::Conversation;
 pub use core::Agent;
 pub use message::{convert_to_llm, AgentMessage, AgentMessageExt};
+#[cfg(feature = "agent")]
+pub use runtime::UserInputCoordinator;
 pub use runtime::{
     AgentConfig, AgentRuntime, AgentSnapshot, AgentState, GetApiKeyFn, QueueDrainMode,
     SessionBeforeCompactHook, SessionBeforeCompactPayload, SessionBeforeTreeHook,

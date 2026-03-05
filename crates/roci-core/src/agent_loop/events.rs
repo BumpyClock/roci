@@ -156,6 +156,11 @@ pub enum AgentEvent {
         is_error: bool,
     },
 
+    // -- User input --
+    UserInputRequested {
+        request: crate::tools::user_input::UserInputRequest,
+    },
+
     // -- Roci-specific events (kept for backward compat) --
     Approval {
         request: ApprovalRequest,

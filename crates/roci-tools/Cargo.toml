@@ -7,6 +7,11 @@ edition = "2021"
 roci = { path = "../.." }
 tokio = { version = "1", features = ["process", "fs", "time", "io-util"] }
 serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = []
+agent = ["roci/agent"]
 
 [dev-dependencies]
 tempfile = "3"

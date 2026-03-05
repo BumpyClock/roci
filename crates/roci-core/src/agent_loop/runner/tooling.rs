@@ -128,6 +128,9 @@ pub(super) async fn execute_tool_call(
     call: &AgentToolCall,
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
+    #[cfg(feature = "agent")] user_input_callback: Option<
+        &crate::tools::user_input::RequestUserInputFn,
+    >,
 ) -> ToolExecutionOutcome {
     let call = match apply_pre_tool_use_hook(hooks, call, cancel.child_token()).await {
         Ok(call) => call,
@@ -159,6 +162,8 @@ pub(super) async fn execute_tool_call(
                 metadata: serde_json::Value::Null,
                 tool_call_id: Some(call.id.clone()),
                 tool_name: Some(call.name.clone()),
+                #[cfg(feature = "agent")]
+                request_user_input: user_input_callback.cloned(),
             };
             let call_id = call.id.clone();
             let call_name = call.name.clone();
@@ -204,10 +209,24 @@ pub(super) async fn execute_parallel_tool_calls(
     calls: &[AgentToolCall],
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
+    #[cfg(feature = "agent")] user_input_callback: Option<
+        &crate::tools::user_input::RequestUserInputFn,
+    >,
 ) -> Vec<ToolExecutionOutcome> {
     let futures = calls
         .iter()
-        .map(|call| execute_tool_call(tools, hooks, call, agent_emitter, cancel.child_token()));
+        .map(|call| {
+            execute_tool_call(
+                tools,
+                hooks,
+                call,
+                agent_emitter,
+                cancel.child_token(),
+                #[cfg(feature = "agent")]
+                user_input_callback,
+            )
+        })
+        .collect::<Vec<_>>();
     future::join_all(futures).await
 }
 

@@ -92,6 +92,8 @@ async fn main() {
         session_before_tree: None,
         pre_tool_use: None,
         post_tool_use: None,
+        user_input_timeout_ms: None,
+        user_input_coordinator: None,
     };
 
     let roci_config = RociConfig::new();

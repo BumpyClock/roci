@@ -213,8 +213,21 @@ Standalone crate for agent coding tools. Import path: `roci_tools::builtin`.
 | `write_file` | Write/create files (creates parent dirs) |
 | `list_directory` | List directory entries with metadata |
 | `grep` | Search file contents with regex |
+| `ask_user` | Request user input and block until response (agent feature) |
 
 **Usage**: `roci_tools::builtin::all_tools()` returns `Vec<Arc<dyn Tool>>`.
+
+#### `ask_user` Tool
+
+The `ask_user` tool enables blocking user input from the agent:
+
+- **Purpose**: Request clarification or input from the user during tool execution
+- **Behavior**: Emits `AgentEvent::UserInputRequested`, blocks until response submitted
+- **Schema**: `questions` (required array), `timeout_ms` (optional number)
+- **Response**: Routed via `AgentRuntime::submit_user_input()`
+- **Error cases**: Missing callback, timeout, cancellation, or non-interactive CLI host → deterministic typed errors
+
+See `docs/architecture/ask-user-v1-peer-bus-seam.md` for full architecture details.
 
 ## Extension Points
 

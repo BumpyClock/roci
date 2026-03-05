@@ -1,8 +1,9 @@
 # ask_user v1 With Peer-Bus-Compatible Seams
 
 ## Status
-- Scope: `tsq-wvfktvr0` + open children (`.7` to `.18`, `.17` docs)
-- Target: implement blocking `ask_user` now; keep architecture reversible for peer bus later.
+- **IMPLEMENTED** (2026-03-05)
+- Scope: `tsq-wvfktvr0` + children (`.7` to `.18`)
+- All phases complete: canonical types, events, config, context extension, coordinator, tool execution, CLI wiring, tests, docs.
 
 ## Goals
 - Add `ask_user` as a core capability in `roci-core`, not a CLI-only behavior.
@@ -38,7 +39,6 @@
 ## Runtime + Runner Contract
 - Add user-input callback + timeout config to runtime/run request surfaces.
 - Add submission API:
-  - `RunHandle::submit_user_input(...)`
   - `AgentRuntime::submit_user_input(...)`
 - Add request/response wait path with correlation by `request_id`.
 - Keep internals behind small interfaces so routing policy can evolve.
@@ -80,3 +80,56 @@
 - Keep public APIs minimal and typed.
 - Prefer additive changes over signature breakage where possible.
 - Include migration comments where v1 choices intentionally preserve v2 path.
+
+## Implementation Summary
+
+### Phase 1: Canonical Types (`roci-core/src/tools/user_input.rs`)
+- `UserInputRequestId` (UUID)
+- `UserInputRequest` (request_id, tool_call_id, questions, timeout_ms)
+- `Question` (id, text, options)
+- `QuestionOption` (id, label)
+- `UserInputResponse` (request_id, answers, canceled)
+- `Answer` (question_id, content)
+- `UnknownUserInputRequest` (typed error)
+- `UserInputError` enum (UnknownRequest, Timeout, Canceled, NoCallback)
+- `RequestUserInputFn` callback type
+
+### Phase 2: Events & Config
+- `AgentEvent::UserInputRequested { request: UserInputRequest }` in `agent_loop/events.rs`
+- `AgentConfig.user_input_timeout_ms: Option<u64>` in `agent/runtime/config.rs`
+- `ToolExecutionContext.request_user_input: Option<RequestUserInputFn>` (agent feature only)
+
+### Phase 3: Coordinator (`roci-core/src/agent/runtime/user_input.rs`)
+- `UserInputCoordinator` manages pending requests via oneshot channels
+- `create_request()` → returns receiver for tool to await
+- `submit_response()` → unblocks waiting tool
+- `cancel_all()` → cleanup on abort/reset
+- timed-out/canceled waits remove pending entries before returning, so late submits deterministically fail with `UnknownUserInputRequest`
+- completion notifications are broadcast to hosts that need to stop waiting on input
+- `wait_for_response()` → helper with optional timeout
+
+### Phase 4: Tool Execution (`roci-tools/src/builtin/ask_user.rs`)
+- Parses questions from tool arguments
+- Creates `UserInputRequest` with UUID
+- Calls `ctx.request_user_input` callback (agent feature only)
+- Returns structured response or error
+
+### Phase 5: Runtime & CLI Integration
+- `AgentRuntime.submit_user_input()` → delegates to coordinator
+- `AgentRuntime.user_input_coordinator` field (agent feature only)
+- Callback built in `run_loop.rs`: creates request via coordinator, emits `UserInputRequested` event, waits for response with timeout
+- Callback threaded through `RunRequest.user_input_callback` → `execute_tool_call` → `ToolExecutionContext`
+- CLI uses shared `UserInputCoordinator` passed via `AgentConfig.user_input_coordinator`
+- CLI event sink forwards `UserInputRequested` into a dedicated prompt host
+- Prompt host uses a single worker thread plus cancellable raw-mode terminal polling to avoid detached per-request stdin readers
+- Prompt host checks coordinator completion/shutdown between polls so timed-out requests stop prompting without spawning orphan readers
+- CLI requires an interactive terminal for `ask_user`; non-interactive/raw-mode-unavailable sessions fail fast with a typed error
+- CLI `prompt_user_for_input()` collects answers and submits via coordinator
+- `ask_user_tool()` added to `all_tools()`
+
+### Key Design Decisions
+1. **Feature-gated callback**: The `request_user_input` callback is only available when the `agent` feature is enabled, ensuring core remains usable without async runtime.
+2. **Blocking semantics**: The tool blocks until response is received, timeout expires, or request is canceled.
+3. **Deterministic errors**: All error cases return typed errors, never panic.
+4. **Peer-bus ready**: Type names avoid parent-specific terminology; routing policy can be swapped later.
+5. **Shared coordinator**: The CLI and runtime share a `UserInputCoordinator` via `AgentConfig`, enabling the event sink to submit responses directly without going through `AgentRuntime::submit_user_input()`.

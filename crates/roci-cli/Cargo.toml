@@ -9,10 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 roci = { path = "../..", features = ["agent", "mcp"] }
-roci-tools = { path = "../roci-tools" }
+roci-tools = { path = "../roci-tools", features = ["agent"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
+crossterm = "0.29"
 
 [dev-dependencies]
 tempfile = "3"

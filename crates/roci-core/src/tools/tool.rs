@@ -11,7 +11,7 @@ use super::types::AgentToolParameters;
 use crate::error::RociError;
 
 /// Context available during tool execution.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct ToolExecutionContext {
     /// Additional metadata for the tool.
     pub metadata: serde_json::Value,
@@ -19,6 +19,47 @@ pub struct ToolExecutionContext {
     pub tool_call_id: Option<String>,
     /// Tool name as requested by the model.
     pub tool_name: Option<String>,
+    /// Callback to request user input. None if not configured.
+    #[cfg(feature = "agent")]
+    pub request_user_input: Option<super::user_input::RequestUserInputFn>,
+}
+
+impl Default for ToolExecutionContext {
+    fn default() -> Self {
+        Self {
+            metadata: serde_json::Value::Null,
+            tool_call_id: None,
+            tool_name: None,
+            #[cfg(feature = "agent")]
+            request_user_input: None,
+        }
+    }
+}
+
+#[cfg(feature = "agent")]
+impl std::fmt::Debug for ToolExecutionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolExecutionContext")
+            .field("metadata", &self.metadata)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("tool_name", &self.tool_name)
+            .field(
+                "request_user_input",
+                &self.request_user_input.as_ref().map(|_| "<callback>"),
+            )
+            .finish()
+    }
+}
+
+#[cfg(not(feature = "agent"))]
+impl std::fmt::Debug for ToolExecutionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolExecutionContext")
+            .field("metadata", &self.metadata)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("tool_name", &self.tool_name)
+            .finish()
+    }
 }
 
 /// Callback for streaming partial tool results during execution.

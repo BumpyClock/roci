@@ -25,6 +25,11 @@ mod run_loop;
 mod state;
 mod summary;
 mod types;
+#[cfg(feature = "agent")]
+mod user_input;
+
+#[cfg(feature = "agent")]
+pub use self::user_input::UserInputCoordinator;
 
 pub use self::config::AgentConfig;
 #[cfg(test)]
@@ -100,6 +105,8 @@ pub struct AgentRuntime {
     last_error: Arc<Mutex<Option<String>>>,
     snapshot_tx: watch::Sender<AgentSnapshot>,
     snapshot_rx: watch::Receiver<AgentSnapshot>,
+    #[cfg(feature = "agent")]
+    user_input_coordinator: Arc<UserInputCoordinator>,
 }
 
 impl AgentRuntime {
@@ -123,6 +130,11 @@ impl AgentRuntime {
             last_error: None,
         };
         let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
+        #[cfg(feature = "agent")]
+        let user_input_coordinator = config
+            .user_input_coordinator
+            .clone()
+            .unwrap_or_else(|| Arc::new(UserInputCoordinator::new()));
         Self {
             config,
             runner,
@@ -145,7 +157,21 @@ impl AgentRuntime {
             last_error: Arc::new(Mutex::new(None)),
             snapshot_tx,
             snapshot_rx,
+            #[cfg(feature = "agent")]
+            user_input_coordinator,
         }
+    }
+
+    /// Submit a user input response.
+    ///
+    /// This is called by the CLI/host when a user responds to a `UserInputRequested` event.
+    /// The response will be routed to the waiting tool execution.
+    #[cfg(feature = "agent")]
+    pub async fn submit_user_input(
+        &self,
+        response: crate::tools::UserInputResponse,
+    ) -> Result<(), crate::tools::UnknownUserInputRequest> {
+        self.user_input_coordinator.submit_response(response).await
     }
 }
 

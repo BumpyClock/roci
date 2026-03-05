@@ -128,6 +128,45 @@ impl ParameterBuilder {
         self
     }
 
+    /// Add an array property with nested items.
+    pub fn array(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        required: bool,
+    ) -> Self {
+        let name = name.into();
+        self.properties.insert(
+            name.clone(),
+            serde_json::json!({
+                "type": "array",
+                "description": description.into(),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Question identifier"},
+                        "text": {"type": "string", "description": "Question text to display"},
+                        "options": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "label": {"type": "string"}
+                                }
+                            }
+                        }
+                    },
+                    "required": ["id", "text"]
+                }
+            }),
+        );
+        if required {
+            self.required.push(name);
+        }
+        self
+    }
+
     /// Build into AgentToolParameters.
     pub fn build(self) -> AgentToolParameters {
         AgentToolParameters {

@@ -144,6 +144,9 @@ pub(super) fn test_agent_config() -> AgentConfig {
         session_before_tree: None,
         pre_tool_use: None,
         post_tool_use: None,
+        user_input_timeout_ms: None,
+        #[cfg(feature = "agent")]
+        user_input_coordinator: None,
     }
 }
 

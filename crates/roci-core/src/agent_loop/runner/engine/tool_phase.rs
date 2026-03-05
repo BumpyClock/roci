@@ -120,6 +120,8 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     &pending_parallel_calls,
                     agent_emitter,
                     run_cancel_token.child_token(),
+                    #[cfg(feature = "agent")]
+                    request.user_input_callback.as_ref(),
                 ) => results,
             };
             pending_parallel_calls.clear();
@@ -187,6 +189,8 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     call,
                     agent_emitter,
                     run_cancel_token.child_token(),
+                    #[cfg(feature = "agent")]
+                    request.user_input_callback.as_ref(),
                 ) => outcome,
             }
         } else {
@@ -270,6 +274,8 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                 &pending_parallel_calls,
                 agent_emitter,
                 run_cancel_token.child_token(),
+                #[cfg(feature = "agent")]
+                request.user_input_callback.as_ref(),
             ) => results,
         };
         pending_parallel_calls.clear();

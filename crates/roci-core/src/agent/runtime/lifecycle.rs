@@ -136,6 +136,9 @@ impl AgentRuntime {
         self.abort().await;
         self.wait_for_idle().await;
 
+        #[cfg(feature = "agent")]
+        self.user_input_coordinator.cancel_all().await;
+
         self.messages.lock().await.clear();
         self.steering_queue.lock().await.clear();
         self.follow_up_queue.lock().await.clear();

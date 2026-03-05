@@ -20,9 +20,9 @@ fn args(json: serde_json::Value) -> ToolArguments {
 // ── all_tools ──────────────────────────────────────────────────────
 
 #[test]
-fn all_tools_returns_five_tools() {
+fn all_tools_returns_six_tools() {
     let tools = all_tools();
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 6);
 }
 
 #[test]
@@ -496,4 +496,108 @@ fn each_tool_has_object_parameter_schema() {
             tool.name()
         );
     }
+}
+
+// ── ask_user ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn ask_user_rejects_missing_questions() {
+    let tool = ask_user_tool();
+    let result = tool
+        .execute(&args(serde_json::json!({})), &default_ctx())
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn ask_user_rejects_non_object_questions() {
+    let tool = ask_user_tool();
+    let result = tool
+        .execute(
+            &args(serde_json::json!({"questions": [42]})),
+            &default_ctx(),
+        )
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn ask_user_rejects_missing_text() {
+    let tool = ask_user_tool();
+    let result = tool
+        .execute(
+            &args(serde_json::json!({"questions": [{"id": "q1"}]})),
+            &default_ctx(),
+        )
+        .await;
+    assert!(result.is_err());
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn ask_user_returns_error_without_callback() {
+    let tool = ask_user_tool();
+    let result = tool
+        .execute(
+            &args(serde_json::json!({"questions": [{"id": "q1", "text": "Name?"}]})),
+            &default_ctx(),
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("callback"));
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn ask_user_returns_response_with_callback() {
+    let tool = ask_user_tool();
+    let ctx = ToolExecutionContext {
+        request_user_input: Some(Arc::new(|req| {
+            Box::pin(async move {
+                Ok(roci::tools::UserInputResponse {
+                    request_id: req.request_id,
+                    answers: vec![roci::tools::Answer {
+                        question_id: "q1".into(),
+                        content: "Alice".into(),
+                    }],
+                    canceled: false,
+                })
+            })
+        })),
+        ..default_ctx()
+    };
+    let result = tool
+        .execute(
+            &args(serde_json::json!({"questions": [{"id": "q1", "text": "Name?"}]})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!result["canceled"].as_bool().unwrap());
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn ask_user_surfaces_interactive_prompt_unavailable_error() {
+    let tool = ask_user_tool();
+    let ctx = ToolExecutionContext {
+        request_user_input: Some(Arc::new(|req| {
+            Box::pin(async move {
+                Err(roci::tools::UserInputError::InteractivePromptUnavailable {
+                    request_id: req.request_id,
+                    reason: "stdin is not an interactive terminal".into(),
+                })
+            })
+        })),
+        ..default_ctx()
+    };
+    let result = tool
+        .execute(
+            &args(serde_json::json!({"questions": [{"id": "q1", "text": "Name?"}]})),
+            &ctx,
+        )
+        .await;
+
+    let err = result.expect_err("interactive prompt failure should surface");
+    assert!(err.to_string().contains("interactive prompt unavailable"));
 }
