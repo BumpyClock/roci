@@ -6,7 +6,6 @@ use futures::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
-use std::sync::{Mutex, OnceLock};
 use tracing::debug;
 
 use crate::models::openai::OpenAiModel;
@@ -22,8 +21,6 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Homie, a helpful assistant.";
 const RESPONSES_PROXY_BASE_URL_ENV: &str = "ROCI_OPENAI_RESPONSES_PROXY_BASE_URL";
 const METADATA_SESSION_KEY: &str = "roci_session_id";
-
-static SESSION_RESPONSE_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 pub struct OpenAiResponsesProvider {
     model: OpenAiModel,
@@ -51,38 +48,6 @@ impl OpenAiResponsesProvider {
             account_id,
             capabilities,
             is_codex,
-        }
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn session_cache() -> &'static Mutex<HashMap<String, String>> {
-        SESSION_RESPONSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    fn session_cache_key(&self, request: &ProviderRequest) -> Option<String> {
-        request
-            .session_id
-            .as_ref()
-            .map(|session_id| format!("{}:{}:{session_id}", self.base_url, self.model.as_str()))
-    }
-
-    fn read_cached_previous_response_id(&self, request: &ProviderRequest) -> Option<String> {
-        let key = self.session_cache_key(request)?;
-        Self::session_cache()
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&key).cloned())
-    }
-
-    fn cache_response_id_for_session(&self, request: &ProviderRequest, response_id: Option<&str>) {
-        let Some(response_id) = response_id else {
-            return;
-        };
-        let Some(cache_key) = self.session_cache_key(request) else {
-            return;
-        };
-        if let Ok(mut cache) = Self::session_cache().lock() {
-            cache.insert(cache_key, response_id.to_string());
         }
     }
 
@@ -130,6 +95,11 @@ impl OpenAiResponsesProvider {
             let user_agent = format!("roci ({} {})", std::env::consts::OS, std::env::consts::ARCH);
             if let Ok(value) = reqwest::header::HeaderValue::from_str(&user_agent) {
                 headers.insert(reqwest::header::USER_AGENT, value);
+            }
+            if let Some(ref session_id) = request.session_id {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(session_id) {
+                    headers.insert("session_id", value);
+                }
             }
         } else if let Some(account_id) = &self.account_id {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(account_id) {
@@ -185,7 +155,6 @@ impl OpenAiResponsesProvider {
             .openai_responses
             .as_ref()
             .and_then(|options| options.previous_response_id.clone())
-            .or_else(|| self.read_cached_previous_response_id(request))
     }
 
     fn merged_metadata(&self, request: &ProviderRequest) -> Option<HashMap<String, String>> {
@@ -344,6 +313,9 @@ impl OpenAiResponsesProvider {
         if let Some(previous_response_id) = self.resolve_previous_response_id(request) {
             obj.insert("previous_response_id".into(), previous_response_id.into());
         }
+        if let Some(ref session_id) = request.session_id {
+            obj.insert("prompt_cache_key".into(), session_id.clone().into());
+        }
         if let Some(metadata) = self.merged_metadata(request) {
             obj.insert("metadata".into(), serde_json::json!(metadata));
         }
@@ -460,6 +432,9 @@ impl OpenAiResponsesProvider {
         }
         if let Some(previous_response_id) = self.resolve_previous_response_id(request) {
             obj.insert("previous_response_id".into(), previous_response_id.into());
+        }
+        if let Some(ref session_id) = request.session_id {
+            obj.insert("prompt_cache_key".into(), session_id.clone().into());
         }
         if let Some(metadata) = self.merged_metadata(request) {
             obj.insert("metadata".into(), serde_json::json!(metadata));
@@ -1015,12 +990,7 @@ impl ModelProvider for OpenAiResponsesProvider {
         }
 
         let payload: serde_json::Value = resp.json().await?;
-        let response_id = payload
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
         let data: ResponsesApiResponse = serde_json::from_value(payload)?;
-        self.cache_response_id_for_session(request, response_id.as_deref());
         Self::parse_response(data)
     }
 
@@ -1032,7 +1002,6 @@ impl ModelProvider for OpenAiResponsesProvider {
         let body = self.build_request_body(request, true);
         self.emit_payload_callback(request, &body);
         let url = self.responses_url(request);
-        let session_cache_key = self.session_cache_key(request);
 
         debug!(model = self.model.as_str(), "OpenAI Responses stream_text");
 
@@ -1059,7 +1028,6 @@ impl ModelProvider for OpenAiResponsesProvider {
             let mut pending_data: Vec<String> = Vec::new();
             let mut saw_done = false;
             let mut debug_event_count = 0usize;
-            let session_cache_key = session_cache_key;
             futures::pin_mut!(byte_stream);
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -1268,16 +1236,6 @@ impl ModelProvider for OpenAiResponsesProvider {
                                             yield Err(RociError::api(400, message));
                                             saw_done = true;
                                             break;
-                                        }
-                                        if let (Some(cache_key), Some(response_id)) = (
-                                            session_cache_key.as_deref(),
-                                            event.get("response")
-                                                .and_then(|r| r.get("id"))
-                                                .and_then(|v| v.as_str()),
-                                        ) {
-                                            if let Ok(mut cache) = OpenAiResponsesProvider::session_cache().lock() {
-                                                cache.insert(cache_key.to_string(), response_id.to_string());
-                                            }
                                         }
                                         if let Some(response) = event.get("response") {
                                             if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
@@ -1706,13 +1664,9 @@ mod tests {
     }
 
     #[test]
-    fn request_body_merges_request_metadata_and_session_cache() {
+    fn request_body_merges_request_metadata_and_includes_prompt_cache_key() {
         let provider =
             OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
-        OpenAiResponsesProvider::session_cache()
-            .lock()
-            .expect("session cache lock")
-            .clear();
 
         let mut options_metadata = std::collections::HashMap::new();
         options_metadata.insert("tag".to_string(), "settings".to_string());
@@ -1738,13 +1692,115 @@ mod tests {
             session_id: Some(session_id.to_string()),
             transport: None,
         };
-        provider.cache_response_id_for_session(&request, Some("resp_cached"));
 
         let body = provider.build_request_body(&request, false);
-        assert_eq!(body["previous_response_id"], "resp_cached");
+        assert_eq!(body["prompt_cache_key"], session_id);
+        assert!(body.get("previous_response_id").is_none());
         assert_eq!(body["metadata"]["tag"], "request");
         assert_eq!(body["metadata"]["trace_id"], "trace-1");
         assert_eq!(body["metadata"][METADATA_SESSION_KEY], session_id);
+    }
+
+    #[test]
+    fn request_body_omits_prompt_cache_key_when_no_session_id() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn codex_request_body_includes_prompt_cache_key() {
+        let provider = OpenAiResponsesProvider::new(
+            OpenAiModel::Gpt5Nano,
+            "test-key".to_string(),
+            Some("https://chatgpt.com/backend-api/codex".to_string()),
+            Some("acct-123".to_string()),
+        );
+        let session_id = "codex-session-1";
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: Some(session_id.to_string()),
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["prompt_cache_key"], session_id);
+    }
+
+    #[test]
+    fn codex_headers_include_session_id() {
+        let provider = OpenAiResponsesProvider::new(
+            OpenAiModel::Gpt5Nano,
+            "test-key".to_string(),
+            Some("https://chatgpt.com/backend-api/codex".to_string()),
+            Some("acct-123".to_string()),
+        );
+        let session_id = "codex-session-1";
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: Some(session_id.to_string()),
+            transport: None,
+        };
+
+        let headers = provider.build_headers(&request).expect("headers");
+        assert_eq!(
+            headers.get("session_id").unwrap().to_str().unwrap(),
+            session_id
+        );
+    }
+
+    #[test]
+    fn codex_headers_omit_session_id_when_absent() {
+        let provider = OpenAiResponsesProvider::new(
+            OpenAiModel::Gpt5Nano,
+            "test-key".to_string(),
+            Some("https://chatgpt.com/backend-api/codex".to_string()),
+            Some("acct-123".to_string()),
+        );
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let headers = provider.build_headers(&request).expect("headers");
+        assert!(headers.get("session_id").is_none());
     }
 
     #[test]

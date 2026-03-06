@@ -10,3 +10,12 @@ Findings:
 - `metadata` is a map of up to 16 key-value pairs (string keys and values) for tagging responses.
 - `service_tier` accepts `auto|default|flex|priority` to control processing tier.
 - `truncation` appears in response objects and can be set on requests; examples show values like `disabled`.
+
+## Session semantics (2026-03-06)
+
+Aligned with pi-mono's stateless approach:
+
+- `session_id` on `ProviderRequest` drives `prompt_cache_key` in the request body for server-side prompt-cache affinity. This applies to both standard OpenAI Responses and Codex endpoints.
+- For Codex endpoints, `session_id` is also sent as an HTTP header (`session_id`) for session affinity.
+- `previous_response_id` in `OpenAiResponsesOptions` is opt-in only — callers must set it explicitly. There is no automatic in-process caching of response IDs.
+- Default flow sends the full transcript in `input` each request, relying on `prompt_cache_key` for efficient caching rather than server-side conversation state via `previous_response_id`.
