@@ -20,8 +20,6 @@ use roci_core::provider::{ModelProvider, ProviderRequest, ProviderResponse};
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Homie, a helpful assistant.";
 const RESPONSES_PROXY_BASE_URL_ENV: &str = "ROCI_OPENAI_RESPONSES_PROXY_BASE_URL";
-const METADATA_SESSION_KEY: &str = "roci_session_id";
-
 pub struct OpenAiResponsesProvider {
     model: OpenAiModel,
     api_key: String,
@@ -167,12 +165,6 @@ impl OpenAiResponsesProvider {
 
         for (key, value) in &request.metadata {
             metadata.insert(key.clone(), value.clone());
-        }
-
-        if let Some(session_id) = request.session_id.as_ref() {
-            metadata
-                .entry(METADATA_SESSION_KEY.to_string())
-                .or_insert_with(|| session_id.clone());
         }
 
         if metadata.is_empty() {
@@ -1698,7 +1690,7 @@ mod tests {
         assert!(body.get("previous_response_id").is_none());
         assert_eq!(body["metadata"]["tag"], "request");
         assert_eq!(body["metadata"]["trace_id"], "trace-1");
-        assert_eq!(body["metadata"][METADATA_SESSION_KEY], session_id);
+        assert!(body["metadata"].get("roci_session_id").is_none());
     }
 
     #[test]

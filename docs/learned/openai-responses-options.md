@@ -17,5 +17,6 @@ Aligned with pi-mono's stateless approach:
 
 - `session_id` on `ProviderRequest` drives `prompt_cache_key` in the request body for server-side prompt-cache affinity. This applies to both standard OpenAI Responses and Codex endpoints.
 - For Codex endpoints, `session_id` is also sent as an HTTP header (`session_id`) for session affinity.
+- `session_id` is not injected into request `metadata` by default.
 - `previous_response_id` in `OpenAiResponsesOptions` is opt-in only — callers must set it explicitly. There is no automatic in-process caching of response IDs.
 - Default flow sends the full transcript in `input` each request, relying on `prompt_cache_key` for efficient caching rather than server-side conversation state via `previous_response_id`.
