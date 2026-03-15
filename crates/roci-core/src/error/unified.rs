@@ -16,7 +16,6 @@ pub enum ErrorCode {
     ServerError,
     ServiceUnavailable,
     Timeout,
-    NetworkError,
     Unknown,
 }
 
@@ -51,7 +50,6 @@ pub enum RecoverySuggestion {
     CheckCredentials,
     CheckConfiguration,
     IncreaseTimeout,
-    ReduceInputSize,
     CheckToolImplementation,
     ContactSupport,
 }

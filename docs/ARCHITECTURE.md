@@ -101,16 +101,15 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 | `provider::sanitize` | `sanitize_messages_for_provider()` |
 | `models` | `LanguageModel` (string-based), `ProviderKey`, `ModelSelector`, `ModelCapabilities` |
 | `auth` | `AuthService` orchestrator, `AuthBackend` trait, `Token`, `FileTokenStore`, `DeviceCodeSession` |
-| `config` | `RociConfig`, `AuthManager`, `AuthValue` |
+| `config` | `RociConfig` |
 | `error` | `RociError` with typed variants, categories, retryability |
 | `types` | `ModelMessage`, `Usage`, `FinishReason`, `GenerationSettings`, `TextStreamDelta`, `ContentPart` |
 | `generation` | `generate_text()`, `stream_text()`, `generate_object()` -- operate on `&dyn ModelProvider` |
 | `skills` | Skill discovery, frontmatter parsing, and prompt formatting |
 | `resource` | Resource loading for settings, context files, prompt templates, and diagnostics |
 | `tools` | `Tool` trait, `AgentTool`, `ToolArguments`, `DynamicTool` |
-| `stream_transform` | `StreamTransform` trait + built-in transforms |
 | `stop` | Stop conditions |
-| `util` | `ResponseCache`, `UsageTracker`, `RetryPolicy` |
+| `util` | `RetryPolicy` |
 | `prelude` | Convenience re-exports |
 | `agent` / `agent_loop` | `AgentRuntime` split into `types`, `config`, `state`, `lifecycle`, `mutations`, `run_loop`, `events`, and `summary`; evented loop runner, approvals, and compaction/summary pipeline. Runtime tests live under `crates/roci-core/src/agent/runtime_tests/` (feature: `agent`) |
 | `audio` | Realtime audio sessions via WebSocket (feature: `audio`) |

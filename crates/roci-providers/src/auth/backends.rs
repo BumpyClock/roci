@@ -7,8 +7,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use roci_core::auth::{
-    AuthBackend, AuthError, AuthPollResult, AuthStep, DeviceCodePoll, DeviceCodeSession, Token,
-    TokenStore,
+    AuthBackend, AuthError, AuthPollResult, AuthStep, DeviceCodeSession, Token, TokenStore,
 };
 
 use super::claude_code::{ClaudeCodeAuth, PkceSession};
@@ -56,7 +55,7 @@ impl AuthBackend for GitHubCopilotBackend {
         let result = auth.poll_device_code(session).await?;
 
         // Attempt Copilot JWT exchange on success; store as github-copilot-api
-        if let DeviceCodePoll::Authorized { .. } = &result {
+        if let AuthPollResult::Authorized { .. } = &result {
             if let Ok(copilot_token) = auth.exchange_copilot_token().await {
                 let api_token = Token {
                     access_token: copilot_token.token,
@@ -71,7 +70,7 @@ impl AuthBackend for GitHubCopilotBackend {
             }
         }
 
-        Ok(map_poll_result(result))
+        Ok(result)
     }
 
     async fn complete_pkce(
@@ -136,7 +135,7 @@ impl AuthBackend for OpenAiCodexBackend {
     ) -> Result<AuthPollResult, AuthError> {
         let auth = OpenAiCodexAuth::new(store.clone());
         let result = auth.poll_device_code(session).await?;
-        Ok(map_poll_result(result))
+        Ok(result)
     }
 
     async fn complete_pkce(
@@ -225,18 +224,6 @@ impl AuthBackend for ClaudeCodeBackend {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn map_poll_result(poll: DeviceCodePoll) -> AuthPollResult {
-    match poll {
-        DeviceCodePoll::Pending { .. } => AuthPollResult::Pending,
-        DeviceCodePoll::SlowDown { interval_secs } => AuthPollResult::SlowDown {
-            new_interval: Duration::from_secs(interval_secs),
-        },
-        DeviceCodePoll::Authorized { token } => AuthPollResult::Authorized { token },
-        DeviceCodePoll::AccessDenied => AuthPollResult::Denied,
-        DeviceCodePoll::Expired => AuthPollResult::Expired,
-    }
-}
 
 fn pkce_session_to_json(session: &PkceSession) -> serde_json::Value {
     serde_json::json!({

@@ -83,17 +83,26 @@ pub struct AgentSnapshot {
 pub type GetApiKeyFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, RociError>> + Send>> + Send + Sync>;
 
-/// Outcome returned by pre-summary session hooks.
+/// Outcome returned by `session_before_compact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionSummaryHookOutcome {
-    /// Continue with normal summary generation.
+pub enum SessionBeforeCompactOutcome {
+    /// Continue with normal compaction summary generation.
     Continue,
-    /// Skip summary generation for this operation.
+    /// Skip compaction for this operation.
+    Cancel,
+    /// Override compaction summary and kept-boundary metadata.
+    OverrideCompaction(SessionCompactionOverride),
+}
+
+/// Outcome returned by `session_before_tree`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionBeforeTreeOutcome {
+    /// Continue with normal branch summary generation.
+    Continue,
+    /// Skip branch summary generation for this operation.
     Cancel,
     /// Use the provided summary text instead of model-generated text.
     OverrideSummary(String),
-    /// Override compaction summary and kept-boundary metadata.
-    OverrideCompaction(SessionCompactionOverride),
 }
 
 /// Full compaction override returned by `session_before_compact`.
@@ -169,7 +178,7 @@ pub type SessionBeforeCompactHook = Arc<
     dyn Fn(
             SessionBeforeCompactPayload,
         )
-            -> Pin<Box<dyn Future<Output = Result<SessionSummaryHookOutcome, RociError>> + Send>>
+            -> Pin<Box<dyn Future<Output = Result<SessionBeforeCompactOutcome, RociError>> + Send>>
         + Send
         + Sync,
 >;
@@ -179,7 +188,7 @@ pub type SessionBeforeTreeHook = Arc<
     dyn Fn(
             SessionBeforeTreePayload,
         )
-            -> Pin<Box<dyn Future<Output = Result<SessionSummaryHookOutcome, RociError>> + Send>>
+            -> Pin<Box<dyn Future<Output = Result<SessionBeforeTreeOutcome, RociError>> + Send>>
         + Send
         + Sync,
 >;

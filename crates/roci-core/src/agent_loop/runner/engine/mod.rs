@@ -5,13 +5,13 @@ use crate::provider::{self, ToolDefinition};
 use crate::types::ModelMessage;
 
 use super::control::{
-    debug_enabled, emit_failed_result, resolve_iteration_limit_approval, AgentEventEmitter,
-    RunEventEmitter,
+    emit_failed_result, resolve_iteration_limit_approval, AgentEventEmitter, RunEventEmitter,
 };
 use super::limits::RunnerLimits;
 use super::message_events::emit_message_lifecycle;
 use super::{AgentEvent, ApprovalDecision, LoopRunner, RunEventPayload, RunEventStream, RunHandle};
 use super::{RunLifecycle, RunRequest, RunResult, Runner};
+use crate::util::debug::roci_debug_enabled;
 
 mod llm_phase;
 mod tool_phase;
@@ -35,7 +35,7 @@ fn canceled_result(
         run_id: request.run_id,
         messages: messages.to_vec(),
     });
-    if debug_enabled() {
+    if roci_debug_enabled() {
         tracing::debug!(run_id = %request.run_id, "roci run canceled");
     }
     RunResult::canceled_with_messages(messages.to_vec())
@@ -63,7 +63,7 @@ impl Runner for LoopRunner {
         let provider_factory = self.provider_factory.clone();
 
         tokio::spawn(async move {
-            if debug_enabled() {
+            if roci_debug_enabled() {
                 tracing::debug!(
                     run_id = %request.run_id,
                     model = %request.model.to_string(),
@@ -83,7 +83,7 @@ impl Runner for LoopRunner {
                 run_id: request.run_id,
             });
 
-            if debug_enabled() {
+            if roci_debug_enabled() {
                 tracing::debug!(
                     run_id = %request.run_id,
                     max_iterations = limits.max_iterations,
@@ -190,7 +190,7 @@ impl Runner for LoopRunner {
                                     max_iterations.saturating_add(limits.iteration_extension);
                                 iteration_extensions_used =
                                     iteration_extensions_used.saturating_add(1);
-                                if debug_enabled() {
+                                if roci_debug_enabled() {
                                     tracing::debug!(
                                         run_id = %request.run_id,
                                         iteration,
@@ -334,7 +334,7 @@ impl Runner for LoopRunner {
                     messages: messages.clone(),
                 });
                 let _ = result_tx.send(RunResult::completed_with_messages(messages));
-                if debug_enabled() {
+                if roci_debug_enabled() {
                     tracing::debug!(run_id = %request.run_id, "roci run completed");
                 }
                 return;

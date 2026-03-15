@@ -9,10 +9,6 @@ use crate::error::RociError;
 pub enum AuthError {
     #[error("Not logged in")]
     NotLoggedIn,
-    #[error("Authorization pending")]
-    AuthorizationPending,
-    #[error("Access denied")]
-    AccessDenied,
     #[error("Expired or invalid grant")]
     ExpiredOrInvalidGrant,
     #[error("Rate limited")]

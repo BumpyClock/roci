@@ -29,8 +29,6 @@ pub struct ResourceLoader {
     skill_options: SkillResourceOptions,
 }
 
-pub type DefaultResourceLoader = ResourceLoader;
-
 /// Controls skill discovery when loading resources.
 #[derive(Debug, Clone)]
 pub struct SkillResourceOptions {

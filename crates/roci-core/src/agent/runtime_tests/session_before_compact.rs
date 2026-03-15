@@ -2,12 +2,34 @@ use super::support::*;
 use super::*;
 use std::sync::{Arc, Mutex};
 
+fn override_compaction(
+    payload: &SessionBeforeCompactPayload,
+    summary: &str,
+    details: Option<&str>,
+) -> SessionCompactionOverride {
+    let first_kept_entry_id =
+        payload.to_summarize.messages.len() + payload.turn_prefix.messages.len();
+    let tokens_before = payload
+        .to_summarize
+        .messages
+        .iter()
+        .chain(payload.turn_prefix.messages.iter())
+        .map(estimate_message_tokens)
+        .sum::<usize>();
+    SessionCompactionOverride {
+        summary: summary.to_string(),
+        first_kept_entry_id,
+        tokens_before,
+        details: details.map(str::to_string),
+    }
+}
+
 #[tokio::test]
 async fn session_before_compact_can_cancel_compaction() {
     let mut config = test_agent_config();
     config.compaction.keep_recent_tokens = 1;
     config.session_before_compact = Some(Arc::new(|_payload| {
-        Box::pin(async { Ok(SessionSummaryHookOutcome::Cancel) })
+        Box::pin(async { Ok(SessionBeforeCompactOutcome::Cancel) })
     }));
     let agent = AgentRuntime::new(test_registry(), test_config(), config);
     let original_messages = vec![
@@ -43,7 +65,7 @@ async fn session_before_compact_accepts_full_override_contract() {
                 .iter()
                 .map(estimate_message_tokens)
                 .sum::<usize>();
-            Ok(SessionSummaryHookOutcome::OverrideCompaction(
+            Ok(SessionBeforeCompactOutcome::OverrideCompaction(
                 SessionCompactionOverride {
                     summary: "hooked full override summary".to_string(),
                     first_kept_entry_id,
@@ -96,7 +118,7 @@ async fn session_before_compact_rejects_invalid_override() {
     config.compaction.keep_recent_tokens = 1;
     config.session_before_compact = Some(Arc::new(|_payload| {
         Box::pin(async {
-            Ok(SessionSummaryHookOutcome::OverrideCompaction(
+            Ok(SessionBeforeCompactOutcome::OverrideCompaction(
                 SessionCompactionOverride {
                     summary: "invalid boundary".to_string(),
                     first_kept_entry_id: 0,
@@ -136,8 +158,8 @@ async fn session_before_compact_payload_exposes_cancellation_token() {
                 .lock()
                 .expect("capture lock should not fail") =
                 Some(payload.cancellation_token.is_cancelled());
-            Ok(SessionSummaryHookOutcome::OverrideSummary(
-                "cancellation token capture".to_string(),
+            Ok(SessionBeforeCompactOutcome::OverrideCompaction(
+                override_compaction(&payload, "cancellation token capture", None),
             ))
         })
     }));
@@ -163,7 +185,7 @@ async fn session_before_compact_payload_exposes_cancellation_token() {
 }
 
 #[tokio::test]
-async fn session_before_compact_can_override_summary_and_receive_preparation_payload() {
+async fn session_before_compact_can_override_compaction_and_receive_preparation_payload() {
     let payload_capture = Arc::new(Mutex::new(None));
     let payload_capture_for_hook = payload_capture.clone();
     let mut config = test_agent_config();
@@ -171,11 +193,12 @@ async fn session_before_compact_can_override_summary_and_receive_preparation_pay
     config.session_before_compact = Some(Arc::new(move |payload| {
         let payload_capture_for_hook = payload_capture_for_hook.clone();
         Box::pin(async move {
+            let override_data = override_compaction(&payload, "hooked compaction summary", None);
             *payload_capture_for_hook
                 .lock()
                 .expect("payload capture should lock") = Some(payload);
-            Ok(SessionSummaryHookOutcome::OverrideSummary(
-                "hooked compaction summary".to_string(),
+            Ok(SessionBeforeCompactOutcome::OverrideCompaction(
+                override_data,
             ))
         })
     }));

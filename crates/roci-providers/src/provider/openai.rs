@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
-use std::env;
 use tracing::debug;
 
 use roci_core::error::RociError;
@@ -16,6 +15,7 @@ use roci_core::provider::http::{bearer_headers, shared_client};
 use roci_core::provider::{ModelProvider, ProviderRequest, ProviderResponse};
 
 use crate::models::openai::OpenAiModel;
+use roci_core::util::debug::roci_debug_enabled;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -72,7 +72,7 @@ impl OpenAiProvider {
         for (name, value) in self.extra_headers.iter() {
             headers.insert(name, value.clone());
         }
-        if debug_enabled() {
+        if roci_debug_enabled() {
             tracing::debug!(
                 model = self.model.as_str(),
                 base_url = %self.base_url,
@@ -184,13 +184,6 @@ impl OpenAiProvider {
 
         body
     }
-}
-
-fn debug_enabled() -> bool {
-    matches!(
-        env::var("HOMIE_DEBUG").as_deref(),
-        Ok("1" | "true" | "TRUE")
-    ) || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
 }
 
 #[async_trait]
@@ -324,7 +317,7 @@ impl ModelProvider for OpenAiProvider {
 
                 chunk_count += 1;
                 byte_count += chunk.len() as u64;
-                if debug_enabled() && chunk_count == 1 {
+                if roci_debug_enabled() && chunk_count == 1 {
                     debug!(chunk_len = chunk.len(), "OpenAI stream first chunk");
                 }
 
@@ -340,7 +333,7 @@ impl ModelProvider for OpenAiProvider {
 
                     line_count += 1;
                     if line == "data: [DONE]" {
-                        if debug_enabled() {
+                        if roci_debug_enabled() {
                             debug!(chunk_count, line_count, byte_count, "OpenAI stream done");
                         }
                         yield Ok(TextStreamDelta {
@@ -432,14 +425,14 @@ impl ModelProvider for OpenAiProvider {
                                     });
                                 }
                             }
-                        } else if debug_enabled() {
+                        } else if roci_debug_enabled() {
                             debug!(line_len = line.len(), "OpenAI stream parse failed");
                         }
                     }
                 }
             }
 
-            if debug_enabled() {
+            if roci_debug_enabled() {
                 debug!(chunk_count, line_count, byte_count, "OpenAI stream ended");
             }
         };

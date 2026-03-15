@@ -14,7 +14,7 @@ async fn session_before_tree_can_override_branch_summary_and_receive_preparation
             *payload_capture_for_hook
                 .lock()
                 .expect("payload capture should lock") = Some(payload);
-            Ok(SessionSummaryHookOutcome::OverrideSummary(
+            Ok(SessionBeforeTreeOutcome::OverrideSummary(
                 "hooked branch summary".to_string(),
             ))
         })
@@ -62,7 +62,7 @@ async fn session_before_tree_can_cancel_branch_summary() {
     let mut config = test_agent_config();
     config.model = "run:run-model".parse().expect("run model should parse");
     config.session_before_tree = Some(Arc::new(|_payload| {
-        Box::pin(async { Ok(SessionSummaryHookOutcome::Cancel) })
+        Box::pin(async { Ok(SessionBeforeTreeOutcome::Cancel) })
     }));
     let agent = AgentRuntime::new(test_registry(), test_config(), config);
     let settings = BranchSummarySettings {

@@ -15,7 +15,8 @@ pub use message::{convert_to_llm, AgentMessage, AgentMessageExt};
 pub use runtime::UserInputCoordinator;
 pub use runtime::{
     AgentConfig, AgentRuntime, AgentSnapshot, AgentState, GetApiKeyFn, QueueDrainMode,
-    SessionBeforeCompactHook, SessionBeforeCompactPayload, SessionBeforeTreeHook,
-    SessionBeforeTreePayload, SessionSummaryHookOutcome, SummaryPreparationData,
+    SessionBeforeCompactHook, SessionBeforeCompactOutcome, SessionBeforeCompactPayload,
+    SessionBeforeTreeHook, SessionBeforeTreeOutcome, SessionBeforeTreePayload,
+    SummaryPreparationData,
 };
 pub use session::AgentSessionManager;

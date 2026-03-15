@@ -8,7 +8,7 @@ pub mod store;
 pub mod token;
 
 pub use backend::AuthBackend;
-pub use device_code::{DeviceCodePoll, DeviceCodeSession};
+pub use device_code::DeviceCodeSession;
 pub use error::AuthError;
 pub use service::{AuthPollResult, AuthService, AuthStep};
 pub use store::{FileTokenStore, TokenStore, TokenStoreConfig};

@@ -61,7 +61,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         extra_roots: skill_root,
     };
 
-    let resources = roci::resource::DefaultResourceLoader::new()
+    let resources = roci::resource::ResourceLoader::new()
         .with_skill_options(skill_options)
         .load(&cwd)?;
     print_resource_diagnostics(&resources);

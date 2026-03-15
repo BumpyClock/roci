@@ -1,4 +1,4 @@
-//! Token usage and cost tracking types.
+//! Token usage types.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,29 +30,6 @@ impl Usage {
         }
         if let Some(v) = other.reasoning_tokens {
             *self.reasoning_tokens.get_or_insert(0) += v;
-        }
-    }
-}
-
-/// Estimated cost for a generation.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct Cost {
-    pub input_cost: f64,
-    pub output_cost: f64,
-    pub total_cost: f64,
-    pub currency: String,
-}
-
-impl Cost {
-    /// Compute cost from usage and per-token pricing.
-    pub fn from_usage(usage: &Usage, input_price_per_m: f64, output_price_per_m: f64) -> Self {
-        let input_cost = (usage.input_tokens as f64 / 1_000_000.0) * input_price_per_m;
-        let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * output_price_per_m;
-        Self {
-            input_cost,
-            output_cost,
-            total_cost: input_cost + output_cost,
-            currency: "USD".to_string(),
         }
     }
 }

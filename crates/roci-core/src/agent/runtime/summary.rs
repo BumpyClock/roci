@@ -5,14 +5,15 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    AgentRuntime, SessionBeforeCompactHook, SessionBeforeCompactPayload, SessionBeforeTreePayload,
-    SessionCompactionOverride, SessionSummaryHookOutcome, SummaryPreparationData,
+    AgentRuntime, SessionBeforeCompactHook, SessionBeforeCompactOutcome,
+    SessionBeforeCompactPayload, SessionBeforeTreeOutcome, SessionBeforeTreePayload,
+    SessionCompactionOverride, SummaryPreparationData,
 };
 use crate::agent::message::{AgentMessage, AgentMessageExt};
 use crate::agent_loop::compaction::{
     estimate_message_tokens, extract_cumulative_file_operations, extract_file_operations,
     prepare_compaction, select_messages_with_token_budget_newest_first,
-    serialize_messages_for_summary, serialize_pi_mono_summary, PiMonoSummary, PreparedCompaction,
+    serialize_messages_for_summary, serialize_pi_mono_summary, PiMonoSummary,
 };
 use crate::config::RociConfig;
 use crate::error::RociError;
@@ -97,13 +98,13 @@ impl AgentRuntime {
         };
         if let Some(hook) = self.config.session_before_tree.as_ref() {
             match hook(tree_payload).await? {
-                SessionSummaryHookOutcome::Continue => {}
-                SessionSummaryHookOutcome::Cancel => {
+                SessionBeforeTreeOutcome::Continue => {}
+                SessionBeforeTreeOutcome::Cancel => {
                     return Err(RociError::InvalidState(
                         "branch summary canceled by session_before_tree hook".to_string(),
                     ));
                 }
-                SessionSummaryHookOutcome::OverrideSummary(summary) => {
+                SessionBeforeTreeOutcome::OverrideSummary(summary) => {
                     let summary = summary.trim().to_string();
                     if summary.is_empty() {
                         return Err(RociError::InvalidState(
@@ -111,12 +112,6 @@ impl AgentRuntime {
                         ));
                     }
                     return Ok(AgentMessage::branch_summary(summary));
-                }
-                SessionSummaryHookOutcome::OverrideCompaction(_) => {
-                    return Err(RociError::InvalidState(
-                        "branch summary hook does not accept compaction override object"
-                            .to_string(),
-                    ));
                 }
             }
         }
@@ -224,23 +219,6 @@ impl AgentRuntime {
             .sum::<usize>()
     }
 
-    fn legacy_summary_override(
-        summary: String,
-        prepared: &PreparedCompaction,
-        conversation_messages: &[ModelMessage],
-    ) -> SessionCompactionOverride {
-        let first_kept_entry_id = prepared.cut_index.min(conversation_messages.len());
-        SessionCompactionOverride {
-            summary,
-            first_kept_entry_id,
-            tokens_before: Self::count_tokens_before_entry(
-                conversation_messages,
-                first_kept_entry_id,
-            ),
-            details: None,
-        }
-    }
-
     fn validate_compaction_override(
         override_data: SessionCompactionOverride,
         conversation_messages: &[ModelMessage],
@@ -325,17 +303,16 @@ impl AgentRuntime {
         );
         let compaction_override = match session_before_compact {
             Some(hook) => match hook(compaction_payload).await? {
-                SessionSummaryHookOutcome::Continue => None,
-                SessionSummaryHookOutcome::Cancel => {
+                SessionBeforeCompactOutcome::Continue => None,
+                SessionBeforeCompactOutcome::Cancel => {
                     cancellation_token.cancel();
                     return Err(RociError::InvalidState(
                         "compaction canceled by session_before_compact hook".to_string(),
                     ));
                 }
-                SessionSummaryHookOutcome::OverrideSummary(summary) => Some(
-                    Self::legacy_summary_override(summary, &prepared, &conversation_messages),
-                ),
-                SessionSummaryHookOutcome::OverrideCompaction(override_data) => Some(override_data),
+                SessionBeforeCompactOutcome::OverrideCompaction(override_data) => {
+                    Some(override_data)
+                }
             },
             None => None,
         };

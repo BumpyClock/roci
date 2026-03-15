@@ -8,7 +8,7 @@ Extract foundational runtime shared types + `AgentConfig` out of `runtime.rs` to
 - Move into `types.rs`:
   - `AgentState`, `QueueDrainMode`, `AgentSnapshot`
   - `GetApiKeyFn`
-  - `SessionSummaryHookOutcome`, `SessionCompactionOverride`
+  - `SessionBeforeCompactOutcome`, `SessionBeforeTreeOutcome`, `SessionCompactionOverride`
   - `SummaryPreparationData` (+ constructor)
   - session hook payload structs + hook type aliases
   - `drain_queue`

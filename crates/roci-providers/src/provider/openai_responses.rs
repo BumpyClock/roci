@@ -12,13 +12,14 @@ use crate::models::openai::OpenAiModel;
 use roci_core::error::{ErrorCode, ErrorDetails, RociError};
 use roci_core::models::capabilities::ModelCapabilities;
 use roci_core::types::*;
+use roci_core::util::debug::roci_debug_enabled;
 
 use roci_core::provider::format::tool_result_to_string;
 use roci_core::provider::http::{bearer_headers, shared_client};
 use roci_core::provider::{ModelProvider, ProviderRequest, ProviderResponse};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Homie, a helpful assistant.";
+const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Roci, a helpful assistant.";
 const RESPONSES_PROXY_BASE_URL_ENV: &str = "ROCI_OPENAI_RESPONSES_PROXY_BASE_URL";
 pub struct OpenAiResponsesProvider {
     model: OpenAiModel,
@@ -112,7 +113,7 @@ impl OpenAiResponsesProvider {
         for (name, value) in request.headers.iter() {
             headers.insert(name, value.clone());
         }
-        if debug_enabled() {
+        if roci_debug_enabled() {
             tracing::debug!(
                 model = self.model.as_str(),
                 base_url = %self.base_url,
@@ -336,7 +337,7 @@ impl OpenAiResponsesProvider {
         );
         let input = Self::build_input_items(&filtered_messages, "system");
 
-        if debug_enabled() {
+        if roci_debug_enabled() {
             tracing::debug!(
                 model = self.model.as_str(),
                 instructions_len = instructions.len(),
@@ -850,13 +851,6 @@ fn extract_response_error(event: &serde_json::Value) -> Option<String> {
     Some(error.to_string())
 }
 
-fn debug_enabled() -> bool {
-    matches!(
-        env::var("HOMIE_DEBUG").as_deref(),
-        Ok("1" | "true" | "TRUE")
-    ) || matches!(env::var("HOME_DEBUG").as_deref(), Ok("1" | "true" | "TRUE"))
-}
-
 #[allow(clippy::result_large_err)]
 fn extract_codex_account_id(token: &str) -> Result<String, RociError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1048,7 +1042,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                             saw_done = true;
                             break;
                         }
-                        if debug_enabled() && debug_event_count < 5 {
+                        if roci_debug_enabled() && debug_event_count < 5 {
                             tracing::debug!(data = %data, "OpenAI Responses SSE raw");
                             debug_event_count += 1;
                         }
@@ -1262,7 +1256,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                                                             reasoning_signature: None,
                                                             reasoning_type: None,
                                                         });
-                                                    } else if debug_enabled() {
+                                                    } else if roci_debug_enabled() {
                                                         tracing::debug!("OpenAI Responses completed event had no output text");
                                                     }
                                                 }
@@ -1316,7 +1310,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                                 }
                             }
                             Err(e) => {
-                                if debug_enabled() {
+                                if roci_debug_enabled() {
                                     tracing::debug!(error = %e, data = %data, "OpenAI Responses SSE parse failed");
                                 }
                             }

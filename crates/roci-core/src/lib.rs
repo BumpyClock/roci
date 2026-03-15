@@ -16,7 +16,6 @@ pub mod provider;
 pub mod resource;
 pub mod skills;
 pub mod stop;
-pub mod stream_transform;
 pub mod tools;
 pub mod types;
 pub mod util;

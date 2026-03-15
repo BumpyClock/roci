@@ -1,18 +1,11 @@
 //! Configuration system (layered: code > env > credential file).
 
-pub mod auth;
-
-pub use auth::{AuthManager, AuthValue};
-
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::auth::store::TokenStore;
 use crate::models::ProviderKey;
-
-/// Global default config (lazy-initialized from env).
-static DEFAULT_CONFIG: OnceLock<RociConfig> = OnceLock::new();
 
 /// Layered configuration for Roci.
 ///
@@ -137,11 +130,6 @@ impl RociConfig {
         }
 
         config
-    }
-
-    /// Get (or create) the global default config.
-    pub fn global() -> &'static RociConfig {
-        DEFAULT_CONFIG.get_or_init(Self::from_env)
     }
 
     pub fn set_api_key(&self, provider: &str, key: String) {

@@ -204,29 +204,3 @@ pub async fn stream_text_with_tools(
     };
     Ok(Box::pin(stream))
 }
-
-/// Collect a stream into a final result.
-pub async fn collect_stream(
-    mut stream: BoxStream<'static, Result<TextStreamDelta, RociError>>,
-) -> Result<StreamTextResult, RociError> {
-    let mut text = String::new();
-    let mut usage = Usage::default();
-    let mut finish_reason = None;
-
-    while let Some(delta) = stream.next().await {
-        let delta = delta?;
-        text.push_str(&delta.text);
-        if let Some(u) = delta.usage {
-            usage = u;
-        }
-        if let Some(fr) = delta.finish_reason {
-            finish_reason = Some(fr);
-        }
-    }
-
-    Ok(StreamTextResult {
-        text,
-        usage,
-        finish_reason,
-    })
-}

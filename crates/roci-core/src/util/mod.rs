@@ -1,6 +1,5 @@
-//! Utility modules: retry, cache, usage tracking, timeout.
+//! Utility modules: debug, retry, and timeout.
 
-pub mod cache;
+pub mod debug;
 pub mod retry;
 pub mod timeout;
-pub mod usage;

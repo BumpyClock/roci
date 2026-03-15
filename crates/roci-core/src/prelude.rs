@@ -6,10 +6,9 @@ pub use crate::models::LanguageModel;
 pub use crate::provider::{ModelProvider, ProviderFactory, ProviderRegistry};
 pub use crate::resource::{
     BranchSummarySettings, CompactionSettings, ContextFileResource, ContextPromptLoader,
-    ContextPromptResources, DefaultResourceLoader, LoadedPromptTemplates, PromptDiagnostic,
-    PromptDiagnosticLevel, PromptTemplate, PromptTemplateLoader, ResourceBundle,
-    ResourceDiagnostic, ResourceDirectories, ResourceLoader, ResourceSettings,
-    ResourceSettingsLoader,
+    ContextPromptResources, LoadedPromptTemplates, PromptDiagnostic, PromptDiagnosticLevel,
+    PromptTemplate, PromptTemplateLoader, ResourceBundle, ResourceDiagnostic, ResourceDirectories,
+    ResourceLoader, ResourceSettings, ResourceSettingsLoader,
 };
 pub use crate::tools::{AgentTool, AgentToolParameters, Tool, ToolArguments};
 pub use crate::types::{

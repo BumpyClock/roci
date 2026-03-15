@@ -6,9 +6,10 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use roci_core::auth::AuthError;
+use roci_core::auth::AuthPollResult;
+use roci_core::auth::DeviceCodeSession;
 use roci_core::auth::Token;
 use roci_core::auth::TokenStore;
-use roci_core::auth::{DeviceCodePoll, DeviceCodeSession};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -123,9 +124,9 @@ impl OpenAiCodexAuth {
     pub async fn poll_device_code(
         &self,
         session: &DeviceCodeSession,
-    ) -> Result<DeviceCodePoll, AuthError> {
+    ) -> Result<AuthPollResult, AuthError> {
         if Utc::now() >= session.expires_at {
-            return Ok(DeviceCodePoll::Expired);
+            return Ok(AuthPollResult::Expired);
         }
         let url = format!(
             "{}/api/accounts/deviceauth/token",
@@ -148,12 +149,10 @@ impl OpenAiCodexAuth {
                 .await?;
             self.token_store
                 .save("openai-codex", &self.profile, &token)?;
-            return Ok(DeviceCodePoll::Authorized { token });
+            return Ok(AuthPollResult::Authorized { token });
         }
         if status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND {
-            return Ok(DeviceCodePoll::Pending {
-                interval_secs: session.interval_secs,
-            });
+            return Ok(AuthPollResult::Pending);
         }
         Err(AuthError::InvalidResponse(format!(
             "Device code poll failed with status {}",

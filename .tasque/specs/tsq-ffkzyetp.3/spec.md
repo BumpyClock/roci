@@ -8,7 +8,7 @@ Extract compaction + branch-summary logic from `runtime.rs` into focused summary
   - `summarize_branch_entries`
   - `split_messages_for_compaction`
   - `count_tokens_before_entry`
-  - `legacy_summary_override`
+  - `validate_compaction_override`
   - `validate_compaction_override`
   - `compact_messages_with_model`
 - Keep call sites in runtime facade delegating with no external API changes.

@@ -88,7 +88,7 @@ impl AgentRuntime {
                             request: request.clone(),
                         });
                         let effective_timeout = request.timeout_ms.or(config_timeout);
-                        super::user_input::wait_for_response(rx, effective_timeout).await
+                        rx.wait(effective_timeout).await
                     })
                 });
             cb

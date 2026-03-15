@@ -50,15 +50,14 @@ Everything provider-agnostic that any consumer or third-party provider needs:
 | `provider::schema` | `normalize_schema_for_provider()` |
 | `provider::sanitize` | `sanitize_messages_for_provider()` |
 | `models` | `LanguageModel` (simplified), `ProviderKey`, `ModelSelector`, `ModelCapabilities` |
-| `auth` | `AuthService` (generic orchestrator), `AuthBackend` trait, `AuthStep`, `AuthPollResult`, `AuthError`, `Token`, `TokenStore`, `FileTokenStore`, `DeviceCodeSession`, `DeviceCodePoll` |
-| `config` | `RociConfig`, `AuthManager`, `AuthValue` |
+| `auth` | `AuthService` (generic orchestrator), `AuthBackend` trait, `AuthStep`, `AuthPollResult`, `AuthError`, `Token`, `TokenStore`, `FileTokenStore`, `DeviceCodeSession` |
+| `config` | `RociConfig` |
 | `error` | `RociError`, `ErrorCategory`, `ErrorDetails`, `RecoverySuggestion` |
 | `types` | `ModelMessage`, `Usage`, `FinishReason`, `GenerationSettings`, `TextStreamDelta`, `ContentPart`, `AgentToolCall`, `AgentToolResult`, `Role` |
 | `generation` | `generate_text()`, `stream_text()`, `generate_object()`, `stream_object()` — operate on `&dyn ModelProvider` |
 | `tools` | `Tool` trait, `AgentTool`, `ToolArguments`, `DynamicTool` |
-| `stream_transform` | `StreamTransform` trait + built-in transforms |
 | `stop` | Stop conditions |
-| `util` | `ResponseCache`, `UsageTracker`, `RetryPolicy` |
+| `util` | `RetryPolicy` |
 | `agent` / `agent_loop` | `AgentRuntime` split into `types`, `config`, `state`, `lifecycle`, `mutations`, `run_loop`, `events`, and `summary`; evented runner, approvals, and compaction/summary pipeline. Runtime tests live under `crates/roci-core/src/agent/runtime_tests/` (feature: `agent`) |
 | `audio` | Realtime audio (feature: `audio`) |
 | `mcp` | MCP transport (feature: `mcp`) |

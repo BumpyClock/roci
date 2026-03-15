@@ -36,8 +36,9 @@ pub use self::config::AgentConfig;
 use self::types::drain_queue;
 pub use self::types::{
     AgentSnapshot, AgentState, GetApiKeyFn, QueueDrainMode, SessionBeforeCompactHook,
-    SessionBeforeCompactPayload, SessionBeforeTreeHook, SessionBeforeTreePayload,
-    SessionCompactionOverride, SessionSummaryHookOutcome, SummaryPreparationData,
+    SessionBeforeCompactOutcome, SessionBeforeCompactPayload, SessionBeforeTreeHook,
+    SessionBeforeTreeOutcome, SessionBeforeTreePayload, SessionCompactionOverride,
+    SummaryPreparationData,
 };
 
 #[cfg(test)]

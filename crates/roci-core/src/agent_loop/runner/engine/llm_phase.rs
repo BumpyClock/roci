@@ -4,9 +4,7 @@ use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 
 use super::super::super::compaction::estimate_context_usage;
-use super::super::control::{
-    debug_enabled, process_stream_delta, AgentEventEmitter, RunEventEmitter,
-};
+use super::super::control::{process_stream_delta, AgentEventEmitter, RunEventEmitter};
 use super::super::message_events::{
     assistant_message_snapshot, emit_message_end_if_open, emit_message_lifecycle,
 };
@@ -18,6 +16,7 @@ use crate::agent::message::{convert_to_llm, AgentMessage};
 use crate::error::{ErrorCode, RociError};
 use crate::provider::{self, ProviderRequest, ToolDefinition};
 use crate::types::{AgentToolCall, ModelMessage};
+use crate::util::debug::roci_debug_enabled;
 
 pub(super) enum LlmPhaseOutcome {
     Ready {
@@ -220,7 +219,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                             0,
                             "overflow_compaction",
                         );
-                        if debug_enabled() {
+                        if roci_debug_enabled() {
                             tracing::debug!(
                                 run_id = %request.run_id,
                                 iteration,
@@ -449,7 +448,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
         &tool_calls,
     );
 
-    if debug_enabled() {
+    if roci_debug_enabled() {
         let tool_names = tool_calls
             .iter()
             .map(|call| call.name.as_str())

@@ -101,12 +101,12 @@
 
 ### Phase 3: Coordinator (`roci-core/src/agent/runtime/user_input.rs`)
 - `UserInputCoordinator` manages pending requests via oneshot channels
-- `create_request()` → returns receiver for tool to await
+- `create_request()` → returns `PendingUserInput` handle for tool to await
 - `submit_response()` → unblocks waiting tool
 - `cancel_all()` → cleanup on abort/reset
 - timed-out/canceled waits remove pending entries before returning, so late submits deterministically fail with `UnknownUserInputRequest`
 - completion notifications are broadcast to hosts that need to stop waiting on input
-- `wait_for_response()` → helper with optional timeout
+- `PendingUserInput::wait(timeout_ms)` → waits for response with optional timeout
 
 ### Phase 4: Tool Execution (`roci-tools/src/builtin/ask_user.rs`)
 - Parses questions from tool arguments
@@ -117,7 +117,7 @@
 ### Phase 5: Runtime & CLI Integration
 - `AgentRuntime.submit_user_input()` → delegates to coordinator
 - `AgentRuntime.user_input_coordinator` field (agent feature only)
-- Callback built in `run_loop.rs`: creates request via coordinator, emits `UserInputRequested` event, waits for response with timeout
+- Callback built in `run_loop.rs`: creates request via coordinator, emits `UserInputRequested` event, calls `PendingUserInput::wait(timeout_ms)` directly
 - Callback threaded through `RunRequest.user_input_callback` → `execute_tool_call` → `ToolExecutionContext`
 - CLI uses shared `UserInputCoordinator` passed via `AgentConfig.user_input_coordinator`
 - CLI event sink forwards `UserInputRequested` into a dedicated prompt host

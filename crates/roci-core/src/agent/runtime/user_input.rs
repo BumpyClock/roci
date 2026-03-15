@@ -196,17 +196,6 @@ impl PendingUserInput {
     }
 }
 
-/// Wait for a user input response with optional timeout.
-///
-/// This remains as a small adapter for existing call sites and tests.
-#[allow(dead_code)]
-pub async fn wait_for_response(
-    pending: PendingUserInput,
-    timeout_ms: Option<u64>,
-) -> Result<UserInputResponse, UserInputError> {
-    pending.wait(timeout_ms).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_response_times_out() {
+    async fn wait_times_out() {
         let coordinator = UserInputCoordinator::new();
         let request = UserInputRequest {
             request_id: Uuid::nil(),
@@ -293,7 +282,7 @@ mod tests {
         };
         let pending = coordinator.create_request(request.clone()).await.unwrap();
         // Don't submit a response - let it timeout
-        let result = wait_for_response(pending, Some(50)).await;
+        let result = pending.wait(Some(50)).await;
         assert!(matches!(result, Err(UserInputError::Timeout { .. })));
         assert!(coordinator.pending.lock().await.is_empty());
         let late = coordinator
@@ -337,7 +326,7 @@ mod tests {
         };
 
         let pending = coordinator.create_request(request.clone()).await.unwrap();
-        let result = wait_for_response(pending, Some(10)).await;
+        let result = pending.wait(Some(10)).await;
         assert!(matches!(result, Err(UserInputError::Timeout { .. })));
 
         let late = coordinator

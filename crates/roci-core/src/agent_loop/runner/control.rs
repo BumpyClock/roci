@@ -283,8 +283,3 @@ pub(super) fn approval_allows_execution(decision: ApprovalDecision) -> bool {
         ApprovalDecision::Accept | ApprovalDecision::AcceptForSession
     )
 }
-
-pub(super) fn debug_enabled() -> bool {
-    matches!(std::env::var("HOMIE_DEBUG").as_deref(), Ok("1"))
-        || matches!(std::env::var("HOME_DEBUG").as_deref(), Ok("1"))
-}

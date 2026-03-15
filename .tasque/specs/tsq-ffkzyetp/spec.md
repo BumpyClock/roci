@@ -26,7 +26,8 @@ At minimum keep these exported symbols and semantics intact:
 - `SessionBeforeCompactPayload`
 - `SessionBeforeTreeHook`
 - `SessionBeforeTreePayload`
-- `SessionSummaryHookOutcome`
+- `SessionBeforeCompactOutcome`
+- `SessionBeforeTreeOutcome`
 - `SummaryPreparationData`
 
 ## Target Module Shape (guideline)

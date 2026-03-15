@@ -5,16 +5,17 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 
 use roci_core::auth::AuthError;
+use roci_core::auth::AuthPollResult;
+use roci_core::auth::DeviceCodeSession;
 use roci_core::auth::Token;
 use roci_core::auth::TokenStore;
-use roci_core::auth::{DeviceCodePoll, DeviceCodeSession};
 
 const DEFAULT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const DEFAULT_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const DEFAULT_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const DEFAULT_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const DEFAULT_COPILOT_BASE_URL: &str = "https://api.individual.githubcopilot.com";
-const DEFAULT_GITHUB_USER_AGENT: &str = "homie-gateway";
+const DEFAULT_GITHUB_USER_AGENT: &str = "roci-gateway";
 
 /// GitHub Copilot OAuth helper with device-code flow.
 ///
@@ -113,9 +114,9 @@ impl GitHubCopilotAuth {
     pub async fn poll_device_code(
         &self,
         session: &DeviceCodeSession,
-    ) -> Result<DeviceCodePoll, AuthError> {
+    ) -> Result<AuthPollResult, AuthError> {
         if Utc::now() >= session.expires_at {
-            return Ok(DeviceCodePoll::Expired);
+            return Ok(AuthPollResult::Expired);
         }
         let resp = self
             .client
@@ -150,17 +151,15 @@ impl GitHubCopilotAuth {
             };
             self.token_store
                 .save("github-copilot", &self.profile, &token)?;
-            return Ok(DeviceCodePoll::Authorized { token });
+            return Ok(AuthPollResult::Authorized { token });
         }
         match payload.error.as_deref() {
-            Some("authorization_pending") => Ok(DeviceCodePoll::Pending {
-                interval_secs: session.interval_secs,
+            Some("authorization_pending") => Ok(AuthPollResult::Pending),
+            Some("slow_down") => Ok(AuthPollResult::SlowDown {
+                new_interval: std::time::Duration::from_secs(session.interval_secs + 2),
             }),
-            Some("slow_down") => Ok(DeviceCodePoll::SlowDown {
-                interval_secs: session.interval_secs + 2,
-            }),
-            Some("expired_token") => Ok(DeviceCodePoll::Expired),
-            Some("access_denied") => Ok(DeviceCodePoll::AccessDenied),
+            Some("expired_token") => Ok(AuthPollResult::Expired),
+            Some("access_denied") => Ok(AuthPollResult::Denied),
             Some(other) => Err(AuthError::InvalidResponse(format!(
                 "Device code error: {other}"
             ))),
