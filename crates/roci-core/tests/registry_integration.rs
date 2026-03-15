@@ -3,7 +3,6 @@
 //! Uses mock implementations to verify the public API round-trip without
 //! real network calls or API keys.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -57,14 +56,6 @@ impl ProviderFactory for MockFactory {
                 max_output_tokens: None,
             },
         }))
-    }
-
-    fn parse_model(
-        &self,
-        _provider_key: &str,
-        _model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
-        None
     }
 }
 

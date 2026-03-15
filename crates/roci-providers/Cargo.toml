@@ -42,11 +42,10 @@ lmstudio = ["openai"]
 azure = ["openai"]
 openrouter = ["openai"]
 together = ["openai"]
-replicate = []
 openai-compatible = ["openai"]
 anthropic-compatible = ["anthropic"]
 all-providers = [
     "openai", "anthropic", "google", "grok", "groq", "mistral",
     "ollama", "lmstudio", "azure", "openrouter", "together",
-    "replicate", "openai-compatible", "anthropic-compatible",
+    "openai-compatible", "anthropic-compatible",
 ]

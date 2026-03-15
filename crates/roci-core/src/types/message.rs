@@ -63,22 +63,6 @@ impl ModelMessage {
         }
     }
 
-    /// Create a user message with image content.
-    pub fn user_with_image(text: impl Into<String>, image_data: String, mime_type: String) -> Self {
-        Self {
-            role: Role::User,
-            content: vec![
-                ContentPart::Text { text: text.into() },
-                ContentPart::Image(ImageContent {
-                    data: image_data,
-                    mime_type,
-                }),
-            ],
-            name: None,
-            timestamp: Some(Utc::now()),
-        }
-    }
-
     /// Extract the text content, concatenating all text parts.
     pub fn text(&self) -> String {
         self.content

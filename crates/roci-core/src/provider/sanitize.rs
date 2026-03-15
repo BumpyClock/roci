@@ -42,7 +42,6 @@ fn requires_tool_pairing(provider: &str) -> bool {
             | "together"
             | "lmstudio"
             | "ollama"
-            | "replicate"
     )
 }
 

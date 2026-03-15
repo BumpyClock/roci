@@ -60,9 +60,6 @@ pub fn register_default_providers(registry: &mut roci_core::provider::ProviderRe
 
     #[cfg(feature = "together")]
     registry.register(Arc::new(factories::TogetherFactory));
-
-    #[cfg(feature = "replicate")]
-    registry.register(Arc::new(factories::ReplicateFactory));
 }
 
 /// Register all built-in auth backends with the given auth service.

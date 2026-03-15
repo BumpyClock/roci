@@ -30,7 +30,6 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         skill_root,
         no_skills,
         max_tokens,
-        stream: _,
         mcp_stdio,
         mcp_sse,
         prompt,

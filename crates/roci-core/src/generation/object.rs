@@ -63,19 +63,6 @@ pub async fn generate_object<T: DeserializeOwned>(
     })
 }
 
-/// Generate a typed object via streaming (collects full response, then parses).
-pub async fn stream_object<T: DeserializeOwned>(
-    provider: &dyn ModelProvider,
-    messages: Vec<ModelMessage>,
-    settings: GenerationSettings,
-    schema: serde_json::Value,
-    type_name: &str,
-) -> Result<GenerateObjectResult<T>, RociError> {
-    // For structured output, streaming doesn't add much value since
-    // we need the full JSON before parsing. Delegate to non-streaming.
-    generate_object(provider, messages, settings, schema, type_name).await
-}
-
 /// Strip markdown code fences from JSON response.
 fn strip_code_fences(text: &str) -> String {
     let trimmed = text.trim();

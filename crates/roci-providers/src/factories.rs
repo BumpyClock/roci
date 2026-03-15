@@ -1,7 +1,5 @@
 //! ProviderFactory implementations for each built-in provider.
 
-use std::any::Any;
-
 use roci_core::config::RociConfig;
 use roci_core::error::RociError;
 use roci_core::models::ProviderKey;
@@ -60,18 +58,6 @@ impl ProviderFactory for OpenAiFactory {
             )))
         }
     }
-
-    fn parse_model(
-        &self,
-        _provider_key: &str,
-        model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::openai::OpenAiModel;
-        use std::str::FromStr;
-        Some(Box::new(
-            OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string())),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,18 +101,6 @@ impl ProviderFactory for CodexFactory {
             )))
         }
     }
-
-    fn parse_model(
-        &self,
-        _provider_key: &str,
-        model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::openai::OpenAiModel;
-        use std::str::FromStr;
-        Some(Box::new(
-            OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string())),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,19 +136,6 @@ impl ProviderFactory for AnthropicFactory {
             ),
         ))
     }
-
-    fn parse_model(
-        &self,
-        _provider_key: &str,
-        model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::anthropic::AnthropicModel;
-        use std::str::FromStr;
-        Some(Box::new(
-            AnthropicModel::from_str(model_id)
-                .unwrap_or(AnthropicModel::Custom(model_id.to_string())),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,18 +166,6 @@ impl ProviderFactory for GoogleFactory {
         Ok(Box::new(crate::provider::google::GoogleProvider::new(
             model, api_key,
         )))
-    }
-
-    fn parse_model(
-        &self,
-        _provider_key: &str,
-        model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::google::GoogleModel;
-        use std::str::FromStr;
-        Some(Box::new(
-            GoogleModel::from_str(model_id).unwrap_or(GoogleModel::Custom(model_id.to_string())),
-        ))
     }
 }
 
@@ -249,14 +198,6 @@ impl ProviderFactory for GrokFactory {
             model, api_key,
         )))
     }
-
-    fn parse_model(&self, _key: &str, model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::grok::GrokModel;
-        use std::str::FromStr;
-        Some(Box::new(
-            GrokModel::from_str(model_id).unwrap_or(GrokModel::Custom(model_id.to_string())),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,14 +229,6 @@ impl ProviderFactory for GroqFactory {
             model, api_key,
         )))
     }
-
-    fn parse_model(&self, _key: &str, model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::groq::GroqModel;
-        use std::str::FromStr;
-        Some(Box::new(
-            GroqModel::from_str(model_id).unwrap_or(GroqModel::Custom(model_id.to_string())),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,14 +259,6 @@ impl ProviderFactory for MistralFactory {
         Ok(Box::new(crate::provider::mistral::MistralProvider::new(
             model, api_key,
         )))
-    }
-
-    fn parse_model(&self, _key: &str, model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::mistral::MistralModel;
-        use std::str::FromStr;
-        Some(Box::new(
-            MistralModel::from_str(model_id).unwrap_or(MistralModel::Custom(model_id.to_string())),
-        ))
     }
 }
 
@@ -368,14 +293,6 @@ impl ProviderFactory for OllamaFactory {
             model, base_url,
         )))
     }
-
-    fn parse_model(&self, _key: &str, model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::ollama::OllamaModel;
-        use std::str::FromStr;
-        Some(Box::new(
-            OllamaModel::from_str(model_id).unwrap_or(OllamaModel::Custom(model_id.to_string())),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,11 +323,6 @@ impl ProviderFactory for LmStudioFactory {
         Ok(Box::new(crate::provider::lmstudio::LmStudioProvider::new(
             model, base_url,
         )))
-    }
-
-    fn parse_model(&self, _key: &str, model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        use crate::models::lmstudio::LmStudioModel;
-        Some(Box::new(LmStudioModel::Custom(model_id.to_string())))
     }
 }
 
@@ -448,10 +360,6 @@ impl ProviderFactory for OpenAiCompatibleFactory {
                 base_url,
             ),
         ))
-    }
-
-    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        None
     }
 }
 
@@ -516,10 +424,6 @@ impl ProviderFactory for GitHubCopilotFactory {
             ),
         ))
     }
-
-    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -554,10 +458,6 @@ impl ProviderFactory for AnthropicCompatibleFactory {
                 base_url,
             ),
         ))
-    }
-
-    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        None
     }
 }
 
@@ -594,10 +494,6 @@ impl ProviderFactory for AzureFactory {
             api_version,
         )))
     }
-
-    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,10 +521,6 @@ impl ProviderFactory for OpenRouterFactory {
         Ok(Box::new(
             crate::provider::openrouter::OpenRouterProvider::new(model_id.to_string(), api_key),
         ))
-    }
-
-    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        None
     }
 }
 
@@ -658,41 +550,5 @@ impl ProviderFactory for TogetherFactory {
             model_id.to_string(),
             api_key,
         )))
-    }
-
-    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Replicate
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "replicate")]
-pub struct ReplicateFactory;
-
-#[cfg(feature = "replicate")]
-impl ProviderFactory for ReplicateFactory {
-    fn provider_keys(&self) -> &[&str] {
-        &["replicate"]
-    }
-
-    fn create(
-        &self,
-        config: &RociConfig,
-        _provider_key: &str,
-        model_id: &str,
-    ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = config
-            .get_api_key_for(ProviderKey::OpenAi)
-            .ok_or_else(|| RociError::Authentication("Missing REPLICATE_API_KEY".into()))?;
-        Ok(Box::new(
-            crate::provider::replicate::ReplicateProvider::new(model_id.to_string(), api_key),
-        ))
-    }
-
-    fn parse_model(&self, _key: &str, _model_id: &str) -> Option<Box<dyn Any + Send + Sync>> {
-        None
     }
 }

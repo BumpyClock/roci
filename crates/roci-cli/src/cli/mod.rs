@@ -88,10 +88,6 @@ pub struct ChatArgs {
     #[arg(long)]
     pub max_tokens: Option<u32>,
 
-    /// Enable streaming output
-    #[arg(long, default_value = "true")]
-    pub stream: bool,
-
     /// MCP stdio server spec (repeatable). Format: `key=value` pairs separated by commas.
     /// Keys: `id`, `label`, `command`, `arg` (repeat for multiple args).
     /// Example: `--mcp-stdio 'id=local,label=Local Files,command=npx,arg=-y,arg=@modelcontextprotocol/server-filesystem,arg=.'`
@@ -213,7 +209,6 @@ mod tests {
                 assert!(args.skill_root.is_empty());
                 assert!(!args.no_skills);
                 assert!(args.max_tokens.is_none());
-                assert!(args.stream);
                 assert!(args.mcp_stdio.is_empty());
                 assert!(args.mcp_sse.is_empty());
                 assert!(args.prompt.is_none());
@@ -247,7 +242,6 @@ mod tests {
                 assert!(args.skill_root.is_empty());
                 assert!(!args.no_skills);
                 assert_eq!(args.max_tokens, Some(1024));
-                assert!(args.stream);
                 assert!(args.mcp_stdio.is_empty());
                 assert!(args.mcp_sse.is_empty());
                 assert_eq!(args.prompt.as_deref(), Some("Hello world"));

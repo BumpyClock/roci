@@ -54,7 +54,7 @@ Everything provider-agnostic that any consumer or third-party provider needs:
 | `config` | `RociConfig` |
 | `error` | `RociError`, `ErrorCategory`, `ErrorDetails`, `RecoverySuggestion` |
 | `types` | `ModelMessage`, `Usage`, `FinishReason`, `GenerationSettings`, `TextStreamDelta`, `ContentPart`, `AgentToolCall`, `AgentToolResult`, `Role` |
-| `generation` | `generate_text()`, `stream_text()`, `generate_object()`, `stream_object()` — operate on `&dyn ModelProvider` |
+| `generation` | `generate_text()`, `stream_text()`, `generate_object()` — operate on `&dyn ModelProvider` |
 | `tools` | `Tool` trait, `AgentTool`, `ToolArguments`, `DynamicTool` |
 | `stop` | Stop conditions |
 | `util` | `RetryPolicy` |
@@ -82,13 +82,12 @@ All concrete provider implementations and OAuth flows:
 | `provider::azure` | `azure` (depends on `openai`) |
 | `provider::openrouter` | `openrouter` (depends on `openai`) |
 | `provider::together` | `together` (depends on `openai`) |
-| `provider::replicate` | `replicate` |
 | `provider::openai_compatible` | `openai-compatible` |
 | `provider::anthropic_compatible` | `anthropic-compatible` |
 | `provider::github_copilot` | `openai-compatible` |
 
 **Provider-specific model enums** (behind matching feature flags):
-`OpenAiModel`, `AnthropicModel`, `GoogleModel`, `GrokModel`, `GroqModel`, `MistralModel`, `OllamaModel`, `LmStudioModel`, `OpenAiCompatibleModel`
+`OpenAiModel`, `AnthropicModel`, `GoogleModel`, `GrokModel`, `GroqModel`, `MistralModel`, `OllamaModel`, `LmStudioModel`
 
 **OAuth flow implementations**:
 - `ClaudeCodeAuth` + `PkceSession`
@@ -140,13 +139,6 @@ pub trait ProviderFactory: Send + Sync {
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError>;
 
-    /// Parse a model ID string into provider-specific representation.
-    /// Returns None if unrecognized (registry falls through to Custom).
-    fn parse_model(
-        &self,
-        provider_key: &str,
-        model_id: &str,
-    ) -> Option<Box<dyn std::any::Any + Send + Sync>>;
 }
 ```
 
@@ -250,7 +242,7 @@ Provider-specific model enums (`OpenAiModel`, `AnthropicModel`, etc.) move to `r
 
 | Feature | Owned by | Effect |
 |---------|----------|--------|
-| `openai`, `anthropic`, `google`, `grok`, `groq`, `mistral`, `ollama`, `lmstudio`, `azure`, `openrouter`, `together`, `replicate`, `openai-compatible`, `anthropic-compatible` | `roci-providers` | Gates provider transport compilation |
+| `openai`, `anthropic`, `google`, `grok`, `groq`, `mistral`, `ollama`, `lmstudio`, `azure`, `openrouter`, `together`, `openai-compatible`, `anthropic-compatible` | `roci-providers` | Gates provider transport compilation |
 | `all-providers` | `roci-providers` | Enables all provider features |
 | `agent`, `audio`, `mcp` | `roci-core` | Gates agent loop, audio, MCP modules |
 | `full` | `roci` (meta-crate) | Enables `all-providers` + `agent` + `audio` + `mcp` |

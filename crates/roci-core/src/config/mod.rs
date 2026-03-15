@@ -105,7 +105,6 @@ impl RociConfig {
         for (env_var, provider) in [
             ("TOGETHER_API_KEY", "together"),
             ("OPENROUTER_API_KEY", "openrouter"),
-            ("REPLICATE_API_TOKEN", "replicate"),
         ] {
             if let Ok(key) = std::env::var(env_var) {
                 config.set_api_key(provider, key);

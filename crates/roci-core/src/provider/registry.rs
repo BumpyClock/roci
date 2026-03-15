@@ -72,8 +72,6 @@ mod tests {
     use crate::types::{TextStreamDelta, Usage};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
-    use std::any::Any;
-
     struct StubFactory;
 
     impl ProviderFactory for StubFactory {
@@ -101,14 +99,6 @@ mod tests {
                     max_output_tokens: None,
                 },
             }))
-        }
-
-        fn parse_model(
-            &self,
-            _provider_key: &str,
-            _model_id: &str,
-        ) -> Option<Box<dyn Any + Send + Sync>> {
-            None
         }
     }
 
@@ -208,14 +198,6 @@ mod tests {
                 },
             }))
         }
-
-        fn parse_model(
-            &self,
-            _provider_key: &str,
-            _model_id: &str,
-        ) -> Option<Box<dyn Any + Send + Sync>> {
-            None
-        }
     }
 
     #[test]
@@ -296,14 +278,6 @@ mod tests {
                     max_output_tokens: None,
                 },
             }))
-        }
-
-        fn parse_model(
-            &self,
-            _provider_key: &str,
-            _model_id: &str,
-        ) -> Option<Box<dyn Any + Send + Sync>> {
-            None
         }
     }
 

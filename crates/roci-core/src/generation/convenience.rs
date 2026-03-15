@@ -34,15 +34,3 @@ pub async fn stream(
     )
     .await
 }
-
-/// Analyze content: provider + system prompt + content -> text.
-pub async fn analyze(
-    provider: &dyn ModelProvider,
-    system: impl Into<String>,
-    content: impl Into<String>,
-) -> Result<String, RociError> {
-    let messages = vec![ModelMessage::system(system), ModelMessage::user(content)];
-    let result =
-        super::text::generate_text(provider, messages, GenerationSettings::default(), &[]).await?;
-    Ok(result.text)
-}

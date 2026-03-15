@@ -4,7 +4,6 @@ pub mod conversation;
 mod core;
 pub mod message;
 pub mod runtime;
-pub mod session;
 #[cfg(feature = "agent")]
 pub mod subagents;
 
@@ -19,4 +18,3 @@ pub use runtime::{
     SessionBeforeTreeHook, SessionBeforeTreeOutcome, SessionBeforeTreePayload,
     SummaryPreparationData,
 };
-pub use session::AgentSessionManager;

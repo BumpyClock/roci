@@ -31,20 +31,3 @@ impl Default for ModelCapabilities {
         }
     }
 }
-
-impl ModelCapabilities {
-    /// Full-featured model capabilities.
-    pub fn full(context_length: usize) -> Self {
-        Self {
-            supports_vision: true,
-            supports_tools: true,
-            supports_streaming: true,
-            supports_json_mode: true,
-            supports_json_schema: true,
-            supports_reasoning: false,
-            supports_system_messages: true,
-            context_length,
-            max_output_tokens: None,
-        }
-    }
-}

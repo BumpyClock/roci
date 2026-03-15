@@ -61,14 +61,6 @@ impl ProviderFactory for SummaryFactory {
             capabilities: ModelCapabilities::default(),
         }))
     }
-
-    fn parse_model(
-        &self,
-        _provider_key: &str,
-        _model_id: &str,
-    ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-        None
-    }
 }
 
 struct SummaryProvider {

@@ -131,7 +131,7 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
   - conversation compaction: `compaction.model` else current run model
   - branch summary: `branch_summary.model` else current run model
 - Session hook interfaces are available in `AgentConfig`:
-  - `session_before_compact` supports continue/cancel/override-summary and accepts a full compaction override object
+  - `session_before_compact` supports continue/cancel/override-compaction with a full compaction override object
   - `session_before_compact` payload now includes cancellation signal/token
   - `session_before_compact` cancel aborts manual compaction with an error; cancel from auto-compaction aborts the run
   - `session_before_tree` supports continue/cancel/override-summary; instruction/label overrides are deferred
@@ -165,7 +165,6 @@ behind a feature flag.
 | Azure OpenAI | `azure` | `azure` | Azure-hosted OpenAI |
 | OpenRouter | `openrouter` | `openrouter` | Multi-model router |
 | Together | `together` | `together` | OpenAI-compatible |
-| Replicate | `replicate` | `replicate` | Replicate API |
 | GitHub Copilot | `github_copilot` | `openai` | Device-code auth |
 | OpenAI-compatible | `openai_compatible` | `openai-compatible` | Generic endpoint |
 | Anthropic-compatible | `anthropic_compatible` | `anthropic-compatible` | Generic endpoint |
@@ -346,8 +345,6 @@ impl ProviderFactory for MyFactory {
     fn provider_keys(&self) -> &[&str] { &["my-provider"] }
     fn create(&self, config: &RociConfig, key: &str, model_id: &str)
         -> Result<Box<dyn ModelProvider>, RociError> { /* ... */ }
-    fn parse_model(&self, _key: &str, _id: &str)
-        -> Option<Box<dyn Any + Send + Sync>> { None }
 }
 
 let mut registry = roci::default_registry();
@@ -367,7 +364,7 @@ svc.register_backend(Arc::new(MyAuthBackend));
 
 Inject pre-summary behavior through `AgentConfig`:
 
-- `session_before_compact`: inspect prepared compaction payload (messages, token counts, file ops, settings, cancellation token) and choose continue/cancel/override-summary via a full override object.
+- `session_before_compact`: inspect prepared compaction payload (messages, token counts, file ops, settings, cancellation token) and choose continue/cancel/override-compaction via a full override object.
 - `session_before_tree`: inspect prepared branch-summary payload and choose continue/cancel/override-summary. Instruction/label overrides returned here are deferred rather than applied to the active branch immediately.
 
 This allows policy enforcement and custom summarization without forking core loop logic.

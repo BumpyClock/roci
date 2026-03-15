@@ -23,6 +23,3 @@ pub mod ollama;
 
 #[cfg(feature = "lmstudio")]
 pub mod lmstudio;
-
-#[cfg(feature = "openai-compatible")]
-pub mod openai_compatible;

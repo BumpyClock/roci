@@ -84,50 +84,6 @@ impl ParameterBuilder {
         self
     }
 
-    /// Add a boolean property.
-    pub fn boolean(
-        mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        required: bool,
-    ) -> Self {
-        let name = name.into();
-        self.properties.insert(
-            name.clone(),
-            serde_json::json!({
-                "type": "boolean",
-                "description": description.into(),
-            }),
-        );
-        if required {
-            self.required.push(name);
-        }
-        self
-    }
-
-    /// Add an enum (string) property.
-    pub fn string_enum(
-        mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        values: &[&str],
-        required: bool,
-    ) -> Self {
-        let name = name.into();
-        self.properties.insert(
-            name.clone(),
-            serde_json::json!({
-                "type": "string",
-                "description": description.into(),
-                "enum": values,
-            }),
-        );
-        if required {
-            self.required.push(name);
-        }
-        self
-    }
-
     /// Add an array property with nested items.
     pub fn array(
         mut self,

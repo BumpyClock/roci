@@ -33,7 +33,5 @@ pub mod openai_compatible;
 pub mod azure;
 #[cfg(feature = "openrouter")]
 pub mod openrouter;
-#[cfg(feature = "replicate")]
-pub mod replicate;
 #[cfg(feature = "together")]
 pub mod together;

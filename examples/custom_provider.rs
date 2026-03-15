@@ -7,7 +7,6 @@
 //!
 //! Run: `cargo run --example custom_provider`
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -155,15 +154,6 @@ impl ProviderFactory for EchoFactory {
         Ok(Box::new(EchoProvider {
             model_id: model_id.to_string(),
         }))
-    }
-
-    fn parse_model(
-        &self,
-        _provider_key: &str,
-        _model_id: &str,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
-        // Echo provider accepts any model ID; no parsing needed.
-        None
     }
 }
 
