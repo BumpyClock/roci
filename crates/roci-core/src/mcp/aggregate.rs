@@ -366,15 +366,14 @@ mod tests {
         list_calls: Arc<AtomicUsize>,
     }
 
+    type MockCallLog = Arc<StdMutex<Vec<(String, serde_json::Value)>>>;
+    type MockClientParts = (MockClientOps, MockCallLog, Arc<AtomicUsize>);
+
     impl MockClientOps {
         fn new(
             list_plan: Vec<Result<Vec<MCPToolSchema>, String>>,
             call_results: HashMap<String, serde_json::Value>,
-        ) -> (
-            Self,
-            Arc<StdMutex<Vec<(String, serde_json::Value)>>>,
-            Arc<AtomicUsize>,
-        ) {
+        ) -> MockClientParts {
             let call_log = Arc::new(StdMutex::new(Vec::new()));
             let list_calls = Arc::new(AtomicUsize::new(0));
             (

@@ -1,4 +1,5 @@
 use super::*;
+#[tokio::test]
 async fn tool_with_schema_rejects_bad_args_through_runner() {
     let (runner, _requests) = test_runner(ProviderScenario::SchemaToolBadArgs);
     let (sink, events) = capture_events();

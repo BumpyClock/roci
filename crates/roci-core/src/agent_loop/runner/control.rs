@@ -270,9 +270,12 @@ pub(super) async fn resolve_iteration_limit_approval(
 }
 
 fn approval_kind_for_tool(call: &AgentToolCall) -> ApprovalKind {
+    // Under ApprovalPolicy::Ask, only tool names mapped here require approval.
+    // Unmapped tools are treated as safe-by-default and auto-accepted.
     match call.name.as_str() {
-        "exec" | "process" => ApprovalKind::CommandExecution,
-        "apply_patch" | "write" | "edit" => ApprovalKind::FileChange,
+        "exec" | "process" | "shell" => ApprovalKind::CommandExecution,
+        "apply_patch" | "write" | "edit" | "write_file" | "edit_file" | "replace_in_file"
+        | "create_file" | "delete_file" => ApprovalKind::FileChange,
         _ => ApprovalKind::Other,
     }
 }
@@ -282,4 +285,90 @@ pub(super) fn approval_allows_execution(decision: ApprovalDecision) -> bool {
         decision,
         ApprovalDecision::Accept | ApprovalDecision::AcceptForSession
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use uuid::Uuid;
+
+    fn emitter_with_events() -> (RunEventEmitter, Arc<Mutex<Vec<RunEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::<RunEvent>::new()));
+        let sink_events = events.clone();
+        let sink: RunEventSink = Arc::new(move |event| {
+            sink_events.lock().expect("event lock").push(event);
+        });
+        (RunEventEmitter::new(Uuid::new_v4(), Some(sink)), events)
+    }
+
+    fn tool_call(name: &str) -> AgentToolCall {
+        AgentToolCall {
+            id: format!("{name}-call"),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            recipient: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_policy_requires_approval_for_shell_and_write_file() {
+        let (emitter, events) = emitter_with_events();
+
+        let shell_decision =
+            resolve_approval(&emitter, &ApprovalPolicy::Ask, None, &tool_call("shell")).await;
+        let write_decision = resolve_approval(
+            &emitter,
+            &ApprovalPolicy::Ask,
+            None,
+            &tool_call("write_file"),
+        )
+        .await;
+
+        assert_eq!(shell_decision, ApprovalDecision::Decline);
+        assert_eq!(write_decision, ApprovalDecision::Decline);
+
+        let events = events.lock().expect("event lock");
+        let requests: Vec<(ApprovalKind, String)> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                RunEventPayload::ApprovalRequired { request } => Some((
+                    request.kind,
+                    request
+                        .payload
+                        .get("tool_name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            requests,
+            vec![
+                (ApprovalKind::CommandExecution, "shell".to_string()),
+                (ApprovalKind::FileChange, "write_file".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_policy_auto_accepts_non_mutating_other_tools() {
+        let (emitter, events) = emitter_with_events();
+
+        let decision = resolve_approval(
+            &emitter,
+            &ApprovalPolicy::Ask,
+            None,
+            &tool_call("read_file"),
+        )
+        .await;
+
+        assert_eq!(decision, ApprovalDecision::Accept);
+        assert!(events.lock().expect("event lock").is_empty());
+    }
 }

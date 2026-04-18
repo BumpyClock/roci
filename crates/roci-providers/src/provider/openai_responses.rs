@@ -57,6 +57,13 @@ impl OpenAiResponsesProvider {
             .unwrap_or(self.api_key.as_str())
     }
 
+    fn add_session_affinity_headers(headers: &mut reqwest::header::HeaderMap, session_id: &str) {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(session_id) {
+            headers.insert("session_id", value.clone());
+            headers.insert("x-client-request-id", value);
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     fn build_headers(
         &self,
@@ -95,15 +102,13 @@ impl OpenAiResponsesProvider {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(&user_agent) {
                 headers.insert(reqwest::header::USER_AGENT, value);
             }
-            if let Some(ref session_id) = request.session_id {
-                if let Ok(value) = reqwest::header::HeaderValue::from_str(session_id) {
-                    headers.insert("session_id", value);
-                }
-            }
         } else if let Some(account_id) = &self.account_id {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(account_id) {
                 headers.insert("ChatGPT-Account-ID", value);
             }
+        }
+        if let Some(ref session_id) = request.session_id {
+            Self::add_session_affinity_headers(&mut headers, session_id);
         }
         if let Some(ref transport) = request.transport {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(transport) {
@@ -1736,7 +1741,62 @@ mod tests {
     }
 
     #[test]
-    fn codex_headers_include_session_id() {
+    fn openai_responses_headers_include_session_affinity() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
+        let session_id = "session-1";
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: Some(session_id.to_string()),
+            transport: None,
+        };
+
+        let headers = provider.build_headers(&request).expect("headers");
+        assert_eq!(
+            headers.get("session_id").unwrap().to_str().unwrap(),
+            session_id
+        );
+        assert_eq!(
+            headers
+                .get("x-client-request-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            session_id
+        );
+    }
+
+    #[test]
+    fn openai_responses_headers_omit_session_affinity_when_absent() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let headers = provider.build_headers(&request).expect("headers");
+        assert!(headers.get("session_id").is_none());
+        assert!(headers.get("x-client-request-id").is_none());
+    }
+
+    #[test]
+    fn codex_headers_include_session_affinity() {
         let provider = OpenAiResponsesProvider::new(
             OpenAiModel::Gpt5Nano,
             "test-key".to_string(),
@@ -1762,10 +1822,18 @@ mod tests {
             headers.get("session_id").unwrap().to_str().unwrap(),
             session_id
         );
+        assert_eq!(
+            headers
+                .get("x-client-request-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            session_id
+        );
     }
 
     #[test]
-    fn codex_headers_omit_session_id_when_absent() {
+    fn codex_headers_omit_session_affinity_when_absent() {
         let provider = OpenAiResponsesProvider::new(
             OpenAiModel::Gpt5Nano,
             "test-key".to_string(),
@@ -1787,6 +1855,7 @@ mod tests {
 
         let headers = provider.build_headers(&request).expect("headers");
         assert!(headers.get("session_id").is_none());
+        assert!(headers.get("x-client-request-id").is_none());
     }
 
     #[test]

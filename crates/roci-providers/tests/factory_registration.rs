@@ -105,7 +105,7 @@ fn temp_auth_service() -> (TempDir, AuthService) {
     let store = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
         dir.path().to_path_buf(),
     )));
-    (dir.into(), AuthService::new(store))
+    (dir, AuthService::new(store))
 }
 
 #[test]

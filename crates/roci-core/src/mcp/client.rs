@@ -553,6 +553,7 @@ mod tests {
 
     #[async_trait]
     impl MCPTransport for MockBootstrapTransport {
+        #[allow(clippy::result_large_err)]
         async fn connect(
             &mut self,
             client_info: rmcp::model::ClientInfo,

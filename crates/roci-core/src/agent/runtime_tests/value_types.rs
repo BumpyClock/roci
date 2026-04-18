@@ -15,9 +15,12 @@ fn agent_state_debug() {
 
 #[test]
 fn agent_state_clone_copy() {
+    fn assert_clone<T: Clone>() {}
+
+    assert_clone::<AgentState>();
     let s = AgentState::Idle;
     let s2 = s; // Copy
-    let s3 = s.clone(); // Clone
+    let s3 = s; // Copy again
     assert_eq!(s, s2);
     assert_eq!(s2, s3);
 }

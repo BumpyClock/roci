@@ -1,9 +1,5 @@
 # AGENTS.MD
 
-READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if files missing).
-
-
-
 roci notes:
 - Default workflow: lint, format, and test before publishing.
 - Docs are under `docs/`; read & update as needed.

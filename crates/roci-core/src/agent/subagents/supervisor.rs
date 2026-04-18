@@ -867,8 +867,10 @@ mod tests {
             let registry = Arc::new(ProviderRegistry::new());
             let roci_config = RociConfig::default();
             let base_config = make_base_config();
-            let mut sup_config = SubagentSupervisorConfig::default();
-            sup_config.abort_on_drop = false;
+            let sup_config = SubagentSupervisorConfig {
+                abort_on_drop: false,
+                ..SubagentSupervisorConfig::default()
+            };
             let profile_registry = SubagentProfileRegistry::with_builtins();
             let supervisor = SubagentSupervisor::new(
                 registry,

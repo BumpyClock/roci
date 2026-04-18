@@ -1,4 +1,5 @@
 use super::*;
+#[tokio::test]
 async fn agent_message_lifecycle_events_emit_for_text_stream() {
     let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
     let (agent_sink, agent_events) = capture_agent_events();
