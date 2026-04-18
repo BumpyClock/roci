@@ -67,8 +67,7 @@ mod tests {
         };
         let overrides = SubagentOverrides::default();
         let prompt = policy.build_system_prompt(&profile, &overrides);
-        assert!(prompt.contains("sub-agent"));
-        assert!(prompt.contains("Write tests first."));
+        assert_eq!(prompt, format!("{}\n\nWrite tests first.", policy.preamble));
     }
 
     #[test]
@@ -83,8 +82,7 @@ mod tests {
             ..Default::default()
         };
         let prompt = policy.build_system_prompt(&profile, &overrides);
-        assert!(prompt.contains("Override prompt."));
-        assert!(!prompt.contains("Profile prompt."));
+        assert_eq!(prompt, format!("{}\n\nOverride prompt.", policy.preamble));
     }
 
     #[test]
@@ -94,5 +92,20 @@ mod tests {
         let overrides = SubagentOverrides::default();
         let prompt = policy.build_system_prompt(&profile, &overrides);
         assert_eq!(prompt, policy.preamble);
+    }
+
+    #[test]
+    fn build_prompt_is_deterministic_for_same_inputs() {
+        let policy = SubagentPromptPolicy::default();
+        let profile = SubagentProfile {
+            system_prompt: Some("Profile prompt.".into()),
+            ..Default::default()
+        };
+        let overrides = SubagentOverrides::default();
+
+        let first = policy.build_system_prompt(&profile, &overrides);
+        let second = policy.build_system_prompt(&profile, &overrides);
+
+        assert_eq!(first, second);
     }
 }

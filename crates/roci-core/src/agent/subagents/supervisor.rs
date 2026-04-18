@@ -15,7 +15,6 @@ use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
-use crate::types::ModelMessage;
 
 use super::context::build_child_initial_messages;
 use super::handle::SubagentHandle;
@@ -26,6 +25,9 @@ use super::types::{
     SubagentCompletion, SubagentContext, SubagentEvent, SubagentId, SubagentRunResult,
     SubagentSnapshot, SubagentSpec, SubagentStatus, SubagentSummary, SubagentSupervisorConfig,
 };
+
+#[cfg(test)]
+use super::launcher::LaunchedChild;
 
 // ---------------------------------------------------------------------------
 // Internal child tracking
@@ -110,9 +112,29 @@ impl SubagentSupervisor {
 
     /// Spawn a new child sub-agent from a [`SubagentSpec`].
     ///
+    /// Convenience wrapper that uses an empty [`SubagentContext`].
+    /// Use [`spawn_with_context`](Self::spawn_with_context) to pass
+    /// materialized parent context (summary, snapshot, etc.).
+    pub async fn spawn(&self, spec: SubagentSpec) -> Result<SubagentHandle, RociError> {
+        self.spawn_with_context(spec, SubagentContext::default())
+            .await
+    }
+
+    /// Spawn a new child sub-agent from a [`SubagentSpec`] and pre-materialized
+    /// [`SubagentContext`].
+    ///
+    /// The full initial message list (system prompt, context, task/continuation)
+    /// is built from the spec and context, then seeded into the child runtime.
+    /// The child is started via `continue_without_input()` so the composed
+    /// prompt policy is applied exactly once — as the first message.
+    ///
     /// Returns a [`SubagentHandle`] immediately. The child runs in a
     /// background tokio task and is subject to the concurrency semaphore.
-    pub async fn spawn(&self, spec: SubagentSpec) -> Result<SubagentHandle, RociError> {
+    pub async fn spawn_with_context(
+        &self,
+        spec: SubagentSpec,
+        context: SubagentContext,
+    ) -> Result<SubagentHandle, RociError> {
         // 1. Check max_active_children hard cap
         if let Some(max) = self.config.max_active_children {
             let children = self.children.lock().await;
@@ -140,8 +162,8 @@ impl SubagentSupervisor {
             self.profile_registry
                 .resolve_model(&profile, &self.registry, &self.roci_config)?;
 
-        // 3. Build initial messages (for system prompt composition)
-        let context = SubagentContext::default();
+        // 3. Build initial messages (system prompt + context + task/continuation).
+        //    The composed prompt policy is the first (system) message.
         let initial_messages = build_child_initial_messages(
             &spec.input,
             &context,
@@ -150,23 +172,21 @@ impl SubagentSupervisor {
             &spec.overrides,
         );
 
-        // 4. Extract task prompt (last user message)
-        let task = extract_task(&initial_messages);
-
-        // 5. Generate ID
+        // 4. Generate ID
         let id: SubagentId = Uuid::new_v4();
 
-        // 6. Build child event sink wrapping events as SubagentEvent::AgentEvent
+        // 5. Build child event sink wrapping events as SubagentEvent::AgentEvent
         let child_event_sink =
             super::events::build_child_event_sink(id, spec.label.clone(), self.event_tx.clone());
 
-        // 7. Launch child runtime
+        // 6. Launch child runtime seeded with the full initial messages.
+        //    System prompt is in the messages, not in the runtime config.
         let launched = self
             .launcher
             .launch(
                 id,
                 model.clone(),
-                profile.system_prompt.clone(),
+                initial_messages,
                 self.base_config.tools.clone(),
                 #[cfg(feature = "agent")]
                 self.coordinator.clone(),
@@ -174,10 +194,10 @@ impl SubagentSupervisor {
             )
             .await?;
 
-        // 8. Shared status
+        // 7. Shared status
         let status = Arc::new(Mutex::new(SubagentStatus::Pending));
 
-        // 9. Snapshot watch channel
+        // 8. Snapshot watch channel
         let initial_snapshot = SubagentSnapshot {
             subagent_id: id,
             profile: spec.profile.clone(),
@@ -191,10 +211,10 @@ impl SubagentSupervisor {
         };
         let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
 
-        // 10. Create shared cancellation token
+        // 9. Create shared cancellation token
         let cancel_token = CancellationToken::new();
 
-        // 11. Register child entry
+        // 10. Register child entry
         {
             let entry = ChildEntry {
                 id,
@@ -207,7 +227,7 @@ impl SubagentSupervisor {
             self.children.lock().await.insert(id, entry);
         }
 
-        // 12. Emit spawned event
+        // 11. Emit spawned event
         let _ = self.event_tx.send(SubagentEvent::Spawned {
             subagent_id: id,
             label: spec.label.clone(),
@@ -215,10 +235,10 @@ impl SubagentSupervisor {
             model: Some(model.clone()),
         });
 
-        // 13. Channels for handle <-> task communication
+        // 12. Channels for handle <-> task communication
         let (completion_tx, completion_rx) = oneshot::channel::<SubagentRunResult>();
 
-        // 14. Spawn background task
+        // 13. Spawn background task
         {
             let semaphore = self.concurrency_semaphore.clone();
             let event_tx = self.event_tx.clone();
@@ -256,20 +276,15 @@ impl SubagentSupervisor {
                     last_error: None,
                 });
 
-                // Run child: prompt with task, racing against cancellation
-                let run_result = if let Some(task) = task {
-                    tokio::select! {
-                        result = runtime.prompt(task) => result,
-                        _ = task_cancel_token.cancelled() => {
-                            runtime.abort().await;
-                            runtime.wait_for_idle().await;
-                            Err(RociError::InvalidState("aborted".into()))
-                        }
+                // Run child from seeded messages via continue_without_input(),
+                // racing against cancellation.
+                let run_result = tokio::select! {
+                    result = runtime.continue_without_input() => result,
+                    _ = task_cancel_token.cancelled() => {
+                        runtime.abort().await;
+                        runtime.wait_for_idle().await;
+                        Err(RociError::InvalidState("aborted".into()))
                     }
-                } else {
-                    Err(RociError::InvalidState(
-                        "no task prompt in SubagentInput".into(),
-                    ))
                 };
 
                 // Map to SubagentRunResult
@@ -355,7 +370,7 @@ impl SubagentSupervisor {
             });
         }
 
-        // 15. Build and return handle
+        // 14. Build and return handle
         let handle = SubagentHandle::new(
             id,
             spec.label,
@@ -650,18 +665,6 @@ fn is_terminal(status: SubagentStatus) -> bool {
     )
 }
 
-/// Extract the task prompt from the initial message list.
-///
-/// Looks for the last User-role message.
-fn extract_task(messages: &[ModelMessage]) -> Option<String> {
-    use crate::types::Role;
-    messages
-        .iter()
-        .rev()
-        .find(|m| m.role == Role::User)
-        .map(|m| m.text().to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -669,7 +672,69 @@ fn extract_task(messages: &[ModelMessage]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::runtime::AgentRuntime;
+    use crate::agent::subagents::context::materialize_context;
+    use crate::agent::subagents::types::{ModelCandidate, SnapshotMode, SubagentInput};
     use crate::agent::subagents::{SubagentProfileRegistry, SubagentSupervisorConfig};
+    use crate::error::RociError as TestRociError;
+    use crate::provider::factory::ProviderFactory;
+    use crate::provider::ModelProvider;
+    use crate::types::{ModelMessage, Role};
+    use async_trait::async_trait;
+
+    // -----------------------------------------------------------------------
+    // Dummy provider factory so model resolution succeeds in tests
+    // -----------------------------------------------------------------------
+
+    struct TestProviderFactory;
+
+    impl ProviderFactory for TestProviderFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["test"]
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, TestRociError> {
+            Err(TestRociError::Configuration("test provider stub".into()))
+        }
+    }
+
+    /// Build a ProviderRegistry with a "test" provider registered.
+    fn test_registry() -> Arc<ProviderRegistry> {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(TestProviderFactory));
+        Arc::new(registry)
+    }
+
+    /// Build a RociConfig with a "test" API key set.
+    fn test_roci_config() -> RociConfig {
+        let config = RociConfig::default();
+        config.set_api_key("test", "test-key".into());
+        config
+    }
+
+    /// Build a profile registry with a "test:dev" profile that uses the test
+    /// provider, so model resolution succeeds without real credentials.
+    fn test_profile_registry() -> SubagentProfileRegistry {
+        use crate::agent::subagents::types::SubagentProfile;
+
+        let mut registry = SubagentProfileRegistry::with_builtins();
+        registry.register(SubagentProfile {
+            name: "test:dev".into(),
+            system_prompt: Some("You are a test sub-agent.".into()),
+            models: vec![ModelCandidate {
+                provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        });
+        registry
+    }
 
     fn make_test_model() -> LanguageModel {
         LanguageModel::Known {
@@ -731,6 +796,131 @@ mod tests {
         )
     }
 
+    // -----------------------------------------------------------------------
+    // Mock launcher that captures initial_messages for assertions
+    // -----------------------------------------------------------------------
+
+    struct MockLauncher {
+        /// Messages received by the last `launch()` call.
+        captured: Arc<Mutex<Vec<ModelMessage>>>,
+        registry: Arc<ProviderRegistry>,
+        roci_config: RociConfig,
+    }
+
+    impl MockLauncher {
+        fn new() -> (Self, Arc<Mutex<Vec<ModelMessage>>>) {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let launcher = Self {
+                captured: captured.clone(),
+                registry: Arc::new(ProviderRegistry::new()),
+                roci_config: RociConfig::default(),
+            };
+            (launcher, captured)
+        }
+    }
+
+    #[async_trait]
+    impl SubagentLauncher for MockLauncher {
+        async fn launch(
+            &self,
+            _id: SubagentId,
+            model: LanguageModel,
+            initial_messages: Vec<ModelMessage>,
+            tools: Vec<Arc<dyn crate::tools::tool::Tool>>,
+            #[cfg(feature = "agent")] coordinator: Arc<UserInputCoordinator>,
+            event_sink: Option<crate::agent_loop::runner::AgentEventSink>,
+        ) -> Result<LaunchedChild, RociError> {
+            // Capture the messages for test assertions.
+            *self.captured.lock().await = initial_messages.clone();
+
+            // Build a real runtime so the supervisor background task can run.
+            // It will fail at LLM call (no provider configured), which the
+            // supervisor handles gracefully.
+            let config = {
+                use crate::agent::runtime::QueueDrainMode;
+                use crate::agent_loop::runner::RetryBackoffPolicy;
+                use crate::resource::CompactionSettings;
+                use crate::types::GenerationSettings;
+
+                AgentConfig {
+                    model,
+                    system_prompt: None,
+                    tools,
+                    event_sink,
+                    #[cfg(feature = "agent")]
+                    user_input_coordinator: Some(coordinator),
+                    dynamic_tool_providers: Vec::new(),
+                    settings: GenerationSettings::default(),
+                    transform_context: None,
+                    convert_to_llm: None,
+                    before_agent_start: None,
+                    session_id: None,
+                    steering_mode: QueueDrainMode::All,
+                    follow_up_mode: QueueDrainMode::All,
+                    transport: None,
+                    max_retry_delay_ms: None,
+                    retry_backoff: RetryBackoffPolicy::default(),
+                    api_key_override: None,
+                    provider_headers: reqwest::header::HeaderMap::new(),
+                    provider_metadata: HashMap::new(),
+                    provider_payload_callback: None,
+                    get_api_key: None,
+                    compaction: CompactionSettings::default(),
+                    session_before_compact: None,
+                    session_before_tree: None,
+                    pre_tool_use: None,
+                    post_tool_use: None,
+                    user_input_timeout_ms: None,
+                }
+            };
+            let runtime =
+                AgentRuntime::new(self.registry.clone(), self.roci_config.clone(), config);
+            if !initial_messages.is_empty() {
+                runtime.replace_messages(initial_messages).await?;
+            }
+            Ok(LaunchedChild { runtime })
+        }
+    }
+
+    fn make_supervisor_with_mock() -> (SubagentSupervisor, Arc<Mutex<Vec<ModelMessage>>>) {
+        let registry = test_registry();
+        let roci_config = test_roci_config();
+        let base_config = make_base_config();
+        let sup_config = SubagentSupervisorConfig::default();
+        let profile_registry = test_profile_registry();
+
+        let (mock, captured) = MockLauncher::new();
+
+        #[cfg(feature = "agent")]
+        let coordinator = base_config
+            .user_input_coordinator
+            .clone()
+            .unwrap_or_else(|| Arc::new(UserInputCoordinator::new()));
+
+        let (event_tx, _) = broadcast::channel(256);
+        let semaphore = Arc::new(Semaphore::new(sup_config.max_concurrent));
+
+        let supervisor = SubagentSupervisor {
+            registry,
+            roci_config,
+            config: sup_config,
+            profile_registry,
+            prompt_policy: SubagentPromptPolicy::default(),
+            base_config,
+            launcher: Box::new(mock),
+            #[cfg(feature = "agent")]
+            coordinator,
+            event_tx,
+            children: Arc::new(Mutex::new(HashMap::new())),
+            concurrency_semaphore: semaphore,
+        };
+        (supervisor, captured)
+    }
+
+    // -----------------------------------------------------------------------
+    // Basic construction
+    // -----------------------------------------------------------------------
+
     #[test]
     fn supervisor_construction_with_builtins() {
         let supervisor = make_supervisor();
@@ -745,32 +935,232 @@ mod tests {
     }
 
     #[test]
-    fn extract_task_finds_last_user_message() {
-        use crate::types::ModelMessage;
-        let messages = vec![
-            ModelMessage::system("sys prompt"),
-            ModelMessage::user("do the thing"),
-        ];
-        assert_eq!(extract_task(&messages), Some("do the thing".to_string()));
-    }
-
-    #[test]
-    fn extract_task_returns_none_for_empty() {
-        assert_eq!(extract_task(&[]), None);
-    }
-
-    #[test]
-    fn extract_task_returns_none_for_system_only() {
-        let messages = vec![ModelMessage::system("sys")];
-        assert_eq!(extract_task(&messages), None);
-    }
-
-    #[test]
     fn subscribe_returns_receiver() {
         let supervisor = make_supervisor();
         let _rx = supervisor.subscribe();
     }
 
+    // -----------------------------------------------------------------------
+    // spawn_with_context: prompt-only mode passes correct messages
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_prompt_only_seeds_system_and_user() {
+        let (supervisor, captured) = make_supervisor_with_mock();
+        let spec = SubagentSpec {
+            profile: "test:dev".into(),
+            label: Some("test-prompt".into()),
+            input: SubagentInput::Prompt {
+                task: "fix the bug".into(),
+            },
+            overrides: Default::default(),
+        };
+
+        let handle = supervisor
+            .spawn_with_context(spec, SubagentContext::default())
+            .await
+            .unwrap();
+
+        // Give the background task a moment to launch.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = captured.lock().await;
+        assert_eq!(msgs.len(), 2, "expected [System, User(task)]");
+        assert_eq!(msgs[0].role, Role::System);
+        assert_eq!(msgs[1].role, Role::User);
+        assert_eq!(msgs[1].text(), "fix the bug");
+
+        // System prompt should be the composed prompt (preamble + profile).
+        let preamble = SubagentPromptPolicy::default_child_preamble();
+        assert!(
+            msgs[0].text().starts_with(preamble),
+            "system prompt must start with preamble"
+        );
+
+        // Clean up.
+        handle.abort().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_with_context: snapshot-only mode succeeds (was broken before)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_snapshot_only_succeeds_without_caller_task() {
+        let (supervisor, captured) = make_supervisor_with_mock();
+        let context = SubagentContext {
+            summary: Some("parent did X".into()),
+            ..Default::default()
+        };
+        let spec = SubagentSpec {
+            profile: "test:dev".into(),
+            label: Some("snapshot-worker".into()),
+            input: SubagentInput::Snapshot {
+                mode: SnapshotMode::SummaryOnly,
+            },
+            overrides: Default::default(),
+        };
+
+        // This previously failed with "no task prompt in SubagentInput".
+        let handle = supervisor.spawn_with_context(spec, context).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = captured.lock().await;
+        // Expect: [System, User(summary), User(continuation prompt)]
+        assert_eq!(
+            msgs.len(),
+            3,
+            "snapshot-only: [System, summary, continuation]"
+        );
+        assert_eq!(msgs[0].role, Role::System);
+        assert!(msgs[1].text().contains("parent did X"));
+        assert!(msgs[2].text().contains("read-only snapshot"));
+
+        handle.abort().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_with_context: prompt+snapshot mode
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_prompt_with_snapshot_seeds_context_before_task() {
+        let (supervisor, captured) = make_supervisor_with_mock();
+        let context = SubagentContext {
+            summary: Some("summary of conversation".into()),
+            ..Default::default()
+        };
+        let spec = SubagentSpec {
+            profile: "test:dev".into(),
+            label: None,
+            input: SubagentInput::PromptWithSnapshot {
+                task: "implement feature Y".into(),
+                mode: SnapshotMode::SummaryOnly,
+            },
+            overrides: Default::default(),
+        };
+
+        let handle = supervisor.spawn_with_context(spec, context).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = captured.lock().await;
+        // Expect: [System, User(summary), User(task)]
+        assert_eq!(msgs.len(), 3, "prompt+snapshot: [System, summary, task]");
+        assert_eq!(msgs[0].role, Role::System);
+        assert!(msgs[1].text().contains("summary of conversation"));
+        assert_eq!(msgs[2].text(), "implement feature Y");
+
+        handle.abort().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // System prompt applied exactly once
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn system_prompt_appears_exactly_once() {
+        let (supervisor, captured) = make_supervisor_with_mock();
+        let spec = SubagentSpec {
+            profile: "test:dev".into(),
+            label: None,
+            input: SubagentInput::Prompt {
+                task: "hello".into(),
+            },
+            overrides: Default::default(),
+        };
+
+        let handle = supervisor
+            .spawn_with_context(spec, SubagentContext::default())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = captured.lock().await;
+        let system_count = msgs.iter().filter(|m| m.role == Role::System).count();
+        assert_eq!(system_count, 1, "system prompt must appear exactly once");
+
+        handle.abort().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Backward-compat: spawn() delegates to spawn_with_context
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_without_context_uses_default() {
+        let (supervisor, captured) = make_supervisor_with_mock();
+        let spec = SubagentSpec {
+            profile: "test:dev".into(),
+            label: None,
+            input: SubagentInput::Prompt {
+                task: "test backward compat".into(),
+            },
+            overrides: Default::default(),
+        };
+
+        let handle = supervisor.spawn(spec).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = captured.lock().await;
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].text(), "test backward compat");
+
+        handle.abort().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Full read-only snapshot mode preserves user/assistant messages
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_full_snapshot_preserves_conversation() {
+        let (supervisor, captured) = make_supervisor_with_mock();
+
+        let parent_messages = vec![
+            ModelMessage::system("parent sys"),
+            ModelMessage::user("question"),
+            ModelMessage::assistant("answer"),
+            ModelMessage::user("follow-up"),
+        ];
+        let context =
+            materialize_context(&parent_messages, &SnapshotMode::FullReadonlySnapshot, None);
+        // FullReadonlySnapshot filters to user+assistant only.
+        assert_eq!(context.selected_messages.len(), 3);
+
+        let spec = SubagentSpec {
+            profile: "test:dev".into(),
+            label: None,
+            input: SubagentInput::Snapshot {
+                mode: SnapshotMode::FullReadonlySnapshot,
+            },
+            overrides: Default::default(),
+        };
+
+        let handle = supervisor.spawn_with_context(spec, context).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = captured.lock().await;
+        // Expect: [System, User(question), Asst(answer), User(follow-up), User(continuation)]
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[0].role, Role::System);
+        assert_eq!(msgs[1].text(), "question");
+        assert_eq!(msgs[2].text(), "answer");
+        assert_eq!(msgs[3].text(), "follow-up");
+        assert!(msgs[4].text().contains("read-only snapshot"));
+
+        handle.abort().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing tests (lifecycle, abort, wait, etc.)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "agent")]
     #[tokio::test]
     async fn submit_user_input_delegates_to_coordinator() {
         use crate::tools::UserInputResponse;

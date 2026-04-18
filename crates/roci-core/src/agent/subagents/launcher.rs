@@ -15,7 +15,7 @@ use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
 use crate::resource::CompactionSettings;
 use crate::tools::tool::Tool;
-use crate::types::GenerationSettings;
+use crate::types::{GenerationSettings, ModelMessage};
 
 use super::types::SubagentId;
 
@@ -32,13 +32,18 @@ pub(super) struct LaunchedChild {
 ///
 /// The trait exists so that tests can inject a mock launcher without needing
 /// real provider credentials.
+///
+/// `initial_messages` is the fully-composed message list from
+/// [`build_child_initial_messages`](super::context::build_child_initial_messages).
+/// The system prompt is already included as the first message — the launcher
+/// must **not** set it again in the runtime config.
 #[async_trait]
 pub(super) trait SubagentLauncher: Send + Sync {
     async fn launch(
         &self,
         id: SubagentId,
         model: LanguageModel,
-        system_prompt: Option<String>,
+        initial_messages: Vec<ModelMessage>,
         tools: Vec<Arc<dyn Tool>>,
         #[cfg(feature = "agent")] coordinator: Arc<UserInputCoordinator>,
         event_sink: Option<AgentEventSink>,
@@ -61,20 +66,27 @@ impl SubagentLauncher for InProcessLauncher {
         &self,
         _id: SubagentId,
         model: LanguageModel,
-        system_prompt: Option<String>,
+        initial_messages: Vec<ModelMessage>,
         tools: Vec<Arc<dyn Tool>>,
         #[cfg(feature = "agent")] coordinator: Arc<UserInputCoordinator>,
         event_sink: Option<AgentEventSink>,
     ) -> Result<LaunchedChild, RociError> {
         let config = build_child_config(
             model,
-            system_prompt,
             tools,
             event_sink,
             #[cfg(feature = "agent")]
             coordinator,
         );
         let runtime = AgentRuntime::new(self.registry.clone(), self.roci_config.clone(), config);
+
+        // Seed the child runtime with the fully-composed message list.
+        // The system prompt is the first message; the config has no system
+        // prompt so `prompt()` won't duplicate it.
+        if !initial_messages.is_empty() {
+            runtime.replace_messages(initial_messages).await?;
+        }
+
         Ok(LaunchedChild { runtime })
     }
 }
@@ -83,9 +95,13 @@ impl SubagentLauncher for InProcessLauncher {
 // Helper
 // ---------------------------------------------------------------------------
 
+/// Build a child [`AgentConfig`] without a system prompt.
+///
+/// The composed system prompt lives in `initial_messages` (first message),
+/// so `system_prompt` is intentionally `None` to prevent double-application
+/// if `prompt()` were ever called on the child runtime.
 fn build_child_config(
     model: LanguageModel,
-    system_prompt: Option<String>,
     tools: Vec<Arc<dyn Tool>>,
     event_sink: Option<AgentEventSink>,
     #[cfg(feature = "agent")] coordinator: Arc<UserInputCoordinator>,
@@ -94,7 +110,7 @@ fn build_child_config(
 
     AgentConfig {
         model,
-        system_prompt,
+        system_prompt: None,
         tools,
         event_sink,
         #[cfg(feature = "agent")]
@@ -129,21 +145,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_child_config_sets_model_and_prompt() {
+    fn build_child_config_has_no_system_prompt() {
         let model = LanguageModel::Known {
             provider_key: "test".into(),
             model_id: "test-model".into(),
         };
         let cfg = build_child_config(
             model.clone(),
-            Some("system".into()),
             Vec::new(),
             None,
             #[cfg(feature = "agent")]
             Arc::new(UserInputCoordinator::new()),
         );
         assert_eq!(cfg.model, model);
-        assert_eq!(cfg.system_prompt.as_deref(), Some("system"));
+        assert!(
+            cfg.system_prompt.is_none(),
+            "system prompt must be None; it lives in initial_messages"
+        );
         assert!(cfg.tools.is_empty());
     }
 }
