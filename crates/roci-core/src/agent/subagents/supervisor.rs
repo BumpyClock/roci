@@ -406,8 +406,11 @@ impl SubagentSupervisor {
 
     /// Wait for a specific child to complete.
     ///
-    /// Returns the child's run result. Returns an error if the child ID is
-    /// unknown.
+    /// Returns the child's run result. If the child already reached a terminal
+    /// state before this call subscribed, or if the event receiver lagged and
+    /// the result must be reconstructed from cached status, the returned result
+    /// is status-only and may have `messages: Vec::new()` with no structured
+    /// error payload. Returns an error if the child ID is unknown.
     pub async fn wait(&self, id: SubagentId) -> Result<SubagentRunResult, RociError> {
         // Check the child exists and whether it's already finished.
         {
@@ -480,7 +483,11 @@ impl SubagentSupervisor {
 
     /// Wait for the next child to complete (any child).
     ///
-    /// Returns `None` if there are no active children.
+    /// Returns the next observed completion for an active child. If the
+    /// completion event was missed and terminal state is reconstructed from the
+    /// cached child status, the embedded result is status-only and may have
+    /// `messages: Vec::new()` with no structured error payload. Returns `None`
+    /// if there are no active children.
     pub async fn wait_any(&self) -> Option<SubagentCompletion> {
         // Collect active child IDs
         let active_ids: Vec<SubagentId> = {
@@ -579,7 +586,10 @@ impl SubagentSupervisor {
 
     /// Wait for all active children to complete.
     ///
-    /// Returns a completion record for each child. Order is completion order.
+    /// Returns a completion record for each child in completion order. Because
+    /// this delegates to [`Self::wait_any`], individual results may be
+    /// status-only fallbacks when terminal state is reconstructed after the
+    /// receiver misses completion events.
     pub async fn wait_all(&self) -> Vec<SubagentCompletion> {
         let mut results = Vec::new();
         while let Some(completion) = self.wait_any().await {

@@ -1,23 +1,31 @@
-//! Tests for SubagentSupervisor lifecycle and concurrency.
+//! Tests for SubagentSupervisor lifecycle and public runtime behavior.
 //!
 //! Drop-behavior tests and internal-access tests live in
 //! `supervisor.rs`'s own `mod tests` block. These tests exercise the
 //! public API only.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 use uuid::Uuid;
 
 use crate::agent::runtime::AgentConfig;
 use crate::agent::subagents::profiles::SubagentProfileRegistry;
 use crate::agent::subagents::supervisor::SubagentSupervisor;
 use crate::agent::subagents::types::{
-    SubagentInput, SubagentSpec, SubagentStatus, SubagentSupervisorConfig,
+    ModelCandidate, SnapshotMode, SubagentContext, SubagentInput, SubagentProfile, SubagentSpec,
+    SubagentStatus, SubagentSupervisorConfig,
 };
+use crate::agent::subagents::SubagentPromptPolicy;
 use crate::config::RociConfig;
-use crate::models::LanguageModel;
-use crate::provider::ProviderRegistry;
+use crate::error::RociError;
+use crate::models::{LanguageModel, ModelCapabilities};
+use crate::provider::{
+    ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
+};
+use crate::types::{ModelMessage, Role, StreamEventType, TextStreamDelta, Usage};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -97,6 +105,165 @@ fn make_supervisor_with_config(sup_config: SubagentSupervisorConfig) -> Subagent
     )
 }
 
+struct RecordingProviderFactory {
+    requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    response_text: String,
+}
+
+impl RecordingProviderFactory {
+    fn new(requests: Arc<Mutex<Vec<ProviderRequest>>>, response_text: impl Into<String>) -> Self {
+        Self {
+            requests,
+            response_text: response_text.into(),
+        }
+    }
+}
+
+impl ProviderFactory for RecordingProviderFactory {
+    fn provider_keys(&self) -> &[&str] {
+        &["test"]
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        _provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(RecordingProvider {
+            provider_key: "test".into(),
+            model_id: model_id.to_string(),
+            requests: self.requests.clone(),
+            response_text: self.response_text.clone(),
+            capabilities: ModelCapabilities {
+                supports_streaming: false,
+                ..ModelCapabilities::default()
+            },
+        }))
+    }
+}
+
+struct RecordingProvider {
+    provider_key: String,
+    model_id: String,
+    requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    response_text: String,
+    capabilities: ModelCapabilities,
+}
+
+#[async_trait]
+impl ModelProvider for RecordingProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "recording test provider uses stream_text".into(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        self.requests
+            .lock()
+            .expect("request capture lock should not be poisoned")
+            .push(request.clone());
+
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(TextStreamDelta {
+                text: self.response_text.clone(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+        ])))
+    }
+}
+
+fn make_recording_supervisor(
+    response_text: &str,
+) -> (SubagentSupervisor, Arc<Mutex<Vec<ProviderRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProviderFactory::new(
+        requests.clone(),
+        response_text,
+    )));
+
+    let roci_config = RociConfig::default();
+    roci_config.set_api_key("test", "test-key".into());
+
+    let mut profile_registry = SubagentProfileRegistry::with_builtins();
+    profile_registry.register(SubagentProfile {
+        name: "test:dev".into(),
+        system_prompt: Some("You are a test sub-agent.".into()),
+        models: vec![ModelCandidate {
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning_effort: None,
+        }],
+        ..Default::default()
+    });
+
+    let supervisor = SubagentSupervisor::new(
+        Arc::new(registry),
+        roci_config,
+        make_base_config(),
+        SubagentSupervisorConfig::default(),
+        profile_registry,
+    );
+    (supervisor, requests)
+}
+
+fn captured_request_messages(requests: &Arc<Mutex<Vec<ProviderRequest>>>) -> Vec<ModelMessage> {
+    let requests = requests
+        .lock()
+        .expect("request capture lock should not be poisoned");
+    assert_eq!(requests.len(), 1, "expected exactly one provider request");
+    requests[0].messages.clone()
+}
+
+fn assert_test_system_prompt(message: &ModelMessage) {
+    let preamble = SubagentPromptPolicy::default_child_preamble();
+    assert_eq!(message.role, Role::System);
+    assert!(
+        message.text().starts_with(preamble),
+        "child system prompt should start with the default preamble"
+    );
+    assert!(
+        message.text().contains("You are a test sub-agent."),
+        "child system prompt should include the profile prompt"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -104,7 +271,6 @@ fn make_supervisor_with_config(sup_config: SubagentSupervisorConfig) -> Subagent
 #[test]
 fn supervisor_construction_with_default_config() {
     let supervisor = make_supervisor();
-    // Should not panic; default max_concurrent is 4
     let _rx = supervisor.subscribe();
 }
 
@@ -138,7 +304,6 @@ async fn list_active_empty_on_fresh_supervisor() {
 fn subscribe_returns_a_receiver() {
     let supervisor = make_supervisor();
     let _rx = supervisor.subscribe();
-    // Subscribing again should also work
     let _rx2 = supervisor.subscribe();
 }
 
@@ -146,7 +311,6 @@ fn subscribe_returns_a_receiver() {
 fn subscribe_receiver_is_empty_initially() {
     let supervisor = make_supervisor();
     let mut rx = supervisor.subscribe();
-    // No events yet -- try_recv should return TryRecvError
     assert!(rx.try_recv().is_err());
 }
 
@@ -222,7 +386,6 @@ async fn spawn_with_unknown_profile_returns_error() {
 async fn shutdown_on_empty_supervisor_is_fine() {
     let supervisor = make_supervisor();
     supervisor.shutdown().await;
-    // Should not hang or panic
     let active = supervisor.list_active().await;
     assert!(active.is_empty());
 }
@@ -243,6 +406,200 @@ async fn wait_unknown_child_returns_error() {
     let supervisor = make_supervisor();
     let result = supervisor.wait(Uuid::new_v4()).await;
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Runtime regression coverage for child-input seeding and transcript shape
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn spawn_with_context_prompt_only_runs_from_seeded_history() {
+    let (supervisor, requests) = make_recording_supervisor("prompt-only complete");
+    let spec = SubagentSpec {
+        profile: "test:dev".into(),
+        label: Some("prompt-only".into()),
+        input: SubagentInput::Prompt {
+            task: "fix the bug".into(),
+        },
+        overrides: Default::default(),
+    };
+
+    let handle = supervisor
+        .spawn_with_context(spec, SubagentContext::default())
+        .await
+        .unwrap();
+    let result = handle.wait().await;
+
+    assert_eq!(result.status, SubagentStatus::Completed);
+    let request_messages = captured_request_messages(&requests);
+    assert_eq!(request_messages.len(), 2);
+    assert_test_system_prompt(&request_messages[0]);
+    assert_eq!(request_messages[1].role, Role::User);
+    assert_eq!(request_messages[1].text(), "fix the bug");
+
+    assert_eq!(result.messages.len(), 3);
+    assert_test_system_prompt(&result.messages[0]);
+    assert_eq!(result.messages[1].text(), "fix the bug");
+    assert_eq!(result.messages[2].role, Role::Assistant);
+    assert_eq!(result.messages[2].text(), "prompt-only complete");
+}
+
+#[tokio::test]
+async fn spawn_with_context_snapshot_only_uses_supplied_context_without_task() {
+    let (supervisor, requests) = make_recording_supervisor("snapshot-only complete");
+    let context = SubagentContext {
+        summary: Some("parent did X".into()),
+        ..Default::default()
+    };
+    let spec = SubagentSpec {
+        profile: "test:dev".into(),
+        label: Some("snapshot-only".into()),
+        input: SubagentInput::Snapshot {
+            mode: SnapshotMode::SummaryOnly,
+        },
+        overrides: Default::default(),
+    };
+
+    let handle = supervisor.spawn_with_context(spec, context).await.unwrap();
+    let result = handle.wait().await;
+
+    assert_eq!(result.status, SubagentStatus::Completed);
+    let request_messages = captured_request_messages(&requests);
+    assert_eq!(request_messages.len(), 3);
+    assert_test_system_prompt(&request_messages[0]);
+    assert_eq!(request_messages[1].role, Role::User);
+    assert_eq!(
+        request_messages[1].text(),
+        "Parent context summary:\nparent did X"
+    );
+    assert_eq!(request_messages[2].role, Role::User);
+    assert!(request_messages[2].text().contains("read-only snapshot"));
+}
+
+#[tokio::test]
+async fn spawn_with_context_prompt_plus_snapshot_preserves_order_end_to_end() {
+    let (supervisor, requests) = make_recording_supervisor("prompt+snapshot complete");
+    let context = SubagentContext {
+        summary: Some("summary of conversation".into()),
+        selected_messages: vec![
+            ModelMessage::assistant("prior answer"),
+            ModelMessage::user("follow-up from parent"),
+        ],
+        ..Default::default()
+    };
+    let spec = SubagentSpec {
+        profile: "test:dev".into(),
+        label: Some("prompt+snapshot".into()),
+        input: SubagentInput::PromptWithSnapshot {
+            task: "implement feature Y".into(),
+            mode: SnapshotMode::SummaryOnly,
+        },
+        overrides: Default::default(),
+    };
+
+    let handle = supervisor.spawn_with_context(spec, context).await.unwrap();
+    let result = handle.wait().await;
+
+    assert_eq!(result.status, SubagentStatus::Completed);
+    let request_messages = captured_request_messages(&requests);
+    assert_eq!(
+        request_messages
+            .iter()
+            .map(|message| (message.role, message.text()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Role::System, request_messages[0].text(),),
+            (
+                Role::User,
+                "Parent context summary:\nsummary of conversation".into()
+            ),
+            (Role::Assistant, "prior answer".into()),
+            (Role::User, "follow-up from parent".into()),
+            (Role::User, "implement feature Y".into()),
+        ]
+    );
+    assert_test_system_prompt(&request_messages[0]);
+
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .map(|message| (message.role, message.text()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Role::System, result.messages[0].text()),
+            (
+                Role::User,
+                "Parent context summary:\nsummary of conversation".into()
+            ),
+            (Role::Assistant, "prior answer".into()),
+            (Role::User, "follow-up from parent".into()),
+            (Role::User, "implement feature Y".into()),
+            (Role::Assistant, "prompt+snapshot complete".into()),
+        ]
+    );
+    assert_test_system_prompt(&result.messages[0]);
+}
+
+#[tokio::test]
+async fn spawn_backward_compat_path_still_runs() {
+    let (supervisor, requests) = make_recording_supervisor("spawn complete");
+    let spec = SubagentSpec {
+        profile: "test:dev".into(),
+        label: Some("backward-compat".into()),
+        input: SubagentInput::Prompt {
+            task: "test backward compat".into(),
+        },
+        overrides: Default::default(),
+    };
+
+    let handle = supervisor.spawn(spec).await.unwrap();
+    let result = handle.wait().await;
+
+    assert_eq!(result.status, SubagentStatus::Completed);
+    let request_messages = captured_request_messages(&requests);
+    assert_eq!(request_messages.len(), 2);
+    assert_test_system_prompt(&request_messages[0]);
+    assert_eq!(request_messages[1].text(), "test backward compat");
+    assert_eq!(result.messages[2].text(), "spawn complete");
+}
+
+#[tokio::test]
+async fn child_runtime_does_not_duplicate_system_prompt() {
+    let (supervisor, requests) = make_recording_supervisor("no duplicate system");
+    let spec = SubagentSpec {
+        profile: "test:dev".into(),
+        label: Some("system-once".into()),
+        input: SubagentInput::Prompt {
+            task: "hello".into(),
+        },
+        overrides: Default::default(),
+    };
+
+    let handle = supervisor
+        .spawn_with_context(spec, SubagentContext::default())
+        .await
+        .unwrap();
+    let result = handle.wait().await;
+
+    let request_messages = captured_request_messages(&requests);
+    assert_eq!(
+        request_messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .count(),
+        1,
+        "provider request should include exactly one system message"
+    );
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .count(),
+        1,
+        "final child transcript should include exactly one system message"
+    );
 }
 
 // ---------------------------------------------------------------------------
