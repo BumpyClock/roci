@@ -18,7 +18,7 @@ pub enum RociError {
         message: String,
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
-        details: Option<ErrorDetails>,
+        details: Option<Box<ErrorDetails>>,
     },
 
     #[error("Network error: {0}")]
@@ -88,7 +88,7 @@ impl RociError {
             status,
             message: message.into(),
             source: None,
-            details: Some(details),
+            details: Some(Box::new(details)),
         }
     }
 
@@ -146,6 +146,44 @@ pub type Result<T> = std::result::Result<T, RociError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard against `RociError` growing back above the clippy
+    /// `result_large_err` threshold (128 bytes).
+    #[test]
+    fn roci_error_fits_in_128_bytes() {
+        let size = std::mem::size_of::<RociError>();
+        assert!(
+            size < 128,
+            "RociError is {size} bytes — must stay under 128 to avoid clippy::result_large_err"
+        );
+    }
+
+    #[test]
+    fn api_with_details_preserves_error_details() {
+        let details = ErrorDetails {
+            code: Some(unified::ErrorCode::ContextLengthExceeded),
+            provider_code: Some("context_length_exceeded".to_string()),
+            param: Some("input".to_string()),
+            request_id: Some("req-123".to_string()),
+        };
+        let err = RociError::api_with_details(400, "overflow", details);
+        match &err {
+            RociError::Api {
+                status,
+                message,
+                details: Some(d),
+                ..
+            } => {
+                assert_eq!(*status, 400);
+                assert_eq!(message, "overflow");
+                assert_eq!(d.code, Some(unified::ErrorCode::ContextLengthExceeded));
+                assert_eq!(d.provider_code.as_deref(), Some("context_length_exceeded"));
+                assert_eq!(d.param.as_deref(), Some("input"));
+                assert_eq!(d.request_id.as_deref(), Some("req-123"));
+            }
+            other => panic!("expected Api variant with details, got {other:?}"),
+        }
+    }
 
     #[test]
     fn missing_credential_has_authentication_category() {

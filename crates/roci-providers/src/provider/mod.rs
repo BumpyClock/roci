@@ -3,6 +3,8 @@
 #[cfg(feature = "openai")]
 pub mod openai;
 #[cfg(feature = "openai")]
+pub(crate) mod openai_errors;
+#[cfg(feature = "openai")]
 pub mod openai_responses;
 
 #[cfg(feature = "anthropic")]

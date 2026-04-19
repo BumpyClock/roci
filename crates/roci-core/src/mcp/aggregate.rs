@@ -11,45 +11,9 @@ use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
 use crate::tools::tool::ToolExecutionContext;
 use crate::tools::types::AgentToolParameters;
 
-use super::client::{MCPClient, MCPToolCallResult};
+use super::client::MCPClient;
+use super::client_ops::MCPClientOps;
 use super::instructions::{MCPInstructionSource, MCPServerMetadata};
-use super::schema::MCPToolSchema;
-
-#[async_trait]
-/// Internal MCP client operations required by the aggregator.
-trait MCPClientOps: Send {
-    async fn initialize(&mut self) -> Result<(), RociError>;
-    async fn list_tools(&mut self) -> Result<Vec<MCPToolSchema>, RociError>;
-    async fn instructions(&mut self) -> Result<Option<String>, RociError>;
-    async fn call_tool(
-        &mut self,
-        name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<MCPToolCallResult, RociError>;
-}
-
-#[async_trait]
-impl MCPClientOps for MCPClient {
-    async fn initialize(&mut self) -> Result<(), RociError> {
-        MCPClient::initialize(self).await
-    }
-
-    async fn list_tools(&mut self) -> Result<Vec<MCPToolSchema>, RociError> {
-        MCPClient::list_tools(self).await
-    }
-
-    async fn instructions(&mut self) -> Result<Option<String>, RociError> {
-        MCPClient::instructions(self)
-    }
-
-    async fn call_tool(
-        &mut self,
-        name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<MCPToolCallResult, RociError> {
-        MCPClient::call_tool(self, name, arguments).await
-    }
-}
 
 /// Tool naming policy used while merging tools across MCP servers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -356,6 +320,9 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
+
+    use crate::mcp::client::MCPToolCallResult;
+    use crate::mcp::schema::MCPToolSchema;
 
     struct MockClientOps {
         initialize_error: Option<String>,

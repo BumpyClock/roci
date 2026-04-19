@@ -3,7 +3,10 @@
 pub mod aggregate;
 pub mod bridge;
 pub mod client;
+mod client_ops;
+mod error;
 pub mod instructions;
+mod mapping;
 pub mod schema;
 pub mod transport;
 
