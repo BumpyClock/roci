@@ -374,4 +374,3 @@ let result = generate_text(&provider, messages, settings, &[]).await?;
 ## Related Documentation
 
 - [LMStudio Integration](lmstudio.md) - Alternative local hosting
-- [AI SDK Integration](ai-sdk.md) - Multi-model integration patterns

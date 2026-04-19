@@ -277,13 +277,16 @@ impl SubagentSupervisor {
                 });
 
                 // Run child from seeded messages via continue_without_input(),
-                // racing against cancellation.
+                // racing against cancellation. Keep the run future alive across
+                // the cancel path so abort can unwind the active run to a real
+                // terminal result instead of dropping the in-flight future.
+                let run_future = runtime.continue_without_input();
+                tokio::pin!(run_future);
                 let run_result = tokio::select! {
-                    result = runtime.continue_without_input() => result,
+                    result = &mut run_future => result,
                     _ = task_cancel_token.cancelled() => {
                         runtime.abort().await;
-                        runtime.wait_for_idle().await;
-                        Err(RociError::InvalidState("aborted".into()))
+                        run_future.await
                     }
                 };
 

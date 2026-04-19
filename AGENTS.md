@@ -4,7 +4,7 @@ roci notes:
 - Default workflow: lint, format, and test before publishing.
 - Docs are under `docs/`; read & update as needed.
 - Use `.env` for sensitive keys; refer to `.env.example` for structure. Keep `.env.example` updated as needed.
-- Tests validate new features and implementations against real endpoints using ` cargo test --test live_providers -- --ignored --nocapture`.
+- Validate provider-facing changes with the relevant crate tests; this repo does not currently ship a `live_providers` integration target.
 - Use parallel-subagents and agent-teams for all tasks.
 
 # Core

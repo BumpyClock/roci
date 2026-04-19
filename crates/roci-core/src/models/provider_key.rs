@@ -14,6 +14,7 @@ pub enum ProviderKey {
     LmStudio,
     OpenAiCompatible,
     GitHubCopilot,
+    Azure,
 }
 
 impl ProviderKey {
@@ -31,6 +32,7 @@ impl ProviderKey {
             Self::LmStudio => "lmstudio",
             Self::OpenAiCompatible => "openai-compatible",
             Self::GitHubCopilot => "github-copilot",
+            Self::Azure => "azure",
         }
     }
 
@@ -48,6 +50,7 @@ impl ProviderKey {
             "lmstudio" => Some(Self::LmStudio),
             "openai-compatible" | "openai_compatible" => Some(Self::OpenAiCompatible),
             "github-copilot" | "github_copilot" | "copilot" => Some(Self::GitHubCopilot),
+            "azure" | "azure-openai" | "azure_openai" => Some(Self::Azure),
             _ => None,
         }
     }
@@ -66,6 +69,7 @@ impl ProviderKey {
             Self::Mistral => &["mistral"],
             Self::Ollama => &["ollama"],
             Self::LmStudio => &["lmstudio"],
+            Self::Azure => &["azure", "azure-openai"],
         }
     }
 
@@ -94,5 +98,21 @@ mod tests {
     #[test]
     fn codex_lookup_has_legacy_key() {
         assert_eq!(ProviderKey::Codex.lookup_keys(), &["codex", "openai-codex"]);
+    }
+
+    #[test]
+    fn parses_azure_aliases() {
+        for alias in ["azure", "azure-openai", "azure_openai"] {
+            assert_eq!(
+                ProviderKey::parse(alias),
+                Some(ProviderKey::Azure),
+                "failed to parse alias: {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_as_str() {
+        assert_eq!(ProviderKey::Azure.as_str(), "azure");
     }
 }

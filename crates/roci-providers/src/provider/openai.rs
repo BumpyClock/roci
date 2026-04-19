@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use tracing::debug;
 
@@ -19,12 +20,20 @@ use roci_core::util::debug::roci_debug_enabled;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+#[derive(Clone, Copy)]
+enum AuthMode {
+    Bearer,
+    ApiKey,
+}
+
 pub struct OpenAiProvider {
     model: OpenAiModel,
     api_key: String,
     base_url: String,
     account_id: Option<String>,
     extra_headers: reqwest::header::HeaderMap,
+    extra_query: Option<String>,
+    auth_mode: AuthMode,
     capabilities: ModelCapabilities,
 }
 
@@ -51,6 +60,57 @@ impl OpenAiProvider {
         account_id: Option<String>,
         extra_headers: reqwest::header::HeaderMap,
     ) -> Self {
+        Self::new_full(model, api_key, base_url, account_id, extra_headers, None)
+    }
+
+    /// Full constructor with all options including extra query parameters.
+    pub fn new_full(
+        model: OpenAiModel,
+        api_key: String,
+        base_url: Option<String>,
+        account_id: Option<String>,
+        extra_headers: reqwest::header::HeaderMap,
+        extra_query: Option<String>,
+    ) -> Self {
+        Self::new_full_with_auth(
+            model,
+            api_key,
+            base_url,
+            account_id,
+            extra_headers,
+            extra_query,
+            AuthMode::Bearer,
+        )
+    }
+
+    pub(crate) fn new_with_api_key_auth(
+        model: OpenAiModel,
+        api_key: String,
+        base_url: Option<String>,
+        account_id: Option<String>,
+        extra_headers: reqwest::header::HeaderMap,
+        extra_query: Option<String>,
+    ) -> Self {
+        Self::new_full_with_auth(
+            model,
+            api_key,
+            base_url,
+            account_id,
+            extra_headers,
+            extra_query,
+            AuthMode::ApiKey,
+        )
+    }
+
+    fn new_full_with_auth(
+        model: OpenAiModel,
+        api_key: String,
+        base_url: Option<String>,
+        account_id: Option<String>,
+        extra_headers: reqwest::header::HeaderMap,
+        extra_query: Option<String>,
+        auth_mode: AuthMode,
+    ) -> Self {
         let capabilities = model.capabilities();
         Self {
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -58,12 +118,29 @@ impl OpenAiProvider {
             api_key,
             account_id,
             extra_headers,
+            extra_query,
+            auth_mode,
             capabilities,
         }
     }
 
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
-        let mut headers = bearer_headers(&self.api_key);
+    pub(crate) fn build_headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        match self.auth_mode {
+            AuthMode::Bearer => {
+                if let Some(value) = bearer_headers(&self.api_key).get(AUTHORIZATION).cloned() {
+                    headers.insert(AUTHORIZATION, value);
+                }
+            }
+            AuthMode::ApiKey => {
+                if let Ok(value) = HeaderValue::from_str(&self.api_key) {
+                    headers.insert("api-key", value);
+                }
+            }
+        }
+
         if let Some(account_id) = &self.account_id {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(account_id) {
                 headers.insert("ChatGPT-Account-ID", value);
@@ -81,6 +158,15 @@ impl OpenAiProvider {
             );
         }
         headers
+    }
+
+    /// Build the chat completions URL, appending extra query params if present.
+    pub(crate) fn chat_url(&self) -> String {
+        let path = format!("{}/chat/completions", self.base_url);
+        match &self.extra_query {
+            Some(q) => format!("{}?{}", path, q),
+            None => path,
+        }
     }
 
     fn build_request_body(&self, request: &ProviderRequest, stream: bool) -> serde_json::Value {
@@ -205,7 +291,7 @@ impl ModelProvider for OpenAiProvider {
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, RociError> {
         let body = self.build_request_body(request, false);
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = self.chat_url();
 
         debug!(model = self.model.as_str(), "OpenAI generate_text");
 
@@ -272,7 +358,7 @@ impl ModelProvider for OpenAiProvider {
         request: &ProviderRequest,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         let body = self.build_request_body(request, true);
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = self.chat_url();
 
         debug!(model = self.model.as_str(), "OpenAI stream_text");
 
@@ -683,5 +769,48 @@ mod tests {
 
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["messages"][0]["content"], "ok");
+    }
+
+    #[test]
+    fn chat_url_without_extra_query() {
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "k".to_string(), None, None);
+        assert_eq!(
+            provider.chat_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_url_with_extra_query() {
+        let provider = OpenAiProvider::new_full(
+            OpenAiModel::Gpt4o,
+            "k".to_string(),
+            Some("https://example.com/v1".to_string()),
+            None,
+            reqwest::header::HeaderMap::new(),
+            Some("api-version=2024-06-01".to_string()),
+        );
+        assert_eq!(
+            provider.chat_url(),
+            "https://example.com/v1/chat/completions?api-version=2024-06-01"
+        );
+    }
+
+    #[test]
+    fn api_key_auth_uses_api_key_header_without_authorization() {
+        let provider = OpenAiProvider::new_with_api_key_auth(
+            OpenAiModel::Gpt4o,
+            "k".to_string(),
+            Some("https://example.com/v1".to_string()),
+            None,
+            HeaderMap::new(),
+            Some("api-version=2024-06-01".to_string()),
+        );
+        let headers = provider.build_headers();
+        assert_eq!(
+            headers.get("api-key").and_then(|value| value.to_str().ok()),
+            Some("k")
+        );
+        assert!(headers.get(AUTHORIZATION).is_none());
     }
 }

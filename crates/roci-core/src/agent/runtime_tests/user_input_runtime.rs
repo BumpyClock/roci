@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
+use tokio::time::{sleep, timeout};
 
 struct AskUserFactory {
     calls: Arc<AtomicUsize>,
@@ -209,4 +211,78 @@ async fn prompt_emits_user_input_event_and_submit_user_input_unblocks_tool() {
     let requests = event_requests.lock().expect("event lock");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].questions[0].id, "temp_unit");
+}
+
+#[tokio::test]
+async fn abort_while_waiting_for_user_input_unblocks_run() {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(AskUserFactory {
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    let registry = Arc::new(registry);
+
+    let ask_user_tool: Arc<dyn Tool> = Arc::new(AgentTool::new(
+        "ask_user",
+        "ask user test tool",
+        AgentToolParameters::empty(),
+        |_args, ctx| async move {
+            let callback = ctx
+                .request_user_input
+                .clone()
+                .ok_or_else(|| RociError::InvalidState("missing request_user_input".to_string()))?;
+            let response = callback(UserInputRequest {
+                request_id: uuid::Uuid::new_v4(),
+                tool_call_id: "ask-user-call-1".to_string(),
+                questions: vec![Question {
+                    id: "abort_unit".to_string(),
+                    text: "Abort me?".to_string(),
+                    options: None,
+                }],
+                timeout_ms: None,
+            })
+            .await
+            .map_err(|err| RociError::InvalidState(err.to_string()))?;
+            Ok(serde_json::json!({
+                "answer": response.answers.first().map(|answer| answer.content.clone())
+            }))
+        },
+    ));
+
+    let (request_seen_tx, request_seen_rx) = oneshot::channel();
+    let request_seen_tx = Arc::new(Mutex::new(Some(request_seen_tx)));
+
+    let mut config = test_agent_config();
+    config.model = "stub:ask-user-runtime".parse().expect("stub model parses");
+    config.tools = vec![ask_user_tool];
+    config.event_sink = Some({
+        let request_seen_tx = Arc::clone(&request_seen_tx);
+        Arc::new(move |event| {
+            if let AgentEvent::UserInputRequested { request } = event {
+                if let Some(tx) = request_seen_tx.lock().expect("event lock").take() {
+                    let _ = tx.send(request);
+                }
+            }
+        })
+    });
+
+    let agent = Arc::new(AgentRuntime::new(registry, test_config(), config));
+    let prompt_agent = Arc::clone(&agent);
+    let prompt_task = tokio::spawn(async move { prompt_agent.prompt("ask me a unit").await });
+
+    let request = timeout(std::time::Duration::from_secs(1), request_seen_rx)
+        .await
+        .expect("user input request should arrive")
+        .expect("request sender should not drop");
+    assert_eq!(request.questions[0].id, "abort_unit");
+
+    sleep(std::time::Duration::from_millis(10)).await;
+    assert!(agent.abort().await, "abort should signal running prompt");
+
+    let result = timeout(std::time::Duration::from_secs(1), prompt_task)
+        .await
+        .expect("prompt task should finish after abort")
+        .expect("prompt task join should succeed")
+        .expect("prompt should resolve to run result");
+
+    assert_eq!(result.status, RunStatus::Canceled);
 }

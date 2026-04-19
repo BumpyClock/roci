@@ -54,20 +54,20 @@ impl AuthBackend for GitHubCopilotBackend {
         let auth = GitHubCopilotAuth::new(store.clone());
         let result = auth.poll_device_code(session).await?;
 
-        // Attempt Copilot JWT exchange on success; store as github-copilot-api
+        // Exchange Copilot JWT on success; both exchange and save must succeed
+        // for the login to be considered successful.
         if let AuthPollResult::Authorized { .. } = &result {
-            if let Ok(copilot_token) = auth.exchange_copilot_token().await {
-                let api_token = Token {
-                    access_token: copilot_token.token,
-                    refresh_token: None,
-                    id_token: None,
-                    expires_at: Some(copilot_token.expires_at),
-                    last_refresh: Some(Utc::now()),
-                    scopes: None,
-                    account_id: Some(copilot_token.base_url),
-                };
-                let _ = store.save("github-copilot-api", "default", &api_token);
-            }
+            let copilot_token = auth.exchange_copilot_token().await?;
+            let api_token = Token {
+                access_token: copilot_token.token,
+                refresh_token: None,
+                id_token: None,
+                expires_at: Some(copilot_token.expires_at),
+                last_refresh: Some(Utc::now()),
+                scopes: None,
+                account_id: Some(copilot_token.base_url),
+            };
+            store.save("github-copilot-api", "default", &api_token)?;
         }
 
         Ok(result)
@@ -203,11 +203,27 @@ impl AuthBackend for ClaudeCodeBackend {
 
     async fn complete_pkce(
         &self,
+        _store: &Arc<dyn TokenStore>,
+        _code: &str,
+        _state: &str,
+    ) -> Result<Token, AuthError> {
+        Err(AuthError::InvalidResponse(
+            "Claude PKCE requires session_data; use complete_pkce_with_session".into(),
+        ))
+    }
+
+    async fn complete_pkce_with_session(
+        &self,
         store: &Arc<dyn TokenStore>,
         code: &str,
-        state: &str,
+        _state: &str,
+        session_data: Option<&serde_json::Value>,
     ) -> Result<Token, AuthError> {
-        let session = pkce_session_from_state(state)?;
+        let session = pkce_session_from_data(session_data.ok_or_else(|| {
+            AuthError::InvalidResponse(
+                "PKCE session_data is required to complete Claude login".into(),
+            )
+        })?)?;
         let auth = ClaudeCodeAuth::new(store.clone());
         auth.exchange_code(&session, code).await
     }
@@ -233,34 +249,126 @@ fn pkce_session_to_json(session: &PkceSession) -> serde_json::Value {
     })
 }
 
-fn pkce_session_from_state(state: &str) -> Result<PkceSession, AuthError> {
-    // The caller provides the state string; we reconstruct a minimal session.
-    // In practice, the complete session data (including code_verifier) must be
-    // preserved by the caller between start_login and complete_pkce.
-    // This is a fallback that works when the session_data JSON is passed via state.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(state) {
-        let authorize_url = v
-            .get("authorize_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let st = v
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let code_verifier = v
-            .get("code_verifier")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        return Ok(PkceSession {
-            authorize_url,
-            state: st,
-            code_verifier,
-        });
+/// Reconstruct a `PkceSession` from preserved session data.
+///
+/// All fields are required; returns an error if any are missing or empty.
+fn pkce_session_from_data(data: &serde_json::Value) -> Result<PkceSession, AuthError> {
+    let authorize_url = data
+        .get("authorize_url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AuthError::InvalidResponse("missing authorize_url in PKCE session data".into())
+        })?
+        .to_string();
+    let state = data
+        .get("state")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AuthError::InvalidResponse("missing state in PKCE session data".into()))?
+        .to_string();
+    let code_verifier = data
+        .get("code_verifier")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AuthError::InvalidResponse("missing code_verifier in PKCE session data".into())
+        })?
+        .to_string();
+    Ok(PkceSession {
+        authorize_url,
+        state,
+        code_verifier,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // PKCE session data round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pkce_session_round_trips_through_json() {
+        let session = PkceSession {
+            authorize_url: "https://example.com/authorize".to_string(),
+            state: "random-state".to_string(),
+            code_verifier: "secret-verifier".to_string(),
+        };
+        let json = pkce_session_to_json(&session);
+        let restored = pkce_session_from_data(&json).expect("should parse");
+        assert_eq!(restored.authorize_url, session.authorize_url);
+        assert_eq!(restored.state, session.state);
+        assert_eq!(restored.code_verifier, session.code_verifier);
     }
-    Err(AuthError::InvalidResponse(
-        "Failed to reconstruct PKCE session from state".into(),
-    ))
+
+    #[test]
+    fn pkce_session_from_data_rejects_missing_code_verifier() {
+        let data = serde_json::json!({
+            "authorize_url": "https://example.com/authorize",
+            "state": "random-state",
+        });
+        let err = pkce_session_from_data(&data).unwrap_err();
+        match err {
+            AuthError::InvalidResponse(msg) => {
+                assert!(
+                    msg.contains("code_verifier"),
+                    "error should mention code_verifier: {msg}"
+                );
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pkce_session_from_data_rejects_empty_fields() {
+        let data = serde_json::json!({
+            "authorize_url": "",
+            "state": "s",
+            "code_verifier": "v",
+        });
+        let err = pkce_session_from_data(&data).unwrap_err();
+        match err {
+            AuthError::InvalidResponse(msg) => {
+                assert!(
+                    msg.contains("authorize_url"),
+                    "error should mention authorize_url: {msg}"
+                );
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pkce_session_from_data_rejects_non_object() {
+        let data = serde_json::json!("just-a-string");
+        let err = pkce_session_from_data(&data).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidResponse(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // ClaudeCodeBackend::complete_pkce requires session_data
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn claude_complete_pkce_requires_session_data() {
+        let store: Arc<dyn TokenStore> =
+            Arc::new(roci_core::auth::store::FileTokenStore::new_default());
+        let backend = ClaudeCodeBackend;
+        let result = backend
+            .complete_pkce_with_session(&store, "code", "state", None)
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AuthError::InvalidResponse(msg) => {
+                assert!(
+                    msg.contains("session_data"),
+                    "error should mention session_data: {msg}"
+                );
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
 }

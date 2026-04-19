@@ -8,23 +8,27 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use uuid::Uuid;
 
 use crate::agent::runtime::AgentConfig;
 use crate::agent::subagents::profiles::SubagentProfileRegistry;
 use crate::agent::subagents::supervisor::SubagentSupervisor;
+use crate::agent::subagents::types::SubagentEvent;
 use crate::agent::subagents::types::{
     ModelCandidate, SnapshotMode, SubagentContext, SubagentInput, SubagentProfile, SubagentSpec,
     SubagentStatus, SubagentSupervisorConfig,
 };
 use crate::agent::subagents::SubagentPromptPolicy;
+use crate::agent_loop::AgentEvent;
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::{LanguageModel, ModelCapabilities};
 use crate::provider::{
     ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
 };
+use crate::tools::tool::Tool;
+use crate::tools::{AgentTool, AgentToolParameters, Question, UserInputRequest};
 use crate::types::{ModelMessage, Role, StreamEventType, TextStreamDelta, Usage};
 
 // ---------------------------------------------------------------------------
@@ -241,6 +245,159 @@ fn make_recording_supervisor(
         profile_registry,
     );
     (supervisor, requests)
+}
+
+struct BlockingAskUserFactory;
+
+impl ProviderFactory for BlockingAskUserFactory {
+    fn provider_keys(&self) -> &[&str] {
+        &["test"]
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        _provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(BlockingAskUserProvider {
+            model_id: model_id.to_string(),
+            capabilities: ModelCapabilities {
+                supports_streaming: false,
+                ..ModelCapabilities::default()
+            },
+        }))
+    }
+}
+
+struct BlockingAskUserProvider {
+    model_id: String,
+    capabilities: ModelCapabilities,
+}
+
+#[async_trait]
+impl ModelProvider for BlockingAskUserProvider {
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "blocking ask_user test provider uses stream_text".into(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        Ok(Box::pin(stream::iter(vec![
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::ToolCallDelta,
+                tool_call: Some(crate::types::AgentToolCall {
+                    id: "ask-user-call-1".into(),
+                    name: "ask_user".into(),
+                    arguments: serde_json::json!({
+                        "questions": [
+                            {
+                                "id": "abort_unit",
+                                "text": "Abort me?"
+                            }
+                        ]
+                    }),
+                    recipient: None,
+                }),
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+        ])))
+    }
+}
+
+fn make_blocking_ask_user_supervisor() -> SubagentSupervisor {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(BlockingAskUserFactory));
+    let roci_config = RociConfig::default();
+    roci_config.set_api_key("test", "test-key".into());
+
+    let ask_user_tool: Arc<dyn Tool> = Arc::new(AgentTool::new(
+        "ask_user",
+        "ask user test tool",
+        AgentToolParameters::empty(),
+        |_args, ctx| async move {
+            let callback = ctx
+                .request_user_input
+                .clone()
+                .ok_or_else(|| RociError::InvalidState("missing request_user_input".to_string()))?;
+            let response = callback(UserInputRequest {
+                request_id: uuid::Uuid::new_v4(),
+                tool_call_id: "ask-user-call-1".to_string(),
+                questions: vec![Question {
+                    id: "abort_unit".to_string(),
+                    text: "Abort me?".to_string(),
+                    options: None,
+                }],
+                timeout_ms: None,
+            })
+            .await
+            .map_err(|err| RociError::InvalidState(err.to_string()))?;
+            Ok(serde_json::json!({
+                "answer": response.answers.first().map(|answer| answer.content.clone())
+            }))
+        },
+    ));
+
+    let mut base_config = make_base_config();
+    base_config.model = LanguageModel::Known {
+        provider_key: "test".into(),
+        model_id: "test-model".into(),
+    };
+    base_config.tools = vec![ask_user_tool];
+
+    let mut profile_registry = SubagentProfileRegistry::with_builtins();
+    profile_registry.register(SubagentProfile {
+        name: "test:dev".into(),
+        system_prompt: Some("You are a test sub-agent.".into()),
+        models: vec![ModelCandidate {
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning_effort: None,
+        }],
+        ..Default::default()
+    });
+
+    SubagentSupervisor::new(
+        Arc::new(registry),
+        roci_config,
+        base_config,
+        SubagentSupervisorConfig::default(),
+        profile_registry,
+    )
 }
 
 fn captured_request_messages(requests: &Arc<Mutex<Vec<ProviderRequest>>>) -> Vec<ModelMessage> {
@@ -600,6 +757,50 @@ async fn child_runtime_does_not_duplicate_system_prompt() {
         1,
         "final child transcript should include exactly one system message"
     );
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn abort_while_child_waits_for_user_input_completes() {
+    let supervisor = make_blocking_ask_user_supervisor();
+    let mut events = supervisor.subscribe();
+    let spec = SubagentSpec {
+        profile: "test:dev".into(),
+        label: Some("abort-ask-user".into()),
+        input: SubagentInput::Prompt {
+            task: "use ask_user and then wait".into(),
+        },
+        overrides: Default::default(),
+    };
+
+    let handle = supervisor.spawn(spec).await.unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await {
+                Ok(SubagentEvent::AgentEvent { event, .. }) => {
+                    if let AgentEvent::UserInputRequested { request } = *event {
+                        assert_eq!(request.questions[0].id, "abort_unit");
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => panic!("event stream closed unexpectedly: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("child should request user input");
+
+    assert!(supervisor.abort(handle.id()).await.unwrap());
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        handle.wait().await
+    })
+    .await
+    .expect("aborted child should complete promptly");
+
+    assert_eq!(result.status, SubagentStatus::Aborted);
 }
 
 // ---------------------------------------------------------------------------

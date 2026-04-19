@@ -43,6 +43,22 @@ pub trait AuthBackend: Send + Sync {
         state: &str,
     ) -> Result<Token, AuthError>;
 
+    /// Complete a PKCE flow with preserved session data.
+    ///
+    /// Backends that require opaque session state (e.g. a PKCE `code_verifier`)
+    /// should override this method. The default delegates to [`complete_pkce`]
+    /// and ignores `session_data`, so existing implementers are unaffected.
+    async fn complete_pkce_with_session(
+        &self,
+        store: &Arc<dyn TokenStore>,
+        code: &str,
+        state: &str,
+        session_data: Option<&serde_json::Value>,
+    ) -> Result<Token, AuthError> {
+        let _ = session_data;
+        self.complete_pkce(store, code, state).await
+    }
+
     /// Get current auth status for this backend.
     fn get_status(&self, store: &Arc<dyn TokenStore>) -> Result<Option<Token>, AuthError>;
 

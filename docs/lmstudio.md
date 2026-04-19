@@ -305,4 +305,3 @@ A: Depends on model and available RAM. The default capability reports 32K; confi
 ## Related Documentation
 
 - [GPT-OSS-120B Guide](gpt-oss.md) - Detailed setup for open-source large models
-- [AI SDK Integration](ai-sdk.md) - Advanced integration patterns

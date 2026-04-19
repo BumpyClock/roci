@@ -104,7 +104,7 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 | `config` | `RociConfig` |
 | `error` | `RociError` with typed variants, categories, retryability |
 | `types` | `ModelMessage`, `Usage`, `FinishReason`, `GenerationSettings`, `TextStreamDelta`, `ContentPart` |
-| `generation` | `generate_text()`, `stream_text()`, `generate_object()` -- operate on `&dyn ModelProvider` |
+| `generation` | `generate_text()` / `generate_object()` operate on `&dyn ModelProvider`; `stream_text()` operates on `Arc<dyn ModelProvider>` |
 | `skills` | Skill discovery, frontmatter parsing, and prompt formatting |
 | `resource` | Resource loading for settings, context files, prompt templates, and diagnostics |
 | `tools` | `Tool` trait, `AgentTool`, `ToolArguments`, `DynamicTool` |
@@ -188,6 +188,7 @@ Produces the `roci-agent` binary. Owns all terminal concerns:
 - Exit codes and `process::exit`
 - User-facing error messages (maps core typed errors to help text)
 - Auth flow orchestration (maps `AuthStep`/`AuthPollResult` to interactive prompts)
+- PKCE flow handoff (preserves `session_data` from `start_login` through `complete_pkce`)
 - Resource diagnostics rendering (surfaces loader warnings from `roci-core::resource`)
 
 Resource loading behavior used by CLI chat:
@@ -429,6 +430,5 @@ cargo test -p roci            # Meta-crate integration tests
 cargo test -p roci-cli        # CLI tests (arg parsing, error formatting)
 cargo test -p roci-tools      # Built-in tool tests
 
-# Live provider smoke tests (requires API keys, --ignored)
-cargo test --test live_providers -- --ignored --nocapture
+# No shared `live_providers` target currently exists; use the relevant crate tests above.
 ```

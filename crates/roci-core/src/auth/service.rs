@@ -104,6 +104,24 @@ impl AuthService {
         backend.complete_pkce(&self.store, code, state).await
     }
 
+    /// Complete a PKCE authorization-code exchange with preserved session data.
+    ///
+    /// `session_data` carries the opaque state produced by `start_login`
+    /// (e.g. the PKCE `code_verifier`). Pass `None` only for backends that
+    /// do not require it.
+    pub async fn complete_pkce_with_session(
+        &self,
+        provider: &str,
+        code: &str,
+        state: &str,
+        session_data: Option<&serde_json::Value>,
+    ) -> Result<Token, AuthError> {
+        let backend = self.find_backend(provider)?;
+        backend
+            .complete_pkce_with_session(&self.store, code, state, session_data)
+            .await
+    }
+
     /// Check the stored token status for a provider.
     pub fn get_status(&self, provider: &str) -> Result<Option<Token>, AuthError> {
         match self.find_backend(provider) {

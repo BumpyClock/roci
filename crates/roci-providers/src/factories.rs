@@ -382,35 +382,45 @@ impl ProviderFactory for GitHubCopilotFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        // Try the copilot-api token first (saved by `roci auth login copilot`)
-        let (api_key, base_url) = if let Some(store) = config.token_store() {
-            if let Ok(Some(token)) = store.load("github-copilot-api", "default") {
-                let is_valid = token
-                    .expires_at
-                    .map(|exp| exp > chrono::Utc::now())
-                    .unwrap_or(false);
-                if is_valid {
-                    let url = token.account_id.unwrap_or_default();
-                    (
-                        Some(token.access_token),
-                        if url.is_empty() { None } else { Some(url) },
-                    )
-                } else {
-                    (None, None)
+        // Try the copilot-api token first (saved by `roci auth login copilot`).
+        // On load error, fall through to config-based fallback credentials.
+        // Only hard-fail when the store error *and* no fallback creds exist.
+        let (cached_key, cached_url, load_err) = if let Some(store) = config.token_store() {
+            match store.load("github-copilot-api", "default") {
+                Ok(Some(token)) => {
+                    let is_valid = token
+                        .expires_at
+                        .map(|exp| exp > chrono::Utc::now())
+                        .unwrap_or(false);
+                    if is_valid {
+                        let url = token.account_id.unwrap_or_default();
+                        (
+                            Some(token.access_token),
+                            if url.is_empty() { None } else { Some(url) },
+                            None,
+                        )
+                    } else {
+                        (None, None, None)
+                    }
                 }
-            } else {
-                (None, None)
+                Ok(None) => (None, None, None),
+                Err(e) => (None, None, Some(e)),
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
-        let api_key = api_key
+        let api_key = cached_key
             .or_else(|| config.get_api_key_for(ProviderKey::GitHubCopilot))
-            .ok_or_else(|| RociError::MissingCredential {
-                provider: "github-copilot".to_string(),
+            .ok_or_else(|| match load_err {
+                Some(e) => RociError::Authentication(format!(
+                    "failed to load github-copilot-api credentials: {e}"
+                )),
+                None => RociError::MissingCredential {
+                    provider: "github-copilot".to_string(),
+                },
             })?;
-        let base_url = base_url
+        let base_url = cached_url
             .or_else(|| config.get_base_url_for(ProviderKey::GitHubCopilot))
             .ok_or_else(|| RociError::MissingConfiguration {
                 key: "base_url".to_string(),
@@ -480,12 +490,17 @@ impl ProviderFactory for AzureFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = config
-            .get_api_key_for(ProviderKey::OpenAi)
-            .ok_or_else(|| RociError::Authentication("Missing AZURE_OPENAI_API_KEY".into()))?;
-        let endpoint = config
-            .get_base_url_for(ProviderKey::OpenAi)
-            .ok_or_else(|| RociError::Configuration("Missing AZURE_OPENAI_ENDPOINT".into()))?;
+        let api_key = config.get_api_key_for(ProviderKey::Azure).ok_or_else(|| {
+            RociError::MissingCredential {
+                provider: "azure".to_string(),
+            }
+        })?;
+        let endpoint = config.get_base_url_for(ProviderKey::Azure).ok_or_else(|| {
+            RociError::MissingConfiguration {
+                key: "AZURE_OPENAI_ENDPOINT".to_string(),
+                provider: "azure".to_string(),
+            }
+        })?;
         let api_version = "2024-06-01".to_string();
         Ok(Box::new(crate::provider::azure::AzureOpenAiProvider::new(
             endpoint,

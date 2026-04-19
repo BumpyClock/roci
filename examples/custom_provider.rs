@@ -85,8 +85,9 @@ impl ModelProvider for EchoProvider {
         // Emit one delta per word, then a final Done delta.
         let words: Vec<String> = echo.split_whitespace().map(|w| format!("{w} ")).collect();
 
-        let text_deltas = words.into_iter().map(|word| {
-            Ok(TextStreamDelta {
+        let mut deltas = Vec::with_capacity(words.len() + 1);
+        for word in words {
+            deltas.push(Ok(TextStreamDelta {
                 text: word,
                 event_type: StreamEventType::TextDelta,
                 tool_call: None,
@@ -95,10 +96,10 @@ impl ModelProvider for EchoProvider {
                 reasoning: None,
                 reasoning_signature: None,
                 reasoning_type: None,
-            })
-        });
+            }));
+        }
 
-        let done = std::iter::once(Ok(TextStreamDelta {
+        deltas.push(Ok(TextStreamDelta {
             text: String::new(),
             event_type: StreamEventType::Done,
             tool_call: None,
@@ -114,7 +115,7 @@ impl ModelProvider for EchoProvider {
             reasoning_type: None,
         }));
 
-        Ok(stream::iter(text_deltas.chain(done)).boxed())
+        Ok(stream::iter(deltas).boxed())
     }
 }
 

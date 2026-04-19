@@ -32,22 +32,26 @@ let provider = AzureOpenAiProvider::new(
 );
 ```
 
-Internally the provider builds:
+Internally `AzureOpenAiProvider` builds the deployment base URL:
 ```
-{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}
+{endpoint}/openai/deployments/{deployment}
 ```
-and passes the `api-key` header.
+It then delegates to `OpenAiProvider`, which appends `/chat/completions`,
+adds `?api-version={api_version}`, and sends `api-key: {api_key}`.
 
 ## Configuration Env Vars
 
 | Variable | Purpose |
 |---|---|
-| `OPENAI_API_KEY` | Used by `AzureFactory` as the Azure API key |
-| `OPENAI_BASE_URL` | Used by `AzureFactory` as the Azure endpoint |
-| model id (`azure:<deployment>`) | Deployment name passed as `model_id` |
+| `AZURE_OPENAI_API_KEY` | Azure API key loaded by `RociConfig::from_env()` |
+| `AZURE_OPENAI_ENDPOINT` | Azure resource endpoint loaded by `RociConfig::from_env()` |
+| model id (for example `azure:gpt-4o`) | Deployment name passed to `AzureFactory` as `model_id` |
 | `api-version` | Hardcoded to `2024-06-01` in `AzureFactory` |
+| `AZURE_OPENAI_DEPLOYMENT` | Optional convenience env var used only by the manual examples below, not by `AzureFactory` |
 
-`RociConfig::from_env()` currently loads `OPENAI_API_KEY` and `OPENAI_BASE_URL` (not `AZURE_OPENAI_*` keys). `AzureFactory` reads from those OpenAI mappings.
+`RociConfig::from_env()` loads the Azure provider from `AZURE_OPENAI_API_KEY`
+and `AZURE_OPENAI_ENDPOINT`. `AzureFactory` reads those Azure-specific
+config entries directly.
 
 ## Usage Examples
 
@@ -61,9 +65,9 @@ use roci_providers::provider::azure::AzureOpenAiProvider;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let provider = AzureOpenAiProvider::new(
-        std::env::var("OPENAI_BASE_URL")?,
+        std::env::var("AZURE_OPENAI_ENDPOINT")?,
         std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or("gpt-4o".into()),
-        std::env::var("OPENAI_API_KEY")?,
+        std::env::var("AZURE_OPENAI_API_KEY")?,
         "2024-06-01".into(),
     );
 
@@ -96,9 +100,9 @@ use roci_providers::provider::azure::AzureOpenAiProvider;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let provider = AzureOpenAiProvider::new(
-        std::env::var("OPENAI_BASE_URL")?,
+        std::env::var("AZURE_OPENAI_ENDPOINT")?,
         "gpt-4o".into(),
-        std::env::var("OPENAI_API_KEY")?,
+        std::env::var("AZURE_OPENAI_API_KEY")?,
         "2024-06-01".into(),
     );
 
@@ -125,28 +129,29 @@ async fn main() -> anyhow::Result<()> {
 
 ## Wire Construction Rules
 
-- Base URL: provider takes the full endpoint (`https://{resource}.openai.azure.com`).
-- Path template: `/openai/deployments/{deployment}/chat/completions?api-version={api_version}`.
-- Auth: `api-key` header.
+- Base URL input: provider takes the Azure resource endpoint (`https://{resource}.openai.azure.com`).
+- Deployment base URL built first: `/openai/deployments/{deployment}`.
+- Final path: `OpenAiProvider` appends `/chat/completions?api-version={api_version}`.
+- Auth as currently implemented: `api-key: {api_key}`.
 - `Content-Type: application/json` set automatically.
 
 ## Integration Points
 
 1. **Provider construction**: `AzureOpenAiProvider::new(endpoint, deployment, api_key, api_version)`.
 2. **Inner delegation**: wraps `OpenAiProvider` with the Azure-specific URL pre-built.
-3. **Factory wiring**: `AzureFactory` reads API key and base URL via `ProviderKey::OpenAi` config mappings and hardcodes `api_version = "2024-06-01"`.
+3. **Factory wiring**: `AzureFactory` reads `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT` via `ProviderKey::Azure` config mappings and hardcodes `api_version = "2024-06-01"`.
 
 ## Tests
 
 - Unit: URL construction with permutations (endpoint, deployment, api-version).
-- Integration (live): `cargo test --test live_providers -- --ignored --nocapture`.
+- Sanity-check the current Azure URL wiring with `cargo test -p roci-providers --features azure azure_url_`.
 - Regression: ensure OpenAI-compatible providers remain unchanged (no Azure defaults leak).
 
 ## Troubleshooting
 
 | Error | Likely cause |
 |---|---|
-| 401 Unauthorized | Wrong `api-key` header value |
+| 401 Unauthorized | Wrong API key, missing `api-key` auth, or wrong Azure endpoint/deployment |
 | 404 Not Found | Wrong deployment name or wrong path (should be `/chat/completions`) |
 | 400 Bad Request | `api-version` too old for the feature (e.g., `json_schema` needs `>=2024-08-01-preview`) |
 

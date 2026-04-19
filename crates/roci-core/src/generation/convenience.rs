@@ -1,15 +1,14 @@
-//! Convenience functions for common generation patterns.
+//! Convenience wrappers around the core generation entry points.
 //!
-//! NOTE: These functions use `create_provider()` from the root crate in the
-//! original code. In roci-core they are placeholder stubs that will be
-//! wired through `ProviderRegistry` by the meta-crate. For now they use
-//! `ProviderRegistry` directly -- callers must supply a pre-built provider.
+//! These helpers do not resolve providers from configuration or a registry.
+//! Callers must pass an already constructed provider; the helpers only turn a
+//! single prompt into a user message and run with default settings.
 
 use crate::error::RociError;
 use crate::provider::ModelProvider;
 use crate::types::*;
 
-/// Simple text generation: provider + prompt -> text.
+/// Generate text from a single user prompt with default settings and no tools.
 pub async fn generate(
     provider: &dyn ModelProvider,
     prompt: impl Into<String>,
@@ -20,7 +19,7 @@ pub async fn generate(
     Ok(result.text)
 }
 
-/// Simple streaming generation: provider + prompt -> stream.
+/// Stream text from a single user prompt with default settings and no stop conditions.
 pub async fn stream(
     provider: std::sync::Arc<dyn ModelProvider>,
     prompt: impl Into<String>,

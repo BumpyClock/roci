@@ -51,7 +51,7 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
         AuthStep::Pkce {
             authorize_url,
             state,
-            ..
+            session_data,
         } => {
             println!("Visit: {authorize_url}");
             println!("After authorizing, paste the response code below:");
@@ -68,7 +68,8 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
                 std::process::exit(1);
             }
 
-            svc.complete_pkce(provider, response, &state).await?;
+            svc.complete_pkce_with_session(provider, response, &state, Some(&session_data))
+                .await?;
             println!("{provider} login successful!");
         }
     }

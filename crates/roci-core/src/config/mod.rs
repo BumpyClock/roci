@@ -95,6 +95,7 @@ impl RociConfig {
             ("GROK_API_KEY", ProviderKey::Grok),
             ("GROQ_API_KEY", ProviderKey::Groq),
             ("MISTRAL_API_KEY", ProviderKey::Mistral),
+            ("AZURE_OPENAI_API_KEY", ProviderKey::Azure),
         ];
 
         for (env_var, provider) in env_mappings {
@@ -120,6 +121,7 @@ impl RociConfig {
             ("ANTHROPIC_BASE_URL", ProviderKey::Anthropic),
             ("OLLAMA_BASE_URL", ProviderKey::Ollama),
             ("LMSTUDIO_BASE_URL", ProviderKey::LmStudio),
+            ("AZURE_OPENAI_ENDPOINT", ProviderKey::Azure),
         ];
 
         for (env_var, provider) in url_mappings {
