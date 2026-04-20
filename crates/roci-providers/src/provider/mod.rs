@@ -26,9 +26,9 @@ pub mod ollama;
 
 #[cfg(feature = "anthropic-compatible")]
 pub mod anthropic_compatible;
-#[cfg(feature = "openai-compatible")]
+#[cfg(feature = "github-copilot")]
 pub mod github_copilot;
-#[cfg(feature = "openai-compatible")]
+#[cfg(feature = "openai-compatible-transport")]
 pub mod openai_compatible;
 
 #[cfg(feature = "azure")]

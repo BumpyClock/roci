@@ -93,6 +93,7 @@ async fn main() {
         pre_tool_use: None,
         post_tool_use: None,
         user_input_timeout_ms: None,
+        context_budget: None,
         user_input_coordinator: None,
     };
 

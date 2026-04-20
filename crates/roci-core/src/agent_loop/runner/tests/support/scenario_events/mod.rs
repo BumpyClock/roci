@@ -12,6 +12,7 @@ pub(super) fn events_for_scenario(
 ) -> Result<Vec<Result<TextStreamDelta, RociError>>, RociError> {
     match scenario {
         ProviderScenario::MissingOptionalFields
+        | ProviderScenario::ImmediateStreamError
         | ProviderScenario::TextThenStreamError
         | ProviderScenario::RepeatedToolFailure
         | ProviderScenario::RateLimitedThenComplete
@@ -40,5 +41,10 @@ pub(super) fn events_for_scenario(
         ProviderScenario::PartialTextThenIdle => Err(RociError::InvalidState(
             "PartialTextThenIdle is generated directly by the stub stream".to_string(),
         )),
+        ProviderScenario::TextOnlyWithUsage
+        | ProviderScenario::TextWithUsageThenStreamError
+        | ProviderScenario::ToolCallWithUsageThenTextWithUsage => {
+            basic::events_for_scenario(scenario, call_index)
+        }
     }
 }

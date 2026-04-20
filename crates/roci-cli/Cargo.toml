@@ -8,7 +8,7 @@ name = "roci-agent"
 path = "src/main.rs"
 
 [dependencies]
-roci = { path = "../..", features = ["agent", "mcp"] }
+roci = { path = "../..", features = ["agent", "mcp", "github-copilot"] }
 roci-tools = { path = "../roci-tools", features = ["agent"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

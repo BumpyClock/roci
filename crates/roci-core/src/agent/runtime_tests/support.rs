@@ -7,6 +7,7 @@ use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
 use crate::tools::tool::ToolExecutionContext;
 use crate::tools::{AgentTool, AgentToolParameters};
 use crate::types::AgentToolCall;
+use crate::types::{StreamEventType, TextStreamDelta};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::sync::{Arc, Mutex};
@@ -137,6 +138,7 @@ pub(super) fn test_agent_config() -> AgentConfig {
         pre_tool_use: None,
         post_tool_use: None,
         user_input_timeout_ms: None,
+        context_budget: None,
         #[cfg(feature = "agent")]
         user_input_coordinator: None,
     }
@@ -216,4 +218,119 @@ impl DynamicToolProvider for MockDynamicToolProvider {
         calls.push(name.to_string());
         Ok(serde_json::json!({ "ok": true }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming test provider — emits "hello" text + Done with usage on each call.
+// Used by runtime budget tests that need a real streaming round-trip.
+// ---------------------------------------------------------------------------
+
+struct StreamingTextFactory {
+    provider_key: &'static str,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+impl ProviderFactory for StreamingTextFactory {
+    fn provider_keys(&self) -> &[&str] {
+        std::slice::from_ref(&self.provider_key)
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        _provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(StreamingTextProvider {
+            provider_key: self.provider_key.to_string(),
+            model_id: model_id.to_string(),
+            capabilities: ModelCapabilities::default(),
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        }))
+    }
+}
+
+struct StreamingTextProvider {
+    provider_key: String,
+    model_id: String,
+    capabilities: ModelCapabilities,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+#[async_trait]
+impl ModelProvider for StreamingTextProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "stream-only test provider".to_string(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        let input = self.input_tokens;
+        let output = self.output_tokens;
+        let total = input + output;
+        let events: Vec<Result<TextStreamDelta, RociError>> = vec![
+            Ok(TextStreamDelta {
+                text: "hello".to_string(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(crate::types::Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: total,
+                    ..crate::types::Usage::default()
+                }),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+pub(super) fn registry_with_streaming_provider(
+    provider_key: &'static str,
+    input_tokens: u32,
+    output_tokens: u32,
+) -> Arc<ProviderRegistry> {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(StreamingTextFactory {
+        provider_key,
+        input_tokens,
+        output_tokens,
+    }));
+    Arc::new(registry)
 }

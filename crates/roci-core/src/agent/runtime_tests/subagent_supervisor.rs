@@ -77,6 +77,7 @@ fn make_base_config() -> AgentConfig {
         user_input_timeout_ms: None,
         #[cfg(feature = "agent")]
         user_input_coordinator: None,
+        context_budget: None,
     }
 }
 

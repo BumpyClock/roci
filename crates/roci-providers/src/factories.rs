@@ -366,10 +366,10 @@ impl ProviderFactory for OpenAiCompatibleFactory {
 // GitHub Copilot
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "openai-compatible")]
+#[cfg(feature = "github-copilot")]
 pub struct GitHubCopilotFactory;
 
-#[cfg(feature = "openai-compatible")]
+#[cfg(feature = "github-copilot")]
 impl ProviderFactory for GitHubCopilotFactory {
     fn provider_keys(&self) -> &[&str] {
         &["github-copilot"]

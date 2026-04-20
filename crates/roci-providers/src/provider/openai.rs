@@ -24,6 +24,7 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 #[derive(Clone, Copy)]
 enum AuthMode {
     Bearer,
+    #[cfg(feature = "azure")]
     ApiKey,
 }
 
@@ -84,6 +85,7 @@ impl OpenAiProvider {
         )
     }
 
+    #[cfg(feature = "azure")]
     pub(crate) fn new_with_api_key_auth(
         model: OpenAiModel,
         api_key: String,
@@ -135,6 +137,7 @@ impl OpenAiProvider {
                     headers.insert(AUTHORIZATION, value);
                 }
             }
+            #[cfg(feature = "azure")]
             AuthMode::ApiKey => {
                 if let Ok(value) = HeaderValue::from_str(&self.api_key) {
                     headers.insert("api-key", value);
@@ -793,6 +796,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "azure")]
     #[test]
     fn api_key_auth_uses_api_key_header_without_authorization() {
         let provider = OpenAiProvider::new_with_api_key_auth(

@@ -276,6 +276,7 @@ fn tool_results_from_events(events: &[RunEvent]) -> Vec<(String, serde_json::Val
 }
 
 mod auto_compaction;
+mod budget;
 mod request_pipeline;
 mod schema_and_hooks;
 mod stream_lifecycle;

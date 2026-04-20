@@ -2,7 +2,7 @@ use tokio::sync::{watch, MutexGuard};
 
 use super::{AgentRuntime, AgentSnapshot, AgentState};
 use crate::error::RociError;
-use crate::types::ModelMessage;
+use crate::types::{ModelMessage, Usage};
 
 impl AgentRuntime {
     /// Current agent state.
@@ -21,6 +21,18 @@ impl AgentRuntime {
     /// Get a snapshot of the current message history.
     pub async fn messages(&self) -> Vec<ModelMessage> {
         self.messages.lock().await.clone()
+    }
+
+    /// Get a snapshot of the cumulative session usage.
+    ///
+    /// Returns the accumulated token usage across all completed runs since
+    /// the last [`reset()`](Self::reset). Excludes in-flight provider usage
+    /// until the current run result is merged back into the ledger.
+    ///
+    /// This ledger is the source of truth for the `prior_session_*_tokens`
+    /// values threaded into each run request.
+    pub async fn session_usage(&self) -> Usage {
+        self.session_usage.lock().await.clone()
     }
 
     /// Get a point-in-time snapshot of agent observable state.

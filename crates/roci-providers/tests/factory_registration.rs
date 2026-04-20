@@ -59,6 +59,18 @@ fn register_default_providers_registers_codex_key() {
     );
 }
 
+#[cfg(feature = "github-copilot")]
+#[test]
+fn register_default_providers_registers_github_copilot_when_feature_enabled() {
+    let mut registry = ProviderRegistry::new();
+    roci_providers::register_default_providers(&mut registry);
+
+    assert!(
+        registry.has_provider("github-copilot"),
+        "expected github-copilot to be registered"
+    );
+}
+
 #[test]
 fn register_default_providers_populates_multiple_keys() {
     let mut registry = ProviderRegistry::new();

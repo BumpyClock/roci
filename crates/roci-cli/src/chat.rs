@@ -123,6 +123,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
                 Box::pin(async move { Ok(result) })
             })),
             user_input_timeout_ms: None,
+            context_budget: None,
             user_input_coordinator: Some(coordinator.clone()),
         },
     );
@@ -207,4 +208,16 @@ fn demo_pre_tool_use_hook(tool_name: &str, tool_call_id: &str) {
 
 fn demo_post_tool_use_hook(tool_name: &str, tool_call_id: &str) {
     eprintln!("[hook] postToolUse called (tool={tool_name}, id={tool_call_id})");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn copilot_provider_available_in_default_registry() {
+        let registry = roci::default_registry();
+        assert!(
+            registry.has_provider("github-copilot"),
+            "expected github-copilot provider to be registered in default roci-cli builds"
+        );
+    }
 }

@@ -2,6 +2,7 @@ pub(super) use super::*;
 
 mod api_key;
 mod before_agent_start;
+mod budget;
 mod compaction_and_branch_summary;
 mod queue_and_continue;
 mod session_before_compact;

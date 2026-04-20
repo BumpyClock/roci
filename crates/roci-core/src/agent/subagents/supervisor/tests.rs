@@ -126,6 +126,7 @@ fn make_base_config() -> AgentConfig {
         user_input_timeout_ms: None,
         #[cfg(feature = "agent")]
         user_input_coordinator: None,
+        context_budget: None,
     }
 }
 
@@ -219,6 +220,7 @@ impl SubagentLauncher for MockLauncher {
                 pre_tool_use: None,
                 post_tool_use: None,
                 user_input_timeout_ms: None,
+                context_budget: None,
             }
         };
         let runtime = AgentRuntime::new(self.registry.clone(), self.roci_config.clone(), config);

@@ -1,7 +1,7 @@
 use super::{AgentRuntime, AgentState};
 use crate::agent_loop::RunResult;
 use crate::error::RociError;
-use crate::types::{ModelMessage, Role};
+use crate::types::{ModelMessage, Role, Usage};
 
 impl AgentRuntime {
     /// Start a new conversation with a user prompt.
@@ -145,6 +145,7 @@ impl AgentRuntime {
         *self.turn_index.lock().await = 0;
         *self.is_streaming.lock().await = false;
         *self.last_error.lock().await = None;
+        *self.session_usage.lock().await = Usage::default();
 
         let mut state = self.state.lock().await;
         *state = AgentState::Idle;

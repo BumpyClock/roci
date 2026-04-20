@@ -11,11 +11,15 @@ use super::{
 };
 use crate::agent::message::{AgentMessage, AgentMessageExt};
 use crate::agent_loop::compaction::{
-    estimate_message_tokens, extract_cumulative_file_operations, extract_file_operations,
-    prepare_compaction, select_messages_with_token_budget_newest_first,
-    serialize_messages_for_summary, serialize_pi_mono_summary, PiMonoSummary,
+    extract_cumulative_file_operations, extract_file_operations, serialize_messages_for_summary,
+    serialize_pi_mono_summary, PiMonoSummary,
 };
 use crate::config::RociConfig;
+use crate::context::{
+    assemble_summary_compaction, estimate_message_tokens, prepare_compaction,
+    select_messages_with_token_budget_newest_first, CompactionSuffix, FileOperationSnapshot,
+    PreparedCompaction,
+};
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::{ProviderRegistry, ProviderRequest};
@@ -351,6 +355,10 @@ impl AgentRuntime {
         }
 
         let file_ops = extract_file_operations(&messages_to_summarize);
+        let file_ops_snapshot = FileOperationSnapshot {
+            read_files: file_ops.read_files.clone(),
+            modified_files: file_ops.modified_files.clone(),
+        };
         let summary_model = match compaction.model.as_deref() {
             Some(model) => LanguageModel::from_str(model)?,
             None => run_model.clone(),
@@ -403,26 +411,34 @@ impl AgentRuntime {
         if let Some(details) = override_details {
             critical_context.push(format!("Compaction override details: {details}"));
         }
-        let summary = PiMonoSummary {
-            progress: vec![summary_text],
+        let pi_mono = PiMonoSummary {
+            progress: vec![summary_text.clone()],
             critical_context,
             read_files: file_ops.read_files,
             modified_files: file_ops.modified_files,
             ..PiMonoSummary::default()
         };
-        let summary_message = AgentMessage::compaction_summary(serialize_pi_mono_summary(&summary))
+        let summary_message = AgentMessage::compaction_summary(serialize_pi_mono_summary(&pi_mono))
             .to_llm_message()
             .ok_or_else(|| {
                 RociError::InvalidState("compaction summary message failed to convert".to_string())
             })?;
 
-        let mut compacted = Vec::with_capacity(
-            system_prefix.len() + 1 + turn_prefix_messages.len() + kept_messages.len(),
+        let effective_prepared = PreparedCompaction {
+            messages_to_summarize,
+            turn_prefix_messages,
+            kept_messages,
+            split_turn,
+            cut_index: prepared.cut_index,
+        };
+        let compaction_result = assemble_summary_compaction(
+            &system_prefix,
+            &effective_prepared,
+            summary_text,
+            summary_message,
+            file_ops_snapshot,
+            CompactionSuffix::default(),
         );
-        compacted.extend(system_prefix);
-        compacted.push(summary_message);
-        compacted.extend(turn_prefix_messages);
-        compacted.extend(kept_messages);
-        Ok(Some(compacted))
+        Ok(Some(compaction_result.messages))
     }
 }

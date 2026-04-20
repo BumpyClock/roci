@@ -104,11 +104,22 @@ impl AgentRuntime {
             }
         };
 
+        // Freeze session usage into the request before dispatching.
+        let session_usage_snapshot = self.session_usage.lock().await.clone();
+
         let mut request = RunRequest::new(model, initial_messages)
             .with_tools(tools)
             .with_steering_messages(steering_fn)
             .with_follow_up_messages(follow_up_fn)
-            .with_agent_event_sink(intercepting_sink);
+            .with_agent_event_sink(intercepting_sink)
+            .with_prior_session_usage(
+                session_usage_snapshot.input_tokens as usize,
+                session_usage_snapshot.output_tokens as usize,
+            );
+
+        if let Some(ref budget) = self.config.context_budget {
+            request = request.with_context_budget(budget.clone());
+        }
 
         #[cfg(feature = "agent")]
         {
@@ -240,6 +251,10 @@ impl AgentRuntime {
                     *self.last_error.lock().await = result.error.clone();
                 } else {
                     *self.last_error.lock().await = None;
+                }
+                // Merge run usage delta into persistent session ledger.
+                if let Some(ref delta) = result.usage_delta {
+                    self.session_usage.lock().await.merge(delta);
                 }
             }
             Err(err) => {

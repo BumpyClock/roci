@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::agent::message::AgentMessage;
 use crate::config::RociConfig;
+use crate::context::ContextBudget;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::{self, ProviderRegistry};
@@ -239,6 +240,12 @@ pub struct RunRequest {
     pub provider_metadata: HashMap<String, String>,
     /// Optional per-request payload inspection callback.
     pub provider_payload_callback: Option<provider::ProviderPayloadCallback>,
+    /// Optional context budget for preflight budget enforcement.
+    pub context_budget: Option<ContextBudget>,
+    /// Cumulative session input tokens from all previous runs (frozen at run start).
+    pub prior_session_input_tokens: usize,
+    /// Cumulative session output tokens from all previous runs (frozen at run start).
+    pub prior_session_output_tokens: usize,
     /// Optional callback for requesting user input from tools.
     #[cfg(feature = "agent")]
     pub user_input_callback: Option<crate::tools::user_input::RequestUserInputFn>,
@@ -271,6 +278,9 @@ impl RunRequest {
             provider_headers: reqwest::header::HeaderMap::new(),
             provider_metadata: HashMap::new(),
             provider_payload_callback: None,
+            context_budget: None,
+            prior_session_input_tokens: 0,
+            prior_session_output_tokens: 0,
             #[cfg(feature = "agent")]
             user_input_callback: None,
         }
@@ -371,6 +381,17 @@ impl RunRequest {
         callback: provider::ProviderPayloadCallback,
     ) -> Self {
         self.provider_payload_callback = Some(callback);
+        self
+    }
+
+    pub fn with_context_budget(mut self, budget: ContextBudget) -> Self {
+        self.context_budget = Some(budget);
+        self
+    }
+
+    pub fn with_prior_session_usage(mut self, input_tokens: usize, output_tokens: usize) -> Self {
+        self.prior_session_input_tokens = input_tokens;
+        self.prior_session_output_tokens = output_tokens;
         self
     }
 

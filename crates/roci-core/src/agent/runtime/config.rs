@@ -5,6 +5,7 @@ use crate::agent_loop::runner::{
     AgentEventSink, BeforeAgentStartHook, ConvertToLlmFn, PostToolUseHook, PreToolUseHook,
     RetryBackoffPolicy, TransformContextFn,
 };
+use crate::context::ContextBudget;
 use crate::models::LanguageModel;
 use crate::provider::ProviderPayloadCallback;
 use crate::resource::CompactionSettings;
@@ -87,6 +88,13 @@ pub struct AgentConfig {
     pub post_tool_use: Option<PostToolUseHook>,
     /// Default timeout for user input requests in milliseconds.
     pub user_input_timeout_ms: Option<u64>,
+    /// Optional context budget for per-turn and per-session token limits.
+    ///
+    /// When set, enables preflight budget enforcement using the session
+    /// usage ledger maintained by the runtime. Each provider call is
+    /// checked against per-turn and cumulative session limits before
+    /// streaming begins.
+    pub context_budget: Option<ContextBudget>,
     /// Optional shared coordinator for user input requests.
     ///
     /// When provided, the runtime uses this coordinator instead of creating

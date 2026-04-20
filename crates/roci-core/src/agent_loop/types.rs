@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::ModelMessage;
+use crate::types::{ModelMessage, Usage};
 
 /// Unique run identifier.
 pub type RunId = Uuid;
@@ -29,6 +29,15 @@ pub struct RunResult {
     pub messages: Vec<ModelMessage>,
     #[serde(default)]
     pub finished_at: DateTime<Utc>,
+    /// Accumulated token usage for the run (input + output across all LLM calls).
+    ///
+    /// `Some` only when the run accrued nonzero observed or estimated usage.
+    /// The value may be exact (provider-reported) or a heuristic estimate
+    /// when the provider did not report usage, and it may appear on
+    /// completed, failed, or canceled runs after provider work began.
+    /// `None` for pre-provider failures and zero-usage cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_delta: Option<Usage>,
 }
 
 impl RunResult {
@@ -42,6 +51,7 @@ impl RunResult {
             error: None,
             messages,
             finished_at: Utc::now(),
+            usage_delta: None,
         }
     }
 
@@ -55,6 +65,7 @@ impl RunResult {
             error: None,
             messages,
             finished_at: Utc::now(),
+            usage_delta: None,
         }
     }
 
@@ -68,6 +79,19 @@ impl RunResult {
             error: Some(error.into()),
             messages,
             finished_at: Utc::now(),
+            usage_delta: None,
         }
+    }
+
+    /// Attach accumulated usage to this result.
+    ///
+    /// Only sets `usage_delta` when the run accrued nonzero observed or
+    /// estimated usage. Pre-provider failures and zero-usage cases leave
+    /// `usage_delta` as `None`.
+    pub fn with_usage_delta(mut self, usage: Usage) -> Self {
+        if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.total_tokens > 0 {
+            self.usage_delta = Some(usage);
+        }
+        self
     }
 }

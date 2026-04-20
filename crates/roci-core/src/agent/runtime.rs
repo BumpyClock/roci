@@ -44,15 +44,15 @@ pub use self::types::{
 #[cfg(test)]
 use crate::agent::message::AgentMessageExt;
 #[cfg(test)]
-use crate::agent_loop::compaction::{
-    estimate_message_tokens, serialize_pi_mono_summary, PiMonoSummary,
-};
+use crate::agent_loop::compaction::{serialize_pi_mono_summary, PiMonoSummary};
 #[cfg(test)]
 use crate::agent_loop::runner::BeforeAgentStartHookResult;
 use crate::agent_loop::LoopRunner;
 #[cfg(test)]
 use crate::agent_loop::RunStatus;
 use crate::config::RociConfig;
+#[cfg(test)]
+use crate::context::estimate_message_tokens;
 #[cfg(test)]
 use crate::error::RociError;
 use crate::models::LanguageModel;
@@ -65,9 +65,9 @@ use crate::tools::dynamic::DynamicToolProvider;
 use crate::tools::tool::Tool;
 #[cfg(test)]
 use crate::types::GenerationSettings;
-use crate::types::ModelMessage;
 #[cfg(test)]
 use crate::types::Role;
+use crate::types::{ModelMessage, Usage};
 
 /// High-level agent runtime wrapping [`LoopRunner`].
 ///
@@ -106,6 +106,8 @@ pub struct AgentRuntime {
     last_error: Arc<Mutex<Option<String>>>,
     snapshot_tx: watch::Sender<AgentSnapshot>,
     snapshot_rx: watch::Receiver<AgentSnapshot>,
+    /// Persistent session usage ledger. Accumulates across runs, cleared on reset.
+    session_usage: Arc<Mutex<Usage>>,
     #[cfg(feature = "agent")]
     user_input_coordinator: Arc<UserInputCoordinator>,
 }
@@ -158,6 +160,7 @@ impl AgentRuntime {
             last_error: Arc::new(Mutex::new(None)),
             snapshot_tx,
             snapshot_rx,
+            session_usage: Arc::new(Mutex::new(Usage::default())),
             #[cfg(feature = "agent")]
             user_input_coordinator,
         }

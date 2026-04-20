@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{self, ToolDefinition};
-use crate::types::ModelMessage;
+use crate::types::{ModelMessage, Usage};
 
 use super::control::{
     emit_failed_result, resolve_iteration_limit_approval, AgentEventEmitter, RunEventEmitter,
@@ -16,7 +16,7 @@ use crate::util::debug::roci_debug_enabled;
 mod llm_phase;
 mod tool_phase;
 
-use llm_phase::{run_llm_phase, LlmPhaseArgs, LlmPhaseOutcome};
+use llm_phase::{run_llm_phase, ExactUsageAnchor, LlmPhaseArgs, LlmPhaseOutcome};
 use tool_phase::{run_tool_phase, ToolPhaseArgs, ToolPhaseOutcome};
 
 fn canceled_result(
@@ -24,6 +24,7 @@ fn canceled_result(
     emitter: &RunEventEmitter,
     agent_emitter: &AgentEventEmitter,
     messages: &[ModelMessage],
+    run_usage: Usage,
 ) -> RunResult {
     emitter.emit(
         RunEventStream::Lifecycle,
@@ -38,7 +39,7 @@ fn canceled_result(
     if roci_debug_enabled() {
         tracing::debug!(run_id = %request.run_id, "roci run canceled");
     }
-    RunResult::canceled_with_messages(messages.to_vec())
+    RunResult::canceled_with_messages(messages.to_vec()).with_usage_delta(run_usage)
 }
 
 fn failed_result(
@@ -47,12 +48,13 @@ fn failed_result(
     agent_emitter: &AgentEventEmitter,
     messages: &[ModelMessage],
     reason: impl Into<String>,
+    run_usage: Usage,
 ) -> RunResult {
     agent_emitter.emit(AgentEvent::AgentEnd {
         run_id: request.run_id,
         messages: messages.to_vec(),
     });
-    emit_failed_result(emitter, reason, messages)
+    emit_failed_result(emitter, reason, messages).with_usage_delta(run_usage)
 }
 
 #[async_trait]
@@ -99,6 +101,12 @@ impl Runner for LoopRunner {
                 emit_message_lifecycle(&agent_emitter, message);
             }
 
+            // Run-local usage accumulator across all LLM calls in this run.
+            let mut run_usage = Usage::default();
+            // Anchor from the last successful provider call for exact-prefix
+            // token estimation in preflight budget checks.
+            let mut exact_anchor: Option<ExactUsageAnchor> = None;
+
             if let Err(err) = provider::validate_transport_preference(request.transport.as_deref())
             {
                 let _ = result_tx.send(failed_result(
@@ -107,6 +115,7 @@ impl Runner for LoopRunner {
                     &agent_emitter,
                     &messages,
                     err.to_string(),
+                    run_usage,
                 ));
                 return;
             }
@@ -120,6 +129,7 @@ impl Runner for LoopRunner {
                         &agent_emitter,
                         &messages,
                         err.to_string(),
+                        run_usage,
                     ));
                     return;
                 }
@@ -169,6 +179,7 @@ impl Runner for LoopRunner {
                                 &agent_emitter,
                                 &messages,
                                 reason,
+                                run_usage,
                             ));
                             return;
                         }
@@ -206,6 +217,7 @@ impl Runner for LoopRunner {
                                     &emitter,
                                     &agent_emitter,
                                     &messages,
+                                    run_usage,
                                 ));
                                 return;
                             }
@@ -219,6 +231,7 @@ impl Runner for LoopRunner {
                                     &agent_emitter,
                                     &messages,
                                     reason,
+                                    run_usage,
                                 ));
                                 return;
                             }
@@ -236,6 +249,8 @@ impl Runner for LoopRunner {
                         abort_rx: &mut abort_rx,
                         run_cancel_token: &run_cancel_token,
                         iteration,
+                        run_usage: &mut run_usage,
+                        exact_anchor: &mut exact_anchor,
                     })
                     .await
                     {
@@ -252,6 +267,7 @@ impl Runner for LoopRunner {
                                 &emitter,
                                 &agent_emitter,
                                 &messages,
+                                run_usage,
                             ));
                             return;
                         }
@@ -268,6 +284,7 @@ impl Runner for LoopRunner {
                                 &agent_emitter,
                                 &messages,
                                 reason,
+                                run_usage,
                             ));
                             return;
                         }
@@ -296,6 +313,7 @@ impl Runner for LoopRunner {
                                 &emitter,
                                 &agent_emitter,
                                 &messages,
+                                run_usage,
                             ));
                             return;
                         }
@@ -306,6 +324,7 @@ impl Runner for LoopRunner {
                                 &agent_emitter,
                                 &messages,
                                 reason,
+                                run_usage,
                             ));
                             return;
                         }
@@ -333,7 +352,8 @@ impl Runner for LoopRunner {
                     run_id: request.run_id,
                     messages: messages.clone(),
                 });
-                let _ = result_tx.send(RunResult::completed_with_messages(messages));
+                let _ = result_tx
+                    .send(RunResult::completed_with_messages(messages).with_usage_delta(run_usage));
                 if roci_debug_enabled() {
                     tracing::debug!(run_id = %request.run_id, "roci run completed");
                 }

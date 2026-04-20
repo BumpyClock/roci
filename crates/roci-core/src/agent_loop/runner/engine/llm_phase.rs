@@ -3,7 +3,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 
-use super::super::super::compaction::estimate_context_usage;
 use super::super::control::{process_stream_delta, AgentEventEmitter, RunEventEmitter};
 use super::super::message_events::{
     assistant_message_snapshot, emit_message_end_if_open, emit_message_lifecycle,
@@ -13,10 +12,60 @@ use super::super::{
     TransformContextHookPayload, TransformContextHookResult,
 };
 use crate::agent::message::{convert_to_llm, AgentMessage};
+use crate::context::{estimate_context_usage, estimate_message_tokens};
 use crate::error::{ErrorCode, RociError};
 use crate::provider::{self, ProviderRequest, ToolDefinition};
-use crate::types::{AgentToolCall, ModelMessage};
+use crate::types::{AgentToolCall, ModelMessage, Usage};
 use crate::util::debug::roci_debug_enabled;
+
+/// Compute the effective usage for a single provider call, merging it into
+/// the run-local accumulator.
+///
+/// When the provider reported usage via `call_usage`, that value is used.
+/// Otherwise a heuristic estimate is produced from the **provider-facing**
+/// request messages and assistant output so the run-local accumulator
+/// still moves forward for failed or canceled post-provider exits.
+///
+/// This **must** be called before every return from the streaming loop
+/// that occurs *after* `stream_text` succeeded — including cancel, timeout,
+/// and error exits — to avoid dropping usage for partially-consumed streams.
+fn finalize_call_usage(
+    call_usage: Option<Usage>,
+    provider_messages: &[ModelMessage],
+    iteration_text: &str,
+    tool_calls: &[AgentToolCall],
+    run_usage: &mut Usage,
+) {
+    let effective = call_usage.unwrap_or_else(|| {
+        let input_est: usize = provider_messages.iter().map(estimate_message_tokens).sum();
+        let output_est = assistant_snapshot_if_present(iteration_text, tool_calls)
+            .as_ref()
+            .map(estimate_message_tokens)
+            .unwrap_or(0);
+        Usage {
+            input_tokens: input_est as u32,
+            output_tokens: output_est as u32,
+            total_tokens: (input_est + output_est) as u32,
+            ..Usage::default()
+        }
+    });
+    run_usage.merge(&effective);
+}
+
+/// Anchor from a prior successful provider call, enabling the
+/// [`from_provider_with_tail`](crate::context::ContextUsageSnapshot::from_provider_with_tail)
+/// path for more accurate preflight token estimates.
+///
+/// When the messages sent to a new call are a prefix-match of the
+/// anchor's messages plus a heuristic tail, the preflight can combine
+/// exact provider counts with the estimated tail instead of re-counting
+/// the entire history heuristically.
+pub(super) struct ExactUsageAnchor {
+    /// The provider messages from the prior call.
+    pub(super) provider_messages: Vec<ModelMessage>,
+    /// Provider-reported prompt (input) tokens for those messages.
+    pub(super) prompt_tokens: usize,
+}
 
 pub(super) enum LlmPhaseOutcome {
     Ready {
@@ -43,6 +92,11 @@ pub(super) struct LlmPhaseArgs<'a> {
     pub(super) abort_rx: &'a mut oneshot::Receiver<()>,
     pub(super) run_cancel_token: &'a CancellationToken,
     pub(super) iteration: usize,
+    /// Run-local usage accumulator; merged after each provider call
+    /// (including failed, canceled, and error exits after streaming began).
+    pub(super) run_usage: &'a mut Usage,
+    /// Optional anchor from a prior call for exact-prefix token estimation.
+    pub(super) exact_anchor: &'a mut Option<ExactUsageAnchor>,
 }
 
 pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
@@ -57,6 +111,8 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
         abort_rx,
         run_cancel_token,
         iteration,
+        run_usage,
+        exact_anchor,
     } = args;
 
     while let Ok(message) = input_rx.try_recv() {
@@ -115,7 +171,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
     let mut next_backoff_ms = request.retry_backoff.initial_delay_ms.max(1);
     let mut overflow_recovery_attempts: u32 = 0;
 
-    let mut stream = loop {
+    let (mut stream, last_provider_messages) = loop {
         let provider_request = match build_provider_request(
             request,
             provider,
@@ -130,8 +186,30 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
             Err(outcome) => return outcome,
         };
 
+        // -- Preflight budget check (5.3) --
+        // Uses exact-anchor path when available: if the prior call's
+        // provider messages are a prefix of the current request, combine
+        // exact provider counts with a heuristic tail estimate.
+        if let Some(ref budget) = request.context_budget {
+            let turn_input_tokens =
+                estimate_turn_input(&provider_request.messages, exact_anchor.as_ref());
+            let prior_input = request.prior_session_input_tokens + run_usage.input_tokens as usize;
+            let prior_output =
+                request.prior_session_output_tokens + run_usage.output_tokens as usize;
+            let context_window = provider.capabilities().context_length;
+            let snapshot =
+                budget.snapshot(context_window, turn_input_tokens, prior_input, prior_output);
+            if snapshot.is_over_budget() {
+                let reason = format_budget_rejection(&snapshot);
+                return LlmPhaseOutcome::Failed {
+                    reason,
+                    assistant_message: None,
+                };
+            }
+        }
+
         match provider.stream_text(&provider_request).await {
-            Ok(stream) => break stream,
+            Ok(stream) => break (stream, provider_request.messages),
             Err(RociError::RateLimited { retry_after_ms }) => {
                 let retry_after_ms = retry_after_ms.unwrap_or(0);
                 if retry_after_ms == 0 {
@@ -285,6 +363,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
     let mut tool_calls: Vec<AgentToolCall> = Vec::new();
     let mut stream_done = false;
     let mut message_open = false;
+    let mut call_usage: Option<Usage> = None;
     let idle_timeout_ms = request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
     let mut idle_sleep = (idle_timeout_ms > 0)
         .then(|| Box::pin(time::sleep(Duration::from_millis(idle_timeout_ms))));
@@ -299,6 +378,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                         &iteration_text,
                         &tool_calls,
                     );
+                    finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
                     return LlmPhaseOutcome::Canceled {
                         assistant_message: assistant_snapshot_if_present(
                             &iteration_text,
@@ -313,6 +393,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                         &iteration_text,
                         &tool_calls,
                     );
+                    finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
                     return LlmPhaseOutcome::Failed {
                         reason: "stream idle timeout".to_string(),
                         assistant_message: assistant_snapshot_if_present(
@@ -328,6 +409,9 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                             sleep.as_mut().reset(
                                 time::Instant::now() + Duration::from_millis(idle_timeout_ms),
                             );
+                            if let Some(ref u) = delta.usage {
+                                call_usage = Some(u.clone());
+                            }
                             if let Some(reason) = process_stream_delta(
                                 emitter,
                                 agent_emitter,
@@ -343,6 +427,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                     &iteration_text,
                                     &tool_calls,
                                 );
+                                finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
                                 return LlmPhaseOutcome::Failed {
                                     reason,
                                     assistant_message: assistant_snapshot_if_present(
@@ -362,6 +447,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                 &iteration_text,
                                 &tool_calls,
                             );
+                            finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
                             return LlmPhaseOutcome::Failed {
                                 reason: err.to_string(),
                                 assistant_message: assistant_snapshot_if_present(
@@ -383,6 +469,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                         &iteration_text,
                         &tool_calls,
                     );
+                    finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
                     return LlmPhaseOutcome::Canceled {
                         assistant_message: assistant_snapshot_if_present(
                             &iteration_text,
@@ -394,6 +481,9 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                     let Some(delta) = delta else { break; };
                     match delta {
                         Ok(delta) => {
+                            if let Some(ref u) = delta.usage {
+                                call_usage = Some(u.clone());
+                            }
                             if let Some(reason) = process_stream_delta(
                                 emitter,
                                 agent_emitter,
@@ -409,6 +499,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                     &iteration_text,
                                     &tool_calls,
                                 );
+                                finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
                                 return LlmPhaseOutcome::Failed {
                                     reason,
                                     assistant_message: assistant_snapshot_if_present(
@@ -428,6 +519,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                 &iteration_text,
                                 &tool_calls,
                             );
+                            finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
                             return LlmPhaseOutcome::Failed {
                                 reason: err.to_string(),
                                 assistant_message: assistant_snapshot_if_present(
@@ -447,6 +539,31 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
         &iteration_text,
         &tool_calls,
     );
+
+    // Merge call usage into the run accumulator on the happy path.
+    // Finalize before updating the anchor so `last_provider_messages` is
+    // still available for the heuristic fallback (when call_usage is None,
+    // the provider messages are used; when Some, the exact usage is used and
+    // the messages param is ignored).
+    finalize_call_usage(
+        call_usage.clone(),
+        &last_provider_messages,
+        &iteration_text,
+        &tool_calls,
+        run_usage,
+    );
+
+    // Update the exact anchor only when the provider reported a meaningful
+    // nonzero prompt count. Zero/default usage must not replace a prior
+    // anchor with a fail-open zero-token prefix.
+    if let Some(ref usage) = call_usage {
+        if usage.input_tokens > 0 {
+            *exact_anchor = Some(ExactUsageAnchor {
+                provider_messages: last_provider_messages,
+                prompt_tokens: usage.input_tokens as usize,
+            });
+        }
+    }
 
     if roci_debug_enabled() {
         let tool_names = tool_calls
@@ -680,4 +797,80 @@ fn assistant_snapshot_if_present(
     } else {
         Some(assistant_message_snapshot(iteration_text, tool_calls))
     }
+}
+
+/// Estimate turn input tokens, using the exact-anchor path when available.
+///
+/// When the anchor's messages are a prefix of `current_messages`, we
+/// re-use the provider-reported prompt token count and only heuristically
+/// estimate the "tail" — messages added since the anchored call (the
+/// assistant reply, tool results, new user messages, etc.).
+///
+/// The anchor's `completion_tokens` are NOT added here because the
+/// assistant reply becomes a message in the tail and is already counted
+/// by the heuristic.
+///
+/// Falls back to a full heuristic recount when:
+/// - No anchor is available.
+/// - The anchor messages are not a prefix of the current messages.
+fn estimate_turn_input(
+    current_messages: &[ModelMessage],
+    anchor: Option<&ExactUsageAnchor>,
+) -> usize {
+    if let Some(anchor) = anchor {
+        let prefix_len = anchor.provider_messages.len();
+        if current_messages.len() >= prefix_len
+            && current_messages[..prefix_len] == anchor.provider_messages[..]
+        {
+            // Anchor is a prefix — estimate only the tail.
+            let tail_tokens: usize = current_messages[prefix_len..]
+                .iter()
+                .map(estimate_message_tokens)
+                .sum();
+            return anchor.prompt_tokens + tail_tokens;
+        }
+    }
+    // Full heuristic fallback.
+    current_messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// Build a concrete rejection reason from a [`BudgetSnapshot`].
+fn format_budget_rejection(snap: &crate::context::BudgetSnapshot) -> String {
+    use std::fmt::Write;
+    let mut reason = String::from("context budget exceeded: ");
+    if snap.turn_input_used > snap.turn_input_limit {
+        write!(
+            reason,
+            "turn input {}/{} tokens",
+            snap.turn_input_used, snap.turn_input_limit,
+        )
+        .ok();
+    }
+    if let Some(limit) = snap.session_input_limit {
+        if snap.projected_session_input > limit {
+            if reason.len() > "context budget exceeded: ".len() {
+                reason.push_str("; ");
+            }
+            write!(
+                reason,
+                "projected session input {}/{} tokens",
+                snap.projected_session_input, limit,
+            )
+            .ok();
+        }
+    }
+    if let Some(limit) = snap.session_output_limit {
+        if snap.projected_session_output > limit {
+            if reason.len() > "context budget exceeded: ".len() {
+                reason.push_str("; ");
+            }
+            write!(
+                reason,
+                "projected session output {}/{} tokens",
+                snap.projected_session_output, limit,
+            )
+            .ok();
+        }
+    }
+    reason
 }

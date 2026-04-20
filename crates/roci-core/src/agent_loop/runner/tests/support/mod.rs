@@ -13,6 +13,7 @@ mod scenario_events;
 #[derive(Clone, Copy)]
 pub(super) enum ProviderScenario {
     MissingOptionalFields,
+    ImmediateStreamError,
     TextThenStreamError,
     RepeatedToolFailure,
     RateLimitedThenComplete,
@@ -37,6 +38,15 @@ pub(super) enum ProviderScenario {
     SchemaToolTypeMismatch,
     /// Emits partial assistant text then idles; used to exercise run abort path.
     PartialTextThenIdle,
+    /// Emits "hello" text + Done with provider-reported usage (input=50, output=10).
+    TextOnlyWithUsage,
+    /// Emits text delta with partial usage then a stream error; verifies that
+    /// mid-stream failures still finalize usage into the run accumulator.
+    TextWithUsageThenStreamError,
+    /// Call 0: tool call for "noop_tool" + usage (input=50, output=10).
+    /// Call 1+: text "done" + usage (input=60, output=5).
+    /// Used to exercise multi-iteration exact-anchor budget estimation.
+    ToolCallWithUsageThenTextWithUsage,
 }
 
 struct StubProvider {

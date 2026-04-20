@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod factories;
 pub mod models;
+pub mod overflow;
 pub mod provider;
 
 use std::sync::Arc;
@@ -44,8 +45,10 @@ pub fn register_default_providers(registry: &mut roci_core::provider::ProviderRe
     registry.register(Arc::new(factories::LmStudioFactory));
 
     #[cfg(feature = "openai-compatible")]
+    registry.register(Arc::new(factories::OpenAiCompatibleFactory));
+
+    #[cfg(feature = "github-copilot")]
     {
-        registry.register(Arc::new(factories::OpenAiCompatibleFactory));
         registry.register(Arc::new(factories::GitHubCopilotFactory));
     }
 

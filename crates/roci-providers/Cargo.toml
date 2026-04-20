@@ -34,6 +34,8 @@ default = ["openai", "anthropic", "google"]
 openai = []
 anthropic = []
 google = []
+openai-compatible-transport = ["openai"]
+github-copilot = ["openai-compatible-transport"]
 grok = ["openai"]
 groq = ["openai"]
 mistral = ["openai"]
@@ -42,10 +44,10 @@ lmstudio = ["openai"]
 azure = ["openai"]
 openrouter = ["openai"]
 together = ["openai"]
-openai-compatible = ["openai"]
+openai-compatible = ["openai-compatible-transport"]
 anthropic-compatible = ["anthropic"]
 all-providers = [
-    "openai", "anthropic", "google", "grok", "groq", "mistral",
+    "openai", "anthropic", "google", "github-copilot", "grok", "groq", "mistral",
     "ollama", "lmstudio", "azure", "openrouter", "together",
     "openai-compatible", "anthropic-compatible",
 ]

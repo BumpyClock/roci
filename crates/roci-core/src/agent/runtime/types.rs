@@ -4,9 +4,8 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_loop::compaction::{
-    estimate_message_tokens, extract_file_operations, FileOperationSet, PreparedCompaction,
-};
+use crate::agent_loop::compaction::{extract_file_operations, FileOperationSet};
+use crate::context::{estimate_message_tokens, PreparedCompaction};
 use crate::error::RociError;
 use crate::resource::{BranchSummarySettings, CompactionSettings};
 use crate::types::ModelMessage;
