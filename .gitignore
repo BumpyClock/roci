@@ -4,3 +4,4 @@ target/
 .claude
 .ai_agents/
 .env
+.tasque/

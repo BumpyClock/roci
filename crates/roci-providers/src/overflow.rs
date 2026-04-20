@@ -11,8 +11,12 @@
 //!   typed `ErrorCode::ContextLengthExceeded` fast path, plus regex fallback
 //!   for unstructured error messages.
 //!
-//! Additional providers (Anthropic, Google) will be added once concrete error
-//! shapes are observed from their transports.
+//! - **Anthropic** (including anthropic-compatible transports): text-based
+//!   matching today because the transport does not yet preserve
+//!   Anthropic-specific structured error details.
+//!
+//! - **Google Gemini**: text-based matching today because the transport does
+//!   not yet preserve Gemini-specific structured error details.
 
 use roci_core::context::overflow::{
     OverflowDetectionInput, OverflowDetector, OverflowKind, OverflowRetryHint, OverflowSignal,
@@ -310,6 +314,120 @@ impl OverflowDetector for BuiltinOverflowDetector {
 /// This is a convenience wrapper around [`BuiltinOverflowDetector::new`].
 pub fn builtin_overflow_detector() -> BuiltinOverflowDetector {
     BuiltinOverflowDetector::new()
+}
+
+// ---------------------------------------------------------------------------
+// Provider wrapper (classify_overflow injection)
+// ---------------------------------------------------------------------------
+
+/// Provider wrapper that adds text-based overflow classification to any
+/// [`ModelProvider`] using the built-in detector chain.
+///
+/// Delegates all trait methods to the inner provider. `classify_overflow`
+/// first preserves any signal the inner provider already produced, then
+/// falls back to the [`BuiltinOverflowDetector`] for provider-specific
+/// text matching.
+pub struct OverflowClassifyingProvider {
+    inner: Box<dyn roci_core::provider::ModelProvider>,
+    detector: BuiltinOverflowDetector,
+}
+
+impl OverflowClassifyingProvider {
+    /// Wrap a provider to gain text-based overflow classification.
+    pub fn wrap(
+        inner: Box<dyn roci_core::provider::ModelProvider>,
+    ) -> Box<dyn roci_core::provider::ModelProvider> {
+        Box::new(Self {
+            inner,
+            detector: BuiltinOverflowDetector::new(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl roci_core::provider::ModelProvider for OverflowClassifyingProvider {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn capabilities(&self) -> &roci_core::models::capabilities::ModelCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn generate_text(
+        &self,
+        request: &roci_core::provider::ProviderRequest,
+    ) -> Result<roci_core::provider::ProviderResponse, RociError> {
+        self.inner.generate_text(request).await
+    }
+
+    async fn stream_text(
+        &self,
+        request: &roci_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<roci_core::types::TextStreamDelta, RociError>>,
+        RociError,
+    > {
+        self.inner.stream_text(request).await
+    }
+
+    fn classify_overflow(&self, error: &RociError) -> Option<OverflowSignal> {
+        // Preserve any classification the inner provider already produced.
+        if let Some(signal) = self.inner.classify_overflow(error) {
+            return Some(signal);
+        }
+        // Fall back to text-based detection via the built-in detector chain.
+        let input = OverflowDetectionInput::from_error(
+            self.inner.provider_name(),
+            self.inner.model_id(),
+            error,
+        );
+        self.detector.detect(&input)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Factory wrapper
+// ---------------------------------------------------------------------------
+
+/// Factory wrapper that wraps created providers with
+/// [`OverflowClassifyingProvider`] at construction time.
+///
+/// Used by [`register_default_providers`](crate::register_default_providers)
+/// to inject text-based overflow classification into all built-in providers
+/// without editing every provider implementation.
+pub struct OverflowClassifyingFactory {
+    inner: std::sync::Arc<dyn roci_core::provider::ProviderFactory>,
+}
+
+impl OverflowClassifyingFactory {
+    /// Wrap a factory so every provider it creates gains text-based
+    /// overflow classification.
+    pub fn wrap(
+        inner: std::sync::Arc<dyn roci_core::provider::ProviderFactory>,
+    ) -> std::sync::Arc<dyn roci_core::provider::ProviderFactory> {
+        std::sync::Arc::new(Self { inner })
+    }
+}
+
+impl roci_core::provider::ProviderFactory for OverflowClassifyingFactory {
+    fn provider_keys(&self) -> &[&str] {
+        self.inner.provider_keys()
+    }
+
+    fn create(
+        &self,
+        config: &roci_core::config::RociConfig,
+        provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn roci_core::provider::ModelProvider>, RociError> {
+        let provider = self.inner.create(config, provider_key, model_id)?;
+        Ok(OverflowClassifyingProvider::wrap(provider))
+    }
 }
 
 // ---------------------------------------------------------------------------

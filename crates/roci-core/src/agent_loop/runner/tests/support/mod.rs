@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::context::overflow::{OverflowKind, OverflowRetryHint, OverflowSignal};
 use crate::models::ModelCapabilities;
 use crate::provider::{ModelProvider, ProviderRequest, ProviderResponse};
 use crate::types::TextStreamDelta;
@@ -24,6 +25,13 @@ pub(super) enum ProviderScenario {
     ContextOverflowThenComplete,
     ContextOverflowAlways,
     UntypedOverflowError,
+    /// Output overflow (provider classifies as OutputOverflow); succeeds on call 1.
+    OutputOverflowThenComplete,
+    /// Output overflow always; used to test reduction + compaction ladder.
+    OutputOverflowAlways,
+    /// Untyped overflow that the provider's `classify_overflow` classifies as
+    /// InputOverflow (simulating text-based detection); succeeds on call 1.
+    ClassifiedOverflowThenComplete,
     ParallelSafeBatchThenComplete,
     MutatingBatchThenComplete,
     MixedTextAndParallelBatchThenComplete,
@@ -141,6 +149,27 @@ impl ModelProvider for StubProvider {
         }
         let events = scenario_events::events_for_scenario(self.scenario, call_index)?;
         Ok(Box::pin(stream::iter(events)))
+    }
+
+    fn classify_overflow(&self, error: &RociError) -> Option<OverflowSignal> {
+        match self.scenario {
+            ProviderScenario::OutputOverflowThenComplete
+            | ProviderScenario::OutputOverflowAlways => Some(OverflowSignal::new(
+                OverflowKind::OutputOverflow,
+                OverflowRetryHint::ReduceOutputTokensFirst,
+            )),
+            ProviderScenario::ClassifiedOverflowThenComplete => {
+                if matches!(error, RociError::Api { .. }) {
+                    Some(OverflowSignal::new(
+                        OverflowKind::InputOverflow,
+                        OverflowRetryHint::CompactContextFirst,
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => crate::provider::classify_overflow_typed(error),
+        }
     }
 }
 

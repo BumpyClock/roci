@@ -553,23 +553,30 @@ async fn typed_overflow_fails_after_bounded_recovery_attempts() {
         .await
         .expect("run wait timeout");
     assert_eq!(result.status, RunStatus::Failed);
+    // With the progress-gated policy, the trivial compaction hook does not
+    // free enough tokens (< 500) to justify a second compaction. The policy
+    // aborts after the first compaction with CompactionProgressInsufficient.
     assert!(
         result
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("persisted after 3 attempts"),
-        "expected bounded overflow failure, got: {:?}",
+            .contains("insufficient progress"),
+        "expected progress-gated abort, got: {:?}",
         result.error
     );
     assert_eq!(
         compaction_calls.load(Ordering::SeqCst),
-        2,
-        "compaction should run for bounded recovery attempts before failure"
+        1,
+        "trivial compaction frees < 500 tokens; second compaction should not run"
     );
 
     let requests = requests.lock().expect("request lock");
-    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests.len(),
+        2,
+        "initial call + one retry after compaction"
+    );
 }
 
 #[tokio::test]

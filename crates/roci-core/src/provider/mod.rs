@@ -12,7 +12,8 @@ use futures::stream::BoxStream;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::error::RociError;
+use crate::context::overflow::{OverflowKind, OverflowRetryHint, OverflowSignal};
+use crate::error::{ErrorCode, RociError};
 use crate::models::capabilities::ModelCapabilities;
 use crate::types::{
     message::{AgentToolCall, ContentPart},
@@ -124,6 +125,16 @@ pub trait ModelProvider: Send + Sync {
         &self,
         request: &ProviderRequest,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError>;
+
+    /// Classify an error as an overflow signal, if applicable.
+    ///
+    /// The default implementation inspects structured API error details only:
+    /// `ErrorDetails::code == ErrorCode::ContextLengthExceeded`.
+    /// Provider wrappers in `roci-providers` may layer provider-specific
+    /// classification on top.
+    fn classify_overflow(&self, error: &RociError) -> Option<OverflowSignal> {
+        classify_overflow_typed(error)
+    }
 }
 
 /// Resolve an API key from config for the given provider, returning an
@@ -136,4 +147,35 @@ pub fn require_api_key(
     config
         .get_api_key_for(provider)
         .ok_or_else(|| RociError::Authentication(missing_message.to_string()))
+}
+
+/// Default typed overflow classification for
+/// [`ModelProvider::classify_overflow`].
+///
+/// Matches `ErrorDetails::code == ErrorCode::ContextLengthExceeded` only.
+/// Contains no provider-code parsing, raw-text matching, or provider-name
+/// branching.
+pub fn classify_overflow_typed(error: &RociError) -> Option<OverflowSignal> {
+    match error {
+        RociError::Api {
+            details: Some(details),
+            ..
+        } => match details.code {
+            Some(ErrorCode::ContextLengthExceeded) => {
+                let mut signal = OverflowSignal::new(
+                    OverflowKind::InputOverflow,
+                    OverflowRetryHint::CompactContextFirst,
+                )
+                .with_typed_code(ErrorCode::ContextLengthExceeded);
+
+                if let Some(ref pc) = details.provider_code {
+                    signal = signal.with_provider_code(pc.clone());
+                }
+
+                Some(signal)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }

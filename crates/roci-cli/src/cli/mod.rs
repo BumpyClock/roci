@@ -4,7 +4,7 @@ pub mod auth;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Roci AI CLI
 #[derive(Parser, Debug)]
@@ -19,6 +19,8 @@ pub struct Cli {
 pub enum Commands {
     /// Authentication management
     Auth(AuthArgs),
+    /// OpenAI-backed file and stdio audio commands
+    Audio(AudioArgs),
     /// Chat with an AI model
     Chat(ChatArgs),
     /// Manage installed skills
@@ -55,6 +57,84 @@ pub struct LoginArgs {
 pub struct LogoutArgs {
     /// Provider to logout from (copilot, codex, claude)
     pub provider: String,
+}
+
+/// Arguments for the `audio` subcommand group.
+#[derive(Parser, Debug)]
+pub struct AudioArgs {
+    #[command(subcommand)]
+    pub command: AudioCommands,
+}
+
+/// Audio subcommands.
+#[derive(Subcommand, Debug)]
+pub enum AudioCommands {
+    /// Transcribe audio bytes from a file or stdin to text
+    Transcribe(TranscribeArgs),
+    /// Generate speech audio from text into a file or stdout
+    Speak(SpeakArgs),
+}
+
+/// Arguments for `roci-agent audio transcribe`.
+#[derive(Parser, Debug)]
+pub struct TranscribeArgs {
+    /// Input audio file path, or '-' to read audio bytes from stdin
+    #[arg(long, value_name = "PATH")]
+    pub input: PathBuf,
+
+    /// Override MIME type (required when reading from stdin)
+    #[arg(long, value_name = "MIME")]
+    pub mime_type: Option<String>,
+
+    /// Language hint (for example: en)
+    #[arg(long, value_name = "LANG")]
+    pub language: Option<String>,
+
+    /// Transcription model
+    #[arg(long, default_value = "whisper-1")]
+    pub model: String,
+
+    /// Print the full transcription result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `roci-agent audio speak`.
+#[derive(Parser, Debug)]
+pub struct SpeakArgs {
+    /// Output file path, or '-' to write audio bytes to stdout
+    #[arg(long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// OpenAI voice id
+    #[arg(long, default_value = "alloy")]
+    pub voice: String,
+
+    /// Output audio format
+    #[arg(long, default_value = "mp3")]
+    pub format: AudioFormatArg,
+
+    /// Speech speed multiplier (0.25 - 4.0)
+    #[arg(long)]
+    pub speed: Option<f64>,
+
+    /// OpenAI speech model
+    #[arg(long, default_value = "tts-1")]
+    pub model: String,
+
+    /// Input text
+    pub text: String,
+}
+
+/// CLI-local audio format values.
+#[derive(Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum AudioFormatArg {
+    Mp3,
+    Opus,
+    Aac,
+    Flac,
+    Wav,
+    Pcm16,
 }
 
 /// Arguments for the `chat` subcommand.
@@ -214,6 +294,93 @@ mod tests {
                 assert!(args.prompt.is_none());
             }
             other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_audio_transcribe_with_json() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "audio",
+            "transcribe",
+            "--input",
+            "sample.wav",
+            "--language",
+            "en",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Audio(audio) => match audio.command {
+                AudioCommands::Transcribe(args) => {
+                    assert_eq!(args.input, PathBuf::from("sample.wav"));
+                    assert_eq!(args.language.as_deref(), Some("en"));
+                    assert_eq!(args.model, "whisper-1");
+                    assert!(args.json);
+                }
+                other => panic!("expected Transcribe, got {other:?}"),
+            },
+            other => panic!("expected Audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_audio_speak_with_defaults() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "audio",
+            "speak",
+            "--output",
+            "out.mp3",
+            "hello world",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Audio(audio) => match audio.command {
+                AudioCommands::Speak(args) => {
+                    assert_eq!(args.output, PathBuf::from("out.mp3"));
+                    assert_eq!(args.voice, "alloy");
+                    assert_eq!(args.format, AudioFormatArg::Mp3);
+                    assert_eq!(args.model, "tts-1");
+                    assert_eq!(args.text, "hello world");
+                }
+                other => panic!("expected Speak, got {other:?}"),
+            },
+            other => panic!("expected Audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_audio_speak_with_all_options() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "audio",
+            "speak",
+            "--output",
+            "-",
+            "--voice",
+            "nova",
+            "--format",
+            "wav",
+            "--speed",
+            "1.25",
+            "--model",
+            "gpt-4o-mini-tts",
+            "hello world",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Audio(audio) => match audio.command {
+                AudioCommands::Speak(args) => {
+                    assert_eq!(args.output, PathBuf::from("-"));
+                    assert_eq!(args.voice, "nova");
+                    assert_eq!(args.format, AudioFormatArg::Wav);
+                    assert_eq!(args.speed, Some(1.25));
+                    assert_eq!(args.model, "gpt-4o-mini-tts");
+                }
+                other => panic!("expected Speak, got {other:?}"),
+            },
+            other => panic!("expected Audio, got {other:?}"),
         }
     }
 

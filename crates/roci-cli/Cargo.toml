@@ -8,12 +8,14 @@ name = "roci-agent"
 path = "src/main.rs"
 
 [dependencies]
-roci = { path = "../..", features = ["agent", "mcp", "github-copilot"] }
+roci = { path = "../..", features = ["agent", "audio", "mcp", "github-copilot"] }
 roci-tools = { path = "../roci-tools", features = ["agent"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.29"
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"

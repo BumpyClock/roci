@@ -173,6 +173,63 @@ pub(super) fn events_for_scenario(
         ProviderScenario::UntypedOverflowError => {
             Err(RociError::api(400, "context length exceeded"))
         }
+        ProviderScenario::OutputOverflowThenComplete => {
+            if call_index == 0 {
+                return Err(RociError::api(400, "max_tokens is too large"));
+            }
+            Ok(vec![
+                Ok(TextStreamDelta {
+                    text: "done".to_string(),
+                    event_type: StreamEventType::TextDelta,
+                    tool_call: None,
+                    finish_reason: None,
+                    usage: None,
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
+                }),
+                Ok(TextStreamDelta {
+                    text: String::new(),
+                    event_type: StreamEventType::Done,
+                    tool_call: None,
+                    finish_reason: None,
+                    usage: Some(Usage::default()),
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
+                }),
+            ])
+        }
+        ProviderScenario::OutputOverflowAlways => {
+            Err(RociError::api(400, "max_tokens is too large"))
+        }
+        ProviderScenario::ClassifiedOverflowThenComplete => {
+            if call_index == 0 {
+                return Err(RociError::api(400, "context length exceeded"));
+            }
+            Ok(vec![
+                Ok(TextStreamDelta {
+                    text: "done".to_string(),
+                    event_type: StreamEventType::TextDelta,
+                    tool_call: None,
+                    finish_reason: None,
+                    usage: None,
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
+                }),
+                Ok(TextStreamDelta {
+                    text: String::new(),
+                    event_type: StreamEventType::Done,
+                    tool_call: None,
+                    finish_reason: None,
+                    usage: Some(Usage::default()),
+                    reasoning: None,
+                    reasoning_signature: None,
+                    reasoning_type: None,
+                }),
+            ])
+        }
         ProviderScenario::TextOnlyWithUsage => Ok(vec![
             Ok(TextStreamDelta {
                 text: "hello".to_string(),

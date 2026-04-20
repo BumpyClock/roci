@@ -12,10 +12,13 @@ use super::super::{
     TransformContextHookPayload, TransformContextHookResult,
 };
 use crate::agent::message::{convert_to_llm, AgentMessage};
-use crate::context::{estimate_context_usage, estimate_message_tokens};
-use crate::error::{ErrorCode, RociError};
+use crate::context::{
+    estimate_context_usage, estimate_message_tokens, AbortReason, CompactionProgress,
+    OverflowRecoveryPolicy, RecoveryAction, RecoveryEvent, RecoveryState,
+};
+use crate::error::RociError;
 use crate::provider::{self, ProviderRequest, ToolDefinition};
-use crate::types::{AgentToolCall, ModelMessage, Usage};
+use crate::types::{AgentToolCall, GenerationSettings, ModelMessage, Usage};
 use crate::util::debug::roci_debug_enabled;
 
 /// Compute the effective usage for a single provider call, merging it into
@@ -169,21 +172,33 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
     let max_attempts = request.retry_backoff.max_attempts.max(1);
     let mut attempt: u32 = 1;
     let mut next_backoff_ms = request.retry_backoff.initial_delay_ms.max(1);
-    let mut overflow_recovery_attempts: u32 = 0;
+
+    // -- Overflow recovery state (separate from generic retry) --
+    // Carries per-attempt adjustments such as a reduced `max_tokens`
+    // budget without mutating the original run request.
+    let mut effective_settings = request.settings.clone();
+    let policy = OverflowRecoveryPolicy::new();
+    let mut recovery_state = RecoveryState::new();
+    let mut in_overflow_episode = false;
+    let mut staged_provider_request: Option<ProviderRequest> = None;
 
     let (mut stream, last_provider_messages) = loop {
-        let provider_request = match build_provider_request(
-            request,
-            provider,
-            tool_defs,
-            messages,
-            abort_rx,
-            run_cancel_token,
-        )
-        .await
-        {
-            Ok(req) => req,
-            Err(outcome) => return outcome,
+        let provider_request = match staged_provider_request.take() {
+            Some(request) => request,
+            None => match build_provider_request(
+                request,
+                provider,
+                tool_defs,
+                messages,
+                abort_rx,
+                run_cancel_token,
+                &effective_settings,
+            )
+            .await
+            {
+                Ok(req) => req,
+                Err(outcome) => return outcome,
+            },
         };
 
         // -- Preflight budget check (5.3) --
@@ -209,7 +224,17 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
         }
 
         match provider.stream_text(&provider_request).await {
-            Ok(stream) => break (stream, provider_request.messages),
+            Ok(stream) => {
+                if in_overflow_episode {
+                    emit_overflow_recovery(
+                        emitter,
+                        &RecoveryEvent::EpisodeResolved {
+                            total_attempts: recovery_state.total_attempts(),
+                        },
+                    );
+                }
+                break (stream, provider_request.messages);
+            }
             Err(RociError::RateLimited { retry_after_ms }) => {
                 let retry_after_ms = retry_after_ms.unwrap_or(0);
                 if retry_after_ms == 0 {
@@ -250,111 +275,231 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                 }
                 attempt += 1;
             }
-            Err(err) if is_typed_overflow_error(&err) => {
-                if attempt >= max_attempts {
-                    return LlmPhaseOutcome::Failed {
-                        reason: format!(
-                            "context overflow persisted after {attempt} attempts despite recovery"
-                        ),
-                        assistant_message: None,
-                    };
-                }
-                let Some(compact) = request.hooks.compaction.as_ref() else {
-                    return LlmPhaseOutcome::Failed {
-                        reason: "context overflow detected but no compaction hook is configured"
-                            .to_string(),
-                        assistant_message: None,
-                    };
-                };
-                let compaction_cancel_token = run_cancel_token.child_token();
-                let compaction_future = compact(messages.clone(), compaction_cancel_token.clone());
-                tokio::pin!(compaction_future);
-                let compaction_result = tokio::select! {
-                    _ = &mut *abort_rx => {
-                        run_cancel_token.cancel();
-                        compaction_cancel_token.cancel();
-                        return LlmPhaseOutcome::Canceled {
-                            assistant_message: None,
-                        };
-                    }
-                    _ = run_cancel_token.cancelled() => {
-                        compaction_cancel_token.cancel();
-                        return LlmPhaseOutcome::Canceled {
-                            assistant_message: None,
-                        };
-                    }
-                    result = &mut compaction_future => result,
-                };
-                match compaction_result {
-                    Ok(Some(compacted)) => {
-                        *messages = compacted;
-                        overflow_recovery_attempts += 1;
-                        attempt += 1;
-                        emit_retry_lifecycle(
+            Err(err) => {
+                // -- Overflow recovery (separate from generic retry) --
+                if let Some(signal) = provider.classify_overflow(&err) {
+                    if !in_overflow_episode {
+                        in_overflow_episode = true;
+                        emit_overflow_recovery(
                             emitter,
-                            attempt - 1,
-                            max_attempts,
-                            0,
-                            "overflow_compaction",
+                            &RecoveryEvent::EpisodeStarted {
+                                overflow_kind: signal.kind,
+                            },
                         );
-                        if roci_debug_enabled() {
-                            tracing::debug!(
-                                run_id = %request.run_id,
-                                iteration,
-                                overflow_recovery_attempts,
-                                "typed overflow recovery compacted context"
-                            );
+                    }
+
+                    // Process recovery decisions. When output budget reduction
+                    // is not possible (no safe smaller budget), advance the
+                    // ladder to the next action without retrying the provider.
+                    'recovery: {
+                        let mut decision = policy.next_action(&signal, &recovery_state);
+                        let attempt_index = recovery_state.total_attempts();
+
+                        if decision.action() == RecoveryAction::ReduceOutputBudget {
+                            if let Some(new_max_tokens) =
+                                safe_smaller_output_budget(request, &effective_settings)
+                            {
+                                recovery_state.record_output_reduction();
+                                emit_overflow_recovery(
+                                    emitter,
+                                    &RecoveryEvent::ActionDecided {
+                                        decision,
+                                        attempt_index,
+                                    },
+                                );
+                                effective_settings.max_tokens = Some(new_max_tokens);
+                                break 'recovery; // retry provider call
+                            }
+
+                            // Output reduction was not applicable (no safe
+                            // smaller budget). Record the attempt on the real
+                            // state so the policy advances the ladder.
+                            recovery_state.record_output_reduction();
+                            decision = policy.next_action(&signal, &recovery_state);
+                        }
+
+                        match decision.action() {
+                            RecoveryAction::CompactContext => {
+                                emit_overflow_recovery(
+                                    emitter,
+                                    &RecoveryEvent::ActionDecided {
+                                        decision,
+                                        attempt_index,
+                                    },
+                                );
+
+                                let Some(compact) = request.hooks.compaction.as_ref() else {
+                                    return LlmPhaseOutcome::Failed {
+                                        reason:
+                                            "overflow detected but no compaction hook is configured"
+                                                .to_string(),
+                                        assistant_message: None,
+                                    };
+                                };
+
+                                let tokens_before: usize = provider_request
+                                    .messages
+                                    .iter()
+                                    .map(estimate_message_tokens)
+                                    .sum();
+
+                                let compaction_cancel_token = run_cancel_token.child_token();
+                                let compaction_future =
+                                    compact(messages.clone(), compaction_cancel_token.clone());
+                                tokio::pin!(compaction_future);
+                                let compaction_result = tokio::select! {
+                                    _ = &mut *abort_rx => {
+                                        run_cancel_token.cancel();
+                                        compaction_cancel_token.cancel();
+                                        return LlmPhaseOutcome::Canceled {
+                                            assistant_message: None,
+                                        };
+                                    }
+                                    _ = run_cancel_token.cancelled() => {
+                                        compaction_cancel_token.cancel();
+                                        return LlmPhaseOutcome::Canceled {
+                                            assistant_message: None,
+                                        };
+                                    }
+                                    result = &mut compaction_future => result,
+                                };
+
+                                match compaction_result {
+                                    Ok(Some(compacted)) => {
+                                        if compacted == *messages {
+                                            return LlmPhaseOutcome::Failed {
+                                                reason:
+                                                    "overflow recovery compaction made no changes"
+                                                        .to_string(),
+                                                assistant_message: None,
+                                            };
+                                        }
+                                        let next_provider_request = match build_provider_request(
+                                            request,
+                                            provider,
+                                            tool_defs,
+                                            &compacted,
+                                            abort_rx,
+                                            run_cancel_token,
+                                            &effective_settings,
+                                        )
+                                        .await
+                                        {
+                                            Ok(req) => req,
+                                            Err(outcome) => return outcome,
+                                        };
+                                        let progress = CompactionProgress::new(
+                                            tokens_before,
+                                            next_provider_request
+                                                .messages
+                                                .iter()
+                                                .map(estimate_message_tokens)
+                                                .sum(),
+                                        );
+                                        recovery_state.record_compaction(progress);
+                                        *messages = compacted;
+                                        staged_provider_request = Some(next_provider_request);
+
+                                        if roci_debug_enabled() {
+                                            tracing::debug!(
+                                                run_id = %request.run_id,
+                                                iteration,
+                                                total_attempts = recovery_state.total_attempts(),
+                                                tokens_freed = progress.tokens_freed(),
+                                                "overflow recovery compacted context"
+                                            );
+                                        }
+                                        break 'recovery; // retry provider call
+                                    }
+                                    Ok(None) => {
+                                        return LlmPhaseOutcome::Failed {
+                                            reason: "overflow recovery compaction made no changes"
+                                                .to_string(),
+                                            assistant_message: None,
+                                        };
+                                    }
+                                    Err(compaction_err) => {
+                                        return LlmPhaseOutcome::Failed {
+                                            reason: format!(
+                                                "overflow recovery compaction failed: {compaction_err}"
+                                            ),
+                                            assistant_message: None,
+                                        };
+                                    }
+                                }
+                            }
+                            RecoveryAction::Abort => {
+                                let abort_reason = decision
+                                    .as_abort_reason()
+                                    .unwrap_or(AbortReason::NotRecoverable);
+                                emit_overflow_recovery(
+                                    emitter,
+                                    &RecoveryEvent::EpisodeExhausted {
+                                        reason: abort_reason,
+                                        total_attempts: recovery_state.total_attempts(),
+                                    },
+                                );
+                                return LlmPhaseOutcome::Failed {
+                                    reason: format_overflow_recovery_abort(
+                                        &err,
+                                        recovery_state.total_attempts(),
+                                        abort_reason,
+                                    ),
+                                    assistant_message: None,
+                                };
+                            }
+                            RecoveryAction::ReduceOutputBudget => {
+                                return LlmPhaseOutcome::Failed {
+                                    reason:
+                                        "overflow recovery could not derive a smaller max_tokens budget"
+                                            .to_string(),
+                                    assistant_message: None,
+                                };
+                            }
                         }
                     }
-                    Ok(None) => {
-                        return LlmPhaseOutcome::Failed {
-                            reason: "context overflow recovery compaction made no changes"
-                                .to_string(),
-                            assistant_message: None,
-                        };
-                    }
-                    Err(compaction_error) => {
+                    // Labeled block broke → retry the provider call
+                } else if err.is_retryable() {
+                    // -- Generic retry (separate from overflow) --
+                    if attempt >= max_attempts {
                         return LlmPhaseOutcome::Failed {
                             reason: format!(
-                                "context overflow recovery compaction failed: {compaction_error}"
+                                "retryable provider error after {attempt} attempts: {err}"
                             ),
                             assistant_message: None,
                         };
                     }
-                }
-            }
-            Err(err) if err.is_retryable() => {
-                if attempt >= max_attempts {
+                    let delay_ms = jittered_backoff_ms(
+                        next_backoff_ms,
+                        request.retry_backoff.jitter_ratio,
+                        request.retry_backoff.max_delay_ms.max(1),
+                    );
+                    emit_retry_lifecycle(
+                        emitter,
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        "retryable_error",
+                    );
+                    if !sleep_with_cancellation(
+                        abort_rx,
+                        run_cancel_token,
+                        Duration::from_millis(delay_ms),
+                    )
+                    .await
+                    {
+                        return LlmPhaseOutcome::Canceled {
+                            assistant_message: None,
+                        };
+                    }
+                    attempt += 1;
+                    next_backoff_ms = next_backoff_ms_for_policy(next_backoff_ms, request);
+                } else {
                     return LlmPhaseOutcome::Failed {
-                        reason: format!("retryable provider error after {attempt} attempts: {err}"),
+                        reason: err.to_string(),
                         assistant_message: None,
                     };
                 }
-                let delay_ms = jittered_backoff_ms(
-                    next_backoff_ms,
-                    request.retry_backoff.jitter_ratio,
-                    request.retry_backoff.max_delay_ms.max(1),
-                );
-                emit_retry_lifecycle(emitter, attempt, max_attempts, delay_ms, "retryable_error");
-                if !sleep_with_cancellation(
-                    abort_rx,
-                    run_cancel_token,
-                    Duration::from_millis(delay_ms),
-                )
-                .await
-                {
-                    return LlmPhaseOutcome::Canceled {
-                        assistant_message: None,
-                    };
-                }
-                attempt += 1;
-                next_backoff_ms = next_backoff_ms_for_policy(next_backoff_ms, request);
-            }
-            Err(err) => {
-                return LlmPhaseOutcome::Failed {
-                    reason: err.to_string(),
-                    assistant_message: None,
-                };
             }
         }
     };
@@ -595,6 +740,7 @@ async fn build_provider_request(
     messages: &[ModelMessage],
     abort_rx: &mut oneshot::Receiver<()>,
     run_cancel_token: &CancellationToken,
+    effective_settings: &GenerationSettings,
 ) -> Result<ProviderRequest, LlmPhaseOutcome> {
     let mut transformed = messages.to_vec();
     if let Some(ref transform) = request.transform_context {
@@ -700,9 +846,9 @@ async fn build_provider_request(
         provider::sanitize_messages_for_provider(&llm_context, provider.provider_name());
     Ok(ProviderRequest {
         messages: provider_messages,
-        settings: request.settings.clone(),
+        settings: effective_settings.clone(),
         tools: tool_defs.clone(),
-        response_format: request.settings.response_format.clone(),
+        response_format: effective_settings.response_format.clone(),
         api_key_override: request.api_key_override.clone(),
         headers: request.provider_headers.clone(),
         metadata: request.provider_metadata.clone(),
@@ -712,14 +858,68 @@ async fn build_provider_request(
     })
 }
 
-fn is_typed_overflow_error(error: &RociError) -> bool {
-    matches!(
-        error,
-        RociError::Api {
-            details: Some(details),
-            ..
-        } if details.code == Some(ErrorCode::ContextLengthExceeded)
-    )
+/// Emit policy-driven overflow recovery progress on the system stream.
+fn emit_overflow_recovery(emitter: &RunEventEmitter, event: &RecoveryEvent) {
+    let message = match event {
+        RecoveryEvent::EpisodeStarted { overflow_kind } => {
+            format!("overflow recovery started: {overflow_kind:?}")
+        }
+        RecoveryEvent::ActionDecided {
+            decision,
+            attempt_index,
+        } => {
+            format!(
+                "overflow recovery attempt={attempt_index} action={:?} reason={:?}",
+                decision.action(),
+                decision.reason()
+            )
+        }
+        RecoveryEvent::EpisodeResolved { total_attempts } => {
+            format!("overflow recovery resolved after {total_attempts} attempts")
+        }
+        RecoveryEvent::EpisodeExhausted {
+            reason,
+            total_attempts,
+        } => {
+            format!("overflow recovery exhausted after {total_attempts} attempts: {reason:?}")
+        }
+    };
+    emitter.emit(RunEventStream::System, RunEventPayload::Error { message });
+}
+
+/// Derive a smaller `max_tokens` budget from the configured output reserve.
+///
+/// Returns `None` when the run has no context budget, the reserve is zero, or
+/// the current effective budget is already at or below the reserve.
+fn safe_smaller_output_budget(
+    request: &RunRequest,
+    effective_settings: &GenerationSettings,
+) -> Option<u32> {
+    let reserve = u32::try_from(request.context_budget.as_ref()?.reserve_output_tokens).ok()?;
+    if reserve == 0 {
+        return None;
+    }
+    match effective_settings.max_tokens {
+        Some(current) if current <= reserve => None,
+        _ => Some(reserve),
+    }
+}
+
+/// Build the user-facing failure message for a terminal recovery decision.
+fn format_overflow_recovery_abort(
+    error: &RociError,
+    total_attempts: u8,
+    abort_reason: AbortReason,
+) -> String {
+    match abort_reason {
+        AbortReason::NotRecoverable => error.to_string(),
+        AbortReason::CompactionAttemptsExhausted => {
+            format!("context overflow persisted after {total_attempts} attempts despite recovery")
+        }
+        AbortReason::CompactionProgressInsufficient => format!(
+            "context overflow recovery stopped after {total_attempts} attempts because compaction made insufficient progress"
+        ),
+    }
 }
 
 fn emit_retry_lifecycle(

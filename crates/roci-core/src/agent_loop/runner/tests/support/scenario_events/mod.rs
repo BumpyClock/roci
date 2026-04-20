@@ -22,7 +22,10 @@ pub(super) fn events_for_scenario(
         | ProviderScenario::RetryableTimeoutExhausted
         | ProviderScenario::ContextOverflowThenComplete
         | ProviderScenario::ContextOverflowAlways
-        | ProviderScenario::UntypedOverflowError => {
+        | ProviderScenario::UntypedOverflowError
+        | ProviderScenario::OutputOverflowThenComplete
+        | ProviderScenario::OutputOverflowAlways
+        | ProviderScenario::ClassifiedOverflowThenComplete => {
             basic::events_for_scenario(scenario, call_index)
         }
         ProviderScenario::ParallelSafeBatchThenComplete

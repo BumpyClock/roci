@@ -1626,8 +1626,10 @@ dependencies = [
  "crossterm",
  "roci",
  "roci-tools",
+ "serde_json",
  "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
