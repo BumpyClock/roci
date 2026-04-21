@@ -250,10 +250,11 @@ pub fn select_messages_with_token_budget_newest_first(
 
     for message in messages.iter().rev() {
         let message_tokens = estimate_message_tokens(message);
-        if used_tokens + message_tokens > token_budget {
+        let next_tokens = used_tokens.saturating_add(message_tokens);
+        if next_tokens > token_budget {
             break;
         }
-        used_tokens += message_tokens;
+        used_tokens = next_tokens;
         selected.push(message.clone());
     }
 

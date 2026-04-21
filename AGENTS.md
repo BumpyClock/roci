@@ -2,7 +2,7 @@
 
 roci notes:
 - Default workflow: lint, format, and test before publishing.
-- Docs are under `docs/`; read & update as needed.
+- Docs are under `docs/`; read & update as needed. Testing requirements live in `docs/testing.md`.
 - Use `.env` for sensitive keys; refer to `.env.example` for structure. Keep `.env.example` updated as needed.
 - Validate provider-facing changes with the relevant crate tests; this repo does not currently ship a `live_providers` integration target.
 - Use parallel-subagents and agent-teams for all tasks.
@@ -17,6 +17,7 @@ roci notes:
 
 # Testing
 - Along with automated tests always run live tests in an interactive tmux terminal to ensure everything is working correctly end to end.
+- Do not call provider-facing work done until it has passed the live tmux/provider verification in `docs/testing.md`.
 - use local models running at `http://127.0.0.1:1234` if not available, inform user.
 - test configured providers as well. work with user to trigger and validate auth flows and make sure calls can be made successfully for OpenAI, OpenAI Codex, Gemini, Anthropic Claude Code, Github Copilot.
 - When running test with tmux, always show user the tmux attach command so they can attach to the same tmux session to interact/watch/co-develop or debug

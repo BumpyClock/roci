@@ -114,8 +114,8 @@ pub struct SpeakArgs {
     #[arg(long, default_value = "mp3")]
     pub format: AudioFormatArg,
 
-    /// Speech speed multiplier (0.25 - 4.0)
-    #[arg(long)]
+    /// Speech speed multiplier (finite value from 0.25 to 4.0 inclusive)
+    #[arg(long, value_parser = parse_speech_speed)]
     pub speed: Option<f64>,
 
     /// OpenAI speech model
@@ -135,6 +135,17 @@ pub enum AudioFormatArg {
     Flac,
     Wav,
     Pcm16,
+}
+
+fn parse_speech_speed(value: &str) -> Result<f64, String> {
+    let speed = value
+        .parse::<f64>()
+        .map_err(|_| "speech speed must be a finite number between 0.25 and 4.0".to_string())?;
+    if (0.25..=4.0).contains(&speed) && speed.is_finite() {
+        Ok(speed)
+    } else {
+        Err("speech speed must be a finite number between 0.25 and 4.0".to_string())
+    }
 }
 
 /// Arguments for the `chat` subcommand.
@@ -382,6 +393,32 @@ mod tests {
             },
             other => panic!("expected Audio, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_audio_speak_rejects_speed_outside_openai_range() {
+        assert!(Cli::try_parse_from([
+            "roci-agent",
+            "audio",
+            "speak",
+            "--output",
+            "out.mp3",
+            "--speed",
+            "0.24",
+            "hello world",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "roci-agent",
+            "audio",
+            "speak",
+            "--output",
+            "out.mp3",
+            "--speed",
+            "4.01",
+            "hello world",
+        ])
+        .is_err());
     }
 
     #[test]

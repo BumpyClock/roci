@@ -41,9 +41,11 @@ pub(super) fn events_for_scenario(
         | ProviderScenario::SchemaToolTypeMismatch => {
             schema::events_for_scenario(scenario, call_index)
         }
-        ProviderScenario::PartialTextThenIdle => Err(RociError::InvalidState(
-            "PartialTextThenIdle is generated directly by the stub stream".to_string(),
-        )),
+        ProviderScenario::PartialTextThenIdle | ProviderScenario::IdleBeforeAnyDelta => {
+            Err(RociError::InvalidState(
+                "idle stream scenarios are generated directly by the stub stream".to_string(),
+            ))
+        }
         ProviderScenario::TextOnlyWithUsage
         | ProviderScenario::TextWithUsageThenStreamError
         | ProviderScenario::ToolCallWithUsageThenTextWithUsage => {

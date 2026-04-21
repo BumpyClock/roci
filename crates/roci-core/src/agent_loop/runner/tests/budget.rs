@@ -3,6 +3,7 @@ use crate::agent_loop::RunStatus;
 use crate::context::{estimate_message_tokens, ContextBudget};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tokio::time::{sleep, timeout, Duration};
 
 use support::{test_model, test_runner, ProviderScenario};
 
@@ -271,6 +272,54 @@ async fn stream_error_before_any_delta_does_not_charge_output_tokens() {
         usage.output_tokens, 0,
         "no output tokens should be charged before any text/tool delta arrives"
     );
+    assert_eq!(usage.total_tokens, usage.input_tokens);
+}
+
+#[tokio::test]
+async fn cancel_before_any_delta_does_not_charge_output_tokens() {
+    let (runner, _requests) = test_runner(ProviderScenario::IdleBeforeAnyDelta);
+    let mut handle = runner
+        .start(RunRequest::new(
+            test_model(),
+            vec![ModelMessage::user("hi")],
+        ))
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(10)).await;
+    assert!(handle.abort(), "abort should be accepted");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Canceled);
+    let usage = result
+        .usage_delta
+        .expect("post-provider cancel should still carry input usage");
+    assert!(usage.input_tokens > 0);
+    assert_eq!(usage.output_tokens, 0);
+    assert_eq!(usage.total_tokens, usage.input_tokens);
+}
+
+#[tokio::test]
+async fn idle_timeout_before_any_delta_does_not_charge_output_tokens() {
+    let (runner, _requests) = test_runner(ProviderScenario::IdleBeforeAnyDelta);
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hi")]);
+    request.settings.stream_idle_timeout_ms = Some(10);
+
+    let handle = runner.start(request).await.unwrap();
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.error.as_deref(), Some("stream idle timeout"));
+    let usage = result
+        .usage_delta
+        .expect("post-provider timeout should still carry input usage");
+    assert!(usage.input_tokens > 0);
+    assert_eq!(usage.output_tokens, 0);
+    assert_eq!(usage.total_tokens, usage.input_tokens);
 }
 
 #[tokio::test]

@@ -46,6 +46,8 @@ pub(super) enum ProviderScenario {
     SchemaToolTypeMismatch,
     /// Emits partial assistant text then idles; used to exercise run abort path.
     PartialTextThenIdle,
+    /// Opens a stream and then idles before any delta arrives.
+    IdleBeforeAnyDelta,
     /// Emits "hello" text + Done with provider-reported usage (input=50, output=10).
     TextOnlyWithUsage,
     /// Emits text delta with partial usage then a stream error; verifies that
@@ -110,6 +112,9 @@ impl ModelProvider for StubProvider {
             .expect("request lock")
             .push(request.clone());
         let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.scenario, ProviderScenario::IdleBeforeAnyDelta) {
+            return Ok(Box::pin(stream::pending()));
+        }
         if matches!(self.scenario, ProviderScenario::PartialTextThenIdle) {
             let stream = futures::stream::unfold(0u8, |state| async move {
                 match state {
