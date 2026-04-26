@@ -1,0 +1,1 @@
+Refactor mcp transport module into submodules: transport.rs defines public trait/type aliases and re-exports; new transport/common.rs holds DynRoleClientTransport + erasure; transport/stdio.rs and transport/sse.rs hold respective transports + tests; transport/test_support.rs holds shared test helpers. Ensure no API changes, tests pass with --features mcp.
