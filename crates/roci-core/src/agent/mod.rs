@@ -10,6 +10,7 @@ pub mod subagents;
 pub use conversation::Conversation;
 pub use core::Agent;
 pub use message::{convert_to_llm, AgentMessage, AgentMessageExt};
+pub use runtime::chat::*;
 #[cfg(feature = "agent")]
 pub use runtime::UserInputCoordinator;
 pub use runtime::{

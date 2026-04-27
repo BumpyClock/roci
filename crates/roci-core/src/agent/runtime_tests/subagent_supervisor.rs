@@ -78,6 +78,7 @@ fn make_base_config() -> AgentConfig {
         #[cfg(feature = "agent")]
         user_input_coordinator: None,
         context_budget: None,
+        chat: Default::default(),
     }
 }
 

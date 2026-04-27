@@ -14,9 +14,11 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{oneshot, watch, Mutex, Notify};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, Notify};
 
+pub mod chat;
 mod config;
 mod events;
 mod lifecycle;
@@ -31,6 +33,7 @@ mod user_input;
 #[cfg(feature = "agent")]
 pub use self::user_input::UserInputCoordinator;
 
+pub use self::chat::*;
 pub use self::config::AgentConfig;
 #[cfg(test)]
 use self::types::drain_queue;
@@ -106,6 +109,9 @@ pub struct AgentRuntime {
     last_error: Arc<Mutex<Option<String>>>,
     snapshot_tx: watch::Sender<AgentSnapshot>,
     snapshot_rx: watch::Receiver<AgentSnapshot>,
+    chat_projector: Arc<StdMutex<ChatProjector>>,
+    runtime_event_tx: broadcast::Sender<AgentRuntimeEvent>,
+    runtime_event_store: Arc<dyn AgentRuntimeEventStore>,
     /// Persistent session usage ledger. Accumulates across runs, cleared on reset.
     session_usage: Arc<Mutex<Usage>>,
     #[cfg(feature = "agent")]
@@ -124,6 +130,14 @@ impl AgentRuntime {
         let system_prompt = Arc::new(Mutex::new(config.system_prompt.clone()));
         let tools = Arc::new(Mutex::new(config.tools.clone()));
         let dynamic_tool_providers = Arc::new(Mutex::new(config.dynamic_tool_providers.clone()));
+        let replay_capacity = normalized_replay_capacity(config.chat.replay_capacity);
+        let runtime_event_store = config.chat.event_store.clone().unwrap_or_else(|| {
+            Arc::new(InMemoryAgentRuntimeEventStore::with_replay_capacity(
+                replay_capacity,
+            ))
+        });
+        let (runtime_event_tx, _) = broadcast::channel(replay_capacity.get());
+        let chat_projector = Arc::new(StdMutex::new(ChatProjector::new(config.chat.clone())));
         let (state_tx, state_rx) = watch::channel(AgentState::Idle);
         let initial_snapshot = AgentSnapshot {
             state: AgentState::Idle,
@@ -160,6 +174,9 @@ impl AgentRuntime {
             last_error: Arc::new(Mutex::new(None)),
             snapshot_tx,
             snapshot_rx,
+            chat_projector,
+            runtime_event_tx,
+            runtime_event_store,
             session_usage: Arc::new(Mutex::new(Usage::default())),
             #[cfg(feature = "agent")]
             user_input_coordinator,
@@ -177,6 +194,12 @@ impl AgentRuntime {
     ) -> Result<(), crate::tools::UnknownUserInputRequest> {
         self.user_input_coordinator.submit_response(response).await
     }
+}
+
+fn normalized_replay_capacity(replay_capacity: usize) -> NonZeroUsize {
+    NonZeroUsize::new(replay_capacity)
+        .or_else(|| NonZeroUsize::new(ChatRuntimeConfig::default().replay_capacity))
+        .expect("default chat replay capacity is non-zero")
 }
 
 #[cfg(test)]

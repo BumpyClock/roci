@@ -139,6 +139,7 @@ pub(super) fn test_agent_config() -> AgentConfig {
         post_tool_use: None,
         user_input_timeout_ms: None,
         context_budget: None,
+        chat: Default::default(),
         #[cfg(feature = "agent")]
         user_input_coordinator: None,
     }

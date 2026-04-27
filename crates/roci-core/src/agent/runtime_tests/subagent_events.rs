@@ -154,6 +154,7 @@ async fn submit_user_input_unknown_request_returns_error() {
         user_input_timeout_ms: None,
         user_input_coordinator: None,
         context_budget: None,
+        chat: Default::default(),
     };
 
     let supervisor = SubagentSupervisor::new(

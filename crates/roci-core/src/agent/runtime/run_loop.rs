@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::types::drain_queue;
-use super::AgentRuntime;
+use super::{AgentRuntime, AgentRuntimeError, TurnId, TurnStatus};
 use crate::agent_loop::runner::{
     AutoCompactionConfig, BeforeAgentStartHookPayload, BeforeAgentStartHookResult,
     CompactionHandler, FollowUpMessagesFn, RunHooks, SteeringMessagesFn,
@@ -15,6 +15,67 @@ use crate::tools::tool::Tool;
 use crate::types::ModelMessage;
 
 impl AgentRuntime {
+    fn complete_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
+        self.terminal_chat_turn(turn_id, TurnStatus::Completed, None)
+    }
+
+    fn fail_chat_turn(&self, turn_id: TurnId, error: String) -> Result<(), RociError> {
+        self.terminal_chat_turn(turn_id, TurnStatus::Failed, Some(error))
+    }
+
+    fn cancel_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
+        self.terminal_chat_turn(turn_id, TurnStatus::Canceled, None)
+    }
+
+    fn terminal_chat_turn(
+        &self,
+        turn_id: TurnId,
+        status: TurnStatus,
+        error: Option<String>,
+    ) -> Result<(), RociError> {
+        let event = {
+            let mut projector = self
+                .chat_projector
+                .lock()
+                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
+            match status {
+                TurnStatus::Completed => projector.complete_turn(turn_id),
+                TurnStatus::Failed => projector.fail_turn(
+                    turn_id,
+                    error.expect("failed terminal projection carries error"),
+                ),
+                TurnStatus::Canceled => projector.cancel_turn(turn_id),
+                TurnStatus::Queued | TurnStatus::Running => {
+                    Err(AgentRuntimeError::ProjectionFailed {
+                        message: format!("non-terminal status requested: {status:?}"),
+                    })
+                }
+            }
+        };
+
+        let event = match event {
+            Ok(event) => event,
+            Err(AgentRuntimeError::AlreadyTerminal {
+                status: terminal_status,
+                ..
+            }) if terminal_status == status => return Ok(()),
+            Err(err) => return Err(Self::map_chat_projection_error(err)),
+        };
+
+        self.publish_runtime_event(event)
+            .map(|_| ())
+            .map_err(Self::map_chat_projection_error)
+    }
+
+    fn chat_turn_status(&self, turn_id: TurnId) -> Result<TurnStatus, RociError> {
+        self.chat_projector
+            .lock()
+            .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
+            .turn_snapshot(turn_id)
+            .map(|turn| turn.status)
+            .map_err(Self::map_chat_projection_error)
+    }
+
     pub(super) async fn resolve_tools_for_run(&self) -> Result<Vec<Arc<dyn Tool>>, RociError> {
         let static_tools = self.tools.lock().await.clone();
         let providers = self.dynamic_tool_providers.lock().await.clone();
@@ -42,6 +103,7 @@ impl AgentRuntime {
     pub(super) async fn run_loop(
         &self,
         initial_messages: Vec<ModelMessage>,
+        turn_id: TurnId,
     ) -> Result<RunResult, RociError> {
         *self.is_streaming.lock().await = true;
         *self.last_error.lock().await = None;
@@ -71,7 +133,14 @@ impl AgentRuntime {
             })
         };
 
-        let intercepting_sink = self.build_intercepting_sink();
+        let (intercepting_sink, chat_projection_error) =
+            self.build_intercepting_sink(turn_id, initial_messages.len());
+
+        if self.chat_turn_status(turn_id)? == TurnStatus::Canceled {
+            *self.is_streaming.lock().await = false;
+            self.restore_idle_after_preflight_error().await;
+            return Ok(RunResult::canceled_with_messages(initial_messages));
+        }
 
         #[cfg(feature = "agent")]
         let user_input_callback = {
@@ -99,7 +168,9 @@ impl AgentRuntime {
         let tools = match self.resolve_tools_for_run().await {
             Ok(tools) => tools,
             Err(err) => {
+                let projection_result = self.fail_chat_turn(turn_id, err.to_string());
                 self.restore_idle_after_preflight_error().await;
+                projection_result?;
                 return Err(err);
             }
         };
@@ -140,11 +211,15 @@ impl AgentRuntime {
                     request.messages = messages;
                 }
                 Ok(BeforeAgentStartHookResult::Cancel { .. }) => {
+                    let projection_result = self.cancel_chat_turn(turn_id);
                     self.restore_idle_after_preflight_error().await;
+                    projection_result?;
                     return Ok(RunResult::canceled_with_messages(request.messages.clone()));
                 }
                 Err(err) => {
+                    let projection_result = self.fail_chat_turn(turn_id, err.to_string());
                     self.restore_idle_after_preflight_error().await;
+                    projection_result?;
                     return Err(RociError::InvalidState(format!(
                         "before_agent_start hook failed: {err}"
                     )));
@@ -221,6 +296,12 @@ impl AgentRuntime {
             request = request.with_provider_payload_callback(callback.clone());
         }
 
+        if self.chat_turn_status(turn_id)? == TurnStatus::Canceled {
+            *self.is_streaming.lock().await = false;
+            self.restore_idle_after_preflight_error().await;
+            return Ok(RunResult::canceled_with_messages(request.messages.clone()));
+        }
+
         let run_result = async {
             let provider_has_config_key = self
                 .roci_config
@@ -233,9 +314,16 @@ impl AgentRuntime {
                 }
             }
 
+            if self.chat_turn_status(turn_id)? == TurnStatus::Canceled {
+                return Ok(RunResult::canceled_with_messages(request.messages.clone()));
+            }
+
             let mut handle: RunHandle = self.runner.start(request).await?;
             let abort_tx = handle.take_abort_sender();
             *self.active_abort_tx.lock().await = abort_tx;
+            if self.chat_turn_status(turn_id)? == TurnStatus::Canceled {
+                self.abort_active_provider_call().await;
+            }
 
             Ok::<RunResult, RociError>(handle.wait().await)
         }
@@ -243,6 +331,22 @@ impl AgentRuntime {
 
         self.active_abort_tx.lock().await.take();
         *self.is_streaming.lock().await = false;
+
+        let projection_result = match &run_result {
+            Ok(result) => match result.status {
+                RunStatus::Completed => self.complete_chat_turn(turn_id),
+                RunStatus::Failed => self.fail_chat_turn(
+                    turn_id,
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "run failed".to_string()),
+                ),
+                RunStatus::Canceled => self.cancel_chat_turn(turn_id),
+                RunStatus::Running => Ok(()),
+            },
+            Err(err) => self.fail_chat_turn(turn_id, err.to_string()),
+        };
 
         match &run_result {
             Ok(result) => {
@@ -269,6 +373,20 @@ impl AgentRuntime {
         self.broadcast_snapshot().await;
         self.idle_notify.notify_waiters();
 
+        projection_result?;
+        if let Some(err) = chat_projection_error
+            .lock()
+            .map_err(|_| RociError::InvalidState("chat projection lock poisoned".into()))?
+            .take()
+        {
+            match err {
+                AgentRuntimeError::AlreadyTerminal {
+                    turn_id: terminal_turn_id,
+                    status: TurnStatus::Canceled,
+                } if terminal_turn_id == turn_id => {}
+                err => return Err(Self::map_chat_projection_error(err)),
+            }
+        }
         run_result
     }
 }

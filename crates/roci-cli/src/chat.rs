@@ -124,6 +124,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             })),
             user_input_timeout_ms: None,
             context_budget: None,
+            chat: Default::default(),
             user_input_coordinator: Some(coordinator.clone()),
         },
     );

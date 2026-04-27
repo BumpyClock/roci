@@ -138,6 +138,7 @@ fn build_child_config(
         post_tool_use: None,
         user_input_timeout_ms: None,
         context_budget: None,
+        chat: Default::default(),
     }
 }
 

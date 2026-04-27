@@ -66,6 +66,15 @@ impl AgentRuntime {
         let mut existing_messages = self.messages.try_lock().map_err(|_| {
             RociError::InvalidState("Agent is busy (messages lock contended)".into())
         })?;
+        let snapshot = self
+            .chat_projector
+            .lock()
+            .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
+            .bootstrap_thread(messages.clone())
+            .map_err(Self::map_chat_projection_error)?;
+        self.runtime_event_store
+            .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
+            .map_err(Self::map_chat_projection_error)?;
         *existing_messages = messages;
         drop(existing_messages);
         drop(state_guard);

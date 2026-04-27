@@ -118,6 +118,7 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 #### Agent runtime subsystem (`agent` feature)
 
 - `AgentRuntime` is the high-level stateful API (prompt/continue/follow-up/steer/reset/abort, snapshots/watchers).
+- See [Agent runtime chat semantics](agent-runtime-chat.md) for projected snapshots/events, cursor replay, and cancellation contracts.
 - Runtime module layout:
   - `crates/roci-core/src/agent/runtime.rs` is the runtime module root/wiring layer.
   - `crates/roci-core/src/agent/runtime/{types,config,state,lifecycle,mutations,run_loop,events,summary}.rs` contains runtime internals by concern.

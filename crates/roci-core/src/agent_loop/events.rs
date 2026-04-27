@@ -88,7 +88,7 @@ pub struct RunEvent {
 // ---------------------------------------------------------------------------
 
 /// Partial result emitted during tool execution via the `on_update` callback.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolUpdatePayload {
     /// Content parts (text, images) produced so far.
     pub content: Vec<ContentPart>,

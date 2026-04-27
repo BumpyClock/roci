@@ -13,6 +13,7 @@ use crate::tools::dynamic::DynamicToolProvider;
 use crate::tools::tool::Tool;
 use crate::types::GenerationSettings;
 
+use super::chat::ChatRuntimeConfig;
 use super::types::{GetApiKeyFn, QueueDrainMode, SessionBeforeCompactHook, SessionBeforeTreeHook};
 
 /// Configuration for creating an [`super::AgentRuntime`].
@@ -95,6 +96,8 @@ pub struct AgentConfig {
     /// checked against per-turn and cumulative session limits before
     /// streaming begins.
     pub context_budget: Option<ContextBudget>,
+    /// Chat runtime contract and event configuration.
+    pub chat: ChatRuntimeConfig,
     /// Optional shared coordinator for user input requests.
     ///
     /// When provided, the runtime uses this coordinator instead of creating
@@ -102,4 +105,44 @@ pub struct AgentConfig {
     /// responses directly.
     #[cfg(feature = "agent")]
     pub user_input_coordinator: Option<std::sync::Arc<super::UserInputCoordinator>>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            model: LanguageModel::Known {
+                provider_key: "openai".to_string(),
+                model_id: "gpt-4o".to_string(),
+            },
+            system_prompt: None,
+            tools: Vec::new(),
+            dynamic_tool_providers: Vec::new(),
+            settings: GenerationSettings::default(),
+            transform_context: None,
+            convert_to_llm: None,
+            before_agent_start: None,
+            event_sink: None,
+            session_id: None,
+            steering_mode: QueueDrainMode::All,
+            follow_up_mode: QueueDrainMode::All,
+            transport: None,
+            max_retry_delay_ms: None,
+            retry_backoff: RetryBackoffPolicy::default(),
+            api_key_override: None,
+            provider_headers: reqwest::header::HeaderMap::new(),
+            provider_metadata: HashMap::new(),
+            provider_payload_callback: None,
+            get_api_key: None,
+            compaction: CompactionSettings::default(),
+            session_before_compact: None,
+            session_before_tree: None,
+            pre_tool_use: None,
+            post_tool_use: None,
+            user_input_timeout_ms: None,
+            context_budget: None,
+            chat: ChatRuntimeConfig::default(),
+            #[cfg(feature = "agent")]
+            user_input_coordinator: None,
+        }
+    }
 }

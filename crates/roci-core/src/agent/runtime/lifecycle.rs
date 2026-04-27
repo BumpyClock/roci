@@ -1,9 +1,24 @@
-use super::{AgentRuntime, AgentState};
+use super::{
+    AgentRuntime, AgentRuntimeError, AgentRuntimeEventPayload, AgentState, TurnId, TurnSnapshot,
+    TurnStatus,
+};
 use crate::agent_loop::RunResult;
 use crate::error::RociError;
 use crate::types::{ModelMessage, Role, Usage};
 
 impl AgentRuntime {
+    fn queue_chat_turn(&self, messages: Vec<ModelMessage>) -> Result<TurnId, RociError> {
+        let projection = self
+            .chat_projector
+            .lock()
+            .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
+            .queue_turn(messages);
+        let turn_id = projection.turn_id;
+        self.publish_runtime_events(projection.events)
+            .map_err(Self::map_chat_projection_error)?;
+        Ok(turn_id)
+    }
+
     /// Start a new conversation with a user prompt.
     ///
     /// If the message history is empty and a system prompt is configured,
@@ -18,16 +33,28 @@ impl AgentRuntime {
         let text = text.into();
         let system_prompt = self.system_prompt.lock().await.clone();
         let mut msgs = self.messages.lock().await;
+        let mut turn_messages = Vec::new();
         if let Some(ref sys) = system_prompt {
             if msgs.is_empty() {
-                msgs.push(ModelMessage::system(sys.clone()));
+                let system_message = ModelMessage::system(sys.clone());
+                msgs.push(system_message.clone());
+                turn_messages.push(system_message);
             }
         }
-        msgs.push(ModelMessage::user(text));
+        let user_message = ModelMessage::user(text);
+        msgs.push(user_message.clone());
+        turn_messages.push(user_message);
         let snapshot = msgs.clone();
         drop(msgs);
 
-        self.run_loop(snapshot).await
+        let turn_id = match self.queue_chat_turn(turn_messages) {
+            Ok(turn_id) => turn_id,
+            Err(err) => {
+                self.restore_idle_after_preflight_error().await;
+                return Err(err);
+            }
+        };
+        self.run_loop(snapshot, turn_id).await
     }
 
     /// Continue the conversation with additional user input.
@@ -43,11 +70,19 @@ impl AgentRuntime {
 
         let text = text.into();
         let mut msgs = self.messages.lock().await;
-        msgs.push(ModelMessage::user(text));
+        let user_message = ModelMessage::user(text);
+        msgs.push(user_message.clone());
         let snapshot = msgs.clone();
         drop(msgs);
 
-        self.run_loop(snapshot).await
+        let turn_id = match self.queue_chat_turn(vec![user_message]) {
+            Ok(turn_id) => turn_id,
+            Err(err) => {
+                self.restore_idle_after_preflight_error().await;
+                return Err(err);
+            }
+        };
+        self.run_loop(snapshot, turn_id).await
     }
 
     /// Continue the conversation without appending a new user message.
@@ -83,7 +118,14 @@ impl AgentRuntime {
             }
         }
 
-        self.run_loop(snapshot).await
+        let turn_id = match self.queue_chat_turn(Vec::new()) {
+            Ok(turn_id) => turn_id,
+            Err(err) => {
+                self.restore_idle_after_preflight_error().await;
+                return Err(err);
+            }
+        };
+        self.run_loop(snapshot, turn_id).await
     }
 
     /// Queue a steering message to interrupt the current tool execution.
@@ -114,6 +156,61 @@ impl AgentRuntime {
     /// Returns `true` if an abort signal was successfully sent, `false` if
     /// the agent was not running or the handle was already consumed.
     pub async fn abort(&self) -> bool {
+        let active_turn_id = self.chat_projector.lock().ok().and_then(|projector| {
+            projector
+                .read_thread(projector.default_thread_id())
+                .ok()
+                .and_then(|thread| thread.active_turn_id)
+        });
+
+        if let Some(turn_id) = active_turn_id {
+            if self.cancel_turn(turn_id).await.is_ok() {
+                return true;
+            }
+        }
+
+        self.abort_legacy().await
+    }
+
+    /// Cancel a semantic chat turn and abort the active provider call when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentRuntimeError::AlreadyTerminal`] for completed, failed, or
+    /// canceled turns. Returns [`AgentRuntimeError::StaleRuntime`] when the
+    /// turn id revision no longer matches the current thread revision.
+    pub async fn cancel_turn(&self, turn_id: TurnId) -> Result<TurnSnapshot, AgentRuntimeError> {
+        let (previous_status, event, canceled) = {
+            let mut projector =
+                self.chat_projector
+                    .lock()
+                    .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                        message: "chat projector lock poisoned".into(),
+                    })?;
+            let previous = projector.turn_snapshot(turn_id)?;
+            let event = projector.cancel_turn(turn_id)?;
+            let canceled = match &event.payload {
+                AgentRuntimeEventPayload::TurnCanceled { turn } => turn.clone(),
+                _ => {
+                    return Err(AgentRuntimeError::ProjectionFailed {
+                        message: format!("cancel projection emitted non-cancel event: {turn_id}"),
+                    });
+                }
+            };
+            (previous.status, event, canceled)
+        };
+
+        let abort_sent = self.abort_active_provider_call().await;
+        if abort_sent || previous_status == TurnStatus::Running {
+            self.transition_running_to_aborting().await;
+        }
+
+        self.publish_runtime_event(event)?;
+
+        Ok(canceled)
+    }
+
+    async fn abort_legacy(&self) -> bool {
         let mut state = self.state.lock().await;
         if *state != AgentState::Running {
             return false;
@@ -131,6 +228,21 @@ impl AgentRuntime {
         }
     }
 
+    pub(super) async fn abort_active_provider_call(&self) -> bool {
+        let mut abort_tx = self.active_abort_tx.lock().await;
+        abort_tx.take().is_some_and(|tx| tx.send(()).is_ok())
+    }
+
+    async fn transition_running_to_aborting(&self) {
+        let mut state = self.state.lock().await;
+        if *state == AgentState::Running {
+            *state = AgentState::Aborting;
+            let _ = self.state_tx.send(AgentState::Aborting);
+        }
+        drop(state);
+        self.broadcast_snapshot().await;
+    }
+
     /// Reset the agent: abort any in-flight run, then clear messages and queues.
     pub async fn reset(&self) {
         self.abort().await;
@@ -146,6 +258,18 @@ impl AgentRuntime {
         *self.is_streaming.lock().await = false;
         *self.last_error.lock().await = None;
         *self.session_usage.lock().await = Usage::default();
+        let snapshot = self
+            .chat_projector
+            .lock()
+            .expect("chat projector mutex poisoned")
+            .bootstrap_thread(Vec::new())
+            .expect("empty chat bootstrap cannot fail");
+        if let Err(err) = self
+            .runtime_event_store
+            .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
+        {
+            *self.last_error.lock().await = Some(err.to_string());
+        }
 
         let mut state = self.state.lock().await;
         *state = AgentState::Idle;

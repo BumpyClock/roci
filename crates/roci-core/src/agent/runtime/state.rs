@@ -1,6 +1,11 @@
-use tokio::sync::{watch, MutexGuard};
+use std::sync::Arc;
 
-use super::{AgentRuntime, AgentSnapshot, AgentState};
+use tokio::sync::{broadcast, watch, MutexGuard};
+
+use super::{
+    AgentRuntime, AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventStore, AgentSnapshot,
+    AgentState, RuntimeCursor, RuntimeSnapshot, RuntimeSubscription, ThreadId, ThreadSnapshot,
+};
 use crate::error::RociError;
 use crate::types::{ModelMessage, Usage};
 
@@ -54,10 +59,74 @@ impl AgentRuntime {
         self.snapshot_rx.clone()
     }
 
+    /// Subscribe to semantic runtime events.
+    ///
+    /// `cursor = None` returns only live events. `Some(cursor)` returns retained
+    /// replay events through [`RuntimeSubscription::replay`] and then live events
+    /// through [`RuntimeSubscription::recv`].
+    pub fn subscribe(&self, cursor: Option<RuntimeCursor>) -> RuntimeSubscription {
+        let live_rx = self.runtime_event_tx.subscribe();
+        let replay = cursor.map_or_else(
+            || Ok(Vec::new()),
+            |cursor| self.runtime_event_store.events_after(cursor),
+        );
+        RuntimeSubscription::new(replay, live_rx, cursor)
+    }
+
+    /// Read the runtime-owned chat projection snapshot.
+    pub async fn read_snapshot(&self) -> RuntimeSnapshot {
+        self.chat_projector
+            .lock()
+            .expect("chat projector mutex poisoned")
+            .read_snapshot()
+    }
+
+    /// Read one runtime-owned chat thread projection snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentRuntimeError::ThreadNotFound`] when `thread_id` is not known.
+    pub async fn read_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<ThreadSnapshot, AgentRuntimeError> {
+        self.chat_projector
+            .lock()
+            .expect("chat projector mutex poisoned")
+            .read_thread(thread_id)
+    }
+
     /// Broadcast the current snapshot to all watchers.
     pub(super) async fn broadcast_snapshot(&self) {
         let snapshot = self.snapshot().await;
         let _ = self.snapshot_tx.send(snapshot);
+    }
+
+    pub(super) fn publish_runtime_events(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<(), AgentRuntimeError> {
+        for event in events {
+            self.publish_runtime_event(event)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn publish_runtime_event(
+        &self,
+        event: AgentRuntimeEvent,
+    ) -> Result<RuntimeCursor, AgentRuntimeError> {
+        Self::publish_runtime_event_to(&self.runtime_event_store, &self.runtime_event_tx, event)
+    }
+
+    pub(super) fn publish_runtime_event_to(
+        event_store: &Arc<dyn AgentRuntimeEventStore>,
+        event_tx: &broadcast::Sender<AgentRuntimeEvent>,
+        event: AgentRuntimeEvent,
+    ) -> Result<RuntimeCursor, AgentRuntimeError> {
+        let cursor = event_store.append(event.clone())?;
+        let _ = event_tx.send(event);
+        Ok(cursor)
     }
 
     /// Atomically transition from Idle → Running.
@@ -104,5 +173,9 @@ impl AgentRuntime {
         drop(state);
         self.broadcast_snapshot().await;
         self.idle_notify.notify_waiters();
+    }
+
+    pub(super) fn map_chat_projection_error(err: AgentRuntimeError) -> RociError {
+        RociError::InvalidState(format!("chat projection failed: {err}"))
     }
 }
