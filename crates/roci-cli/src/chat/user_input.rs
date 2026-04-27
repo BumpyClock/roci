@@ -84,11 +84,10 @@ impl PromptHost {
 
     pub(crate) fn build_agent_sink(&self) -> Arc<dyn Fn(AgentEvent) + Send + Sync> {
         let command_tx = self.command_tx.clone();
-        Arc::new(move |event: AgentEvent| match event {
-            AgentEvent::UserInputRequested { request } => {
+        Arc::new(move |event: AgentEvent| {
+            if let AgentEvent::UserInputRequested { request } = event {
                 let _ = command_tx.send(PromptCommand::Request(request));
             }
-            other => super::render_agent_event(other),
         })
     }
 
@@ -454,6 +453,45 @@ mod tests {
             result,
             Err(UserInputError::InteractivePromptUnavailable { .. })
         ));
+
+        host.shutdown();
+    }
+
+    #[tokio::test]
+    async fn raw_agent_sink_only_forwards_user_input_requests() {
+        let coordinator = Arc::new(UserInputCoordinator::new());
+        let request = test_request();
+        let pending = coordinator.create_request(request.clone()).await.unwrap();
+        let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host = PromptHost::spawn_with_prompt_fn(
+            coordinator.clone(),
+            Arc::new({
+                let prompt_calls = prompt_calls.clone();
+                move |request, _, _, _| {
+                    prompt_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(Some(UserInputResponse {
+                        request_id: request.request_id,
+                        answers: vec![Answer {
+                            question_id: "q1".to_string(),
+                            content: "yes".to_string(),
+                        }],
+                        canceled: false,
+                    }))
+                }
+            }),
+        );
+
+        let sink = host.build_agent_sink();
+        sink(AgentEvent::MessageStart {
+            message: roci::types::ModelMessage::assistant("ignore"),
+        });
+        sink(AgentEvent::UserInputRequested {
+            request: request.clone(),
+        });
+
+        let response = pending.wait(Some(100)).await.unwrap();
+        assert_eq!(response.request_id, request.request_id);
+        assert_eq!(prompt_calls.load(Ordering::Relaxed), 1);
 
         host.shutdown();
     }

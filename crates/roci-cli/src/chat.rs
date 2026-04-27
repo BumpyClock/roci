@@ -2,23 +2,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use roci::agent::{AgentConfig, AgentRuntime, QueueDrainMode, UserInputCoordinator};
-use roci::agent_loop::{AgentEvent, PreToolUseHookResult, RunStatus};
+use roci::agent_loop::{PreToolUseHookResult, RunStatus};
 use roci::config::RociConfig;
 use roci::mcp::{merge_mcp_instructions, MCPInstructionMergePolicy};
 use roci::resource::SkillResourceOptions;
 use roci::skills::merge_system_prompt_with_skills;
-use roci::types::{ContentPart, StreamEventType};
 
 use crate::cli::ChatArgs;
 
 mod mcp;
 mod resource_prompt;
+mod runtime_events;
 mod user_input;
 
 use mcp::build_mcp_runtime_wiring;
 use resource_prompt::{
-    build_resource_system_prompt, expand_chat_prompt, print_resource_diagnostics, truncate_preview,
+    build_resource_system_prompt, expand_chat_prompt, print_resource_diagnostics,
 };
+use runtime_events::RuntimeEventRenderer;
 use user_input::PromptHost;
 
 pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -129,7 +130,10 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         },
     );
 
+    let renderer = RuntimeEventRenderer::spawn(agent.subscribe(None));
+
     let result = agent.prompt(prompt).await;
+    renderer.finish().await;
     prompt_host.shutdown();
     let result = result?;
     println!();
@@ -141,66 +145,6 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
-}
-
-fn render_agent_event(event: AgentEvent) {
-    use std::io::Write;
-
-    match event {
-        AgentEvent::MessageUpdate {
-            assistant_message_event,
-            ..
-        } => match assistant_message_event.event_type {
-            StreamEventType::TextDelta => {
-                if !assistant_message_event.text.is_empty() {
-                    print!("{}", assistant_message_event.text);
-                    let _ = std::io::stdout().flush();
-                }
-            }
-            StreamEventType::Reasoning => {
-                if let Some(reasoning) = assistant_message_event.reasoning {
-                    if !reasoning.is_empty() {
-                        eprintln!("\n💭 {}", truncate_preview(&reasoning, 120));
-                    }
-                }
-            }
-            _ => {}
-        },
-        AgentEvent::ToolExecutionStart {
-            tool_name,
-            tool_call_id,
-            ..
-        } => {
-            eprintln!("\n⚡ {tool_name} ({tool_call_id})");
-        }
-        AgentEvent::ToolExecutionUpdate {
-            tool_name,
-            partial_result,
-            ..
-        } => {
-            let preview = if let Some(text) = partial_result.content.iter().find_map(|part| {
-                if let ContentPart::Text { text } = part {
-                    Some(text.as_str())
-                } else {
-                    None
-                }
-            }) {
-                truncate_preview(text, 80)
-            } else {
-                truncate_preview(&partial_result.details.to_string(), 80)
-            };
-            eprintln!("  … {tool_name}: {preview}");
-        }
-        AgentEvent::ToolExecutionEnd { result, .. } => {
-            let preview = truncate_preview(&result.result.to_string(), 200);
-            if result.is_error {
-                eprintln!("  ❌ {preview}");
-            } else {
-                eprintln!("  ✅ {preview}");
-            }
-        }
-        _ => {}
-    }
 }
 
 fn demo_pre_tool_use_hook(tool_name: &str, tool_call_id: &str) {
