@@ -170,7 +170,7 @@ async fn cancel_turn_from_reset_history_returns_stale_runtime() {
 #[tokio::test]
 async fn cancel_running_turn_emits_event_and_marks_thread_canceled() {
     let agent = runtime_with_blocking_provider();
-    let mut sub = agent.subscribe(None);
+    let mut sub = agent.subscribe(None).await;
 
     let prompt_agent = Arc::clone(&agent);
     let prompt_task = tokio::spawn(async move { prompt_agent.prompt("block").await });
@@ -205,7 +205,7 @@ async fn cancel_running_turn_emits_event_and_marks_thread_canceled() {
 #[tokio::test]
 async fn abort_running_turn_emits_event_and_marks_thread_canceled() {
     let agent = runtime_with_blocking_provider();
-    let mut sub = agent.subscribe(None);
+    let mut sub = agent.subscribe(None).await;
 
     let prompt_agent = Arc::clone(&agent);
     let prompt_task = tokio::spawn(async move { prompt_agent.prompt("block").await });

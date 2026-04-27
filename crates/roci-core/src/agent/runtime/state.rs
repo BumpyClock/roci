@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
-use tokio::sync::{broadcast, watch, MutexGuard};
+use tokio::sync::{watch, MutexGuard};
 
 use super::{
-    AgentRuntime, AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventStore, AgentSnapshot,
-    AgentState, RuntimeCursor, RuntimeSnapshot, RuntimeSubscription, ThreadId, ThreadSnapshot,
+    AgentRuntime, AgentRuntimeError, AgentRuntimeEvent, AgentSnapshot, AgentState, RuntimeCursor,
+    RuntimeEventPublishRequest, RuntimeSnapshot, RuntimeSubscription, ThreadId, ThreadSnapshot,
 };
 use crate::error::RociError;
 use crate::types::{ModelMessage, Usage};
@@ -64,12 +62,13 @@ impl AgentRuntime {
     /// `cursor = None` returns only live events. `Some(cursor)` returns retained
     /// replay events through [`RuntimeSubscription::replay`] and then live events
     /// through [`RuntimeSubscription::recv`].
-    pub fn subscribe(&self, cursor: Option<RuntimeCursor>) -> RuntimeSubscription {
+    pub async fn subscribe(&self, cursor: Option<RuntimeCursor>) -> RuntimeSubscription {
         let live_rx = self.runtime_event_tx.subscribe();
-        let replay = cursor.map_or_else(
-            || Ok(Vec::new()),
-            |cursor| self.runtime_event_store.events_after(cursor),
-        );
+        let replay = if let Some(cursor) = cursor {
+            self.runtime_event_store.events_after(cursor).await
+        } else {
+            Ok(Vec::new())
+        };
         RuntimeSubscription::new(replay, live_rx, cursor)
     }
 
@@ -102,31 +101,55 @@ impl AgentRuntime {
         let _ = self.snapshot_tx.send(snapshot);
     }
 
-    pub(super) fn publish_runtime_events(
+    pub(super) async fn publish_runtime_events(
         &self,
         events: Vec<AgentRuntimeEvent>,
     ) -> Result<(), AgentRuntimeError> {
         for event in events {
-            self.publish_runtime_event(event)?;
+            self.publish_runtime_event(event).await?;
         }
         Ok(())
     }
 
-    pub(super) fn publish_runtime_event(
+    pub(super) async fn publish_runtime_event(
         &self,
         event: AgentRuntimeEvent,
     ) -> Result<RuntimeCursor, AgentRuntimeError> {
-        Self::publish_runtime_event_to(&self.runtime_event_store, &self.runtime_event_tx, event)
+        Self::publish_runtime_event_to(&self.runtime_event_publish_tx, event).await
     }
 
-    pub(super) fn publish_runtime_event_to(
-        event_store: &Arc<dyn AgentRuntimeEventStore>,
-        event_tx: &broadcast::Sender<AgentRuntimeEvent>,
+    pub(super) async fn publish_runtime_event_to(
+        publish_tx: &tokio::sync::mpsc::UnboundedSender<RuntimeEventPublishRequest>,
         event: AgentRuntimeEvent,
     ) -> Result<RuntimeCursor, AgentRuntimeError> {
-        let cursor = event_store.append(event.clone())?;
-        let _ = event_tx.send(event);
-        Ok(cursor)
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        publish_tx
+            .send(RuntimeEventPublishRequest {
+                event,
+                ack_tx: Some(ack_tx),
+            })
+            .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                message: "runtime event publisher closed".to_string(),
+            })?;
+        ack_rx
+            .await
+            .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                message: "runtime event publisher dropped acknowledgement".to_string(),
+            })?
+    }
+
+    pub(super) fn queue_runtime_event_to(
+        publish_tx: &tokio::sync::mpsc::UnboundedSender<RuntimeEventPublishRequest>,
+        event: AgentRuntimeEvent,
+    ) -> Result<(), AgentRuntimeError> {
+        publish_tx
+            .send(RuntimeEventPublishRequest {
+                event,
+                ack_tx: None,
+            })
+            .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                message: "runtime event publisher closed".to_string(),
+            })
     }
 
     /// Atomically transition from Idle → Running.

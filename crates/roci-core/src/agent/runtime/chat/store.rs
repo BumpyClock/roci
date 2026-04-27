@@ -2,23 +2,26 @@ use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
+use async_trait::async_trait;
+
 use super::domain::ThreadId;
 use super::error::AgentRuntimeError;
 use super::event::{AgentRuntimeEvent, RuntimeCursor};
 
-/// Sync storage contract for semantic [`AgentRuntimeEvent`] replay.
+/// Async storage contract for semantic [`AgentRuntimeEvent`] replay.
+#[async_trait]
 pub trait AgentRuntimeEventStore: Send + Sync {
     /// Append one semantic runtime event.
-    fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError>;
+    async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError>;
 
     /// Return retained events for `cursor.thread_id` with `seq > cursor.seq`.
-    fn events_after(
+    async fn events_after(
         &self,
         cursor: RuntimeCursor,
     ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError>;
 
     /// Invalidate retained replay for a thread after an out-of-band snapshot rewrite.
-    fn invalidate_thread(
+    async fn invalidate_thread(
         &self,
         thread_id: ThreadId,
         latest_seq: u64,
@@ -54,8 +57,9 @@ impl InMemoryAgentRuntimeEventStore {
     }
 }
 
+#[async_trait]
 impl AgentRuntimeEventStore for InMemoryAgentRuntimeEventStore {
-    fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
+    async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
         let mut inner = self.lock_inner()?;
         let thread = inner.threads.entry(event.thread_id).or_default();
         if event.seq <= thread.latest_seq {
@@ -79,7 +83,7 @@ impl AgentRuntimeEventStore for InMemoryAgentRuntimeEventStore {
         Ok(cursor)
     }
 
-    fn events_after(
+    async fn events_after(
         &self,
         cursor: RuntimeCursor,
     ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
@@ -105,7 +109,7 @@ impl AgentRuntimeEventStore for InMemoryAgentRuntimeEventStore {
             .collect())
     }
 
-    fn invalidate_thread(
+    async fn invalidate_thread(
         &self,
         thread_id: ThreadId,
         latest_seq: u64,
@@ -184,19 +188,20 @@ mod tests {
         )
     }
 
-    #[test]
-    fn events_after_returns_events_after_cursor_for_same_thread() {
+    #[tokio::test]
+    async fn events_after_returns_events_after_cursor_for_same_thread() {
         let store = InMemoryAgentRuntimeEventStore::new();
         let thread_id = ThreadId::new();
         let other_thread_id = ThreadId::new();
 
-        store.append(test_event(thread_id, 1)).unwrap();
-        store.append(test_event(other_thread_id, 1)).unwrap();
-        store.append(test_event(thread_id, 2)).unwrap();
-        store.append(test_event(thread_id, 3)).unwrap();
+        store.append(test_event(thread_id, 1)).await.unwrap();
+        store.append(test_event(other_thread_id, 1)).await.unwrap();
+        store.append(test_event(thread_id, 2)).await.unwrap();
+        store.append(test_event(thread_id, 3)).await.unwrap();
 
         let events = store
             .events_after(RuntimeCursor::new(thread_id, 1))
+            .await
             .unwrap();
 
         assert_eq!(
@@ -206,17 +211,18 @@ mod tests {
         assert!(events.iter().all(|event| event.thread_id == thread_id));
     }
 
-    #[test]
-    fn append_returns_cursor_and_preserves_append_order() {
+    #[tokio::test]
+    async fn append_returns_cursor_and_preserves_append_order() {
         let store = InMemoryAgentRuntimeEventStore::new();
         let thread_id = ThreadId::new();
 
-        let cursor = store.append(test_event(thread_id, 1)).unwrap();
-        store.append(test_event(thread_id, 2)).unwrap();
-        store.append(test_event(thread_id, 3)).unwrap();
+        let cursor = store.append(test_event(thread_id, 1)).await.unwrap();
+        store.append(test_event(thread_id, 2)).await.unwrap();
+        store.append(test_event(thread_id, 3)).await.unwrap();
 
         let events = store
             .events_after(RuntimeCursor::new(thread_id, 0))
+            .await
             .unwrap();
 
         assert_eq!(cursor, RuntimeCursor::new(thread_id, 1));
@@ -226,21 +232,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bounded_store_evicts_old_events_and_reports_stale_cursors() {
+    #[tokio::test]
+    async fn bounded_store_evicts_old_events_and_reports_stale_cursors() {
         let store =
             InMemoryAgentRuntimeEventStore::with_replay_capacity(NonZeroUsize::new(2).unwrap());
         let thread_id = ThreadId::new();
 
-        store.append(test_event(thread_id, 1)).unwrap();
-        store.append(test_event(thread_id, 2)).unwrap();
-        store.append(test_event(thread_id, 3)).unwrap();
+        store.append(test_event(thread_id, 1)).await.unwrap();
+        store.append(test_event(thread_id, 2)).await.unwrap();
+        store.append(test_event(thread_id, 3)).await.unwrap();
 
         let events = store
             .events_after(RuntimeCursor::new(thread_id, 1))
+            .await
             .unwrap();
         let stale = store
             .events_after(RuntimeCursor::new(thread_id, 0))
+            .await
             .unwrap_err();
 
         assert_eq!(
@@ -258,28 +266,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn append_rejects_non_increasing_seq_per_thread() {
+    #[tokio::test]
+    async fn append_rejects_non_increasing_seq_per_thread() {
         let store = InMemoryAgentRuntimeEventStore::new();
         let thread_id = ThreadId::new();
 
-        store.append(test_event(thread_id, 2)).unwrap();
-        let err = store.append(test_event(thread_id, 2)).unwrap_err();
+        store.append(test_event(thread_id, 2)).await.unwrap();
+        let err = store.append(test_event(thread_id, 2)).await.unwrap_err();
 
         assert!(matches!(err, AgentRuntimeError::ProjectionFailed { .. }));
     }
 
-    #[test]
-    fn invalidate_thread_clears_replay_and_marks_old_cursors_stale() {
+    #[tokio::test]
+    async fn invalidate_thread_clears_replay_and_marks_old_cursors_stale() {
         let store = InMemoryAgentRuntimeEventStore::new();
         let thread_id = ThreadId::new();
 
-        store.append(test_event(thread_id, 1)).unwrap();
-        store.append(test_event(thread_id, 2)).unwrap();
-        store.invalidate_thread(thread_id, 3).unwrap();
+        store.append(test_event(thread_id, 1)).await.unwrap();
+        store.append(test_event(thread_id, 2)).await.unwrap();
+        store.invalidate_thread(thread_id, 3).await.unwrap();
 
         let err = store
             .events_after(RuntimeCursor::new(thread_id, 2))
+            .await
             .unwrap_err();
 
         assert_eq!(

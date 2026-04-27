@@ -132,7 +132,7 @@ async fn drive_runtime_subscription(
                 ..
             }) => {
                 let replay_cursor = RuntimeCursor::new(thread_id, latest_seq);
-                let replay_subscription = agent.subscribe(Some(replay_cursor));
+                let replay_subscription = agent.subscribe(Some(replay_cursor)).await;
                 if let Ok(events) = replay_subscription.replay() {
                     for event in events {
                         if command_tx
@@ -150,7 +150,7 @@ async fn drive_runtime_subscription(
                     break;
                 }
                 let snapshot = agent.read_snapshot().await;
-                subscription = agent.subscribe(latest_snapshot_cursor(&snapshot));
+                subscription = agent.subscribe(latest_snapshot_cursor(&snapshot)).await;
                 match subscription.replay() {
                     Ok(events) => {
                         for event in events {

@@ -74,6 +74,7 @@ impl AgentRuntime {
             .map_err(Self::map_chat_projection_error)?;
         self.runtime_event_store
             .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
+            .await
             .map_err(Self::map_chat_projection_error)?;
         *existing_messages = messages;
         drop(existing_messages);

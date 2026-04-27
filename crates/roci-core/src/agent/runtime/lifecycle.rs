@@ -7,7 +7,7 @@ use crate::error::RociError;
 use crate::types::{ModelMessage, Role, Usage};
 
 impl AgentRuntime {
-    fn queue_chat_turn(&self, messages: Vec<ModelMessage>) -> Result<TurnId, RociError> {
+    async fn queue_chat_turn(&self, messages: Vec<ModelMessage>) -> Result<TurnId, RociError> {
         let projection = self
             .chat_projector
             .lock()
@@ -15,6 +15,7 @@ impl AgentRuntime {
             .queue_turn(messages);
         let turn_id = projection.turn_id;
         self.publish_runtime_events(projection.events)
+            .await
             .map_err(Self::map_chat_projection_error)?;
         Ok(turn_id)
     }
@@ -47,7 +48,7 @@ impl AgentRuntime {
         let snapshot = msgs.clone();
         drop(msgs);
 
-        let turn_id = match self.queue_chat_turn(turn_messages) {
+        let turn_id = match self.queue_chat_turn(turn_messages).await {
             Ok(turn_id) => turn_id,
             Err(err) => {
                 self.restore_idle_after_preflight_error().await;
@@ -75,7 +76,7 @@ impl AgentRuntime {
         let snapshot = msgs.clone();
         drop(msgs);
 
-        let turn_id = match self.queue_chat_turn(vec![user_message]) {
+        let turn_id = match self.queue_chat_turn(vec![user_message]).await {
             Ok(turn_id) => turn_id,
             Err(err) => {
                 self.restore_idle_after_preflight_error().await;
@@ -118,7 +119,7 @@ impl AgentRuntime {
             }
         }
 
-        let turn_id = match self.queue_chat_turn(Vec::new()) {
+        let turn_id = match self.queue_chat_turn(Vec::new()).await {
             Ok(turn_id) => turn_id,
             Err(err) => {
                 self.restore_idle_after_preflight_error().await;
@@ -205,7 +206,7 @@ impl AgentRuntime {
             self.transition_running_to_aborting().await;
         }
 
-        self.publish_runtime_event(event)?;
+        self.publish_runtime_event(event).await?;
 
         Ok(canceled)
     }
@@ -267,6 +268,7 @@ impl AgentRuntime {
         if let Err(err) = self
             .runtime_event_store
             .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
+            .await
         {
             *self.last_error.lock().await = Some(err.to_string());
         }

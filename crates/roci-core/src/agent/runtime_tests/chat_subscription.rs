@@ -1,11 +1,15 @@
 use super::chat::{
-    AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, ChatRuntimeConfig,
-    RuntimeCursor, RuntimeSubscription,
+    AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, AgentRuntimeEventStore,
+    ChatRuntimeConfig, InMemoryAgentRuntimeEventStore, RuntimeCursor, RuntimeSubscription,
+    ThreadId,
 };
 use super::support::*;
 use super::*;
 use crate::agent_loop::RunStatus;
+use async_trait::async_trait;
 use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::time::{timeout, Duration};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(2);
@@ -79,10 +83,49 @@ fn assert_no_snapshot_updated(events: &[AgentRuntimeEvent]) {
     }
 }
 
+#[derive(Default)]
+struct DelayedAppendStore {
+    inner: InMemoryAgentRuntimeEventStore,
+    append_started: Notify,
+    release_append: Notify,
+    append_count: TokioMutex<usize>,
+}
+
+#[async_trait]
+impl AgentRuntimeEventStore for DelayedAppendStore {
+    async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
+        {
+            let mut count = self.append_count.lock().await;
+            *count += 1;
+            if *count == 1 {
+                self.append_started.notify_waiters();
+                drop(count);
+                self.release_append.notified().await;
+            }
+        }
+        self.inner.append(event).await
+    }
+
+    async fn events_after(
+        &self,
+        cursor: RuntimeCursor,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.inner.events_after(cursor).await
+    }
+
+    async fn invalidate_thread(
+        &self,
+        thread_id: ThreadId,
+        latest_seq: u64,
+    ) -> Result<(), AgentRuntimeError> {
+        self.inner.invalidate_thread(thread_id, latest_seq).await
+    }
+}
+
 #[tokio::test]
 async fn subscribe_before_prompt_receives_live_semantic_events_in_order() {
     let agent = runtime_with_chat_provider();
-    let mut sub = agent.subscribe(None);
+    let mut sub = agent.subscribe(None).await;
 
     let result = agent.prompt("hello").await.expect("prompt should run");
     assert_eq!(
@@ -145,6 +188,38 @@ async fn subscribe_before_prompt_receives_live_semantic_events_in_order() {
 }
 
 #[tokio::test]
+async fn live_event_broadcast_waits_for_async_store_append() {
+    let store = Arc::new(DelayedAppendStore::default());
+    let agent = runtime_with_chat_provider_config(ChatRuntimeConfig {
+        event_store: Some(store.clone()),
+        ..ChatRuntimeConfig::default()
+    });
+    let mut sub = agent.subscribe(None).await;
+
+    let prompt = tokio::spawn(async move { agent.prompt("hello").await });
+    store.append_started.notified().await;
+
+    let no_event_before_append = timeout(Duration::from_millis(50), sub.recv()).await;
+    assert!(
+        no_event_before_append.is_err(),
+        "event broadcasted before async store append completed"
+    );
+
+    store.release_append.notify_waiters();
+    let first_event = recv_event(&mut sub).await;
+    assert!(matches!(
+        first_event.payload,
+        AgentRuntimeEventPayload::TurnQueued { .. }
+    ));
+
+    let result = prompt
+        .await
+        .expect("prompt task should not panic")
+        .expect("prompt should run");
+    assert_eq!(result.status, RunStatus::Completed);
+}
+
+#[tokio::test]
 async fn subscribe_after_cursor_replays_tail_then_receives_fresh_live_events_without_duplicates() {
     let agent = runtime_with_chat_provider();
 
@@ -161,7 +236,7 @@ async fn subscribe_after_cursor_replays_tail_then_receives_fresh_live_events_wit
 
     let thread = agent.read_snapshot().await.threads[0].clone();
     let cursor = RuntimeCursor::new(thread.thread_id, 2);
-    let mut sub = agent.subscribe(Some(cursor));
+    let mut sub = agent.subscribe(Some(cursor)).await;
     let replayed = sub.replay().expect("cursor should replay retained events");
 
     assert!(
@@ -229,7 +304,9 @@ async fn stale_cursor_returns_stale_runtime_from_subscription_replay() {
         result.error
     );
 
-    let mut sub = agent.subscribe(Some(RuntimeCursor::new(thread_id, 0)));
+    let mut sub = agent
+        .subscribe(Some(RuntimeCursor::new(thread_id, 0)))
+        .await;
     let replay_err = sub.replay().expect_err("evicted cursor should be stale");
 
     assert!(
@@ -266,7 +343,7 @@ async fn rewrite_invalidates_prior_subscription_cursor() {
         .await
         .expect("history should replace");
 
-    let sub = agent.subscribe(Some(old_cursor));
+    let sub = agent.subscribe(Some(old_cursor)).await;
     let replay_err = sub.replay().expect_err("rewrite should stale old cursor");
     assert!(
         matches!(replay_err, AgentRuntimeError::StaleRuntime { .. }),
@@ -290,7 +367,7 @@ async fn reset_invalidates_prior_subscription_cursor() {
 
     agent.reset().await;
 
-    let sub = agent.subscribe(Some(old_cursor));
+    let sub = agent.subscribe(Some(old_cursor)).await;
     let replay_err = sub.replay().expect_err("reset should stale old cursor");
     assert!(
         matches!(replay_err, AgentRuntimeError::StaleRuntime { .. }),
@@ -301,7 +378,7 @@ async fn reset_invalidates_prior_subscription_cursor() {
 #[tokio::test]
 async fn event_stream_has_no_snapshot_updated_payload() {
     let agent = runtime_with_chat_provider();
-    let mut sub = agent.subscribe(None);
+    let mut sub = agent.subscribe(None).await;
 
     let result = agent.prompt("hello").await.expect("prompt should run");
     assert_eq!(

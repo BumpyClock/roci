@@ -129,7 +129,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         },
     ));
 
-    let subscription = agent.subscribe(None);
+    let subscription = agent.subscribe(None).await;
     renderer.subscribe(subscription, agent.clone());
 
     let result = agent.prompt(prompt).await;

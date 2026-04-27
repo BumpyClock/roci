@@ -15,19 +15,22 @@ use crate::tools::tool::Tool;
 use crate::types::ModelMessage;
 
 impl AgentRuntime {
-    fn complete_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
+    async fn complete_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
         self.terminal_chat_turn(turn_id, TurnStatus::Completed, None)
+            .await
     }
 
-    fn fail_chat_turn(&self, turn_id: TurnId, error: String) -> Result<(), RociError> {
+    async fn fail_chat_turn(&self, turn_id: TurnId, error: String) -> Result<(), RociError> {
         self.terminal_chat_turn(turn_id, TurnStatus::Failed, Some(error))
+            .await
     }
 
-    fn cancel_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
+    async fn cancel_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
         self.terminal_chat_turn(turn_id, TurnStatus::Canceled, None)
+            .await
     }
 
-    fn terminal_chat_turn(
+    async fn terminal_chat_turn(
         &self,
         turn_id: TurnId,
         status: TurnStatus,
@@ -63,6 +66,7 @@ impl AgentRuntime {
         };
 
         self.publish_runtime_event(event)
+            .await
             .map(|_| ())
             .map_err(Self::map_chat_projection_error)
     }
@@ -168,7 +172,7 @@ impl AgentRuntime {
         let tools = match self.resolve_tools_for_run().await {
             Ok(tools) => tools,
             Err(err) => {
-                let projection_result = self.fail_chat_turn(turn_id, err.to_string());
+                let projection_result = self.fail_chat_turn(turn_id, err.to_string()).await;
                 self.restore_idle_after_preflight_error().await;
                 projection_result?;
                 return Err(err);
@@ -211,13 +215,13 @@ impl AgentRuntime {
                     request.messages = messages;
                 }
                 Ok(BeforeAgentStartHookResult::Cancel { .. }) => {
-                    let projection_result = self.cancel_chat_turn(turn_id);
+                    let projection_result = self.cancel_chat_turn(turn_id).await;
                     self.restore_idle_after_preflight_error().await;
                     projection_result?;
                     return Ok(RunResult::canceled_with_messages(request.messages.clone()));
                 }
                 Err(err) => {
-                    let projection_result = self.fail_chat_turn(turn_id, err.to_string());
+                    let projection_result = self.fail_chat_turn(turn_id, err.to_string()).await;
                     self.restore_idle_after_preflight_error().await;
                     projection_result?;
                     return Err(RociError::InvalidState(format!(
@@ -334,18 +338,21 @@ impl AgentRuntime {
 
         let projection_result = match &run_result {
             Ok(result) => match result.status {
-                RunStatus::Completed => self.complete_chat_turn(turn_id),
-                RunStatus::Failed => self.fail_chat_turn(
-                    turn_id,
-                    result
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "run failed".to_string()),
-                ),
-                RunStatus::Canceled => self.cancel_chat_turn(turn_id),
+                RunStatus::Completed => self.complete_chat_turn(turn_id).await,
+                RunStatus::Failed => {
+                    self.fail_chat_turn(
+                        turn_id,
+                        result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "run failed".to_string()),
+                    )
+                    .await
+                }
+                RunStatus::Canceled => self.cancel_chat_turn(turn_id).await,
                 RunStatus::Running => Ok(()),
             },
-            Err(err) => self.fail_chat_turn(turn_id, err.to_string()),
+            Err(err) => self.fail_chat_turn(turn_id, err.to_string()).await,
         };
 
         match &run_result {
