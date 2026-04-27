@@ -169,6 +169,7 @@ impl AgentRuntime {
         let runtime_event_publish_tx = self.runtime_event_publish_tx.clone();
         let projection_error = Arc::new(StdMutex::new(None));
         let projection_error_for_sink = projection_error.clone();
+        let projection_error_for_publish = projection_error.clone();
         let projection_run_state = Arc::new(StdMutex::new(ChatProjectionRunState {
             remaining_context_message_lifecycles: initial_message_count,
             ..ChatProjectionRunState::default()
@@ -178,18 +179,19 @@ impl AgentRuntime {
             if let (Ok(mut projector), Ok(mut run_state)) =
                 (chat_projector.lock(), projection_run_state.lock())
             {
-                let projection_result = project_agent_event(
-                    &mut projector,
-                    &mut run_state,
-                    turn_id,
-                    &event,
-                )
-                .and_then(|events| {
-                    for event in events {
-                        AgentRuntime::queue_runtime_event_to(&runtime_event_publish_tx, event)?;
-                    }
-                    Ok(())
-                });
+                let projection_result =
+                    project_agent_event(&mut projector, &mut run_state, turn_id, &event).and_then(
+                        |events| {
+                            for event in events {
+                                AgentRuntime::queue_runtime_event_to(
+                                    &runtime_event_publish_tx,
+                                    event,
+                                    projection_error_for_publish.clone(),
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    );
                 if let Err(err) = projection_result {
                     if let Ok(mut stored_error) = projection_error_for_sink.lock() {
                         if stored_error.is_none() {

@@ -8,6 +8,7 @@ use super::*;
 use crate::agent_loop::RunStatus;
 use async_trait::async_trait;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::time::{timeout, Duration};
@@ -91,6 +92,69 @@ struct DelayedAppendStore {
     append_count: TokioMutex<usize>,
 }
 
+struct BlockOnAppendStore {
+    inner: InMemoryAgentRuntimeEventStore,
+    block_on_append: usize,
+    append_started: Notify,
+    release_append: Notify,
+    append_count: AtomicUsize,
+}
+
+struct FailingAppendStore {
+    inner: InMemoryAgentRuntimeEventStore,
+    fail_on_append: usize,
+    append_count: AtomicUsize,
+}
+
+impl BlockOnAppendStore {
+    fn block_on_append(block_on_append: usize) -> Self {
+        Self {
+            inner: InMemoryAgentRuntimeEventStore::new(),
+            block_on_append,
+            append_started: Notify::new(),
+            release_append: Notify::new(),
+            append_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl FailingAppendStore {
+    fn fail_on_append(fail_on_append: usize) -> Self {
+        Self {
+            inner: InMemoryAgentRuntimeEventStore::new(),
+            fail_on_append,
+            append_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRuntimeEventStore for BlockOnAppendStore {
+    async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
+        let append_count = self.append_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if append_count == self.block_on_append {
+            self.append_started.notify_waiters();
+            self.release_append.notified().await;
+        }
+        self.inner.append(event).await
+    }
+
+    async fn events_after(
+        &self,
+        cursor: RuntimeCursor,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.inner.events_after(cursor).await
+    }
+
+    async fn invalidate_thread(
+        &self,
+        thread_id: ThreadId,
+        latest_seq: u64,
+    ) -> Result<(), AgentRuntimeError> {
+        self.inner.invalidate_thread(thread_id, latest_seq).await
+    }
+}
+
 #[async_trait]
 impl AgentRuntimeEventStore for DelayedAppendStore {
     async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
@@ -102,6 +166,34 @@ impl AgentRuntimeEventStore for DelayedAppendStore {
                 drop(count);
                 self.release_append.notified().await;
             }
+        }
+        self.inner.append(event).await
+    }
+
+    async fn events_after(
+        &self,
+        cursor: RuntimeCursor,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.inner.events_after(cursor).await
+    }
+
+    async fn invalidate_thread(
+        &self,
+        thread_id: ThreadId,
+        latest_seq: u64,
+    ) -> Result<(), AgentRuntimeError> {
+        self.inner.invalidate_thread(thread_id, latest_seq).await
+    }
+}
+
+#[async_trait]
+impl AgentRuntimeEventStore for FailingAppendStore {
+    async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
+        let append_count = self.append_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if append_count == self.fail_on_append {
+            return Err(AgentRuntimeError::ProjectionFailed {
+                message: format!("injected append failure at {append_count}"),
+            });
         }
         self.inner.append(event).await
     }
@@ -217,6 +309,59 @@ async fn live_event_broadcast_waits_for_async_store_append() {
         .expect("prompt task should not panic")
         .expect("prompt should run");
     assert_eq!(result.status, RunStatus::Completed);
+}
+
+#[tokio::test]
+async fn sink_event_store_append_failure_fails_run() {
+    let store = Arc::new(FailingAppendStore::fail_on_append(2));
+    let agent = runtime_with_chat_provider_config(ChatRuntimeConfig {
+        event_store: Some(store),
+        ..ChatRuntimeConfig::default()
+    });
+
+    let result = agent.prompt("hello").await;
+
+    assert!(
+        matches!(&result, Err(crate::error::RociError::InvalidState(message)) if message.contains("injected append failure at 2")),
+        "sink event store failure should fail run, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn slow_event_store_does_not_fail_long_stream() {
+    const STREAM_CHUNKS: usize = 1_100;
+
+    let store = Arc::new(BlockOnAppendStore::block_on_append(4));
+    let registry = registry_with_streaming_chunks_provider("stub", STREAM_CHUNKS);
+    let mut config = test_agent_config();
+    config.model = "stub:long-stream".parse().expect("stub model should parse");
+    config.chat = ChatRuntimeConfig {
+        event_store: Some(store.clone()),
+        ..ChatRuntimeConfig::default()
+    };
+    let agent = AgentRuntime::new(registry, test_config(), config);
+
+    let mut prompt = tokio::spawn(async move { agent.prompt("hello").await });
+    store.append_started.notified().await;
+
+    if let Ok(result) = timeout(Duration::from_millis(50), &mut prompt).await {
+        panic!("prompt finished while event store was blocked: {result:?}");
+    }
+
+    store.release_append.notify_waiters();
+
+    let result = prompt
+        .await
+        .expect("prompt task should not panic")
+        .expect("prompt should run");
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(
+        result
+            .usage_delta
+            .expect("usage should be recorded")
+            .output_tokens,
+        STREAM_CHUNKS as u32
+    );
 }
 
 #[tokio::test]

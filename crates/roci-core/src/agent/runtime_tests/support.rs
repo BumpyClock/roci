@@ -232,6 +232,11 @@ struct StreamingTextFactory {
     output_tokens: u32,
 }
 
+struct StreamingChunksFactory {
+    provider_key: &'static str,
+    chunk_count: usize,
+}
+
 impl ProviderFactory for StreamingTextFactory {
     fn provider_keys(&self) -> &[&str] {
         std::slice::from_ref(&self.provider_key)
@@ -259,6 +264,33 @@ struct StreamingTextProvider {
     capabilities: ModelCapabilities,
     input_tokens: u32,
     output_tokens: u32,
+}
+
+struct StreamingChunksProvider {
+    provider_key: String,
+    model_id: String,
+    capabilities: ModelCapabilities,
+    chunk_count: usize,
+}
+
+impl ProviderFactory for StreamingChunksFactory {
+    fn provider_keys(&self) -> &[&str] {
+        std::slice::from_ref(&self.provider_key)
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        _provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(StreamingChunksProvider {
+            provider_key: self.provider_key.to_string(),
+            model_id: model_id.to_string(),
+            capabilities: ModelCapabilities::default(),
+            chunk_count: self.chunk_count,
+        }))
+    }
 }
 
 #[async_trait]
@@ -322,6 +354,65 @@ impl ModelProvider for StreamingTextProvider {
     }
 }
 
+#[async_trait]
+impl ModelProvider for StreamingChunksProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "stream-only chunk test provider".to_string(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        let mut events = Vec::with_capacity(self.chunk_count + 1);
+        for _ in 0..self.chunk_count {
+            events.push(Ok(TextStreamDelta {
+                text: "x".to_string(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }));
+        }
+        events.push(Ok(TextStreamDelta {
+            text: String::new(),
+            event_type: StreamEventType::Done,
+            tool_call: None,
+            finish_reason: None,
+            usage: Some(crate::types::Usage {
+                input_tokens: 1,
+                output_tokens: self.chunk_count as u32,
+                total_tokens: self.chunk_count as u32 + 1,
+                ..crate::types::Usage::default()
+            }),
+            reasoning: None,
+            reasoning_signature: None,
+            reasoning_type: None,
+        }));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
 pub(super) fn registry_with_streaming_provider(
     provider_key: &'static str,
     input_tokens: u32,
@@ -332,6 +423,18 @@ pub(super) fn registry_with_streaming_provider(
         provider_key,
         input_tokens,
         output_tokens,
+    }));
+    Arc::new(registry)
+}
+
+pub(super) fn registry_with_streaming_chunks_provider(
+    provider_key: &'static str,
+    chunk_count: usize,
+) -> Arc<ProviderRegistry> {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(StreamingChunksFactory {
+        provider_key,
+        chunk_count,
     }));
     Arc::new(registry)
 }

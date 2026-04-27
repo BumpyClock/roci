@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex as StdMutex};
+
 use tokio::sync::{watch, MutexGuard};
 
 use super::{
@@ -115,18 +117,20 @@ impl AgentRuntime {
         &self,
         event: AgentRuntimeEvent,
     ) -> Result<RuntimeCursor, AgentRuntimeError> {
-        Self::publish_runtime_event_to(&self.runtime_event_publish_tx, event).await
+        self.publish_runtime_event_to(event).await
     }
 
     pub(super) async fn publish_runtime_event_to(
-        publish_tx: &tokio::sync::mpsc::UnboundedSender<RuntimeEventPublishRequest>,
+        &self,
         event: AgentRuntimeEvent,
     ) -> Result<RuntimeCursor, AgentRuntimeError> {
+        self.ensure_runtime_event_publisher().await;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        publish_tx
+        self.runtime_event_publish_tx
             .send(RuntimeEventPublishRequest {
                 event,
                 ack_tx: Some(ack_tx),
+                error_slot: None,
             })
             .map_err(|_| AgentRuntimeError::ProjectionFailed {
                 message: "runtime event publisher closed".to_string(),
@@ -138,14 +142,46 @@ impl AgentRuntime {
             })?
     }
 
+    async fn ensure_runtime_event_publisher(&self) {
+        let Some(mut publish_rx) = self.runtime_event_publish_rx.lock().await.take() else {
+            return;
+        };
+        let event_store = self.runtime_event_store.clone();
+        let event_tx = self.runtime_event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(request) = publish_rx.recv().await {
+                let result = event_store.append(request.event.clone()).await;
+                match &result {
+                    Ok(_) => {
+                        let _ = event_tx.send(request.event);
+                    }
+                    Err(err) => {
+                        if let Some(error_slot) = &request.error_slot {
+                            if let Ok(mut stored_error) = error_slot.lock() {
+                                if stored_error.is_none() {
+                                    *stored_error = Some(err.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ack_tx) = request.ack_tx {
+                    let _ = ack_tx.send(result);
+                }
+            }
+        });
+    }
+
     pub(super) fn queue_runtime_event_to(
         publish_tx: &tokio::sync::mpsc::UnboundedSender<RuntimeEventPublishRequest>,
         event: AgentRuntimeEvent,
+        error_slot: Arc<StdMutex<Option<AgentRuntimeError>>>,
     ) -> Result<(), AgentRuntimeError> {
         publish_tx
             .send(RuntimeEventPublishRequest {
                 event,
                 ack_tx: None,
+                error_slot: Some(error_slot),
             })
             .map_err(|_| AgentRuntimeError::ProjectionFailed {
                 message: "runtime event publisher closed".to_string(),

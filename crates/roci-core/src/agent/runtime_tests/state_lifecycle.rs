@@ -1,6 +1,11 @@
 use super::support::*;
 use super::*;
 
+#[test]
+fn new_agent_can_be_constructed_without_tokio_runtime() {
+    let _agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+}
+
 #[tokio::test]
 async fn new_agent_starts_idle() {
     let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());

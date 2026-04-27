@@ -113,6 +113,8 @@ pub struct AgentRuntime {
     runtime_event_tx: broadcast::Sender<AgentRuntimeEvent>,
     runtime_event_store: Arc<dyn AgentRuntimeEventStore>,
     runtime_event_publish_tx: mpsc::UnboundedSender<RuntimeEventPublishRequest>,
+    runtime_event_publish_rx:
+        Arc<Mutex<Option<mpsc::UnboundedReceiver<RuntimeEventPublishRequest>>>>,
     /// Persistent session usage ledger. Accumulates across runs, cleared on reset.
     session_usage: Arc<Mutex<Usage>>,
     #[cfg(feature = "agent")]
@@ -122,6 +124,7 @@ pub struct AgentRuntime {
 pub(super) struct RuntimeEventPublishRequest {
     pub event: AgentRuntimeEvent,
     pub ack_tx: Option<oneshot::Sender<Result<RuntimeCursor, AgentRuntimeError>>>,
+    pub error_slot: Option<Arc<StdMutex<Option<AgentRuntimeError>>>>,
 }
 
 impl AgentRuntime {
@@ -143,21 +146,8 @@ impl AgentRuntime {
             ))
         });
         let (runtime_event_tx, _) = broadcast::channel(replay_capacity.get());
-        let (runtime_event_publish_tx, mut runtime_event_publish_rx) =
+        let (runtime_event_publish_tx, runtime_event_publish_rx) =
             mpsc::unbounded_channel::<RuntimeEventPublishRequest>();
-        let publisher_store = runtime_event_store.clone();
-        let publisher_tx = runtime_event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(request) = runtime_event_publish_rx.recv().await {
-                let result = publisher_store.append(request.event.clone()).await;
-                if result.is_ok() {
-                    let _ = publisher_tx.send(request.event);
-                }
-                if let Some(ack_tx) = request.ack_tx {
-                    let _ = ack_tx.send(result);
-                }
-            }
-        });
         let chat_projector = Arc::new(StdMutex::new(ChatProjector::new(config.chat.clone())));
         let (state_tx, state_rx) = watch::channel(AgentState::Idle);
         let initial_snapshot = AgentSnapshot {
@@ -199,6 +189,7 @@ impl AgentRuntime {
             runtime_event_tx,
             runtime_event_store,
             runtime_event_publish_tx,
+            runtime_event_publish_rx: Arc::new(Mutex::new(Some(runtime_event_publish_rx))),
             session_usage: Arc::new(Mutex::new(Usage::default())),
             #[cfg(feature = "agent")]
             user_input_coordinator,
