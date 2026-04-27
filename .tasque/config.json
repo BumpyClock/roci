@@ -1,4 +1,5 @@
 {
   "schema_version": 1,
-  "snapshot_every": 200
+  "snapshot_every": 200,
+  "sync_branch": "tsq-sync"
 }
