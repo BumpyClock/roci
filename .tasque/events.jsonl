@@ -1923,3 +1923,4 @@
 {"id":"01KQ86A7993Y568XH16PB5P6YS","event_id":"01KQ86A7993Y568XH16PB5P6YS","ts":"2026-04-27T19:23:00.777Z","actor":"adityasharma","type":"dep.added","task_id":"tsq-c9dvskta.6","payload":{"blocker":"tsq-c9dvskta.3","dep_type":"starts_after"}}
 {"id":"01KQ86A7DAACNDZCB4BV2ME2XX","event_id":"01KQ86A7DAACNDZCB4BV2ME2XX","ts":"2026-04-27T19:23:00.906Z","actor":"adityasharma","type":"dep.added","task_id":"tsq-c9dvskta.6","payload":{"blocker":"tsq-c9dvskta.4","dep_type":"starts_after"}}
 {"id":"01KQ86A7HJS023PJ9TY598G50H","event_id":"01KQ86A7HJS023PJ9TY598G50H","ts":"2026-04-27T19:23:01.042Z","actor":"adityasharma","type":"dep.added","task_id":"tsq-c9dvskta.6","payload":{"blocker":"tsq-c9dvskta.5","dep_type":"starts_after"}}
+{"id":"01KQ86A7NSMK9ETP5ZTG720KP0","event_id":"01KQ86A7NSMK9ETP5ZTG720KP0","ts":"2026-04-27T19:23:01.177Z","actor":"adityasharma","type":"link.added","task_id":"tsq-c9dvskta","payload":{"target":"tsq-jhvzt78z","type":"relates_to"}}
