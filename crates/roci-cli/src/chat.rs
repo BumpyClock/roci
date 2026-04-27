@@ -20,7 +20,6 @@ use resource_prompt::{
     build_resource_system_prompt, expand_chat_prompt, print_resource_diagnostics,
 };
 use runtime_events::RuntimeEventRenderer;
-use user_input::PromptHost;
 
 pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ChatArgs {
@@ -86,9 +85,9 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     let coordinator = Arc::new(UserInputCoordinator::new());
-    let prompt_host = PromptHost::spawn(coordinator.clone());
+    let mut renderer = RuntimeEventRenderer::spawn(coordinator.clone());
     let tools = roci_tools::builtin::all_tools();
-    let agent = AgentRuntime::new(
+    let agent = Arc::new(AgentRuntime::new(
         registry,
         config,
         AgentConfig {
@@ -100,7 +99,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             transform_context: None,
             convert_to_llm: None,
             before_agent_start: None,
-            event_sink: Some(prompt_host.build_agent_sink()),
+            event_sink: Some(renderer.build_agent_sink()),
             session_id: None,
             steering_mode: QueueDrainMode::All,
             follow_up_mode: QueueDrainMode::All,
@@ -128,13 +127,13 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             chat: Default::default(),
             user_input_coordinator: Some(coordinator.clone()),
         },
-    );
+    ));
 
-    let renderer = RuntimeEventRenderer::spawn(agent.subscribe(None));
+    let subscription = agent.subscribe(None);
+    renderer.subscribe(subscription, agent.clone());
 
     let result = agent.prompt(prompt).await;
     renderer.finish().await;
-    prompt_host.shutdown();
     let result = result?;
     println!();
 

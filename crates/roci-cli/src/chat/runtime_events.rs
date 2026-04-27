@@ -1,63 +1,228 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::JoinHandle;
 
 use roci::agent::{
-    AgentRuntimeEventPayload, MessageId, MessageSnapshot, RuntimeSubscription,
-    ToolExecutionSnapshot,
+    AgentRuntime, AgentRuntimeError, AgentRuntimeEventPayload, MessageId, MessageSnapshot,
+    RuntimeCursor, RuntimeSnapshot, RuntimeSubscription, ToolExecutionSnapshot,
+    UserInputCoordinator,
 };
+use roci::agent_loop::AgentEvent;
+use roci::tools::UserInputRequest;
 use roci::types::{ContentPart, Role};
+use tokio::task::JoinHandle as TaskJoinHandle;
 
 use super::resource_prompt::truncate_preview;
+use super::user_input::{default_prompt_fn, handle_prompt_request, PromptFn};
+
+enum TerminalCommand {
+    RuntimeEvent(Box<AgentRuntimeEventPayload>),
+    UserInputRequest(UserInputRequest),
+    Snapshot(RuntimeSnapshot),
+    StreamError(AgentRuntimeError),
+    Shutdown,
+}
 
 pub(crate) struct RuntimeEventRenderer {
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    handle: tokio::task::JoinHandle<()>,
+    command_tx: mpsc::Sender<TerminalCommand>,
+    shutdown: Arc<AtomicBool>,
+    subscription_handle: Option<TaskJoinHandle<()>>,
+    terminal_handle: Option<JoinHandle<()>>,
 }
 
 impl RuntimeEventRenderer {
-    pub(crate) fn spawn(subscription: RuntimeSubscription) -> Self {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            drive_chat_renderer(subscription, shutdown_rx).await;
+    pub(crate) fn spawn(coordinator: Arc<UserInputCoordinator>) -> Self {
+        Self::spawn_with_prompt_fn(coordinator, default_prompt_fn())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_prompt_fn(
+        coordinator: Arc<UserInputCoordinator>,
+        prompt_fn: PromptFn,
+    ) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = tokio::runtime::Handle::current();
+        let terminal_handle = std::thread::spawn(move || {
+            drive_terminal(command_rx, coordinator, prompt_fn, handle, thread_shutdown);
         });
 
         Self {
-            shutdown_tx: Some(shutdown_tx),
-            handle,
+            command_tx,
+            shutdown,
+            subscription_handle: None,
+            terminal_handle: Some(terminal_handle),
         }
     }
 
-    pub(crate) async fn finish(mut self) {
-        if tokio::time::timeout(Duration::from_secs(1), &mut self.handle)
-            .await
-            .is_err()
-        {
-            if let Some(shutdown_tx) = self.shutdown_tx.take() {
-                let _ = shutdown_tx.send(());
+    #[cfg(not(test))]
+    fn spawn_with_prompt_fn(coordinator: Arc<UserInputCoordinator>, prompt_fn: PromptFn) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = tokio::runtime::Handle::current();
+        let terminal_handle = std::thread::spawn(move || {
+            drive_terminal(command_rx, coordinator, prompt_fn, handle, thread_shutdown);
+        });
+
+        Self {
+            command_tx,
+            shutdown,
+            subscription_handle: None,
+            terminal_handle: Some(terminal_handle),
+        }
+    }
+
+    pub(crate) fn build_agent_sink(&self) -> Arc<dyn Fn(AgentEvent) + Send + Sync> {
+        let command_tx = self.command_tx.clone();
+        Arc::new(move |event: AgentEvent| {
+            if let AgentEvent::UserInputRequested { request } = event {
+                let _ = command_tx.send(TerminalCommand::UserInputRequest(request));
             }
-            let _ = self.handle.await;
+        })
+    }
+
+    pub(crate) fn subscribe(
+        &mut self,
+        subscription: RuntimeSubscription,
+        agent: Arc<AgentRuntime>,
+    ) {
+        let command_tx = self.command_tx.clone();
+        self.subscription_handle = Some(tokio::spawn(async move {
+            drive_runtime_subscription(subscription, agent, command_tx).await;
+        }));
+    }
+
+    pub(crate) async fn finish(mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.command_tx.send(TerminalCommand::Shutdown);
+
+        if let Some(handle) = self.subscription_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        if let Some(handle) = self.terminal_handle.take() {
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
         }
     }
 }
 
-async fn drive_chat_renderer(
+async fn drive_runtime_subscription(
     mut subscription: RuntimeSubscription,
-    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    agent: Arc<AgentRuntime>,
+    command_tx: mpsc::Sender<TerminalCommand>,
 ) {
-    let mut renderer = ChatRenderer::default();
-
     loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => break,
-            event = subscription.recv() => match event {
-                Ok(event) => {
-                    if renderer.render_payload(event.payload) {
+        match subscription.recv().await {
+            Ok(event) => {
+                if command_tx
+                    .send(TerminalCommand::RuntimeEvent(Box::new(event.payload)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(AgentRuntimeError::StaleRuntime {
+                thread_id,
+                latest_seq,
+                ..
+            }) => {
+                let replay_cursor = RuntimeCursor::new(thread_id, latest_seq);
+                let replay_subscription = agent.subscribe(Some(replay_cursor));
+                if let Ok(events) = replay_subscription.replay() {
+                    for event in events {
+                        if command_tx
+                            .send(TerminalCommand::RuntimeEvent(Box::new(event.payload)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    subscription = replay_subscription;
+                    continue;
+                }
+
+                if !send_snapshot_fallback(&agent, &command_tx).await {
+                    break;
+                }
+                let snapshot = agent.read_snapshot().await;
+                subscription = agent.subscribe(latest_snapshot_cursor(&snapshot));
+                match subscription.replay() {
+                    Ok(events) => {
+                        for event in events {
+                            if command_tx
+                                .send(TerminalCommand::RuntimeEvent(Box::new(event.payload)))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = command_tx.send(TerminalCommand::StreamError(error));
                         break;
                     }
                 }
-                Err(_) => break,
             }
+            Err(error) => {
+                let _ = command_tx.send(TerminalCommand::StreamError(error));
+                break;
+            }
+        }
+    }
+}
+
+async fn send_snapshot_fallback(
+    agent: &AgentRuntime,
+    command_tx: &mpsc::Sender<TerminalCommand>,
+) -> bool {
+    let snapshot = agent.read_snapshot().await;
+    command_tx.send(TerminalCommand::Snapshot(snapshot)).is_ok()
+}
+
+fn latest_snapshot_cursor(snapshot: &RuntimeSnapshot) -> Option<RuntimeCursor> {
+    snapshot
+        .threads
+        .iter()
+        .max_by_key(|thread| thread.last_seq)
+        .map(|thread| RuntimeCursor::new(thread.thread_id, thread.last_seq))
+}
+
+fn drive_terminal(
+    command_rx: mpsc::Receiver<TerminalCommand>,
+    coordinator: Arc<UserInputCoordinator>,
+    prompt_fn: PromptFn,
+    handle: tokio::runtime::Handle,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut renderer = ChatRenderer::default();
+
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            TerminalCommand::RuntimeEvent(payload) => {
+                if renderer.render_payload(*payload) {
+                    break;
+                }
+            }
+            TerminalCommand::UserInputRequest(request) => {
+                handle_prompt_request(
+                    request,
+                    coordinator.clone(),
+                    prompt_fn.clone(),
+                    handle.clone(),
+                    shutdown.clone(),
+                );
+            }
+            TerminalCommand::Snapshot(snapshot) => renderer.render_snapshot(snapshot),
+            TerminalCommand::StreamError(error) => {
+                eprintln!("\n[roci] runtime event stream ended: {error:?}");
+                break;
+            }
+            TerminalCommand::Shutdown => break,
         }
     }
 }
@@ -65,9 +230,38 @@ async fn drive_chat_renderer(
 #[derive(Default)]
 struct ChatRenderer {
     printed_text_by_message_id: HashMap<MessageId, String>,
+    completed_message_ids: HashSet<MessageId>,
+    started_tool_call_ids: HashSet<String>,
+    completed_tool_call_ids: HashSet<String>,
 }
 
 impl ChatRenderer {
+    fn render_snapshot(&mut self, snapshot: RuntimeSnapshot) {
+        let mut stdout = std::io::stdout();
+        let mut stderr = std::io::stderr();
+        for thread in snapshot.threads {
+            let Some(target_turn_id) = thread
+                .active_turn_id
+                .or_else(|| thread.turns.last().map(|turn| turn.turn_id))
+            else {
+                continue;
+            };
+            for message in thread.messages {
+                if message.turn_id == target_turn_id {
+                    self.render_message_snapshot(message, &mut stdout);
+                }
+            }
+            for tool in thread.tools {
+                if tool.turn_id != target_turn_id {
+                    continue;
+                }
+                self.render_tool_start(&tool, &mut stderr);
+                self.render_tool_update(tool.clone(), &mut stderr);
+                self.render_tool_completion(tool, &mut stderr);
+            }
+        }
+    }
+
     fn render_payload(&mut self, payload: AgentRuntimeEventPayload) -> bool {
         let mut stdout = std::io::stdout();
         let mut stderr = std::io::stderr();
@@ -87,7 +281,7 @@ impl ChatRenderer {
                 self.render_message_snapshot(message, stdout);
             }
             AgentRuntimeEventPayload::ToolStarted { tool } => {
-                let _ = writeln!(stderr, "\n⚡ {} ({})", tool.tool_name, tool.tool_call_id);
+                self.render_tool_start(&tool, stderr);
             }
             AgentRuntimeEventPayload::ToolUpdated { tool } => {
                 self.render_tool_update(tool, stderr);
@@ -106,6 +300,12 @@ impl ChatRenderer {
     }
 
     fn render_message_snapshot(&mut self, message: MessageSnapshot, stdout: &mut impl Write) {
+        if matches!(message.status, roci::agent::MessageStatus::Completed)
+            && self.completed_message_ids.contains(&message.message_id)
+        {
+            return;
+        }
+
         if message.payload.role != Role::Assistant {
             self.printed_text_by_message_id.remove(&message.message_id);
             return;
@@ -133,7 +333,14 @@ impl ChatRenderer {
         }
 
         if matches!(message.status, roci::agent::MessageStatus::Completed) {
+            self.completed_message_ids.insert(message.message_id);
             self.printed_text_by_message_id.remove(&message.message_id);
+        }
+    }
+
+    fn render_tool_start(&mut self, tool: &ToolExecutionSnapshot, stderr: &mut impl Write) {
+        if self.started_tool_call_ids.insert(tool.tool_call_id.clone()) {
+            let _ = writeln!(stderr, "\n⚡ {} ({})", tool.tool_name, tool.tool_call_id);
         }
     }
 
@@ -155,10 +362,14 @@ impl ChatRenderer {
         let _ = writeln!(stderr, "  … {}: {preview}", tool.tool_name);
     }
 
-    fn render_tool_completion(&self, tool: ToolExecutionSnapshot, stderr: &mut impl Write) {
+    fn render_tool_completion(&mut self, tool: ToolExecutionSnapshot, stderr: &mut impl Write) {
+        if self.completed_tool_call_ids.contains(&tool.tool_call_id) {
+            return;
+        }
         let Some(result) = tool.final_result else {
             return;
         };
+        self.completed_tool_call_ids.insert(tool.tool_call_id);
         let preview = truncate_preview(&result.result.to_string(), 200);
         if result.is_error {
             let _ = writeln!(stderr, "  ❌ {preview}");
@@ -175,6 +386,7 @@ mod tests {
     use super::*;
     use roci::agent::{MessageStatus, ThreadId, ToolStatus, TurnId, TurnSnapshot, TurnStatus};
     use roci::agent_loop::ToolUpdatePayload;
+    use roci::tools::{Answer, UserInputRequest, UserInputRequestId, UserInputResponse};
     use roci::types::{AgentToolResult, ModelMessage};
 
     fn assistant_message(
@@ -234,6 +446,19 @@ mod tests {
             queued_at: Utc::now(),
             started_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
+        }
+    }
+
+    fn user_input_request() -> UserInputRequest {
+        UserInputRequest {
+            request_id: UserInputRequestId::new_v4(),
+            tool_call_id: "call_1".to_string(),
+            questions: vec![roci::tools::Question {
+                id: "q1".to_string(),
+                text: "Need input".to_string(),
+                options: None,
+            }],
+            timeout_ms: None,
         }
     }
 
@@ -336,5 +561,44 @@ mod tests {
             String::from_utf8(stderr).unwrap(),
             "\n⚡ search (call_1)\n  … search: step 1\n  ✅ {\"ok\":true}\n"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_agent_sink_forwards_user_input_into_terminal_actor() {
+        let coordinator = Arc::new(UserInputCoordinator::new());
+        let request = user_input_request();
+        let pending = coordinator.create_request(request.clone()).await.unwrap();
+        let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let renderer = RuntimeEventRenderer::spawn_with_prompt_fn(
+            coordinator.clone(),
+            Arc::new({
+                let prompt_calls = prompt_calls.clone();
+                move |request, _, _, _| {
+                    prompt_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(Some(UserInputResponse {
+                        request_id: request.request_id,
+                        answers: vec![Answer {
+                            question_id: "q1".to_string(),
+                            content: "yes".to_string(),
+                        }],
+                        canceled: false,
+                    }))
+                }
+            }),
+        );
+
+        let sink = renderer.build_agent_sink();
+        sink(AgentEvent::MessageStart {
+            message: ModelMessage::assistant("ignore"),
+        });
+        sink(AgentEvent::UserInputRequested {
+            request: request.clone(),
+        });
+
+        let response = pending.wait(Some(100)).await.unwrap();
+        assert_eq!(response.request_id, request.request_id);
+        assert_eq!(prompt_calls.load(Ordering::Relaxed), 1);
+
+        renderer.finish().await;
     }
 }

@@ -1,14 +1,11 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use roci::agent::UserInputCoordinator;
-use roci::agent_loop::AgentEvent;
 use roci::tools::{
     Answer, UserInputError, UserInputRequest, UserInputRequestId, UserInputResponse,
 };
@@ -24,128 +21,39 @@ pub(crate) type PromptFn = Arc<
         + Sync,
 >;
 
-enum PromptCommand {
-    Request(UserInputRequest),
-    Shutdown,
+pub(crate) fn default_prompt_fn() -> PromptFn {
+    Arc::new(|request, coordinator, handle, shutdown| {
+        prompt_user_for_input(&request, &coordinator, &handle, &shutdown)
+    })
 }
 
-pub(crate) struct PromptHost {
-    command_tx: Sender<PromptCommand>,
-    shutdown: Arc<AtomicBool>,
-    join_handle: Option<JoinHandle<()>>,
-}
-
-impl PromptHost {
-    pub(crate) fn spawn(coordinator: Arc<UserInputCoordinator>) -> Self {
-        Self::spawn_with_prompt_fn(
-            coordinator,
-            Arc::new(|request, coordinator, handle, shutdown| {
-                prompt_user_for_input(&request, &coordinator, &handle, &shutdown)
-            }),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn spawn_with_prompt_fn(
-        coordinator: Arc<UserInputCoordinator>,
-        prompt_fn: PromptFn,
-    ) -> Self {
-        let (command_tx, command_rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = shutdown.clone();
-        let handle = tokio::runtime::Handle::current();
-        let join_handle = std::thread::spawn(move || {
-            run_prompt_host_loop(command_rx, coordinator, prompt_fn, handle, thread_shutdown);
-        });
-
-        Self {
-            command_tx,
-            shutdown,
-            join_handle: Some(join_handle),
-        }
-    }
-
-    #[cfg(not(test))]
-    fn spawn_with_prompt_fn(coordinator: Arc<UserInputCoordinator>, prompt_fn: PromptFn) -> Self {
-        let (command_tx, command_rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = shutdown.clone();
-        let handle = tokio::runtime::Handle::current();
-        let join_handle = std::thread::spawn(move || {
-            run_prompt_host_loop(command_rx, coordinator, prompt_fn, handle, thread_shutdown);
-        });
-
-        Self {
-            command_tx,
-            shutdown,
-            join_handle: Some(join_handle),
-        }
-    }
-
-    pub(crate) fn build_agent_sink(&self) -> Arc<dyn Fn(AgentEvent) + Send + Sync> {
-        let command_tx = self.command_tx.clone();
-        Arc::new(move |event: AgentEvent| {
-            if let AgentEvent::UserInputRequested { request } = event {
-                let _ = command_tx.send(PromptCommand::Request(request));
-            }
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn enqueue_request(&self, request: UserInputRequest) {
-        let _ = self.command_tx.send(PromptCommand::Request(request));
-    }
-
-    pub(crate) fn shutdown(mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        let _ = self.command_tx.send(PromptCommand::Shutdown);
-        if let Some(join_handle) = self.join_handle.take() {
-            let _ = join_handle.join();
-        }
-    }
-}
-
-fn run_prompt_host_loop(
-    command_rx: Receiver<PromptCommand>,
+pub(crate) fn handle_prompt_request(
+    request: UserInputRequest,
     coordinator: Arc<UserInputCoordinator>,
     prompt_fn: PromptFn,
     handle: tokio::runtime::Handle,
     shutdown: Arc<AtomicBool>,
 ) {
-    while let Ok(command) = command_rx.recv() {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
+    if shutdown.load(Ordering::Relaxed) {
+        return;
+    }
 
-        match command {
-            PromptCommand::Request(request) => {
-                let fallback_request_id = request.request_id;
-                let outcome = prompt_fn(
-                    request,
-                    coordinator.clone(),
-                    handle.clone(),
-                    shutdown.clone(),
-                );
-                match outcome {
-                    Ok(Some(response)) => {
-                        let _ = handle.block_on(coordinator.submit_response(response));
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let request_id = match &error {
-                            UserInputError::UnknownRequest { request_id }
-                            | UserInputError::Timeout { request_id }
-                            | UserInputError::Canceled { request_id }
-                            | UserInputError::InteractivePromptUnavailable { request_id, .. } => {
-                                *request_id
-                            }
-                            UserInputError::NoCallback => fallback_request_id,
-                        };
-                        let _ = handle.block_on(coordinator.submit_error(request_id, error));
-                    }
-                }
-            }
-            PromptCommand::Shutdown => break,
+    let fallback_request_id = request.request_id;
+    let outcome = prompt_fn(request, coordinator.clone(), handle.clone(), shutdown);
+    match outcome {
+        Ok(Some(response)) => {
+            let _ = handle.block_on(coordinator.submit_response(response));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let request_id = match &error {
+                UserInputError::UnknownRequest { request_id }
+                | UserInputError::Timeout { request_id }
+                | UserInputError::Canceled { request_id }
+                | UserInputError::InteractivePromptUnavailable { request_id, .. } => *request_id,
+                UserInputError::NoCallback => fallback_request_id,
+            };
+            let _ = handle.block_on(coordinator.submit_error(request_id, error));
         }
     }
 }
@@ -364,12 +272,25 @@ mod tests {
         }
     }
 
+    fn spawn_prompt_handler(
+        request: UserInputRequest,
+        coordinator: Arc<UserInputCoordinator>,
+        prompt_fn: PromptFn,
+        shutdown: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        let handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            handle_prompt_request(request, coordinator, prompt_fn, handle, shutdown);
+        })
+    }
+
     #[tokio::test]
-    async fn prompt_host_submits_response_for_active_request() {
+    async fn prompt_handler_submits_response_for_active_request() {
         let coordinator = Arc::new(UserInputCoordinator::new());
         let request = test_request();
         let pending = coordinator.create_request(request.clone()).await.unwrap();
-        let host = PromptHost::spawn_with_prompt_fn(
+        let join_handle = spawn_prompt_handler(
+            request.clone(),
             coordinator.clone(),
             Arc::new(|request, _, _, _| {
                 Ok(Some(UserInputResponse {
@@ -381,24 +302,26 @@ mod tests {
                     canceled: false,
                 }))
             }),
+            Arc::new(AtomicBool::new(false)),
         );
 
-        host.enqueue_request(request.clone());
         let response = pending.wait(Some(100)).await.unwrap();
 
         assert_eq!(response.request_id, request.request_id);
         assert_eq!(response.answers[0].content, "yes");
-
-        host.shutdown();
+        let _ = join_handle.join();
     }
 
     #[tokio::test]
-    async fn prompt_host_ignores_late_response_after_timeout() {
+    async fn prompt_handler_ignores_late_response_after_timeout() {
         let coordinator = Arc::new(UserInputCoordinator::new());
         let request = test_request();
         let pending = coordinator.create_request(request.clone()).await.unwrap();
         let release_flag = Arc::new(AtomicBool::new(false));
-        let host = PromptHost::spawn_with_prompt_fn(
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let join_handle = spawn_prompt_handler(
+            request.clone(),
             coordinator.clone(),
             Arc::new({
                 let release_flag = release_flag.clone();
@@ -419,9 +342,9 @@ mod tests {
                     Ok(None)
                 }
             }),
+            thread_shutdown,
         );
 
-        host.enqueue_request(request.clone());
         let result = pending.wait(Some(10)).await;
         assert!(matches!(result, Err(UserInputError::Timeout { .. })));
 
@@ -429,15 +352,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!coordinator.is_pending(request.request_id).await);
 
-        host.shutdown();
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = join_handle.join();
     }
 
     #[tokio::test]
-    async fn prompt_host_submits_interactive_unavailable_error() {
+    async fn prompt_handler_submits_interactive_unavailable_error() {
         let coordinator = Arc::new(UserInputCoordinator::new());
         let request = test_request();
         let pending = coordinator.create_request(request.clone()).await.unwrap();
-        let host = PromptHost::spawn_with_prompt_fn(
+        let join_handle = spawn_prompt_handler(
+            request.clone(),
             coordinator.clone(),
             Arc::new(|request, _, _, _| {
                 Err(UserInputError::InteractivePromptUnavailable {
@@ -445,54 +370,14 @@ mod tests {
                     reason: "stdin is not an interactive terminal".to_string(),
                 })
             }),
+            Arc::new(AtomicBool::new(false)),
         );
 
-        host.enqueue_request(request.clone());
         let result = pending.wait(Some(100)).await;
         assert!(matches!(
             result,
             Err(UserInputError::InteractivePromptUnavailable { .. })
         ));
-
-        host.shutdown();
-    }
-
-    #[tokio::test]
-    async fn raw_agent_sink_only_forwards_user_input_requests() {
-        let coordinator = Arc::new(UserInputCoordinator::new());
-        let request = test_request();
-        let pending = coordinator.create_request(request.clone()).await.unwrap();
-        let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let host = PromptHost::spawn_with_prompt_fn(
-            coordinator.clone(),
-            Arc::new({
-                let prompt_calls = prompt_calls.clone();
-                move |request, _, _, _| {
-                    prompt_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(Some(UserInputResponse {
-                        request_id: request.request_id,
-                        answers: vec![Answer {
-                            question_id: "q1".to_string(),
-                            content: "yes".to_string(),
-                        }],
-                        canceled: false,
-                    }))
-                }
-            }),
-        );
-
-        let sink = host.build_agent_sink();
-        sink(AgentEvent::MessageStart {
-            message: roci::types::ModelMessage::assistant("ignore"),
-        });
-        sink(AgentEvent::UserInputRequested {
-            request: request.clone(),
-        });
-
-        let response = pending.wait(Some(100)).await.unwrap();
-        assert_eq!(response.request_id, request.request_id);
-        assert_eq!(prompt_calls.load(Ordering::Relaxed), 1);
-
-        host.shutdown();
+        let _ = join_handle.join();
     }
 }
