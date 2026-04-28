@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
@@ -9,7 +9,7 @@ use roci::agent::{
     RuntimeCursor, RuntimeSnapshot, RuntimeSubscription, ToolExecutionSnapshot,
     UserInputCoordinator,
 };
-use roci::agent_loop::AgentEvent;
+use roci::agent_loop::{AgentEvent, ApprovalDecision, ApprovalHandler, ApprovalRequest};
 use roci::tools::UserInputRequest;
 use roci::types::{ContentPart, Role};
 use tokio::task::JoinHandle as TaskJoinHandle;
@@ -17,9 +17,15 @@ use tokio::task::JoinHandle as TaskJoinHandle;
 use super::resource_prompt::truncate_preview;
 use super::user_input::{default_prompt_fn, handle_prompt_request, PromptFn};
 
+type ApprovalPromptFn = Arc<dyn Fn(ApprovalRequest) -> ApprovalDecision + Send + Sync>;
+
 enum TerminalCommand {
     RuntimeEvent(Box<AgentRuntimeEventPayload>),
     UserInputRequest(UserInputRequest),
+    ApprovalRequest {
+        request: ApprovalRequest,
+        response_tx: tokio::sync::oneshot::Sender<ApprovalDecision>,
+    },
     Snapshot(RuntimeSnapshot),
     StreamError(AgentRuntimeError),
     Shutdown,
@@ -34,7 +40,11 @@ pub(crate) struct RuntimeEventRenderer {
 
 impl RuntimeEventRenderer {
     pub(crate) fn spawn(coordinator: Arc<UserInputCoordinator>) -> Self {
-        Self::spawn_with_prompt_fn(coordinator, default_prompt_fn())
+        Self::spawn_with_prompt_fns(
+            coordinator,
+            default_prompt_fn(),
+            default_approval_prompt_fn(),
+        )
     }
 
     #[cfg(test)]
@@ -42,12 +52,28 @@ impl RuntimeEventRenderer {
         coordinator: Arc<UserInputCoordinator>,
         prompt_fn: PromptFn,
     ) -> Self {
+        Self::spawn_with_prompt_fns(coordinator, prompt_fn, default_approval_prompt_fn())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_prompt_fns(
+        coordinator: Arc<UserInputCoordinator>,
+        prompt_fn: PromptFn,
+        approval_prompt_fn: ApprovalPromptFn,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
         let handle = tokio::runtime::Handle::current();
         let terminal_handle = std::thread::spawn(move || {
-            drive_terminal(command_rx, coordinator, prompt_fn, handle, thread_shutdown);
+            drive_terminal(
+                command_rx,
+                coordinator,
+                prompt_fn,
+                approval_prompt_fn,
+                handle,
+                thread_shutdown,
+            );
         });
 
         Self {
@@ -59,13 +85,24 @@ impl RuntimeEventRenderer {
     }
 
     #[cfg(not(test))]
-    fn spawn_with_prompt_fn(coordinator: Arc<UserInputCoordinator>, prompt_fn: PromptFn) -> Self {
+    fn spawn_with_prompt_fns(
+        coordinator: Arc<UserInputCoordinator>,
+        prompt_fn: PromptFn,
+        approval_prompt_fn: ApprovalPromptFn,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
         let handle = tokio::runtime::Handle::current();
         let terminal_handle = std::thread::spawn(move || {
-            drive_terminal(command_rx, coordinator, prompt_fn, handle, thread_shutdown);
+            drive_terminal(
+                command_rx,
+                coordinator,
+                prompt_fn,
+                approval_prompt_fn,
+                handle,
+                thread_shutdown,
+            );
         });
 
         Self {
@@ -82,6 +119,31 @@ impl RuntimeEventRenderer {
             if let AgentEvent::UserInputRequested { request } = event {
                 let _ = command_tx.send(TerminalCommand::UserInputRequest(request));
             }
+        })
+    }
+
+    pub(crate) fn build_approval_handler(&self) -> ApprovalHandler {
+        let command_tx = self.command_tx.clone();
+        let shutdown = self.shutdown.clone();
+        Arc::new(move |request: ApprovalRequest| {
+            let command_tx = command_tx.clone();
+            let shutdown = shutdown.clone();
+            Box::pin(async move {
+                if shutdown.load(Ordering::Relaxed) {
+                    return ApprovalDecision::Cancel;
+                }
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                if command_tx
+                    .send(TerminalCommand::ApprovalRequest {
+                        request,
+                        response_tx,
+                    })
+                    .is_err()
+                {
+                    return ApprovalDecision::Decline;
+                }
+                response_rx.await.unwrap_or(ApprovalDecision::Decline)
+            })
         })
     }
 
@@ -196,6 +258,7 @@ fn drive_terminal(
     command_rx: mpsc::Receiver<TerminalCommand>,
     coordinator: Arc<UserInputCoordinator>,
     prompt_fn: PromptFn,
+    approval_prompt_fn: ApprovalPromptFn,
     handle: tokio::runtime::Handle,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -217,12 +280,70 @@ fn drive_terminal(
                     shutdown.clone(),
                 );
             }
+            TerminalCommand::ApprovalRequest {
+                request,
+                response_tx,
+            } => {
+                let decision = if shutdown.load(Ordering::Relaxed) {
+                    ApprovalDecision::Cancel
+                } else {
+                    approval_prompt_fn(request)
+                };
+                let _ = response_tx.send(decision);
+            }
             TerminalCommand::Snapshot(snapshot) => renderer.render_snapshot(snapshot),
             TerminalCommand::StreamError(error) => {
                 eprintln!("\n[roci] runtime event stream ended: {error:?}");
                 break;
             }
             TerminalCommand::Shutdown => break,
+        }
+    }
+}
+
+fn default_approval_prompt_fn() -> ApprovalPromptFn {
+    Arc::new(prompt_for_approval)
+}
+
+fn prompt_for_approval(request: ApprovalRequest) -> ApprovalDecision {
+    eprintln!("\n? approval required: {}", request.id);
+    eprintln!("  kind: {:?}", request.kind);
+    if let Some(reason) = request.reason.as_deref() {
+        eprintln!("  reason: {}", truncate_preview(reason, 200));
+    }
+    if !request.payload.is_null() {
+        eprintln!(
+            "  payload: {}",
+            truncate_preview(&request.payload.to_string(), 400)
+        );
+    }
+    if let Some(update) = request.suggested_policy_change.as_ref() {
+        eprintln!(
+            "  suggested policy: rule={:?} argv={:?}",
+            update.rule_id, update.argv
+        );
+    }
+
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        eprintln!("  declining: interactive terminal unavailable");
+        return ApprovalDecision::Decline;
+    }
+
+    loop {
+        eprint!("  approve? [y]es/[a] session/[n]o/[c]ancel: ");
+        let _ = io::stderr().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            eprintln!();
+            return ApprovalDecision::Decline;
+        }
+
+        match input.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return ApprovalDecision::Accept,
+            "a" | "session" | "always" => return ApprovalDecision::AcceptForSession,
+            "" | "n" | "no" => return ApprovalDecision::Decline,
+            "c" | "cancel" => return ApprovalDecision::Cancel,
+            _ => eprintln!("  enter y, a, n, or c"),
         }
     }
 }
@@ -419,7 +540,7 @@ mod tests {
 
     use super::*;
     use roci::agent::{MessageStatus, ThreadId, ToolStatus, TurnId, TurnSnapshot, TurnStatus};
-    use roci::agent_loop::ToolUpdatePayload;
+    use roci::agent_loop::{ApprovalKind, ToolUpdatePayload};
     use roci::tools::{Answer, UserInputRequest, UserInputRequestId, UserInputResponse};
     use roci::types::{AgentToolResult, ModelMessage};
 
@@ -493,6 +614,16 @@ mod tests {
                 options: None,
             }],
             timeout_ms: None,
+        }
+    }
+
+    fn approval_request() -> ApprovalRequest {
+        ApprovalRequest {
+            id: "approval_1".to_string(),
+            kind: ApprovalKind::CommandExecution,
+            reason: Some("Run shell".to_string()),
+            payload: serde_json::json!({ "tool_name": "shell" }),
+            suggested_policy_change: None,
         }
     }
 
@@ -631,6 +762,32 @@ mod tests {
 
         let response = pending.wait(Some(100)).await.unwrap();
         assert_eq!(response.request_id, request.request_id);
+        assert_eq!(prompt_calls.load(Ordering::Relaxed), 1);
+
+        renderer.finish().await;
+    }
+
+    #[tokio::test]
+    async fn approval_handler_forwards_request_into_terminal_actor() {
+        let coordinator = Arc::new(UserInputCoordinator::new());
+        let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let renderer = RuntimeEventRenderer::spawn_with_prompt_fns(
+            coordinator,
+            Arc::new(|_, _, _, _| Ok(None)),
+            Arc::new({
+                let prompt_calls = prompt_calls.clone();
+                move |request| {
+                    prompt_calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(request.id, "approval_1");
+                    ApprovalDecision::AcceptForSession
+                }
+            }),
+        );
+
+        let handler = renderer.build_approval_handler();
+        let decision = handler(approval_request()).await;
+
+        assert_eq!(decision, ApprovalDecision::AcceptForSession);
         assert_eq!(prompt_calls.load(Ordering::Relaxed), 1);
 
         renderer.finish().await;

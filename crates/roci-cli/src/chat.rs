@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use roci::agent::{AgentConfig, AgentRuntime, QueueDrainMode, UserInputCoordinator};
-use roci::agent_loop::{PreToolUseHookResult, RunStatus};
+use roci::agent_loop::{ApprovalPolicy, PreToolUseHookResult, RunStatus};
 use roci::config::RociConfig;
 use roci::mcp::{merge_mcp_instructions, MCPInstructionMergePolicy};
 use roci::resource::SkillResourceOptions;
 use roci::skills::merge_system_prompt_with_skills;
 
-use crate::cli::ChatArgs;
+use crate::cli::{ChatApprovalArg, ChatArgs};
 
 mod mcp;
 mod resource_prompt;
@@ -30,6 +30,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         skill_root,
         no_skills,
         max_tokens,
+        approval,
         mcp_stdio,
         mcp_sse,
         prompt,
@@ -86,6 +87,9 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
 
     let coordinator = Arc::new(UserInputCoordinator::new());
     let mut renderer = RuntimeEventRenderer::spawn(coordinator.clone());
+    let approval_policy = approval_policy_from_arg(approval);
+    let approval_handler =
+        (approval == ChatApprovalArg::Ask).then(|| renderer.build_approval_handler());
     let tools = roci_tools::builtin::all_tools();
     let agent = Arc::new(AgentRuntime::new(
         registry,
@@ -100,8 +104,8 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             convert_to_llm: None,
             before_agent_start: None,
             event_sink: Some(renderer.build_agent_sink()),
-            approval_policy: Default::default(),
-            approval_handler: None,
+            approval_policy,
+            approval_handler,
             session_id: None,
             steering_mode: QueueDrainMode::All,
             follow_up_mode: QueueDrainMode::All,
@@ -154,6 +158,14 @@ fn demo_pre_tool_use_hook(tool_name: &str, tool_call_id: &str) {
 
 fn demo_post_tool_use_hook(tool_name: &str, tool_call_id: &str) {
     eprintln!("[hook] postToolUse called (tool={tool_name}, id={tool_call_id})");
+}
+
+fn approval_policy_from_arg(arg: ChatApprovalArg) -> ApprovalPolicy {
+    match arg {
+        ChatApprovalArg::Ask => ApprovalPolicy::Ask,
+        ChatApprovalArg::Always => ApprovalPolicy::Always,
+        ChatApprovalArg::Never => ApprovalPolicy::Never,
+    }
 }
 
 #[cfg(test)]

@@ -179,6 +179,10 @@ pub struct ChatArgs {
     #[arg(long)]
     pub max_tokens: Option<u32>,
 
+    /// Tool approval behavior
+    #[arg(long, value_enum, default_value_t = ChatApprovalArg::Ask)]
+    pub approval: ChatApprovalArg,
+
     /// MCP stdio server spec (repeatable). Format: `key=value` pairs separated by commas.
     /// Keys: `id`, `label`, `command`, `arg` (repeat for multiple args).
     /// Example: `--mcp-stdio 'id=local,label=Local Files,command=npx,arg=-y,arg=@modelcontextprotocol/server-filesystem,arg=.'`
@@ -193,6 +197,14 @@ pub struct ChatArgs {
 
     /// User prompt (positional)
     pub prompt: Option<String>,
+}
+
+/// CLI-local tool approval policy values.
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ChatApprovalArg {
+    Ask,
+    Always,
+    Never,
 }
 
 /// Arguments for the `skills` subcommand group.
@@ -300,6 +312,7 @@ mod tests {
                 assert!(args.skill_root.is_empty());
                 assert!(!args.no_skills);
                 assert!(args.max_tokens.is_none());
+                assert_eq!(args.approval, ChatApprovalArg::Ask);
                 assert!(args.mcp_stdio.is_empty());
                 assert!(args.mcp_sse.is_empty());
                 assert!(args.prompt.is_none());
@@ -434,6 +447,8 @@ mod tests {
             "0.7",
             "--max-tokens",
             "1024",
+            "--approval",
+            "always",
             "Hello world",
         ])
         .unwrap();
@@ -446,6 +461,7 @@ mod tests {
                 assert!(args.skill_root.is_empty());
                 assert!(!args.no_skills);
                 assert_eq!(args.max_tokens, Some(1024));
+                assert_eq!(args.approval, ChatApprovalArg::Always);
                 assert!(args.mcp_stdio.is_empty());
                 assert!(args.mcp_sse.is_empty());
                 assert_eq!(args.prompt.as_deref(), Some("Hello world"));
