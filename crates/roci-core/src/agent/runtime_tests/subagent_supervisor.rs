@@ -28,7 +28,7 @@ use crate::provider::{
     ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
 };
 use crate::tools::tool::Tool;
-use crate::tools::{AgentTool, AgentToolParameters, Question, UserInputRequest};
+use crate::tools::{AgentTool, AgentToolParameters, Question, ToolApproval, UserInputRequest};
 use crate::types::{ModelMessage, Role, StreamEventType, TextStreamDelta, Usage};
 
 // ---------------------------------------------------------------------------
@@ -349,32 +349,34 @@ fn make_blocking_ask_user_supervisor() -> SubagentSupervisor {
     let roci_config = RociConfig::default();
     roci_config.set_api_key("test", "test-key".into());
 
-    let ask_user_tool: Arc<dyn Tool> = Arc::new(AgentTool::new(
-        "ask_user",
-        "ask user test tool",
-        AgentToolParameters::empty(),
-        |_args, ctx| async move {
-            let callback = ctx
-                .request_user_input
-                .clone()
-                .ok_or_else(|| RociError::InvalidState("missing request_user_input".to_string()))?;
-            let response = callback(UserInputRequest {
-                request_id: uuid::Uuid::new_v4(),
-                tool_call_id: "ask-user-call-1".to_string(),
-                questions: vec![Question {
-                    id: "abort_unit".to_string(),
-                    text: "Abort me?".to_string(),
-                    options: None,
-                }],
-                timeout_ms: None,
-            })
-            .await
-            .map_err(|err| RociError::InvalidState(err.to_string()))?;
-            Ok(serde_json::json!({
-                "answer": response.answers.first().map(|answer| answer.content.clone())
-            }))
-        },
-    ));
+    let ask_user_tool: Arc<dyn Tool> = Arc::new(
+        AgentTool::new(
+            "ask_user",
+            "ask user test tool",
+            AgentToolParameters::empty(),
+            |_args, ctx| async move {
+                let callback = ctx.request_user_input.clone().ok_or_else(|| {
+                    RociError::InvalidState("missing request_user_input".to_string())
+                })?;
+                let response = callback(UserInputRequest {
+                    request_id: uuid::Uuid::new_v4(),
+                    tool_call_id: "ask-user-call-1".to_string(),
+                    questions: vec![Question {
+                        id: "abort_unit".to_string(),
+                        text: "Abort me?".to_string(),
+                        options: None,
+                    }],
+                    timeout_ms: None,
+                })
+                .await
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
+                Ok(serde_json::json!({
+                    "answer": response.answers.first().map(|answer| answer.content.clone())
+                }))
+            },
+        )
+        .with_approval(ToolApproval::safe_host_input()),
+    );
 
     let mut base_config = make_base_config();
     base_config.model = LanguageModel::Known {

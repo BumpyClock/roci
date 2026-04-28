@@ -36,6 +36,7 @@ pub struct OpenAiProvider {
     extra_headers: reqwest::header::HeaderMap,
     extra_query: Option<String>,
     auth_mode: AuthMode,
+    auth_required: bool,
     capabilities: ModelCapabilities,
 }
 
@@ -114,6 +115,29 @@ impl OpenAiProvider {
         extra_query: Option<String>,
         auth_mode: AuthMode,
     ) -> Self {
+        Self::new_full_with_auth_required(
+            model,
+            api_key,
+            base_url,
+            account_id,
+            extra_headers,
+            extra_query,
+            auth_mode,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_full_with_auth_required(
+        model: OpenAiModel,
+        api_key: String,
+        base_url: Option<String>,
+        account_id: Option<String>,
+        extra_headers: reqwest::header::HeaderMap,
+        extra_query: Option<String>,
+        auth_mode: AuthMode,
+        auth_required: bool,
+    ) -> Self {
         let capabilities = model.capabilities();
         Self {
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -123,24 +147,68 @@ impl OpenAiProvider {
             extra_headers,
             extra_query,
             auth_mode,
+            auth_required,
             capabilities,
         }
     }
 
-    pub(crate) fn build_headers(&self) -> reqwest::header::HeaderMap {
+    #[cfg_attr(
+        not(any(feature = "lmstudio", feature = "ollama", test)),
+        allow(dead_code)
+    )]
+    pub(crate) fn new_without_auth(model: OpenAiModel, base_url: Option<String>) -> Self {
+        Self::new_full_with_auth_required(
+            model,
+            String::new(),
+            base_url,
+            None,
+            HeaderMap::new(),
+            None,
+            AuthMode::Bearer,
+            false,
+        )
+    }
+
+    fn resolved_api_key<'a>(
+        &'a self,
+        request: &'a ProviderRequest,
+    ) -> Result<Option<&'a str>, RociError> {
+        if let Some(api_key) = request.api_key_override.as_deref() {
+            return Ok(Some(api_key));
+        }
+        if !self.api_key.is_empty() {
+            return Ok(Some(self.api_key.as_str()));
+        }
+        if self.auth_required {
+            return Err(RociError::MissingCredential {
+                provider: self.provider_name().to_string(),
+            });
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn build_headers(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<reqwest::header::HeaderMap, RociError> {
+        let resolved_api_key = self.resolved_api_key(request)?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        match self.auth_mode {
-            AuthMode::Bearer => {
-                if let Some(value) = bearer_headers(&self.api_key).get(AUTHORIZATION).cloned() {
-                    headers.insert(AUTHORIZATION, value);
+        if let Some(resolved_api_key) = resolved_api_key {
+            match self.auth_mode {
+                AuthMode::Bearer => {
+                    if let Some(value) =
+                        bearer_headers(resolved_api_key).get(AUTHORIZATION).cloned()
+                    {
+                        headers.insert(AUTHORIZATION, value);
+                    }
                 }
-            }
-            #[cfg(feature = "azure")]
-            AuthMode::ApiKey => {
-                if let Ok(value) = HeaderValue::from_str(&self.api_key) {
-                    headers.insert("api-key", value);
+                #[cfg(feature = "azure")]
+                AuthMode::ApiKey => {
+                    if let Ok(value) = HeaderValue::from_str(resolved_api_key) {
+                        headers.insert("api-key", value);
+                    }
                 }
             }
         }
@@ -153,15 +221,20 @@ impl OpenAiProvider {
         for (name, value) in self.extra_headers.iter() {
             headers.insert(name, value.clone());
         }
+        for (name, value) in request.headers.iter() {
+            headers.insert(name, value.clone());
+        }
         if roci_debug_enabled() {
             tracing::debug!(
                 model = self.model.as_str(),
                 base_url = %self.base_url,
                 account_id_present = self.account_id.is_some(),
+                api_key_overridden = request.api_key_override.is_some(),
+                request_header_overrides = request.headers.len(),
                 "OpenAI Chat headers prepared"
             );
         }
-        headers
+        Ok(headers)
     }
 
     /// Build the chat completions URL, appending extra query params if present.
@@ -301,7 +374,7 @@ impl ModelProvider for OpenAiProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(self.build_headers())
+            .headers(self.build_headers(request)?)
             .json(&body)
             .send()
             .await?;
@@ -366,7 +439,7 @@ impl ModelProvider for OpenAiProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(self.build_headers())
+            .headers(self.build_headers(request)?)
             .json(&body)
             .send()
             .await?;
@@ -715,6 +788,24 @@ mod tests {
         }
     }
 
+    fn request_with_headers(
+        api_key_override: Option<&str>,
+        headers: reqwest::header::HeaderMap,
+    ) -> ProviderRequest {
+        ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: api_key_override.map(str::to_string),
+            headers,
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        }
+    }
+
     #[test]
     fn chat_request_uses_max_completion_tokens_for_gpt5() {
         let provider = OpenAiProvider::new(
@@ -807,11 +898,89 @@ mod tests {
             HeaderMap::new(),
             Some("api-version=2024-06-01".to_string()),
         );
-        let headers = provider.build_headers();
+        let request = request_with_headers(None, HeaderMap::new());
+        let headers = provider.build_headers(&request).expect("headers");
         assert_eq!(
             headers.get("api-key").and_then(|value| value.to_str().ok()),
             Some("k")
         );
         assert!(headers.get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn headers_use_request_api_key_override_when_default_key_missing() {
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, String::new(), None, None);
+        let request = request_with_headers(Some("request-key"), HeaderMap::new());
+
+        let headers = provider.build_headers(&request).expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer request-key")
+        );
+    }
+
+    #[test]
+    fn headers_merge_request_overrides_after_auth_and_extra_headers() {
+        let mut extra = HeaderMap::new();
+        extra.insert("x-extra", HeaderValue::from_static("base"));
+        let provider = OpenAiProvider::new_with_extra_headers(
+            OpenAiModel::Gpt4o,
+            "default-key".to_string(),
+            None,
+            None,
+            extra,
+        );
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("x-extra", HeaderValue::from_static("request"));
+        request_headers.insert("x-request", HeaderValue::from_static("value"));
+        let request = request_with_headers(Some("request-key"), request_headers);
+
+        let headers = provider.build_headers(&request).expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer request-key")
+        );
+        assert_eq!(
+            headers.get("x-extra").and_then(|value| value.to_str().ok()),
+            Some("request")
+        );
+        assert_eq!(
+            headers
+                .get("x-request")
+                .and_then(|value| value.to_str().ok()),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn headers_error_when_no_default_or_request_api_key() {
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, String::new(), None, None);
+        let request = request_with_headers(None, HeaderMap::new());
+
+        let err = provider.build_headers(&request).unwrap_err();
+
+        assert!(matches!(err, RociError::MissingCredential { .. }));
+    }
+
+    #[test]
+    fn headers_omit_authorization_when_auth_not_required() {
+        let provider = OpenAiProvider::new_without_auth(OpenAiModel::Gpt4o, None);
+        let request = request_with_headers(None, HeaderMap::new());
+
+        let headers = provider.build_headers(&request).expect("headers");
+
+        assert!(headers.get(AUTHORIZATION).is_none());
+        assert_eq!(
+            headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
     }
 }

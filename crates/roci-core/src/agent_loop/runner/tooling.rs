@@ -33,6 +33,19 @@ pub(super) struct ToolExecutionOutcome {
     pub(super) result: AgentToolResult,
 }
 
+#[derive(Clone)]
+pub(super) struct ResolvedToolCall {
+    pub(super) call: AgentToolCall,
+    pub(super) tool: Option<Arc<dyn Tool>>,
+}
+
+pub(super) fn resolve_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -> ResolvedToolCall {
+    ResolvedToolCall {
+        call: call.clone(),
+        tool: tools.iter().find(|tool| tool.name() == call.name).cloned(),
+    }
+}
+
 fn synthetic_hook_error_result(
     call: &AgentToolCall,
     source: &str,
@@ -123,16 +136,16 @@ pub(super) fn emit_tool_execution_end(
 }
 
 pub(super) async fn execute_tool_call(
-    tools: &[Arc<dyn Tool>],
     hooks: &RunHooks,
-    call: &AgentToolCall,
+    resolved: ResolvedToolCall,
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
     #[cfg(feature = "agent")] user_input_callback: Option<
         &crate::tools::user_input::RequestUserInputFn,
     >,
 ) -> ToolExecutionOutcome {
-    let call = match apply_pre_tool_use_hook(hooks, call, cancel.child_token()).await {
+    let ResolvedToolCall { call, tool } = resolved;
+    let call = match apply_pre_tool_use_hook(hooks, &call, cancel.child_token()).await {
         Ok(call) => call,
         Err(result) => {
             return ToolExecutionOutcome {
@@ -141,7 +154,6 @@ pub(super) async fn execute_tool_call(
             };
         }
     };
-    let tool = tools.iter().find(|t| t.name() == call.name);
     match tool {
         Some(tool) => {
             let schema = &tool.parameters().schema;
@@ -204,9 +216,8 @@ pub(super) async fn execute_tool_call(
 }
 
 pub(super) async fn execute_parallel_tool_calls(
-    tools: &[Arc<dyn Tool>],
     hooks: &RunHooks,
-    calls: &[AgentToolCall],
+    calls: &[ResolvedToolCall],
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
     #[cfg(feature = "agent")] user_input_callback: Option<
@@ -215,11 +226,11 @@ pub(super) async fn execute_parallel_tool_calls(
 ) -> Vec<ToolExecutionOutcome> {
     let futures = calls
         .iter()
-        .map(|call| {
+        .cloned()
+        .map(|resolved| {
             execute_tool_call(
-                tools,
                 hooks,
-                call,
+                resolved,
                 agent_emitter,
                 cancel.child_token(),
                 #[cfg(feature = "agent")]

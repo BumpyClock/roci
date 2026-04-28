@@ -61,8 +61,11 @@ impl std::fmt::Debug for ProviderRequest {
             .field("settings", &self.settings)
             .field("tools", &self.tools)
             .field("response_format", &self.response_format)
-            .field("api_key_override", &self.api_key_override)
-            .field("headers", &self.headers)
+            .field(
+                "api_key_override",
+                &self.api_key_override.as_ref().map(|_| "<redacted>"),
+            )
+            .field("headers", &format_args!("{} header(s)", self.headers.len()))
             .field("metadata", &self.metadata)
             .field(
                 "payload_callback",

@@ -28,7 +28,9 @@ use crate::provider::ProviderRegistry;
 
 use super::context::build_child_initial_messages;
 use super::handle::SubagentHandle;
-use super::launcher::{InProcessLauncher, SubagentLauncher};
+use super::launcher::{
+    build_child_config, select_child_tools, InProcessLauncher, SubagentLauncher,
+};
 use super::profiles::SubagentProfileRegistry;
 use super::prompt::SubagentPromptPolicy;
 use super::types::{
@@ -154,9 +156,12 @@ impl SubagentSupervisor {
         let profile = self
             .profile_registry
             .resolve_effective(&spec.profile, &spec.overrides)?;
-        let model =
-            self.profile_registry
-                .resolve_model(&profile, &self.registry, &self.roci_config)?;
+        let resolved_model = self.profile_registry.resolve_model_candidate(
+            &profile,
+            &self.registry,
+            &self.roci_config,
+        )?;
+        let model = resolved_model.model;
 
         // 3. Build initial messages (system prompt + context + task/continuation).
         //    The composed prompt policy is the first (system) message.
@@ -175,19 +180,22 @@ impl SubagentSupervisor {
         let child_event_sink =
             super::events::build_child_event_sink(id, spec.label.clone(), self.event_tx.clone());
 
+        let child_tools = select_child_tools(&self.base_config.tools, &profile.tools)?;
+        let child_config = build_child_config(
+            &self.base_config,
+            model.clone(),
+            child_tools,
+            resolved_model.reasoning_effort.as_deref(),
+            Some(child_event_sink),
+            #[cfg(feature = "agent")]
+            self.coordinator.clone(),
+        )?;
+
         // 6. Launch child runtime seeded with the full initial messages.
         //    System prompt is in the messages, not in the runtime config.
         let launched = self
             .launcher
-            .launch(
-                id,
-                model.clone(),
-                initial_messages,
-                self.base_config.tools.clone(),
-                #[cfg(feature = "agent")]
-                self.coordinator.clone(),
-                Some(child_event_sink),
-            )
+            .launch(id, initial_messages, child_config)
             .await?;
 
         // 7. Shared status
@@ -246,6 +254,7 @@ impl SubagentSupervisor {
             model.clone(),
             launched.runtime,
             cancel_token.clone(),
+            profile.default_timeout_ms,
             completion_tx,
         ));
 

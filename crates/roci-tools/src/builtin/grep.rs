@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
-use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 
 use super::common::{truncate_utf8, GREP_OUTPUT_MAX_BYTES};
@@ -11,7 +11,7 @@ use super::common::{truncate_utf8, GREP_OUTPUT_MAX_BYTES};
 /// Runs `grep -rn` with the given pattern. Output is truncated to 32 KB.
 /// When `path` is omitted the search defaults to the current directory.
 pub fn grep_tool() -> Arc<dyn Tool> {
-    Arc::new(AgentTool::new(
+    let tool = AgentTool::new(
         "grep",
         "Search for a pattern in files using grep",
         AgentToolParameters::object()
@@ -55,5 +55,6 @@ pub fn grep_tool() -> Arc<dyn Tool> {
                 "truncated": truncated,
             }))
         },
-    ))
+    );
+    Arc::new(tool.with_approval(ToolApproval::safe_read_only()))
 }

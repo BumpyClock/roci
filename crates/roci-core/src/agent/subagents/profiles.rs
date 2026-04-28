@@ -9,7 +9,13 @@ use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
 
 use super::config::{TomlProfile, TomlProfileFile};
-use super::types::{SubagentKind, SubagentOverrides, SubagentProfile, ToolPolicy};
+use super::types::{ModelCandidate, SubagentKind, SubagentOverrides, SubagentProfile, ToolPolicy};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResolvedSubagentModel {
+    pub model: LanguageModel,
+    pub reasoning_effort: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Registry
@@ -113,21 +119,34 @@ impl SubagentProfileRegistry {
     /// Pick the first viable model candidate from a resolved profile.
     ///
     /// A candidate is viable when the provider is registered **and**
-    /// credentials are configured. This is intended for launch-time
-    /// selection only (no runtime fallback).
+    /// credentials are configured, unless provider metadata marks credentials
+    /// as unnecessary. This is intended for launch-time selection only (no
+    /// runtime fallback).
     pub fn resolve_model(
         &self,
         profile: &SubagentProfile,
         registry: &ProviderRegistry,
         config: &RociConfig,
     ) -> Result<LanguageModel, RociError> {
+        Ok(self
+            .resolve_model_candidate(profile, registry, config)?
+            .model)
+    }
+
+    pub(super) fn resolve_model_candidate(
+        &self,
+        profile: &SubagentProfile,
+        registry: &ProviderRegistry,
+        config: &RociConfig,
+    ) -> Result<ResolvedSubagentModel, RociError> {
         for candidate in &profile.models {
-            if registry.has_provider(&candidate.provider)
-                && config.has_credentials(&candidate.provider)
-            {
-                return Ok(LanguageModel::Known {
-                    provider_key: candidate.provider.clone(),
-                    model_id: candidate.model.clone(),
+            if is_viable_model_candidate(candidate, registry, config) {
+                return Ok(ResolvedSubagentModel {
+                    model: LanguageModel::Known {
+                        provider_key: candidate.provider.clone(),
+                        model_id: candidate.model.clone(),
+                    },
+                    reasoning_effort: candidate.reasoning_effort.clone(),
                 });
             }
         }
@@ -153,6 +172,18 @@ impl SubagentProfileRegistry {
         }
         Ok(())
     }
+}
+
+fn is_viable_model_candidate(
+    candidate: &ModelCandidate,
+    registry: &ProviderRegistry,
+    config: &RociConfig,
+) -> bool {
+    registry.has_provider(&candidate.provider)
+        && (!registry
+            .requires_credentials(&candidate.provider)
+            .unwrap_or(true)
+            || config.has_credentials(&candidate.provider))
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +287,7 @@ fn toml_profile_to_subagent_profile(tp: TomlProfile) -> SubagentProfile {
 mod tests {
     use super::*;
     use crate::agent::subagents::types::ModelCandidate;
+    use crate::provider::factory::ProviderFactory;
 
     // -- TOML roundtrip -----------------------------------------------------
 
@@ -455,6 +487,64 @@ model = "claude-opus-4"
         let config = RociConfig::default();
         let err = reg.resolve_model(&profile, &provider_reg, &config);
         assert!(err.is_err());
+    }
+
+    struct LocalNoCredentialFactory;
+
+    impl ProviderFactory for LocalNoCredentialFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["lmstudio", "ollama"]
+        }
+
+        fn requires_credentials(&self, _provider_key: &str) -> bool {
+            false
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn crate::provider::ModelProvider>, RociError> {
+            Err(RociError::Configuration("local test factory".into()))
+        }
+    }
+
+    #[test]
+    fn local_providers_are_viable_without_credentials_when_registered() {
+        let reg = SubagentProfileRegistry::new();
+        let profile = SubagentProfile {
+            name: "local".into(),
+            models: vec![
+                ModelCandidate {
+                    provider: "lmstudio".into(),
+                    model: "local-model".into(),
+                    reasoning_effort: Some("medium".into()),
+                },
+                ModelCandidate {
+                    provider: "ollama".into(),
+                    model: "llama3.2".into(),
+                    reasoning_effort: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut provider_reg = ProviderRegistry::new();
+        provider_reg.register(std::sync::Arc::new(LocalNoCredentialFactory));
+        let config = RociConfig::default();
+
+        let resolved = reg
+            .resolve_model_candidate(&profile, &provider_reg, &config)
+            .unwrap();
+
+        assert_eq!(
+            resolved.model,
+            LanguageModel::Known {
+                provider_key: "lmstudio".into(),
+                model_id: "local-model".into()
+            }
+        );
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
     }
 
     // -- Profile versioning -------------------------------------------------

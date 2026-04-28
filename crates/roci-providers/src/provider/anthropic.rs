@@ -48,9 +48,31 @@ impl AnthropicProvider {
             .is_some_and(|t| matches!(t, ThinkingMode::Enabled { .. }))
     }
 
+    fn resolved_api_key<'a>(&'a self, request: &'a ProviderRequest) -> Result<&'a str, RociError> {
+        let default_key = (!self.api_key.is_empty()).then_some(self.api_key.as_str());
+        request
+            .api_key_override
+            .as_deref()
+            .or(default_key)
+            .ok_or_else(|| RociError::MissingCredential {
+                provider: self.provider_name().to_string(),
+            })
+    }
+
     /// Build HTTP headers, always including beta flags.
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
-        anthropic_headers(&self.api_key, API_VERSION, Some(BETA_FLAGS))
+    fn build_headers(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<reqwest::header::HeaderMap, RociError> {
+        let mut headers = anthropic_headers(
+            self.resolved_api_key(request)?,
+            API_VERSION,
+            Some(BETA_FLAGS),
+        );
+        for (name, value) in request.headers.iter() {
+            headers.insert(name, value.clone());
+        }
+        Ok(headers)
     }
 
     fn build_request_body(&self, request: &ProviderRequest, stream: bool) -> serde_json::Value {
@@ -279,7 +301,7 @@ impl ModelProvider for AnthropicProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(self.build_headers())
+            .headers(self.build_headers(request)?)
             .json(&body)
             .send()
             .await?;
@@ -375,7 +397,7 @@ impl ModelProvider for AnthropicProvider {
 
         let resp = shared_client()
             .post(&url)
-            .headers(self.build_headers())
+            .headers(self.build_headers(request)?)
             .json(&body)
             .send()
             .await?;
@@ -641,6 +663,24 @@ mod tests {
         GenerationSettings::default()
     }
 
+    fn request_with_headers(
+        api_key_override: Option<&str>,
+        headers: reqwest::header::HeaderMap,
+    ) -> ProviderRequest {
+        ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: api_key_override.map(str::to_string),
+            headers,
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        }
+    }
+
     #[test]
     fn request_body_includes_thinking_config() {
         let provider =
@@ -793,10 +833,76 @@ mod tests {
     fn beta_headers_always_sent() {
         let provider =
             AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
-        let headers = provider.build_headers();
+        let request = request_with_headers(None, reqwest::header::HeaderMap::new());
+        let headers = provider.build_headers(&request).expect("headers");
         let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
         assert!(beta.contains("interleaved-thinking-2025-05-14"));
         assert!(beta.contains("fine-grained-tool-streaming-2025-05-14"));
+    }
+
+    #[test]
+    fn headers_use_request_api_key_override_when_default_key_missing() {
+        let provider = AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, String::new(), None);
+        let request = request_with_headers(Some("request-key"), reqwest::header::HeaderMap::new());
+
+        let headers = provider.build_headers(&request).expect("headers");
+
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("request-key")
+        );
+    }
+
+    #[test]
+    fn headers_merge_request_overrides_after_anthropic_defaults() {
+        let provider = AnthropicProvider::new(
+            AnthropicModel::ClaudeSonnet4,
+            "default-key".to_string(),
+            None,
+        );
+        let mut request_headers = reqwest::header::HeaderMap::new();
+        request_headers.insert(
+            "anthropic-version",
+            reqwest::header::HeaderValue::from_static("override-version"),
+        );
+        request_headers.insert(
+            "x-request",
+            reqwest::header::HeaderValue::from_static("value"),
+        );
+        let request = request_with_headers(Some("request-key"), request_headers);
+
+        let headers = provider.build_headers(&request).expect("headers");
+
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("request-key")
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("override-version")
+        );
+        assert_eq!(
+            headers
+                .get("x-request")
+                .and_then(|value| value.to_str().ok()),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn headers_error_when_no_default_or_request_api_key() {
+        let provider = AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, String::new(), None);
+        let request = request_with_headers(None, reqwest::header::HeaderMap::new());
+
+        let err = provider.build_headers(&request).unwrap_err();
+
+        assert!(matches!(err, RociError::MissingCredential { .. }));
     }
 
     #[test]

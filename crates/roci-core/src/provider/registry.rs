@@ -50,6 +50,13 @@ impl ProviderRegistry {
         self.factories.contains_key(provider_key)
     }
 
+    /// Check whether the registered factory requires credentials.
+    pub fn requires_credentials(&self, provider_key: &str) -> Option<bool> {
+        self.factories
+            .get(provider_key)
+            .map(|factory| factory.requires_credentials(provider_key))
+    }
+
     /// List all registered provider keys.
     pub fn provider_keys(&self) -> Vec<&str> {
         self.factories.keys().map(|s| s.as_str()).collect()
@@ -229,6 +236,51 @@ mod tests {
         let mut keys = registry.provider_keys();
         keys.sort();
         assert_eq!(keys, vec!["another", "stub", "stub-alias"]);
+    }
+
+    struct LocalFactory;
+
+    impl ProviderFactory for LocalFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["local"]
+        }
+
+        fn requires_credentials(&self, _provider_key: &str) -> bool {
+            false
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            Ok(Box::new(StubProvider {
+                model_id: model_id.to_string(),
+                caps: ModelCapabilities {
+                    supports_vision: false,
+                    supports_tools: false,
+                    supports_streaming: false,
+                    supports_json_mode: false,
+                    supports_json_schema: false,
+                    supports_reasoning: false,
+                    supports_system_messages: true,
+                    context_length: 4096,
+                    max_output_tokens: None,
+                },
+            }))
+        }
+    }
+
+    #[test]
+    fn requires_credentials_uses_factory_metadata() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(StubFactory));
+        registry.register(Arc::new(LocalFactory));
+
+        assert_eq!(registry.requires_credentials("stub"), Some(true));
+        assert_eq!(registry.requires_credentials("local"), Some(false));
+        assert_eq!(registry.requires_credentials("missing"), None);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::arguments::ToolArguments;
-use super::tool::{Tool, ToolExecutionContext};
+use super::tool::{Tool, ToolApproval, ToolExecutionContext};
 use super::types::AgentToolParameters;
 use crate::error::RociError;
 
@@ -15,6 +15,29 @@ pub struct DynamicTool {
     pub name: String,
     pub description: String,
     pub parameters: AgentToolParameters,
+    pub approval: ToolApproval,
+}
+
+impl DynamicTool {
+    /// Create a dynamic tool with approval required by default.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: AgentToolParameters,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            approval: ToolApproval::requires_approval(super::tool::ToolApprovalKind::Other),
+        }
+    }
+
+    /// Set explicit approval metadata for a dynamic tool.
+    pub fn with_approval(mut self, approval: ToolApproval) -> Self {
+        self.approval = approval;
+        self
+    }
 }
 
 /// Trait for providers that can discover and execute tools at runtime.
@@ -38,6 +61,7 @@ pub struct DynamicToolAdapter {
     name: String,
     description: String,
     parameters: AgentToolParameters,
+    approval: ToolApproval,
 }
 
 impl DynamicToolAdapter {
@@ -48,6 +72,7 @@ impl DynamicToolAdapter {
             name: tool.name,
             description: tool.description,
             parameters: tool.parameters,
+            approval: tool.approval,
         }
     }
 }
@@ -66,11 +91,60 @@ impl Tool for DynamicToolAdapter {
         &self.parameters
     }
 
+    fn approval(&self) -> ToolApproval {
+        self.approval
+    }
+
     async fn execute(
         &self,
         args: &ToolArguments,
         ctx: &ToolExecutionContext,
     ) -> Result<serde_json::Value, RociError> {
         self.provider.execute_tool(&self.name, args, ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tool::ToolApprovalKind;
+    use super::*;
+
+    struct NoopProvider;
+
+    #[async_trait]
+    impl DynamicToolProvider for NoopProvider {
+        async fn list_tools(&self) -> Result<Vec<DynamicTool>, RociError> {
+            Ok(Vec::new())
+        }
+
+        async fn execute_tool(
+            &self,
+            _name: &str,
+            _args: &ToolArguments,
+            _ctx: &ToolExecutionContext,
+        ) -> Result<serde_json::Value, RociError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    #[test]
+    fn dynamic_tool_defaults_to_approval_required() {
+        let tool = DynamicTool::new("dynamic", "dynamic tool", AgentToolParameters::empty());
+
+        assert_eq!(
+            tool.approval,
+            ToolApproval::requires_approval(ToolApprovalKind::Other)
+        );
+    }
+
+    #[test]
+    fn dynamic_tool_adapter_uses_declared_approval_metadata() {
+        let adapter = DynamicToolAdapter::new(
+            Arc::new(NoopProvider),
+            DynamicTool::new("dynamic", "dynamic tool", AgentToolParameters::empty())
+                .with_approval(ToolApproval::safe_read_only()),
+        );
+
+        assert_eq!(adapter.approval(), ToolApproval::safe_read_only());
     }
 }

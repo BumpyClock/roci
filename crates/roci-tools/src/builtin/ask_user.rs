@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use roci::error::RociError;
 use roci::tools::arguments::ToolArguments;
-use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 use roci::tools::{Question, QuestionOption, UserInputRequest};
 use uuid::Uuid;
@@ -24,7 +24,8 @@ pub fn ask_user_tool() -> Arc<dyn Tool> {
         |args, ctx: ToolExecutionContext| async move {
             execute_ask_user(args, ctx).await
         },
-    ))
+    )
+    .with_approval(ToolApproval::safe_host_input()))
 }
 
 async fn execute_ask_user(

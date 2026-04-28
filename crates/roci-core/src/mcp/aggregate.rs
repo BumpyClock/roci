@@ -297,6 +297,9 @@ impl DynamicToolProvider for MCPToolAggregator {
                 name: tool.exposed_name,
                 description: tool.description,
                 parameters: tool.parameters,
+                approval: crate::tools::ToolApproval::requires_approval(
+                    crate::tools::ToolApprovalKind::Other,
+                ),
             })
             .collect())
     }

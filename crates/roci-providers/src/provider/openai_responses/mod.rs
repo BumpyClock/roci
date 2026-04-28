@@ -54,11 +54,15 @@ impl OpenAiResponsesProvider {
         }
     }
 
-    fn resolved_api_key<'a>(&'a self, request: &'a ProviderRequest) -> &'a str {
+    fn resolved_api_key<'a>(&'a self, request: &'a ProviderRequest) -> Result<&'a str, RociError> {
+        let default_key = (!self.api_key.is_empty()).then_some(self.api_key.as_str());
         request
             .api_key_override
             .as_deref()
-            .unwrap_or(self.api_key.as_str())
+            .or(default_key)
+            .ok_or_else(|| RociError::MissingCredential {
+                provider: self.provider_name().to_string(),
+            })
     }
 
     fn add_session_affinity_headers(headers: &mut reqwest::header::HeaderMap, session_id: &str) {
@@ -72,7 +76,7 @@ impl OpenAiResponsesProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<reqwest::header::HeaderMap, RociError> {
-        let resolved_api_key = self.resolved_api_key(request);
+        let resolved_api_key = self.resolved_api_key(request)?;
         let mut headers = bearer_headers(resolved_api_key);
         if self.is_codex {
             let account_id = match (&self.account_id, extract_codex_account_id(resolved_api_key)) {
@@ -1052,6 +1056,57 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(roci_core::provider::TRANSPORT_PROXY)
         );
+    }
+
+    #[test]
+    fn headers_use_request_api_key_override_when_default_key_missing() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, String::new(), None, None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: Some("override-key".to_string()),
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let headers = provider
+            .build_headers(&request)
+            .expect("headers should build");
+
+        assert_eq!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer override-key")
+        );
+    }
+
+    #[test]
+    fn headers_error_when_no_default_or_request_api_key() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, String::new(), None, None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let err = provider.build_headers(&request).unwrap_err();
+
+        assert!(matches!(err, RociError::MissingCredential { .. }));
     }
 
     #[test]

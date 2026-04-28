@@ -114,7 +114,19 @@ mod tests {
             "test-key".to_string(),
             "2024-06-01".to_string(),
         );
-        let headers = provider.inner.build_headers();
+        let request = ProviderRequest {
+            messages: vec![],
+            settings: roci_core::types::GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+        let headers = provider.inner.build_headers(&request).expect("headers");
         assert_eq!(
             headers.get("api-key").and_then(|value| value.to_str().ok()),
             Some("test-key")

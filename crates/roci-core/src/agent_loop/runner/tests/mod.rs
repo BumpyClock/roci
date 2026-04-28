@@ -7,7 +7,7 @@ use crate::agent::message::{convert_to_llm, AgentMessage};
 use crate::agent_loop::events::ToolUpdatePayload;
 use crate::agent_loop::RunStatus;
 use crate::tools::arguments::ToolArguments;
-use crate::tools::tool::{AgentTool, ToolExecutionContext, ToolUpdateCallback};
+use crate::tools::tool::{AgentTool, ToolApproval, ToolExecutionContext, ToolUpdateCallback};
 use crate::tools::types::AgentToolParameters;
 use crate::types::{ContentPart, StreamEventType};
 

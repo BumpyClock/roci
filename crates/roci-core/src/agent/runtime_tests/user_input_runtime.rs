@@ -4,7 +4,9 @@ use crate::agent_loop::AgentEvent;
 use crate::models::ModelCapabilities;
 use crate::provider::{ModelProvider, ProviderFactory, ProviderRequest, ProviderResponse};
 use crate::tools::tool::Tool;
-use crate::tools::{AgentTool, AgentToolParameters, Question, UserInputRequest, UserInputResponse};
+use crate::tools::{
+    AgentTool, AgentToolParameters, Question, ToolApproval, UserInputRequest, UserInputResponse,
+};
 use crate::types::{AgentToolCall, StreamEventType, TextStreamDelta, Usage};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -133,32 +135,34 @@ async fn prompt_emits_user_input_event_and_submit_user_input_unblocks_tool() {
     }));
     let registry = Arc::new(registry);
 
-    let ask_user_tool: Arc<dyn Tool> = Arc::new(AgentTool::new(
-        "ask_user",
-        "ask user test tool",
-        AgentToolParameters::empty(),
-        |_args, ctx| async move {
-            let callback = ctx
-                .request_user_input
-                .clone()
-                .ok_or_else(|| RociError::InvalidState("missing request_user_input".to_string()))?;
-            let response = callback(UserInputRequest {
-                request_id: uuid::Uuid::new_v4(),
-                tool_call_id: "ask-user-call-1".to_string(),
-                questions: vec![Question {
-                    id: "temp_unit".to_string(),
-                    text: "C or F?".to_string(),
-                    options: None,
-                }],
-                timeout_ms: Some(1_000),
-            })
-            .await
-            .map_err(|err| RociError::InvalidState(err.to_string()))?;
-            Ok(serde_json::json!({
-                "answer": response.answers.first().map(|answer| answer.content.clone())
-            }))
-        },
-    ));
+    let ask_user_tool: Arc<dyn Tool> = Arc::new(
+        AgentTool::new(
+            "ask_user",
+            "ask user test tool",
+            AgentToolParameters::empty(),
+            |_args, ctx| async move {
+                let callback = ctx.request_user_input.clone().ok_or_else(|| {
+                    RociError::InvalidState("missing request_user_input".to_string())
+                })?;
+                let response = callback(UserInputRequest {
+                    request_id: uuid::Uuid::new_v4(),
+                    tool_call_id: "ask-user-call-1".to_string(),
+                    questions: vec![Question {
+                        id: "temp_unit".to_string(),
+                        text: "C or F?".to_string(),
+                        options: None,
+                    }],
+                    timeout_ms: Some(1_000),
+                })
+                .await
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
+                Ok(serde_json::json!({
+                    "answer": response.answers.first().map(|answer| answer.content.clone())
+                }))
+            },
+        )
+        .with_approval(ToolApproval::safe_host_input()),
+    );
 
     let agent_slot: Arc<Mutex<Option<Arc<AgentRuntime>>>> = Arc::new(Mutex::new(None));
     let mut config = test_agent_config();
@@ -221,32 +225,34 @@ async fn abort_while_waiting_for_user_input_unblocks_run() {
     }));
     let registry = Arc::new(registry);
 
-    let ask_user_tool: Arc<dyn Tool> = Arc::new(AgentTool::new(
-        "ask_user",
-        "ask user test tool",
-        AgentToolParameters::empty(),
-        |_args, ctx| async move {
-            let callback = ctx
-                .request_user_input
-                .clone()
-                .ok_or_else(|| RociError::InvalidState("missing request_user_input".to_string()))?;
-            let response = callback(UserInputRequest {
-                request_id: uuid::Uuid::new_v4(),
-                tool_call_id: "ask-user-call-1".to_string(),
-                questions: vec![Question {
-                    id: "abort_unit".to_string(),
-                    text: "Abort me?".to_string(),
-                    options: None,
-                }],
-                timeout_ms: None,
-            })
-            .await
-            .map_err(|err| RociError::InvalidState(err.to_string()))?;
-            Ok(serde_json::json!({
-                "answer": response.answers.first().map(|answer| answer.content.clone())
-            }))
-        },
-    ));
+    let ask_user_tool: Arc<dyn Tool> = Arc::new(
+        AgentTool::new(
+            "ask_user",
+            "ask user test tool",
+            AgentToolParameters::empty(),
+            |_args, ctx| async move {
+                let callback = ctx.request_user_input.clone().ok_or_else(|| {
+                    RociError::InvalidState("missing request_user_input".to_string())
+                })?;
+                let response = callback(UserInputRequest {
+                    request_id: uuid::Uuid::new_v4(),
+                    tool_call_id: "ask-user-call-1".to_string(),
+                    questions: vec![Question {
+                        id: "abort_unit".to_string(),
+                        text: "Abort me?".to_string(),
+                        options: None,
+                    }],
+                    timeout_ms: None,
+                })
+                .await
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
+                Ok(serde_json::json!({
+                    "answer": response.answers.first().map(|answer| answer.content.clone())
+                }))
+            },
+        )
+        .with_approval(ToolApproval::safe_host_input()),
+    );
 
     let (request_seen_tx, request_seen_rx) = oneshot::channel();
     let request_seen_tx = Arc::new(Mutex::new(Some(request_seen_tx)));

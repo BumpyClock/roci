@@ -7,6 +7,7 @@ use super::message_events::{
     assistant_message_snapshot, emit_message_end_if_open, emit_message_start_if_needed,
 };
 use super::{AgentEventSink, RunEventSink};
+use crate::tools::{Tool, ToolApproval, ToolApprovalKind};
 use crate::types::{AgentToolCall, ModelMessage, StreamEventType, TextStreamDelta};
 
 pub(super) fn emit_failed_result(
@@ -199,15 +200,19 @@ pub(super) async fn resolve_approval(
     policy: &ApprovalPolicy,
     handler: Option<&ApprovalHandler>,
     call: &AgentToolCall,
+    tool: Option<&dyn Tool>,
 ) -> ApprovalDecision {
     match policy {
         ApprovalPolicy::Always => ApprovalDecision::Accept,
         ApprovalPolicy::Never => ApprovalDecision::Decline,
         ApprovalPolicy::Ask => {
-            let kind = approval_kind_for_tool(call);
-            if matches!(kind, ApprovalKind::Other) {
+            let approval = tool
+                .map(Tool::approval)
+                .unwrap_or_else(|| ToolApproval::requires_approval(ToolApprovalKind::Other));
+            let ToolApproval::RequiresApproval { kind } = approval else {
                 return ApprovalDecision::Accept;
-            }
+            };
+            let kind = approval_kind_for_tool_metadata(kind);
             let request = ApprovalRequest {
                 id: call.id.clone(),
                 kind,
@@ -301,14 +306,11 @@ pub(super) struct IterationLimitApprovalContext {
     pub(super) attempt: usize,
 }
 
-fn approval_kind_for_tool(call: &AgentToolCall) -> ApprovalKind {
-    // Under ApprovalPolicy::Ask, only tool names mapped here require approval.
-    // Unmapped tools are treated as safe-by-default and auto-accepted.
-    match call.name.as_str() {
-        "exec" | "process" | "shell" => ApprovalKind::CommandExecution,
-        "apply_patch" | "write" | "edit" | "write_file" | "edit_file" | "replace_in_file"
-        | "create_file" | "delete_file" => ApprovalKind::FileChange,
-        _ => ApprovalKind::Other,
+fn approval_kind_for_tool_metadata(kind: ToolApprovalKind) -> ApprovalKind {
+    match kind {
+        ToolApprovalKind::CommandExecution => ApprovalKind::CommandExecution,
+        ToolApprovalKind::FileChange => ApprovalKind::FileChange,
+        ToolApprovalKind::Other => ApprovalKind::Other,
     }
 }
 
@@ -325,6 +327,7 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
+    use crate::tools::{AgentTool, AgentToolParameters};
     use uuid::Uuid;
 
     fn emitter_with_events() -> (RunEventEmitter, Arc<Mutex<Vec<RunEvent>>>) {
@@ -345,10 +348,28 @@ mod tests {
         }
     }
 
+    fn tool(name: &str, approval: ToolApproval) -> AgentTool {
+        AgentTool::new(
+            name,
+            format!("{name} tool"),
+            AgentToolParameters::empty(),
+            |_args, _ctx| async { Ok(serde_json::json!({})) },
+        )
+        .with_approval(approval)
+    }
+
     #[tokio::test]
     async fn ask_policy_requires_approval_for_shell_and_write_file() {
         let (emitter, events) = emitter_with_events();
         let agent_emitter = AgentEventEmitter::new(None);
+        let shell = tool(
+            "shell",
+            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
+        );
+        let write_file = tool(
+            "write_file",
+            ToolApproval::requires_approval(ToolApprovalKind::FileChange),
+        );
 
         let shell_decision = resolve_approval(
             &emitter,
@@ -356,6 +377,7 @@ mod tests {
             &ApprovalPolicy::Ask,
             None,
             &tool_call("shell"),
+            Some(&shell),
         )
         .await;
         let write_decision = resolve_approval(
@@ -364,6 +386,7 @@ mod tests {
             &ApprovalPolicy::Ask,
             None,
             &tool_call("write_file"),
+            Some(&write_file),
         )
         .await;
 
@@ -397,9 +420,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_policy_auto_accepts_non_mutating_other_tools() {
+    async fn ask_policy_auto_accepts_explicit_safe_tools() {
         let (emitter, events) = emitter_with_events();
         let agent_emitter = AgentEventEmitter::new(None);
+        let read_file = tool("read_file", ToolApproval::safe_read_only());
 
         let decision = resolve_approval(
             &emitter,
@@ -407,10 +431,52 @@ mod tests {
             &ApprovalPolicy::Ask,
             None,
             &tool_call("read_file"),
+            Some(&read_file),
         )
         .await;
 
         assert_eq!(decision, ApprovalDecision::Accept);
         assert!(events.lock().expect("event lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ask_policy_requires_approval_for_custom_default_and_unknown_tools() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+
+        let custom = AgentTool::new(
+            "custom_tool",
+            "custom tool",
+            AgentToolParameters::empty(),
+            |_args, _ctx| async { Ok(serde_json::json!({})) },
+        );
+        let custom_decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::Ask,
+            None,
+            &tool_call("custom_tool"),
+            Some(&custom),
+        )
+        .await;
+        let unknown_decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::Ask,
+            None,
+            &tool_call("unknown_tool"),
+            None,
+        )
+        .await;
+
+        assert_eq!(custom_decision, ApprovalDecision::Decline);
+        assert_eq!(unknown_decision, ApprovalDecision::Decline);
+
+        let events = events.lock().expect("event lock");
+        let approvals = events
+            .iter()
+            .filter(|event| matches!(event.payload, RunEventPayload::ApprovalRequired { .. }))
+            .count();
+        assert_eq!(approvals, 2);
     }
 }

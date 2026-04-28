@@ -54,7 +54,7 @@ Everything provider-agnostic that any consumer or third-party provider needs:
 | `config` | `RociConfig` |
 | `error` | `RociError`, `ErrorCategory`, `ErrorDetails`, `RecoverySuggestion` |
 | `types` | `ModelMessage`, `Usage`, `FinishReason`, `GenerationSettings`, `TextStreamDelta`, `ContentPart`, `AgentToolCall`, `AgentToolResult`, `Role` |
-| `generation` | `generate_text()`, `stream_text()`, `generate_object()` — operate on `&dyn ModelProvider` |
+| `generation` | Provider-only `generate_text()`, `stream_text()`, `generate_object()` helpers. They do not execute tools; tool-capable runs go through `agent` / `agent_loop`. |
 | `tools` | `Tool` trait, `AgentTool`, `ToolArguments`, `DynamicTool` |
 | `stop` | Stop conditions |
 | `util` | `RetryPolicy` |

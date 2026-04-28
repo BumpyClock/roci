@@ -10,18 +10,21 @@ async fn main() -> roci::error::Result<()> {
     let model: LanguageModel = "openai:gpt-4o".parse()?;
     let registry = Arc::new(roci::default_registry());
 
-    let calc_tool: Box<dyn Tool> = Box::new(AgentTool::new(
-        "calculate",
-        "Evaluate a math expression",
-        AgentToolParameters::object()
-            .string("expression", "Math expression to evaluate", true)
-            .build(),
-        |args, _ctx| async move {
-            let expr = args.get_str("expression")?;
-            // Simplified: just return the expression (real impl would eval)
-            Ok(serde_json::json!({"result": expr, "note": "evaluation stub"}))
-        },
-    ));
+    let calc_tool: Box<dyn Tool> = Box::new(
+        AgentTool::new(
+            "calculate",
+            "Evaluate a math expression",
+            AgentToolParameters::object()
+                .string("expression", "Math expression to evaluate", true)
+                .build(),
+            |args, _ctx| async move {
+                let expr = args.get_str("expression")?;
+                // Simplified: just return the expression (real impl would eval)
+                Ok(serde_json::json!({"result": expr, "note": "evaluation stub"}))
+            },
+        )
+        .with_approval(roci::tools::ToolApproval::safe_read_only()),
+    );
 
     let mut agent = roci::agent::Agent::new(model, registry)
         .with_system_prompt("You are a helpful math assistant.")

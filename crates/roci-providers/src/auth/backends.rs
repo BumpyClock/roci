@@ -85,11 +85,17 @@ impl AuthBackend for GitHubCopilotBackend {
     }
 
     fn get_status(&self, store: &Arc<dyn TokenStore>) -> Result<Option<Token>, AuthError> {
-        store.load(self.store_key(), "default")
+        match store.load(self.store_key(), "default")? {
+            Some(token) => Ok(Some(token)),
+            None => store.load("github-copilot-api", "default"),
+        }
     }
 
     fn logout(&self, store: &Arc<dyn TokenStore>) -> Result<(), AuthError> {
-        store.clear(self.store_key(), "default")
+        let primary = store.clear(self.store_key(), "default");
+        let api = store.clear("github-copilot-api", "default");
+        primary?;
+        api
     }
 }
 
@@ -286,6 +292,26 @@ fn pkce_session_from_data(data: &serde_json::Value) -> Result<PkceSession, AuthE
 mod tests {
     use super::*;
 
+    fn temp_store() -> (tempfile::TempDir, Arc<dyn TokenStore>) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = roci_core::auth::store::FileTokenStore::new(
+            roci_core::auth::store::TokenStoreConfig::new(dir.path().to_path_buf()),
+        );
+        (dir, Arc::new(store))
+    }
+
+    fn token(access_token: &str) -> Token {
+        Token {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+            id_token: None,
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            last_refresh: Some(Utc::now()),
+            scopes: None,
+            account_id: None,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // PKCE session data round-trip
     // -----------------------------------------------------------------------
@@ -354,8 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_complete_pkce_requires_session_data() {
-        let store: Arc<dyn TokenStore> =
-            Arc::new(roci_core::auth::store::FileTokenStore::new_default());
+        let (_dir, store) = temp_store();
         let backend = ClaudeCodeBackend;
         let result = backend
             .complete_pkce_with_session(&store, "code", "state", None)
@@ -370,5 +395,44 @@ mod tests {
             }
             other => panic!("expected InvalidResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn copilot_status_falls_back_to_api_token_store() {
+        let (_dir, store) = temp_store();
+        store
+            .save("github-copilot-api", "default", &token("api-token"))
+            .expect("save token");
+        let backend = GitHubCopilotBackend;
+
+        let status = backend.get_status(&store).expect("status");
+
+        assert_eq!(
+            status.map(|token| token.access_token).as_deref(),
+            Some("api-token")
+        );
+    }
+
+    #[test]
+    fn copilot_logout_clears_primary_and_api_token_stores() {
+        let (_dir, store) = temp_store();
+        store
+            .save("github-copilot", "default", &token("primary-token"))
+            .expect("save primary token");
+        store
+            .save("github-copilot-api", "default", &token("api-token"))
+            .expect("save api token");
+        let backend = GitHubCopilotBackend;
+
+        backend.logout(&store).expect("logout");
+
+        assert!(store
+            .load("github-copilot", "default")
+            .expect("load primary")
+            .is_none());
+        assert!(store
+            .load("github-copilot-api", "default")
+            .expect("load api")
+            .is_none());
     }
 }

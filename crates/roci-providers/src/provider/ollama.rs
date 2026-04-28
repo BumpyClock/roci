@@ -21,11 +21,9 @@ impl OllamaProvider {
     pub fn new(model: OllamaModel, base_url: String) -> Self {
         let openai_model = OpenAiModel::Custom(model.as_str().to_string());
         Self {
-            inner: OpenAiProvider::new(
+            inner: OpenAiProvider::new_without_auth(
                 openai_model,
-                String::new(), // no API key for local
                 Some(format!("{}/v1", base_url.trim_end_matches('/'))),
-                None,
             ),
         }
     }

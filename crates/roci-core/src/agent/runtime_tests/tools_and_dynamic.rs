@@ -1,7 +1,7 @@
 use super::support::*;
 use super::*;
 use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
-use crate::tools::AgentToolParameters;
+use crate::tools::{AgentToolParameters, ToolApproval, ToolApprovalKind};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -39,6 +39,7 @@ async fn resolve_tools_for_run_merges_static_and_dynamic_tools() {
             name: "dynamic".into(),
             description: "dynamic tool".into(),
             parameters: AgentToolParameters::empty(),
+            approval: ToolApproval::requires_approval(ToolApprovalKind::Other),
         }]));
 
     let mut config = test_agent_config();

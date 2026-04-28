@@ -4,6 +4,7 @@
 //! spawn method focused on setup and registration.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, oneshot, watch, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -32,6 +33,7 @@ pub(super) async fn run_child_task(
     model: LanguageModel,
     runtime: AgentRuntime,
     cancel_token: CancellationToken,
+    timeout_ms: Option<u64>,
     completion_tx: oneshot::Sender<SubagentRunResult>,
 ) {
     // Acquire semaphore permit (blocks if at capacity)
@@ -64,9 +66,22 @@ pub(super) async fn run_child_task(
     // terminal result instead of dropping the in-flight future.
     let run_future = runtime.continue_without_input();
     tokio::pin!(run_future);
+    let timeout = timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
+    tokio::pin!(timeout);
     let run_result = tokio::select! {
         result = &mut run_future => result,
         _ = cancel_token.cancelled() => {
+            runtime.abort().await;
+            run_future.await
+        }
+        _ = async {
+            if let Some(timeout) = timeout.as_mut().as_pin_mut() {
+                timeout.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            cancel_token.cancel();
             runtime.abort().await;
             run_future.await
         }
