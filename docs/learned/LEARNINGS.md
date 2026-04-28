@@ -21,7 +21,7 @@
 - `read_when`: implementing sub-agent features or extending supervisor
 - Sub-agent supervisor uses `CancellationToken` (not oneshot) for abort -- idempotent and shareable between handle and supervisor. Both hold clones of the same token.
 - `AgentRuntime` is not `Clone` -- child runtimes are owned by background tokio tasks. Handles communicate via channels (oneshot for completion, watch for snapshots, broadcast for events).
-- Model fallback is launch-time only via `has_provider()` + `has_credentials()` -- no mid-run failover. If no candidate is viable, spawn returns an error immediately.
+- Model fallback is launch-time only. Candidate selection requires a registered provider plus usable auth: no-credential provider, `RociConfig` credential, or inherited parent `AgentConfig` request auth (`api_key_override` / `get_api_key`). There is no mid-run failover.
 - Profile inheritance is single-parent only. Child scalars replace parent scalars. `models` replaces wholesale (no merge). `tools` uses `ToolPolicy` (Inherit / Replace / InheritWithOverrides).
 - TOML profiles support both single-file (top-level fields) and multi-profile (`[[profiles]]`) formats. `TomlProfileFile::parse()` tries multi first, falls back to single.
 - `ask_user` routing across multiple children uses the same `UserInputCoordinator` -- `request_id` correlation already handles multi-child dispatch without a generic bus.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
-use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 
 use super::common::{truncate_utf8, READ_FILE_MAX_BYTES};
@@ -11,7 +11,7 @@ use super::common::{truncate_utf8, READ_FILE_MAX_BYTES};
 /// Returns the content, the byte count, and a truncation flag. Content is
 /// capped at 64 KB with a trailing note when truncated.
 pub fn read_file_tool() -> Arc<dyn Tool> {
-    Arc::new(AgentTool::new(
+    let tool = AgentTool::new(
         "read_file",
         "Read a file's contents as UTF-8 text",
         AgentToolParameters::object()
@@ -44,5 +44,6 @@ pub fn read_file_tool() -> Arc<dyn Tool> {
                 "truncated": truncated,
             }))
         },
-    ))
+    );
+    Arc::new(tool.with_approval(ToolApproval::safe_read_only()))
 }

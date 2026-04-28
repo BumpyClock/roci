@@ -67,6 +67,50 @@ impl std::fmt::Debug for ToolExecutionContext {
 pub type ToolUpdateCallback =
     Arc<dyn Fn(crate::agent_loop::events::ToolUpdatePayload) + Send + Sync>;
 
+/// Safety metadata used by `ApprovalPolicy::Ask`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSafety {
+    /// Reads local or remote state without intentional mutation.
+    ReadOnly,
+    /// Requests host/user input without modifying external state.
+    HostInput,
+}
+
+/// Tool-level approval category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolApprovalKind {
+    CommandExecution,
+    FileChange,
+    Other,
+}
+
+/// Approval behavior declared by a tool implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolApproval {
+    /// Safe to execute without prompting under `ApprovalPolicy::Ask`.
+    AutoAccept { safety: ToolSafety },
+    /// Prompt before execution under `ApprovalPolicy::Ask`.
+    RequiresApproval { kind: ToolApprovalKind },
+}
+
+impl ToolApproval {
+    pub const fn safe_read_only() -> Self {
+        Self::AutoAccept {
+            safety: ToolSafety::ReadOnly,
+        }
+    }
+
+    pub const fn safe_host_input() -> Self {
+        Self::AutoAccept {
+            safety: ToolSafety::HostInput,
+        }
+    }
+
+    pub const fn requires_approval(kind: ToolApprovalKind) -> Self {
+        Self::RequiresApproval { kind }
+    }
+}
+
 /// Core tool trait -- implement to create custom tools.
 ///
 /// Existing implementations only need [`execute`]. The agent loop calls
@@ -87,6 +131,13 @@ pub trait Tool: Send + Sync {
 
     /// JSON Schema parameters.
     fn parameters(&self) -> &AgentToolParameters;
+
+    /// Approval metadata for `ApprovalPolicy::Ask`.
+    ///
+    /// Custom, dynamic, and unknown tools are approval-required by default.
+    fn approval(&self) -> ToolApproval {
+        ToolApproval::requires_approval(ToolApprovalKind::Other)
+    }
 
     /// Execute the tool with parsed arguments.
     async fn execute(
@@ -125,6 +176,7 @@ pub struct AgentTool {
     name: String,
     description: String,
     parameters: AgentToolParameters,
+    approval: ToolApproval,
     handler: Arc<ToolHandler>,
 }
 
@@ -144,8 +196,15 @@ impl AgentTool {
             name: name.into(),
             description: description.into(),
             parameters,
+            approval: ToolApproval::requires_approval(ToolApprovalKind::Other),
             handler: Arc::new(move |args, ctx| Box::pin(handler(args, ctx))),
         }
+    }
+
+    /// Set approval metadata for `ApprovalPolicy::Ask`.
+    pub fn with_approval(mut self, approval: ToolApproval) -> Self {
+        self.approval = approval;
+        self
     }
 }
 
@@ -161,6 +220,10 @@ impl Tool for AgentTool {
 
     fn parameters(&self) -> &AgentToolParameters {
         &self.parameters
+    }
+
+    fn approval(&self) -> ToolApproval {
+        self.approval
     }
 
     async fn execute(

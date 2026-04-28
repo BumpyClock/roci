@@ -60,6 +60,9 @@ fn map_mcp_tool_to_dynamic(tool: MCPToolSchema) -> DynamicTool {
         name: tool.name,
         description: tool.description.unwrap_or_default(),
         parameters: AgentToolParameters::from_schema(tool.input_schema),
+        approval: crate::tools::ToolApproval::requires_approval(
+            crate::tools::ToolApprovalKind::Other,
+        ),
     }
 }
 

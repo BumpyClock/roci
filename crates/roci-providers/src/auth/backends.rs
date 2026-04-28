@@ -85,11 +85,28 @@ impl AuthBackend for GitHubCopilotBackend {
     }
 
     fn get_status(&self, store: &Arc<dyn TokenStore>) -> Result<Option<Token>, AuthError> {
-        store.load(self.store_key(), "default")
+        match store.load(self.store_key(), "default")? {
+            Some(token) => Ok(Some(token)),
+            None => store.load("github-copilot-api", "default"),
+        }
     }
 
     fn logout(&self, store: &Arc<dyn TokenStore>) -> Result<(), AuthError> {
-        store.clear(self.store_key(), "default")
+        let primary_token = store.load(self.store_key(), "default")?;
+
+        store.clear(self.store_key(), "default")?;
+        if let Err(clear_error) = store.clear("github-copilot-api", "default") {
+            if let Some(token) = primary_token {
+                if let Err(rollback_error) = store.save(self.store_key(), "default", &token) {
+                    return Err(AuthError::Io(format!(
+                        "failed to clear github-copilot-api after clearing github-copilot: {clear_error}; failed to restore github-copilot: {rollback_error}"
+                    )));
+                }
+            }
+            return Err(clear_error);
+        }
+
+        Ok(())
     }
 }
 
@@ -285,6 +302,72 @@ fn pkce_session_from_data(data: &serde_json::Value) -> Result<PkceSession, AuthE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    fn temp_store() -> (tempfile::TempDir, Arc<dyn TokenStore>) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = roci_core::auth::store::FileTokenStore::new(
+            roci_core::auth::store::TokenStoreConfig::new(dir.path().to_path_buf()),
+        );
+        (dir, Arc::new(store))
+    }
+
+    fn token(access_token: &str) -> Token {
+        Token {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+            id_token: None,
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            last_refresh: Some(Utc::now()),
+            scopes: None,
+            account_id: None,
+        }
+    }
+
+    struct FailingClearTokenStore {
+        tokens: Mutex<HashMap<(String, String), Token>>,
+        fail_clear_provider: &'static str,
+    }
+
+    impl FailingClearTokenStore {
+        fn new(fail_clear_provider: &'static str) -> Self {
+            Self {
+                tokens: Mutex::new(HashMap::new()),
+                fail_clear_provider,
+            }
+        }
+    }
+
+    impl TokenStore for FailingClearTokenStore {
+        fn load(&self, provider: &str, profile: &str) -> Result<Option<Token>, AuthError> {
+            Ok(self
+                .tokens
+                .lock()
+                .expect("tokens lock")
+                .get(&(provider.to_string(), profile.to_string()))
+                .cloned())
+        }
+
+        fn save(&self, provider: &str, profile: &str, token: &Token) -> Result<(), AuthError> {
+            self.tokens
+                .lock()
+                .expect("tokens lock")
+                .insert((provider.to_string(), profile.to_string()), token.clone());
+            Ok(())
+        }
+
+        fn clear(&self, provider: &str, profile: &str) -> Result<(), AuthError> {
+            if provider == self.fail_clear_provider {
+                return Err(AuthError::Io(format!("clear failed for {provider}")));
+            }
+            self.tokens
+                .lock()
+                .expect("tokens lock")
+                .remove(&(provider.to_string(), profile.to_string()));
+            Ok(())
+        }
+    }
 
     // -----------------------------------------------------------------------
     // PKCE session data round-trip
@@ -354,8 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_complete_pkce_requires_session_data() {
-        let store: Arc<dyn TokenStore> =
-            Arc::new(roci_core::auth::store::FileTokenStore::new_default());
+        let (_dir, store) = temp_store();
         let backend = ClaudeCodeBackend;
         let result = backend
             .complete_pkce_with_session(&store, "code", "state", None)
@@ -370,5 +452,96 @@ mod tests {
             }
             other => panic!("expected InvalidResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn copilot_status_falls_back_to_api_token_store() {
+        let (_dir, store) = temp_store();
+        store
+            .save("github-copilot-api", "default", &token("api-token"))
+            .expect("save token");
+        let backend = GitHubCopilotBackend;
+
+        let status = backend.get_status(&store).expect("status");
+
+        assert_eq!(
+            status.map(|token| token.access_token).as_deref(),
+            Some("api-token")
+        );
+    }
+
+    #[test]
+    fn copilot_status_prefers_primary_token_store() {
+        let (_dir, store) = temp_store();
+        store
+            .save("github-copilot", "default", &token("primary-token"))
+            .expect("save primary token");
+        store
+            .save("github-copilot-api", "default", &token("api-token"))
+            .expect("save api token");
+        let backend = GitHubCopilotBackend;
+
+        let status = backend.get_status(&store).expect("status");
+
+        assert_eq!(
+            status.map(|token| token.access_token).as_deref(),
+            Some("primary-token")
+        );
+    }
+
+    #[test]
+    fn copilot_logout_clears_primary_and_api_token_stores() {
+        let (_dir, store) = temp_store();
+        store
+            .save("github-copilot", "default", &token("primary-token"))
+            .expect("save primary token");
+        store
+            .save("github-copilot-api", "default", &token("api-token"))
+            .expect("save api token");
+        let backend = GitHubCopilotBackend;
+
+        backend.logout(&store).expect("logout");
+
+        assert!(store
+            .load("github-copilot", "default")
+            .expect("load primary")
+            .is_none());
+        assert!(store
+            .load("github-copilot-api", "default")
+            .expect("load api")
+            .is_none());
+    }
+
+    #[test]
+    fn copilot_logout_restores_primary_token_when_api_clear_fails() {
+        let store: Arc<dyn TokenStore> =
+            Arc::new(FailingClearTokenStore::new("github-copilot-api"));
+        store
+            .save("github-copilot", "default", &token("primary-token"))
+            .expect("save primary token");
+        store
+            .save("github-copilot-api", "default", &token("api-token"))
+            .expect("save api token");
+        let backend = GitHubCopilotBackend;
+
+        let err = backend.logout(&store).unwrap_err();
+
+        assert!(matches!(err, AuthError::Io(_)));
+        assert_eq!(
+            store
+                .load("github-copilot", "default")
+                .expect("load primary")
+                .map(|token| token.access_token)
+                .as_deref(),
+            Some("primary-token")
+        );
+        assert_eq!(
+            store
+                .load("github-copilot-api", "default")
+                .expect("load api")
+                .map(|token| token.access_token)
+                .as_deref(),
+            Some("api-token")
+        );
     }
 }

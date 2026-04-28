@@ -18,17 +18,22 @@ use crate::agent::subagents::launcher::SubagentLauncher;
 use crate::agent::subagents::profiles::SubagentProfileRegistry;
 use crate::agent::subagents::prompt::SubagentPromptPolicy;
 use crate::agent::subagents::types::{
-    ModelCandidate, SnapshotMode, SubagentId, SubagentInput, SubagentSpec, SubagentStatus,
-    SubagentSupervisorConfig,
+    ModelCandidate, SnapshotMode, SubagentId, SubagentInput, SubagentProfile, SubagentSpec,
+    SubagentStatus, SubagentSupervisorConfig, ToolPolicy,
 };
 use crate::config::RociConfig;
 use crate::error::RociError as TestRociError;
 use crate::models::LanguageModel;
 use crate::provider::factory::ProviderFactory;
-use crate::provider::{ModelProvider, ProviderRegistry};
-use crate::types::{ModelMessage, Role};
+use crate::provider::{ModelProvider, ProviderRegistry, ProviderRequest, ProviderResponse};
+use crate::tools::tool::Tool;
+use crate::tools::{AgentTool, AgentToolParameters};
+use crate::types::{
+    GenerationSettings, ModelMessage, ReasoningEffort, Role, TextStreamDelta, Usage,
+};
 
 use async_trait::async_trait;
+use futures::stream::{self, BoxStream, StreamExt};
 
 // ---------------------------------------------------------------------------
 // Dummy provider factory so model resolution succeeds in tests
@@ -155,19 +160,27 @@ fn make_supervisor() -> SubagentSupervisor {
 struct MockLauncher {
     /// Messages received by the last `launch()` call.
     captured: Arc<Mutex<Vec<ModelMessage>>>,
+    captured_config: Arc<Mutex<Option<AgentConfig>>>,
     registry: Arc<ProviderRegistry>,
     roci_config: RociConfig,
 }
 
+type CapturedMessages = Arc<Mutex<Vec<ModelMessage>>>;
+type CapturedConfig = Arc<Mutex<Option<AgentConfig>>>;
+type MockSupervisorParts = (SubagentSupervisor, CapturedMessages, CapturedConfig);
+type MockLauncherParts = (MockLauncher, CapturedMessages, CapturedConfig);
+
 impl MockLauncher {
-    fn new() -> (Self, Arc<Mutex<Vec<ModelMessage>>>) {
+    fn new() -> MockLauncherParts {
         let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_config = Arc::new(Mutex::new(None));
         let launcher = Self {
             captured: captured.clone(),
+            captured_config: captured_config.clone(),
             registry: Arc::new(ProviderRegistry::new()),
             roci_config: RociConfig::default(),
         };
-        (launcher, captured)
+        (launcher, captured, captured_config)
     }
 }
 
@@ -176,59 +189,16 @@ impl SubagentLauncher for MockLauncher {
     async fn launch(
         &self,
         _id: SubagentId,
-        model: LanguageModel,
         initial_messages: Vec<ModelMessage>,
-        tools: Vec<Arc<dyn crate::tools::tool::Tool>>,
-        #[cfg(feature = "agent")] coordinator: Arc<UserInputCoordinator>,
-        event_sink: Option<crate::agent_loop::runner::AgentEventSink>,
+        config: AgentConfig,
     ) -> Result<LaunchedChild, crate::error::RociError> {
         // Capture the messages for test assertions.
         *self.captured.lock().await = initial_messages.clone();
+        *self.captured_config.lock().await = Some(config.clone());
 
         // Build a real runtime so the supervisor background task can run.
         // It will fail at LLM call (no provider configured), which the
         // supervisor handles gracefully.
-        let config = {
-            use crate::agent::runtime::QueueDrainMode;
-            use crate::agent_loop::runner::RetryBackoffPolicy;
-            use crate::resource::CompactionSettings;
-            use crate::types::GenerationSettings;
-
-            AgentConfig {
-                model,
-                system_prompt: None,
-                tools,
-                event_sink,
-                approval_policy: Default::default(),
-                approval_handler: None,
-                #[cfg(feature = "agent")]
-                user_input_coordinator: Some(coordinator),
-                dynamic_tool_providers: Vec::new(),
-                settings: GenerationSettings::default(),
-                transform_context: None,
-                convert_to_llm: None,
-                before_agent_start: None,
-                session_id: None,
-                steering_mode: QueueDrainMode::All,
-                follow_up_mode: QueueDrainMode::All,
-                transport: None,
-                max_retry_delay_ms: None,
-                retry_backoff: RetryBackoffPolicy::default(),
-                api_key_override: None,
-                provider_headers: reqwest::header::HeaderMap::new(),
-                provider_metadata: HashMap::new(),
-                provider_payload_callback: None,
-                get_api_key: None,
-                compaction: CompactionSettings::default(),
-                session_before_compact: None,
-                session_before_tree: None,
-                pre_tool_use: None,
-                post_tool_use: None,
-                user_input_timeout_ms: None,
-                context_budget: None,
-                chat: Default::default(),
-            }
-        };
         let runtime = AgentRuntime::new(self.registry.clone(), self.roci_config.clone(), config);
         if !initial_messages.is_empty() {
             runtime.replace_messages(initial_messages).await?;
@@ -237,14 +207,19 @@ impl SubagentLauncher for MockLauncher {
     }
 }
 
-fn make_supervisor_with_mock() -> (SubagentSupervisor, Arc<Mutex<Vec<ModelMessage>>>) {
+fn make_supervisor_with_mock() -> MockSupervisorParts {
+    make_supervisor_with_mock_config(make_base_config(), test_profile_registry())
+}
+
+fn make_supervisor_with_mock_config(
+    base_config: AgentConfig,
+    profile_registry: SubagentProfileRegistry,
+) -> MockSupervisorParts {
     let registry = test_registry();
     let roci_config = test_roci_config();
-    let base_config = make_base_config();
     let sup_config = SubagentSupervisorConfig::default();
-    let profile_registry = test_profile_registry();
 
-    let (mock, captured) = MockLauncher::new();
+    let (mock, captured, captured_config) = MockLauncher::new();
 
     #[cfg(feature = "agent")]
     let coordinator = base_config
@@ -269,7 +244,20 @@ fn make_supervisor_with_mock() -> (SubagentSupervisor, Arc<Mutex<Vec<ModelMessag
         children: Arc::new(Mutex::new(HashMap::new())),
         concurrency_semaphore: semaphore,
     };
-    (supervisor, captured)
+    (supervisor, captured, captured_config)
+}
+
+fn dummy_tool(name: &str) -> Arc<dyn Tool> {
+    Arc::new(AgentTool::new(
+        name,
+        "test tool",
+        AgentToolParameters::empty(),
+        |_args, _ctx| async { Ok(serde_json::Value::Null) },
+    ))
+}
+
+fn captured_tool_names(config: &AgentConfig) -> Vec<&str> {
+    config.tools.iter().map(|tool| tool.name()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +289,7 @@ fn subscribe_returns_receiver() {
 
 #[tokio::test]
 async fn spawn_prompt_only_seeds_system_and_user() {
-    let (supervisor, captured) = make_supervisor_with_mock();
+    let (supervisor, captured, _) = make_supervisor_with_mock();
     let spec = SubagentSpec {
         profile: "test:dev".into(),
         label: Some("test-prompt".into()),
@@ -336,13 +324,100 @@ async fn spawn_prompt_only_seeds_system_and_user() {
     handle.abort().await;
 }
 
+#[tokio::test]
+async fn spawn_applies_tool_policy_and_reasoning_effort() {
+    let mut base_config = make_base_config();
+    base_config.tools = vec![dummy_tool("read"), dummy_tool("write"), dummy_tool("shell")];
+    base_config.settings = GenerationSettings {
+        temperature: Some(0.4),
+        ..GenerationSettings::default()
+    };
+
+    let mut profile_registry = test_profile_registry();
+    profile_registry.register(SubagentProfile {
+        name: "test:scoped".into(),
+        system_prompt: Some("Scoped sub-agent".into()),
+        tools: ToolPolicy::Replace {
+            tools: vec!["read".into(), "shell".into()],
+        },
+        models: vec![ModelCandidate {
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning_effort: Some("high".into()),
+        }],
+        ..Default::default()
+    });
+    let (supervisor, _, captured_config) =
+        make_supervisor_with_mock_config(base_config, profile_registry);
+
+    let spec = SubagentSpec {
+        profile: "test:scoped".into(),
+        label: None,
+        input: SubagentInput::Prompt {
+            task: "use scoped tools".into(),
+        },
+        overrides: Default::default(),
+    };
+
+    let handle = supervisor
+        .spawn_with_context(spec, SubagentContext::default())
+        .await
+        .unwrap();
+
+    let cfg = captured_config.lock().await.clone().unwrap();
+    assert_eq!(captured_tool_names(&cfg), vec!["read", "shell"]);
+    assert_eq!(cfg.settings.temperature, Some(0.4));
+    assert_eq!(cfg.settings.reasoning_effort, Some(ReasoningEffort::High));
+
+    handle.abort().await;
+}
+
+#[tokio::test]
+async fn spawn_rejects_unknown_tool_policy_entry() {
+    let mut base_config = make_base_config();
+    base_config.tools = vec![dummy_tool("read")];
+    let mut profile_registry = test_profile_registry();
+    profile_registry.register(SubagentProfile {
+        name: "test:missing-tool".into(),
+        system_prompt: Some("Scoped sub-agent".into()),
+        tools: ToolPolicy::Replace {
+            tools: vec!["missing".into()],
+        },
+        models: vec![ModelCandidate {
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning_effort: None,
+        }],
+        ..Default::default()
+    });
+    let (supervisor, _, _) = make_supervisor_with_mock_config(base_config, profile_registry);
+
+    let result = supervisor
+        .spawn_with_context(
+            SubagentSpec {
+                profile: "test:missing-tool".into(),
+                label: None,
+                input: SubagentInput::Prompt { task: "x".into() },
+                overrides: Default::default(),
+            },
+            SubagentContext::default(),
+        )
+        .await;
+    let err = match result {
+        Ok(_) => panic!("expected missing tool policy entry to fail"),
+        Err(err) => err,
+    };
+
+    assert!(err.to_string().contains("subagent tool 'missing'"));
+}
+
 // ---------------------------------------------------------------------------
 // spawn_with_context: snapshot-only mode succeeds (was broken before)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn spawn_snapshot_only_succeeds_without_caller_task() {
-    let (supervisor, captured) = make_supervisor_with_mock();
+    let (supervisor, captured, _) = make_supervisor_with_mock();
     let context = SubagentContext {
         summary: Some("parent did X".into()),
         ..Default::default()
@@ -381,7 +456,7 @@ async fn spawn_snapshot_only_succeeds_without_caller_task() {
 
 #[tokio::test]
 async fn spawn_prompt_with_snapshot_seeds_context_before_task() {
-    let (supervisor, captured) = make_supervisor_with_mock();
+    let (supervisor, captured, _) = make_supervisor_with_mock();
     let context = SubagentContext {
         summary: Some("summary of conversation".into()),
         ..Default::default()
@@ -416,7 +491,7 @@ async fn spawn_prompt_with_snapshot_seeds_context_before_task() {
 
 #[tokio::test]
 async fn system_prompt_appears_exactly_once() {
-    let (supervisor, captured) = make_supervisor_with_mock();
+    let (supervisor, captured, _) = make_supervisor_with_mock();
     let spec = SubagentSpec {
         profile: "test:dev".into(),
         label: None,
@@ -446,7 +521,7 @@ async fn system_prompt_appears_exactly_once() {
 
 #[tokio::test]
 async fn spawn_without_context_uses_default() {
-    let (supervisor, captured) = make_supervisor_with_mock();
+    let (supervisor, captured, _) = make_supervisor_with_mock();
     let spec = SubagentSpec {
         profile: "test:dev".into(),
         label: None,
@@ -473,7 +548,7 @@ async fn spawn_without_context_uses_default() {
 
 #[tokio::test]
 async fn spawn_full_snapshot_preserves_conversation() {
-    let (supervisor, captured) = make_supervisor_with_mock();
+    let (supervisor, captured, _) = make_supervisor_with_mock();
 
     let parent_messages = vec![
         ModelMessage::system("parent sys"),
@@ -508,6 +583,126 @@ async fn spawn_full_snapshot_preserves_conversation() {
     assert!(msgs[4].text().contains("read-only snapshot"));
 
     handle.abort().await;
+}
+
+#[tokio::test]
+async fn profile_timeout_aborts_child_run() {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(BlockingStreamFactory));
+    let mut profile_registry = SubagentProfileRegistry::new();
+    profile_registry.register(SubagentProfile {
+        name: "test:timeout".into(),
+        system_prompt: Some("Timeout sub-agent".into()),
+        default_timeout_ms: Some(20),
+        models: vec![ModelCandidate {
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning_effort: None,
+        }],
+        ..Default::default()
+    });
+
+    let supervisor = SubagentSupervisor::new(
+        Arc::new(registry),
+        test_roci_config(),
+        make_base_config(),
+        SubagentSupervisorConfig::default(),
+        profile_registry,
+    );
+    let handle = supervisor
+        .spawn_with_context(
+            SubagentSpec {
+                profile: "test:timeout".into(),
+                label: None,
+                input: SubagentInput::Prompt {
+                    task: "wait forever".into(),
+                },
+                overrides: Default::default(),
+            },
+            SubagentContext::default(),
+        )
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait())
+        .await
+        .expect("subagent timeout should complete handle wait");
+
+    assert_eq!(result.status, SubagentStatus::Aborted);
+}
+
+struct BlockingStreamFactory;
+
+impl ProviderFactory for BlockingStreamFactory {
+    fn provider_keys(&self) -> &[&str] {
+        &["test"]
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, TestRociError> {
+        Ok(Box::new(BlockingStreamProvider {
+            provider_key: provider_key.to_string(),
+            model_id: model_id.to_string(),
+            capabilities: crate::models::capabilities::ModelCapabilities {
+                supports_streaming: true,
+                ..Default::default()
+            },
+        }))
+    }
+}
+
+struct BlockingStreamProvider {
+    provider_key: String,
+    model_id: String,
+    capabilities: crate::models::capabilities::ModelCapabilities,
+}
+
+#[async_trait]
+impl ModelProvider for BlockingStreamProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &crate::models::capabilities::ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, TestRociError> {
+        Err(TestRociError::UnsupportedOperation(
+            "blocking stream test provider does not generate text".into(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, TestRociError>>, TestRociError> {
+        let events = stream::once(async {
+            Ok(TextStreamDelta {
+                text: "partial".to_string(),
+                event_type: crate::types::StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            })
+        })
+        .chain(stream::pending());
+        Ok(Box::pin(events))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ pub use arguments::ToolArguments;
 pub use dynamic::{DynamicTool, DynamicToolAdapter, DynamicToolProvider};
 #[cfg(feature = "agent")]
 pub use tool::ToolUpdateCallback;
-pub use tool::{AgentTool, Tool, ToolExecutionContext};
+pub use tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext, ToolSafety};
 pub use types::AgentToolParameters;
 pub use user_input::{
     Answer, Question, QuestionOption, RequestUserInputFn, UnknownUserInputRequest, UserInputError,

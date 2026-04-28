@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use roci::error::RociError;
 use roci::tools::arguments::ToolArguments;
-use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 
 use super::common::{truncate_utf8, READ_FILE_MAX_BYTES, SHELL_OUTPUT_MAX_BYTES};
@@ -34,6 +34,25 @@ fn all_tools_contains_expected_names() {
     assert!(names.contains(&"write_file"));
     assert!(names.contains(&"list_directory"));
     assert!(names.contains(&"grep"));
+}
+
+#[test]
+fn builtins_declare_expected_approval_metadata() {
+    assert_eq!(read_file_tool().approval(), ToolApproval::safe_read_only());
+    assert_eq!(
+        list_directory_tool().approval(),
+        ToolApproval::safe_read_only()
+    );
+    assert_eq!(grep_tool().approval(), ToolApproval::safe_read_only());
+    assert_eq!(ask_user_tool().approval(), ToolApproval::safe_host_input());
+    assert_eq!(
+        shell_tool().approval(),
+        ToolApproval::requires_approval(ToolApprovalKind::CommandExecution)
+    );
+    assert_eq!(
+        write_file_tool().approval(),
+        ToolApproval::requires_approval(ToolApprovalKind::FileChange)
+    );
 }
 
 // ── shell ──────────────────────────────────────────────────────────

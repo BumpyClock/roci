@@ -21,11 +21,9 @@ impl LmStudioProvider {
     pub fn new(model: LmStudioModel, base_url: String) -> Self {
         let openai_model = OpenAiModel::Custom(model.as_str().to_string());
         Self {
-            inner: OpenAiProvider::new(
+            inner: OpenAiProvider::new_without_auth(
                 openai_model,
-                String::new(),
                 Some(format!("{}/v1", base_url.trim_end_matches('/'))),
-                None,
             ),
         }
     }

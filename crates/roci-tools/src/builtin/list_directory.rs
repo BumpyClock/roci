@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
-use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 
 /// Create the `list_directory` tool — lists directory entries.
@@ -9,7 +9,7 @@ use roci::tools::types::AgentToolParameters;
 /// Returns a sorted JSON array of entries, each with `name`, `type`
 /// (`"file"` | `"dir"` | `"other"`), and `size` in bytes.
 pub fn list_directory_tool() -> Arc<dyn Tool> {
-    Arc::new(AgentTool::new(
+    let tool = AgentTool::new(
         "list_directory",
         "List files and directories in a given path",
         AgentToolParameters::object()
@@ -72,5 +72,6 @@ pub fn list_directory_tool() -> Arc<dyn Tool> {
                 "count": count,
             }))
         },
-    ))
+    );
+    Arc::new(tool.with_approval(ToolApproval::safe_read_only()))
 }

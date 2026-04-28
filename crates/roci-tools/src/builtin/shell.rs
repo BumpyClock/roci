@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
-use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 
 use super::common::{truncate_utf8, SHELL_OUTPUT_MAX_BYTES, SHELL_TIMEOUT};
@@ -11,7 +11,7 @@ use super::common::{truncate_utf8, SHELL_OUTPUT_MAX_BYTES, SHELL_TIMEOUT};
 /// Captures stdout and stderr, applies a 30-second timeout, and truncates
 /// output beyond 32 KB to prevent context explosion.
 pub fn shell_tool() -> Arc<dyn Tool> {
-    Arc::new(AgentTool::new(
+    let tool = AgentTool::new(
         "shell",
         "Execute a shell command and return its output",
         AgentToolParameters::object()
@@ -60,5 +60,8 @@ pub fn shell_tool() -> Arc<dyn Tool> {
                 "truncated": truncated,
             }))
         },
-    ))
+    );
+    Arc::new(tool.with_approval(ToolApproval::requires_approval(
+        ToolApprovalKind::CommandExecution,
+    )))
 }

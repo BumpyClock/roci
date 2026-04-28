@@ -14,6 +14,22 @@ fn require_api_key(
     roci_core::provider::require_api_key(config, provider, missing_message)
 }
 
+#[cfg_attr(
+    not(any(feature = "openai", feature = "anthropic", test)),
+    allow(dead_code)
+)]
+fn optional_api_key_for(config: &RociConfig, provider: ProviderKey) -> String {
+    config.get_api_key_for(provider).unwrap_or_default()
+}
+
+#[cfg_attr(
+    not(any(feature = "openrouter", feature = "together", test)),
+    allow(dead_code)
+)]
+fn optional_api_key(config: &RociConfig, provider: &str) -> String {
+    config.get_api_key(provider).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI
 // ---------------------------------------------------------------------------
@@ -36,7 +52,7 @@ impl ProviderFactory for OpenAiFactory {
         use crate::models::openai::OpenAiModel;
         use std::str::FromStr;
 
-        let api_key = require_api_key(config, ProviderKey::OpenAi, "Missing OPENAI_API_KEY")?;
+        let api_key = optional_api_key_for(config, ProviderKey::OpenAi);
         let model =
             OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
         if model.uses_responses_api() {
@@ -81,7 +97,7 @@ impl ProviderFactory for CodexFactory {
         use crate::models::openai::OpenAiModel;
         use std::str::FromStr;
 
-        let api_key = require_api_key(config, ProviderKey::Codex, "Missing OPENAI_CODEX_TOKEN")?;
+        let api_key = optional_api_key_for(config, ProviderKey::Codex);
         let base_url = config
             .get_base_url_for(ProviderKey::Codex)
             .or_else(|| Some("https://chatgpt.com/backend-api/codex".to_string()));
@@ -124,7 +140,7 @@ impl ProviderFactory for AnthropicFactory {
         use crate::models::anthropic::AnthropicModel;
         use std::str::FromStr;
 
-        let api_key = require_api_key(config, ProviderKey::Anthropic, "Missing ANTHROPIC_API_KEY")?;
+        let api_key = optional_api_key_for(config, ProviderKey::Anthropic);
         let model = AnthropicModel::from_str(model_id)
             .unwrap_or(AnthropicModel::Custom(model_id.to_string()));
         Ok(Box::new(
@@ -274,6 +290,10 @@ impl ProviderFactory for OllamaFactory {
         &["ollama"]
     }
 
+    fn requires_credentials(&self, _provider_key: &str) -> bool {
+        false
+    }
+
     fn create(
         &self,
         config: &RociConfig,
@@ -305,6 +325,10 @@ pub struct LmStudioFactory;
 impl ProviderFactory for LmStudioFactory {
     fn provider_keys(&self) -> &[&str] {
         &["lmstudio"]
+    }
+
+    fn requires_credentials(&self, _provider_key: &str) -> bool {
+        false
     }
 
     fn create(
@@ -529,9 +553,7 @@ impl ProviderFactory for OpenRouterFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = config
-            .get_api_key_for(ProviderKey::OpenAi)
-            .ok_or_else(|| RociError::Authentication("Missing OPENROUTER_API_KEY".into()))?;
+        let api_key = optional_api_key(config, "openrouter");
         Ok(Box::new(
             crate::provider::openrouter::OpenRouterProvider::new(model_id.to_string(), api_key),
         ))
@@ -557,12 +579,81 @@ impl ProviderFactory for TogetherFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = config
-            .get_api_key_for(ProviderKey::OpenAi)
-            .ok_or_else(|| RociError::Authentication("Missing TOGETHER_API_KEY".into()))?;
+        let api_key = optional_api_key(config, "together");
         Ok(Box::new(crate::provider::together::TogetherProvider::new(
             model_id.to_string(),
             api_key,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_without_credentials() -> RociConfig {
+        RociConfig::new().with_token_store(None)
+    }
+
+    #[cfg(feature = "openai")]
+    #[test]
+    fn openai_factory_allows_missing_default_api_key() {
+        let config = config_without_credentials();
+
+        let provider = OpenAiFactory.create(&config, "openai", "gpt-4o");
+
+        assert!(provider.is_ok());
+    }
+
+    #[cfg(feature = "openai")]
+    #[test]
+    fn codex_factory_allows_missing_default_api_key() {
+        let config = config_without_credentials();
+
+        let provider = CodexFactory.create(&config, "codex", "gpt-5-nano");
+
+        assert!(provider.is_ok());
+    }
+
+    #[cfg(feature = "anthropic")]
+    #[test]
+    fn anthropic_factory_allows_missing_default_api_key() {
+        let config = config_without_credentials();
+
+        let provider = AnthropicFactory.create(&config, "anthropic", "claude-sonnet-4");
+
+        assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn openrouter_api_key_ignores_openai_key() {
+        let config = config_without_credentials();
+        config.set_api_key("openai", "openai-key".to_string());
+
+        assert_eq!(optional_api_key(&config, "openrouter"), "");
+    }
+
+    #[test]
+    fn openrouter_api_key_reads_dedicated_key() {
+        let config = config_without_credentials();
+        config.set_api_key("openrouter", "openrouter-key".to_string());
+
+        assert_eq!(optional_api_key(&config, "openrouter"), "openrouter-key");
+    }
+
+    #[test]
+    fn together_api_key_ignores_openai_key() {
+        let config = config_without_credentials();
+        config.set_api_key("openai", "openai-key".to_string());
+
+        assert_eq!(optional_api_key(&config, "together"), "");
+    }
+
+    #[test]
+    fn together_api_key_reads_dedicated_key() {
+        let config = config_without_credentials();
+        config.set_api_key("together", "together-key".to_string());
+
+        assert_eq!(optional_api_key(&config, "together"), "together-key");
     }
 }

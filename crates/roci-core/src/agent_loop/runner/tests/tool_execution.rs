@@ -352,6 +352,59 @@ async fn duplicate_tool_call_deltas_are_deduplicated_by_call_id() {
 }
 
 #[tokio::test]
+async fn approval_uses_same_duplicate_named_tool_instance_as_execution() {
+    let (runner, _requests) = test_runner(ProviderScenario::DuplicateToolCallDeltaThenComplete);
+    let (sink, events) = capture_events();
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("dup tool names")]);
+    let unsafe_read: Arc<dyn Tool> = Arc::new(AgentTool::new(
+        "read",
+        "custom read with side effects",
+        AgentToolParameters::empty(),
+        |_args, _ctx: ToolExecutionContext| async move {
+            Ok(serde_json::json!({ "executed": "unsafe-read" }))
+        },
+    ));
+    let safe_read: Arc<dyn Tool> = Arc::new(
+        AgentTool::new(
+            "read",
+            "safe read",
+            AgentToolParameters::empty(),
+            |_args, _ctx: ToolExecutionContext| async move {
+                Ok(serde_json::json!({ "executed": "safe-read" }))
+            },
+        )
+        .with_approval(ToolApproval::safe_read_only()),
+    );
+    request.tools = vec![unsafe_read, safe_read];
+    request.approval_policy = ApprovalPolicy::Ask;
+    request.event_sink = Some(sink);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let events = events.lock().expect("event lock");
+    let approval_requests = events
+        .iter()
+        .filter(|event| matches!(event.payload, RunEventPayload::ApprovalRequired { .. }))
+        .count();
+    assert_eq!(approval_requests, 1);
+
+    let tool_results = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            RunEventPayload::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0].result["error"], "approval declined");
+    assert!(tool_results[0].result.get("executed").is_none());
+}
+
+#[tokio::test]
 async fn stream_end_without_done_falls_back_to_tool_execution_and_completion() {
     let (runner, requests) = test_runner(ProviderScenario::StreamEndsWithoutDoneThenComplete);
     let (sink, events) = capture_events();

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
-use roci::tools::tool::{AgentTool, Tool, ToolExecutionContext};
+use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 
 /// Create the `write_file` tool — writes content to a file.
@@ -9,7 +9,7 @@ use roci::tools::types::AgentToolParameters;
 /// Creates parent directories when they do not exist. Returns the written
 /// byte count and the resolved path.
 pub fn write_file_tool() -> Arc<dyn Tool> {
-    Arc::new(AgentTool::new(
+    let tool = AgentTool::new(
         "write_file",
         "Write content to a file, creating parent directories if needed",
         AgentToolParameters::object()
@@ -45,5 +45,8 @@ pub fn write_file_tool() -> Arc<dyn Tool> {
                 "bytes_written": bytes,
             }))
         },
-    ))
+    );
+    Arc::new(tool.with_approval(ToolApproval::requires_approval(
+        ToolApprovalKind::FileChange,
+    )))
 }

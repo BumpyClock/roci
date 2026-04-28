@@ -104,7 +104,7 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 | `config` | `RociConfig` |
 | `error` | `RociError` with typed variants, categories, retryability |
 | `types` | `ModelMessage`, `Usage`, `FinishReason`, `GenerationSettings`, `TextStreamDelta`, `ContentPart` |
-| `generation` | `generate_text()` / `generate_object()` operate on `&dyn ModelProvider`; `stream_text()` operates on `Arc<dyn ModelProvider>` |
+| `generation` | Provider-only `generate_text()` / `generate_object()` on `&dyn ModelProvider`; `stream_text()` on `Arc<dyn ModelProvider>`. Tool execution is intentionally centralized in `agent` / `agent_loop`. |
 | `skills` | Skill discovery, frontmatter parsing, and prompt formatting |
 | `resource` | Resource loading for settings, context files, prompt templates, and diagnostics |
 | `tools` | `Tool` trait, `AgentTool`, `ToolArguments`, `DynamicTool` |
@@ -124,6 +124,7 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
   - `crates/roci-core/src/agent/runtime/{types,config,state,lifecycle,mutations,run_loop,events,summary}.rs` contains runtime internals by concern.
   - `crates/roci-core/src/agent/runtime_tests/` contains `agent::runtime::tests::*` (support + domain test modules).
 - `agent_loop::runner` executes provider turns, streaming, tool execution, approvals, retries, and event emission.
+- `agent::Agent` is the simple conversation API. When tools are attached it delegates to `agent_loop::LoopRunner`, so approvals and tool hooks follow the same path as `AgentRuntime`.
 - Compaction is supported in two modes:
   - automatic pre-provider compaction in the run loop when reserved context budget would be exceeded
   - explicit/manual compaction via `AgentRuntime::compact()`
@@ -260,9 +261,10 @@ Sub-agent behavior is driven by named profiles (`SubagentProfile`), not ad-hoc p
 
 ### Model fallback
 
-Each profile defines an ordered list of `ModelCandidate`s. At launch time, `resolve_model()` picks the first candidate whose provider is registered (`has_provider()`) and has credentials configured (`has_credentials()`).
+Each profile defines an ordered list of `ModelCandidate`s. At launch time, model selection picks the first registered provider that is auth-viable: local/no-credential providers are allowed immediately, credentialed providers require either configured `RociConfig` credentials or parent runtime request-scoped auth (`api_key_override` / `get_api_key`) that the child will inherit.
 
 - Fallback is launch-time only. No mid-run model switching.
+- Missing credentials are skipped during fallback when no inherited auth source exists; provider creation/execution still performs final validation for the selected candidate.
 - The selected model is surfaced in `SubagentEvent::Spawned` and `SubagentSnapshot`.
 
 ### Input modes

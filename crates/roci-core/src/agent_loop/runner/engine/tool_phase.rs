@@ -12,7 +12,8 @@ use super::super::message_events::emit_message_lifecycle;
 use super::super::tooling::{
     append_skipped_tool_call, append_tool_result, apply_post_tool_use_hook, canceled_tool_result,
     declined_tool_result, emit_tool_execution_end, emit_tool_execution_start,
-    execute_parallel_tool_calls, execute_tool_call, ToolExecutionOutcome,
+    execute_parallel_tool_calls, execute_tool_call, resolve_tool_call, ResolvedToolCall,
+    ToolExecutionOutcome,
 };
 use super::super::{AgentEvent, ApprovalDecision, RunRequest};
 
@@ -74,15 +75,18 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
     let mut iteration_failures = 0usize;
     let mut turn_tool_results: Vec<AgentToolResult> = Vec::new();
     let mut steering_interrupted = false;
-    let mut pending_parallel_calls: Vec<AgentToolCall> = Vec::new();
+    let mut pending_parallel_calls: Vec<ResolvedToolCall> = Vec::new();
 
     for (call_idx, call) in tool_calls.iter().enumerate() {
+        let resolved_call = resolve_tool_call(&request.tools, call);
+        let approval_tool = resolved_call.tool.clone();
         let approval = resolve_approval(
             emitter,
             agent_emitter,
             &request.approval_policy,
             request.approval_handler.as_ref(),
             call,
+            approval_tool.as_deref(),
         );
         tokio::pin!(approval);
         let decision = tokio::select! {
@@ -100,13 +104,13 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
 
         let can_execute = approval_allows_execution(decision);
         if can_execute && is_parallel_safe_tool(&call.name) {
-            pending_parallel_calls.push(call.clone());
+            pending_parallel_calls.push(resolved_call);
             continue;
         }
 
         if !pending_parallel_calls.is_empty() {
             for parallel_call in &pending_parallel_calls {
-                emit_tool_execution_start(agent_emitter, parallel_call);
+                emit_tool_execution_start(agent_emitter, &parallel_call.call);
             }
             let parallel_results = tokio::select! {
                 _ = &mut *abort_rx => {
@@ -114,16 +118,19 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     for parallel_call in &pending_parallel_calls {
                         let canceled_result = apply_post_tool_use_hook(
                             &request.hooks,
-                            parallel_call,
-                            canceled_tool_result(parallel_call),
+                            &parallel_call.call,
+                            canceled_tool_result(&parallel_call.call),
                         )
                         .await;
-                        emit_tool_execution_end(agent_emitter, parallel_call, &canceled_result);
+                        emit_tool_execution_end(
+                            agent_emitter,
+                            &parallel_call.call,
+                            &canceled_result,
+                        );
                     }
                     return ToolPhaseOutcome::Canceled;
                 }
                 results = execute_parallel_tool_calls(
-                    &request.tools,
                     &request.hooks,
                     &pending_parallel_calls,
                     agent_emitter,
@@ -192,9 +199,8 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     return ToolPhaseOutcome::Canceled;
                 }
                 outcome = execute_tool_call(
-                    &request.tools,
                     &request.hooks,
-                    call,
+                    resolved_call,
                     agent_emitter,
                     run_cancel_token.child_token(),
                     #[cfg(feature = "agent")]
@@ -260,7 +266,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
 
     if !pending_parallel_calls.is_empty() {
         for parallel_call in &pending_parallel_calls {
-            emit_tool_execution_start(agent_emitter, parallel_call);
+            emit_tool_execution_start(agent_emitter, &parallel_call.call);
         }
         let parallel_results = tokio::select! {
             _ = &mut *abort_rx => {
@@ -268,16 +274,15 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                 for parallel_call in &pending_parallel_calls {
                     let canceled_result = apply_post_tool_use_hook(
                         &request.hooks,
-                        parallel_call,
-                        canceled_tool_result(parallel_call),
+                        &parallel_call.call,
+                        canceled_tool_result(&parallel_call.call),
                     )
                     .await;
-                    emit_tool_execution_end(agent_emitter, parallel_call, &canceled_result);
+                    emit_tool_execution_end(agent_emitter, &parallel_call.call, &canceled_result);
                 }
                 return ToolPhaseOutcome::Canceled;
             }
             results = execute_parallel_tool_calls(
-                &request.tools,
                 &request.hooks,
                 &pending_parallel_calls,
                 agent_emitter,
