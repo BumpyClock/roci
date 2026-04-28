@@ -471,6 +471,25 @@ mod tests {
     }
 
     #[test]
+    fn copilot_status_prefers_primary_token_store() {
+        let (_dir, store) = temp_store();
+        store
+            .save("github-copilot", "default", &token("primary-token"))
+            .expect("save primary token");
+        store
+            .save("github-copilot-api", "default", &token("api-token"))
+            .expect("save api token");
+        let backend = GitHubCopilotBackend;
+
+        let status = backend.get_status(&store).expect("status");
+
+        assert_eq!(
+            status.map(|token| token.access_token).as_deref(),
+            Some("primary-token")
+        );
+    }
+
+    #[test]
     fn copilot_logout_clears_primary_and_api_token_stores() {
         let (_dir, store) = temp_store();
         store

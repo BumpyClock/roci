@@ -219,6 +219,13 @@ fn has_request_scoped_credentials(config: &AgentConfig) -> bool {
         .as_deref()
         .is_some_and(|key| !key.is_empty())
         || config.get_api_key.is_some()
+        || has_auth_provider_headers(&config.provider_headers)
+}
+
+fn has_auth_provider_headers(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key(reqwest::header::AUTHORIZATION)
+        || headers.contains_key("api-key")
+        || headers.contains_key("x-api-key")
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +610,50 @@ model = "claude-opus-4"
         let config = RociConfig::default();
         let base_config = AgentConfig {
             api_key_override: Some("request-key".into()),
+            ..AgentConfig::default()
+        };
+
+        let resolved = reg
+            .resolve_model_candidate(&profile, &provider_reg, &config, &base_config)
+            .unwrap();
+
+        assert_eq!(
+            resolved.model,
+            LanguageModel::Known {
+                provider_key: "anthropic".into(),
+                model_id: "claude-sonnet-4.5".into()
+            }
+        );
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn registered_credentialed_provider_is_viable_with_request_scoped_provider_headers() {
+        let reg = SubagentProfileRegistry::new();
+        let profile = SubagentProfile {
+            name: "remote".into(),
+            models: vec![
+                ModelCandidate {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4.5".into(),
+                    reasoning_effort: Some("medium".into()),
+                },
+                ModelCandidate {
+                    provider: "lmstudio".into(),
+                    model: "local-model".into(),
+                    reasoning_effort: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut provider_reg = ProviderRegistry::new();
+        provider_reg.register(std::sync::Arc::new(CredentialFactory));
+        provider_reg.register(std::sync::Arc::new(LocalNoCredentialFactory));
+        let config = RociConfig::default().with_token_store(None);
+        let mut provider_headers = reqwest::header::HeaderMap::new();
+        provider_headers.insert("x-api-key", "request-key".parse().unwrap());
+        let base_config = AgentConfig {
+            provider_headers,
             ..AgentConfig::default()
         };
 
