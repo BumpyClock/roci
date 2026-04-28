@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::message::ContentPart;
 use crate::types::{AgentToolCall, AgentToolResult, ModelMessage, TextStreamDelta};
 
-use super::approvals::ApprovalRequest;
+use super::approvals::{ApprovalDecision, ApprovalRequest};
 use super::types::RunId;
 
 /// Stream category for events.
@@ -165,8 +165,18 @@ pub enum AgentEvent {
     Approval {
         request: ApprovalRequest,
     },
+    ApprovalResolved {
+        request_id: String,
+        decision: ApprovalDecision,
+    },
     Reasoning {
         text: String,
+    },
+    PlanUpdated {
+        plan: String,
+    },
+    DiffUpdated {
+        diff: String,
     },
     Error {
         error: String,

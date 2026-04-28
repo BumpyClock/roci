@@ -77,13 +77,21 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
     let mut pending_parallel_calls: Vec<AgentToolCall> = Vec::new();
 
     for (call_idx, call) in tool_calls.iter().enumerate() {
-        let decision = resolve_approval(
+        let approval = resolve_approval(
             emitter,
+            agent_emitter,
             &request.approval_policy,
             request.approval_handler.as_ref(),
             call,
-        )
-        .await;
+        );
+        tokio::pin!(approval);
+        let decision = tokio::select! {
+            _ = &mut *abort_rx => {
+                run_cancel_token.cancel();
+                return ToolPhaseOutcome::Canceled;
+            }
+            decision = &mut approval => decision,
+        };
 
         if matches!(decision, ApprovalDecision::Cancel) {
             run_cancel_token.cancel();

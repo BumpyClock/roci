@@ -76,6 +76,8 @@ async fn main() {
         convert_to_llm: None,
         before_agent_start: None,
         event_sink: Some(event_sink),
+        approval_policy: Default::default(),
+        approval_handler: None,
         session_id: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,

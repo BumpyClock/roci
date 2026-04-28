@@ -4,6 +4,7 @@ use super::{
     AgentRuntime, AgentRuntimeError, AgentRuntimeEvent, AgentSnapshot, AgentState, ChatProjector,
     MessageId, TurnId,
 };
+use crate::agent_loop::approvals::ApprovalDecision;
 use crate::agent_loop::runner::AgentEventSink;
 use crate::agent_loop::AgentEvent;
 
@@ -137,12 +138,42 @@ fn project_agent_event(
                 }
             }
         }
+        AgentEvent::Approval { request } => {
+            events.extend(ensure_turn_started(projector, run_state, turn_id)?);
+            events.push(projector.require_approval(turn_id, request.clone())?);
+        }
+        AgentEvent::ApprovalResolved {
+            request_id,
+            decision,
+        } => {
+            events.extend(ensure_turn_started(projector, run_state, turn_id)?);
+            let event = if matches!(decision, ApprovalDecision::Cancel) {
+                projector.cancel_approval(turn_id, request_id)?
+            } else {
+                projector.resolve_approval(turn_id, request_id, *decision)?
+            };
+            events.push(event);
+        }
+        AgentEvent::Reasoning { text } => {
+            events.extend(ensure_turn_started(projector, run_state, turn_id)?);
+            events.push(projector.update_reasoning(
+                turn_id,
+                run_state.active_message_id,
+                text.clone(),
+            )?);
+        }
+        AgentEvent::PlanUpdated { plan } => {
+            events.extend(ensure_turn_started(projector, run_state, turn_id)?);
+            events.push(projector.update_plan(turn_id, plan.clone())?);
+        }
+        AgentEvent::DiffUpdated { diff } => {
+            events.extend(ensure_turn_started(projector, run_state, turn_id)?);
+            events.push(projector.update_diff(turn_id, diff.clone())?);
+        }
         AgentEvent::AgentStart { .. }
         | AgentEvent::AgentEnd { .. }
         | AgentEvent::TurnEnd { .. }
         | AgentEvent::UserInputRequested { .. }
-        | AgentEvent::Approval { .. }
-        | AgentEvent::Reasoning { .. }
         | AgentEvent::Error { .. }
         | AgentEvent::System { .. } => {}
     }
@@ -229,5 +260,135 @@ impl AgentRuntime {
         });
 
         (sink, projection_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::runtime::chat::{AgentRuntimeEventPayload, ApprovalStatus, ChatProjector};
+    use crate::agent_loop::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+    use crate::types::ModelMessage;
+
+    fn queued_turn(projector: &mut ChatProjector) -> TurnId {
+        projector.queue_turn(Vec::new()).turn_id
+    }
+
+    fn approval_request(id: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            id: id.to_string(),
+            kind: ApprovalKind::CommandExecution,
+            reason: Some("needs command".to_string()),
+            payload: serde_json::json!({ "tool_name": "shell" }),
+            suggested_policy_change: None,
+        }
+    }
+
+    #[test]
+    fn projects_approval_events_with_terminal_state() {
+        let mut projector = ChatProjector::default();
+        let turn_id = queued_turn(&mut projector);
+        let mut run_state = ChatProjectionRunState::default();
+
+        let required = project_agent_event(
+            &mut projector,
+            &mut run_state,
+            turn_id,
+            &AgentEvent::Approval {
+                request: approval_request("approval-1"),
+            },
+        )
+        .expect("approval projects");
+        let resolved = project_agent_event(
+            &mut projector,
+            &mut run_state,
+            turn_id,
+            &AgentEvent::ApprovalResolved {
+                request_id: "approval-1".to_string(),
+                decision: ApprovalDecision::Decline,
+            },
+        )
+        .expect("approval resolution projects");
+        let thread = projector
+            .read_thread(projector.default_thread_id())
+            .expect("thread exists");
+
+        assert!(matches!(
+            required.last().map(|event| &event.payload),
+            Some(AgentRuntimeEventPayload::ApprovalRequired { .. })
+        ));
+        assert!(matches!(
+            resolved.last().map(|event| &event.payload),
+            Some(AgentRuntimeEventPayload::ApprovalResolved { .. })
+        ));
+        assert_eq!(thread.approvals[0].status, ApprovalStatus::Resolved);
+        assert_eq!(
+            thread.approvals[0].decision,
+            Some(ApprovalDecision::Decline)
+        );
+    }
+
+    #[test]
+    fn projects_reasoning_plan_and_diff_agent_events() {
+        let mut projector = ChatProjector::default();
+        let turn_id = queued_turn(&mut projector);
+        let mut run_state = ChatProjectionRunState::default();
+
+        project_agent_event(
+            &mut projector,
+            &mut run_state,
+            turn_id,
+            &AgentEvent::MessageStart {
+                message: ModelMessage::assistant(""),
+            },
+        )
+        .expect("message starts");
+        let reasoning = project_agent_event(
+            &mut projector,
+            &mut run_state,
+            turn_id,
+            &AgentEvent::Reasoning {
+                text: "analysis".to_string(),
+            },
+        )
+        .expect("reasoning projects");
+        let plan = project_agent_event(
+            &mut projector,
+            &mut run_state,
+            turn_id,
+            &AgentEvent::PlanUpdated {
+                plan: "inspect then edit".to_string(),
+            },
+        )
+        .expect("plan projects");
+        let diff = project_agent_event(
+            &mut projector,
+            &mut run_state,
+            turn_id,
+            &AgentEvent::DiffUpdated {
+                diff: "+line".to_string(),
+            },
+        )
+        .expect("diff projects");
+        let thread = projector
+            .read_thread(projector.default_thread_id())
+            .expect("thread exists");
+
+        assert_eq!(thread.reasoning[0].text, "analysis");
+        assert_eq!(thread.reasoning[0].message_id, run_state.active_message_id);
+        assert_eq!(thread.plans[0].plan, "inspect then edit");
+        assert_eq!(thread.diffs[0].diff, "+line");
+        assert!(matches!(
+            reasoning.last().map(|event| &event.payload),
+            Some(AgentRuntimeEventPayload::ReasoningUpdated { .. })
+        ));
+        assert!(matches!(
+            plan.last().map(|event| &event.payload),
+            Some(AgentRuntimeEventPayload::PlanUpdated { .. })
+        ));
+        assert!(matches!(
+            diff.last().map(|event| &event.payload),
+            Some(AgentRuntimeEventPayload::DiffUpdated { .. })
+        ));
     }
 }

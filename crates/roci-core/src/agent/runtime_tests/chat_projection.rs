@@ -1,8 +1,8 @@
 use super::chat::{
-    AgentRuntimeError, AgentRuntimeEventPayload, ChatProjector, MessageStatus, RuntimeCursor,
-    ToolStatus, TurnStatus,
+    AgentRuntimeError, AgentRuntimeEventPayload, ApprovalStatus, ChatProjector, MessageStatus,
+    RuntimeCursor, ToolStatus, TurnStatus,
 };
-use crate::agent_loop::ToolUpdatePayload;
+use crate::agent_loop::{ApprovalDecision, ApprovalKind, ApprovalRequest, ToolUpdatePayload};
 use crate::types::{AgentToolCall, AgentToolResult, ContentPart, ModelMessage, Role};
 
 #[test]
@@ -164,6 +164,150 @@ fn tool_lifecycle_projects_started_updated_and_completed_snapshots() {
         }
         other => panic!("expected tool completed, got {other:?}"),
     }
+}
+
+#[test]
+fn approval_lifecycle_projects_required_resolved_and_canceled_snapshots() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).expect("turn starts");
+    let request = ApprovalRequest {
+        id: "approval-1".to_string(),
+        kind: ApprovalKind::CommandExecution,
+        reason: Some("run shell".to_string()),
+        payload: serde_json::json!({ "tool_name": "shell" }),
+        suggested_policy_change: None,
+    };
+
+    let required = projector
+        .require_approval(queued.turn_id, request.clone())
+        .expect("approval required projects");
+    let resolved = projector
+        .resolve_approval(queued.turn_id, &request.id, ApprovalDecision::Accept)
+        .expect("approval resolved projects");
+    let cancel_request = ApprovalRequest {
+        id: "approval-2".to_string(),
+        ..request
+    };
+    projector
+        .require_approval(queued.turn_id, cancel_request.clone())
+        .expect("second approval required projects");
+    let canceled = projector
+        .cancel_approval(queued.turn_id, &cancel_request.id)
+        .expect("approval canceled projects");
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert_eq!(thread.approvals.len(), 2);
+    assert_eq!(thread.approvals[0].status, ApprovalStatus::Resolved);
+    assert_eq!(thread.approvals[0].decision, Some(ApprovalDecision::Accept));
+    assert_eq!(thread.approvals[1].status, ApprovalStatus::Canceled);
+    assert_eq!(thread.approvals[1].decision, Some(ApprovalDecision::Cancel));
+
+    assert!(matches!(
+        required.payload,
+        AgentRuntimeEventPayload::ApprovalRequired { .. }
+    ));
+    assert!(matches!(
+        resolved.payload,
+        AgentRuntimeEventPayload::ApprovalResolved { .. }
+    ));
+    assert!(matches!(
+        canceled.payload,
+        AgentRuntimeEventPayload::ApprovalCanceled { .. }
+    ));
+}
+
+#[test]
+fn cancel_turn_marks_pending_approvals_canceled() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).expect("turn starts");
+    let request = ApprovalRequest {
+        id: "approval-1".to_string(),
+        kind: ApprovalKind::CommandExecution,
+        reason: Some("run shell".to_string()),
+        payload: serde_json::json!({ "tool_name": "shell" }),
+        suggested_policy_change: None,
+    };
+    projector
+        .require_approval(queued.turn_id, request)
+        .expect("approval required projects");
+
+    let approval_canceled = projector
+        .cancel_pending_approvals(queued.turn_id)
+        .expect("pending approvals cancel");
+    let turn_canceled = projector.cancel_turn(queued.turn_id).expect("turn cancels");
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert!(matches!(
+        approval_canceled[0].payload,
+        AgentRuntimeEventPayload::ApprovalCanceled { .. }
+    ));
+    assert!(matches!(
+        turn_canceled.payload,
+        AgentRuntimeEventPayload::TurnCanceled { .. }
+    ));
+    assert_eq!(thread.approvals[0].status, ApprovalStatus::Canceled);
+    assert_eq!(thread.approvals[0].decision, Some(ApprovalDecision::Cancel));
+}
+
+#[test]
+fn reasoning_plan_and_diff_project_latest_turn_state() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).expect("turn starts");
+    let message = projector
+        .start_message(queued.turn_id, ModelMessage::assistant(""))
+        .expect("message starts");
+
+    let first_reasoning = projector
+        .update_reasoning(queued.turn_id, Some(message.message_id), "think ")
+        .expect("reasoning projects");
+    let second_reasoning = projector
+        .update_reasoning(queued.turn_id, Some(message.message_id), "more")
+        .expect("reasoning appends");
+    let plan = projector
+        .update_plan(queued.turn_id, "1. inspect\n2. edit")
+        .expect("plan projects");
+    let diff = projector
+        .update_diff(queued.turn_id, "-old\n+new")
+        .expect("diff projects");
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert_eq!(thread.reasoning.len(), 1);
+    assert_eq!(thread.reasoning[0].message_id, Some(message.message_id));
+    assert_eq!(thread.reasoning[0].text, "think more");
+    assert_eq!(thread.plans[0].plan, "1. inspect\n2. edit");
+    assert_eq!(thread.diffs[0].diff, "-old\n+new");
+
+    match first_reasoning.payload {
+        AgentRuntimeEventPayload::ReasoningUpdated { reasoning, delta } => {
+            assert_eq!(reasoning.text, "think ");
+            assert_eq!(delta, "think ");
+        }
+        other => panic!("expected reasoning updated, got {other:?}"),
+    }
+    match second_reasoning.payload {
+        AgentRuntimeEventPayload::ReasoningUpdated { reasoning, delta } => {
+            assert_eq!(reasoning.text, "think more");
+            assert_eq!(delta, "more");
+        }
+        other => panic!("expected reasoning updated, got {other:?}"),
+    }
+    assert!(matches!(
+        plan.payload,
+        AgentRuntimeEventPayload::PlanUpdated { .. }
+    ));
+    assert!(matches!(
+        diff.payload,
+        AgentRuntimeEventPayload::DiffUpdated { .. }
+    ));
 }
 
 #[test]

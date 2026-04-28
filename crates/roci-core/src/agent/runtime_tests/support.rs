@@ -121,6 +121,8 @@ pub(super) fn test_agent_config() -> AgentConfig {
         convert_to_llm: None,
         before_agent_start: None,
         event_sink: None,
+        approval_policy: Default::default(),
+        approval_handler: None,
         session_id: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,
@@ -237,6 +239,10 @@ struct StreamingChunksFactory {
     chunk_count: usize,
 }
 
+struct ReasoningTextFactory {
+    provider_key: &'static str,
+}
+
 impl ProviderFactory for StreamingTextFactory {
     fn provider_keys(&self) -> &[&str] {
         std::slice::from_ref(&self.provider_key)
@@ -291,6 +297,31 @@ impl ProviderFactory for StreamingChunksFactory {
             chunk_count: self.chunk_count,
         }))
     }
+}
+
+impl ProviderFactory for ReasoningTextFactory {
+    fn provider_keys(&self) -> &[&str] {
+        std::slice::from_ref(&self.provider_key)
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        _provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(ReasoningTextProvider {
+            provider_key: self.provider_key.to_string(),
+            model_id: model_id.to_string(),
+            capabilities: ModelCapabilities::default(),
+        }))
+    }
+}
+
+struct ReasoningTextProvider {
+    provider_key: String,
+    model_id: String,
+    capabilities: ModelCapabilities,
 }
 
 #[async_trait]
@@ -413,6 +444,84 @@ impl ModelProvider for StreamingChunksProvider {
     }
 }
 
+#[async_trait]
+impl ModelProvider for ReasoningTextProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "stream-only reasoning test provider".to_string(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        let events: Vec<Result<TextStreamDelta, RociError>> = vec![
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Reasoning,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: Some("think ".to_string()),
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Reasoning,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: Some("more".to_string()),
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: "answer".to_string(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(crate::types::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    total_tokens: 2,
+                    ..crate::types::Usage::default()
+                }),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
 pub(super) fn registry_with_streaming_provider(
     provider_key: &'static str,
     input_tokens: u32,
@@ -436,5 +545,13 @@ pub(super) fn registry_with_streaming_chunks_provider(
         provider_key,
         chunk_count,
     }));
+    Arc::new(registry)
+}
+
+pub(super) fn registry_with_reasoning_provider(
+    provider_key: &'static str,
+) -> Arc<ProviderRegistry> {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(ReasoningTextFactory { provider_key }));
     Arc::new(registry)
 }

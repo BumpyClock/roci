@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent_loop::ToolUpdatePayload;
+use crate::agent_loop::{ApprovalDecision, ApprovalRequest, ToolUpdatePayload};
 use crate::types::{AgentToolResult, ModelMessage};
 
 use super::store::AgentRuntimeEventStore;
@@ -214,6 +214,50 @@ pub enum ToolStatus {
     Completed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    Pending,
+    Resolved,
+    Canceled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalSnapshot {
+    pub request: ApprovalRequest,
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub status: ApprovalStatus,
+    pub decision: Option<ApprovalDecision>,
+    pub requested_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningSnapshot {
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub message_id: Option<MessageId>,
+    pub text: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanSnapshot {
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub plan: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffSnapshot {
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub diff: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageSnapshot {
     pub message_id: MessageId,
@@ -261,6 +305,10 @@ pub struct ThreadSnapshot {
     pub turns: Vec<TurnSnapshot>,
     pub messages: Vec<MessageSnapshot>,
     pub tools: Vec<ToolExecutionSnapshot>,
+    pub approvals: Vec<ApprovalSnapshot>,
+    pub reasoning: Vec<ReasoningSnapshot>,
+    pub plans: Vec<PlanSnapshot>,
+    pub diffs: Vec<DiffSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

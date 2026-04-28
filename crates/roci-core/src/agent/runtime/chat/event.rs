@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::domain::{MessageSnapshot, ThreadId, ToolExecutionSnapshot, TurnId, TurnSnapshot};
+use super::domain::{
+    ApprovalSnapshot, DiffSnapshot, MessageSnapshot, PlanSnapshot, ReasoningSnapshot, ThreadId,
+    ToolExecutionSnapshot, TurnId, TurnSnapshot,
+};
 
 pub const AGENT_RUNTIME_EVENT_SCHEMA_VERSION: u16 = 1;
 
@@ -59,17 +62,59 @@ impl AgentRuntimeEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentRuntimeEventPayload {
-    TurnQueued { turn: TurnSnapshot },
-    TurnStarted { turn: TurnSnapshot },
-    MessageStarted { message: MessageSnapshot },
-    MessageUpdated { message: MessageSnapshot },
-    MessageCompleted { message: MessageSnapshot },
-    ToolStarted { tool: ToolExecutionSnapshot },
-    ToolUpdated { tool: ToolExecutionSnapshot },
-    ToolCompleted { tool: ToolExecutionSnapshot },
-    TurnCompleted { turn: TurnSnapshot },
-    TurnFailed { turn: TurnSnapshot, error: String },
-    TurnCanceled { turn: TurnSnapshot },
+    TurnQueued {
+        turn: TurnSnapshot,
+    },
+    TurnStarted {
+        turn: TurnSnapshot,
+    },
+    MessageStarted {
+        message: MessageSnapshot,
+    },
+    MessageUpdated {
+        message: MessageSnapshot,
+    },
+    MessageCompleted {
+        message: MessageSnapshot,
+    },
+    ToolStarted {
+        tool: ToolExecutionSnapshot,
+    },
+    ToolUpdated {
+        tool: ToolExecutionSnapshot,
+    },
+    ToolCompleted {
+        tool: ToolExecutionSnapshot,
+    },
+    ApprovalRequired {
+        approval: ApprovalSnapshot,
+    },
+    ApprovalResolved {
+        approval: ApprovalSnapshot,
+    },
+    ApprovalCanceled {
+        approval: ApprovalSnapshot,
+    },
+    ReasoningUpdated {
+        reasoning: ReasoningSnapshot,
+        delta: String,
+    },
+    PlanUpdated {
+        plan: PlanSnapshot,
+    },
+    DiffUpdated {
+        diff: DiffSnapshot,
+    },
+    TurnCompleted {
+        turn: TurnSnapshot,
+    },
+    TurnFailed {
+        turn: TurnSnapshot,
+        error: String,
+    },
+    TurnCanceled {
+        turn: TurnSnapshot,
+    },
 }
 
 impl AgentRuntimeEventPayload {
@@ -111,6 +156,36 @@ impl AgentRuntimeEventPayload {
     #[must_use]
     pub const fn tool_completed_name() -> &'static str {
         "tool_completed"
+    }
+
+    #[must_use]
+    pub const fn approval_required_name() -> &'static str {
+        "approval_required"
+    }
+
+    #[must_use]
+    pub const fn approval_resolved_name() -> &'static str {
+        "approval_resolved"
+    }
+
+    #[must_use]
+    pub const fn approval_canceled_name() -> &'static str {
+        "approval_canceled"
+    }
+
+    #[must_use]
+    pub const fn reasoning_updated_name() -> &'static str {
+        "reasoning_updated"
+    }
+
+    #[must_use]
+    pub const fn plan_updated_name() -> &'static str {
+        "plan_updated"
+    }
+
+    #[must_use]
+    pub const fn diff_updated_name() -> &'static str {
+        "diff_updated"
     }
 
     #[must_use]

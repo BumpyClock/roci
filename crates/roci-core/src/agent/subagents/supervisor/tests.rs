@@ -107,6 +107,8 @@ fn make_base_config() -> AgentConfig {
         convert_to_llm: None,
         before_agent_start: None,
         event_sink: None,
+        approval_policy: Default::default(),
+        approval_handler: None,
         session_id: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,
@@ -197,6 +199,8 @@ impl SubagentLauncher for MockLauncher {
                 system_prompt: None,
                 tools,
                 event_sink,
+                approval_policy: Default::default(),
+                approval_handler: None,
                 #[cfg(feature = "agent")]
                 user_input_coordinator: Some(coordinator),
                 dynamic_tool_providers: Vec::new(),

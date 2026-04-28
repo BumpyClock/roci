@@ -181,7 +181,7 @@ impl AgentRuntime {
     /// canceled turns. Returns [`AgentRuntimeError::StaleRuntime`] when the
     /// turn id revision no longer matches the current thread revision.
     pub async fn cancel_turn(&self, turn_id: TurnId) -> Result<TurnSnapshot, AgentRuntimeError> {
-        let (previous_status, event, canceled) = {
+        let (previous_status, events, canceled) = {
             let mut projector =
                 self.chat_projector
                     .lock()
@@ -189,6 +189,7 @@ impl AgentRuntime {
                         message: "chat projector lock poisoned".into(),
                     })?;
             let previous = projector.turn_snapshot(turn_id)?;
+            let mut events = projector.cancel_pending_approvals(turn_id)?;
             let event = projector.cancel_turn(turn_id)?;
             let canceled = match &event.payload {
                 AgentRuntimeEventPayload::TurnCanceled { turn } => turn.clone(),
@@ -198,7 +199,8 @@ impl AgentRuntime {
                     });
                 }
             };
-            (previous.status, event, canceled)
+            events.push(event);
+            (previous.status, events, canceled)
         };
 
         let abort_sent = self.abort_active_provider_call().await;
@@ -206,7 +208,7 @@ impl AgentRuntime {
             self.transition_running_to_aborting().await;
         }
 
-        self.publish_runtime_event(event).await?;
+        self.publish_runtime_events(events).await?;
 
         Ok(canceled)
     }

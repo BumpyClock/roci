@@ -46,6 +46,12 @@ fn payload_name(payload: &AgentRuntimeEventPayload) -> &'static str {
         AgentRuntimeEventPayload::ToolStarted { .. } => "tool_started",
         AgentRuntimeEventPayload::ToolUpdated { .. } => "tool_updated",
         AgentRuntimeEventPayload::ToolCompleted { .. } => "tool_completed",
+        AgentRuntimeEventPayload::ApprovalRequired { .. } => "approval_required",
+        AgentRuntimeEventPayload::ApprovalResolved { .. } => "approval_resolved",
+        AgentRuntimeEventPayload::ApprovalCanceled { .. } => "approval_canceled",
+        AgentRuntimeEventPayload::ReasoningUpdated { .. } => "reasoning_updated",
+        AgentRuntimeEventPayload::PlanUpdated { .. } => "plan_updated",
+        AgentRuntimeEventPayload::DiffUpdated { .. } => "diff_updated",
         AgentRuntimeEventPayload::TurnCompleted { .. } => "turn_completed",
         AgentRuntimeEventPayload::TurnFailed { .. } => "turn_failed",
         AgentRuntimeEventPayload::TurnCanceled { .. } => "turn_canceled",
@@ -277,6 +283,65 @@ async fn subscribe_before_prompt_receives_live_semantic_events_in_order() {
             .any(|(index, name)| *name == "message_started" && index > turn_started),
         "assistant message should be emitted after turn starts: {names:?}"
     );
+}
+
+#[tokio::test]
+async fn reasoning_updates_flow_through_subscription_and_replay() {
+    let registry = registry_with_reasoning_provider("stub");
+    let mut config = test_agent_config();
+    config.model = "stub:reasoning".parse().expect("stub model should parse");
+    let agent = AgentRuntime::new(registry, test_config(), config);
+    let mut sub = agent.subscribe(None).await;
+
+    let result = agent.prompt("hello").await.expect("prompt should run");
+    assert_eq!(
+        result.status,
+        RunStatus::Completed,
+        "error: {:?}",
+        result.error
+    );
+
+    let mut events = Vec::new();
+    while !matches!(
+        events
+            .last()
+            .map(|event: &AgentRuntimeEvent| &event.payload),
+        Some(AgentRuntimeEventPayload::TurnCompleted { .. })
+    ) {
+        events.push(recv_event(&mut sub).await);
+    }
+
+    let reasoning_events = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            AgentRuntimeEventPayload::ReasoningUpdated { reasoning, delta } => {
+                Some((reasoning.text.clone(), delta.clone(), event.cursor()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasoning_events
+            .iter()
+            .map(|(_, delta, _)| delta.as_str())
+            .collect::<Vec<_>>(),
+        ["think ", "more"]
+    );
+    assert_eq!(reasoning_events[1].0, "think more");
+
+    let replay_cursor = RuntimeCursor::new(
+        reasoning_events[0].2.thread_id,
+        reasoning_events[0].2.seq.saturating_sub(1),
+    );
+    let replayed = agent
+        .subscribe(Some(replay_cursor))
+        .await
+        .replay()
+        .expect("reasoning cursor should replay");
+    assert!(replayed.iter().any(|event| matches!(
+        event.payload,
+        AgentRuntimeEventPayload::ReasoningUpdated { .. }
+    )));
 }
 
 #[tokio::test]

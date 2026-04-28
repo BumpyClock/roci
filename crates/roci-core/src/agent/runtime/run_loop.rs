@@ -36,12 +36,19 @@ impl AgentRuntime {
         status: TurnStatus,
         error: Option<String>,
     ) -> Result<(), RociError> {
-        let event = {
-            let mut projector = self
-                .chat_projector
-                .lock()
-                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
-            match status {
+        let events: Result<Vec<_>, AgentRuntimeError> = (|| {
+            let mut projector =
+                self.chat_projector
+                    .lock()
+                    .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                        message: "chat projector lock poisoned".into(),
+                    })?;
+            let mut events = if status == TurnStatus::Canceled {
+                projector.cancel_pending_approvals(turn_id)
+            } else {
+                Ok(Vec::new())
+            }?;
+            let event = match status {
                 TurnStatus::Completed => projector.complete_turn(turn_id),
                 TurnStatus::Failed => projector.fail_turn(
                     turn_id,
@@ -53,11 +60,13 @@ impl AgentRuntime {
                         message: format!("non-terminal status requested: {status:?}"),
                     })
                 }
-            }
-        };
+            };
+            events.push(event?);
+            Ok::<_, AgentRuntimeError>(events)
+        })();
 
-        let event = match event {
-            Ok(event) => event,
+        let events = match events {
+            Ok(events) => events,
             Err(AgentRuntimeError::AlreadyTerminal {
                 status: terminal_status,
                 ..
@@ -65,7 +74,7 @@ impl AgentRuntime {
             Err(err) => return Err(Self::map_chat_projection_error(err)),
         };
 
-        self.publish_runtime_event(event)
+        self.publish_runtime_events(events)
             .await
             .map(|_| ())
             .map_err(Self::map_chat_projection_error)
@@ -186,11 +195,15 @@ impl AgentRuntime {
             .with_tools(tools)
             .with_steering_messages(steering_fn)
             .with_follow_up_messages(follow_up_fn)
+            .with_approval_policy(self.config.approval_policy)
             .with_agent_event_sink(intercepting_sink)
             .with_prior_session_usage(
                 session_usage_snapshot.input_tokens as usize,
                 session_usage_snapshot.output_tokens as usize,
             );
+        if let Some(ref approval_handler) = self.config.approval_handler {
+            request = request.with_approval_handler(approval_handler.clone());
+        }
 
         if let Some(ref budget) = self.config.context_budget {
             request = request.with_context_budget(budget.clone());

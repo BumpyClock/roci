@@ -135,6 +135,8 @@ async fn submit_user_input_unknown_request_returns_error() {
         convert_to_llm: None,
         before_agent_start: None,
         event_sink: None,
+        approval_policy: Default::default(),
+        approval_handler: None,
         session_id: None,
         steering_mode: crate::agent::runtime::QueueDrainMode::All,
         follow_up_mode: crate::agent::runtime::QueueDrainMode::All,

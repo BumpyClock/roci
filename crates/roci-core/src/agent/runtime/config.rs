@@ -5,6 +5,7 @@ use crate::agent_loop::runner::{
     AgentEventSink, BeforeAgentStartHook, ConvertToLlmFn, PostToolUseHook, PreToolUseHook,
     RetryBackoffPolicy, TransformContextFn,
 };
+use crate::agent_loop::{ApprovalHandler, ApprovalPolicy};
 use crate::context::ContextBudget;
 use crate::models::LanguageModel;
 use crate::provider::ProviderPayloadCallback;
@@ -46,6 +47,10 @@ pub struct AgentConfig {
     pub before_agent_start: Option<BeforeAgentStartHook>,
     /// Optional sink for high-level [`crate::agent_loop::AgentEvent`] emission.
     pub event_sink: Option<AgentEventSink>,
+    /// Tool approval policy for each run.
+    pub approval_policy: ApprovalPolicy,
+    /// Optional host-owned approval resolver.
+    pub approval_handler: Option<ApprovalHandler>,
     /// Optional session ID for provider-side prompt caching.
     pub session_id: Option<String>,
     /// Drain mode for steering queue retrieval.
@@ -122,6 +127,8 @@ impl Default for AgentConfig {
             convert_to_llm: None,
             before_agent_start: None,
             event_sink: None,
+            approval_policy: ApprovalPolicy::Ask,
+            approval_handler: None,
             session_id: None,
             steering_mode: QueueDrainMode::All,
             follow_up_mode: QueueDrainMode::All,

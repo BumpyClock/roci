@@ -289,6 +289,40 @@ impl ChatRenderer {
             AgentRuntimeEventPayload::ToolCompleted { tool } => {
                 self.render_tool_completion(tool, stderr);
             }
+            AgentRuntimeEventPayload::ApprovalRequired { approval } => {
+                let reason = approval
+                    .request
+                    .reason
+                    .as_deref()
+                    .unwrap_or("approval required");
+                let _ = writeln!(
+                    stderr,
+                    "\n? approval {}: {}",
+                    approval.request.id,
+                    truncate_preview(reason, 120)
+                );
+            }
+            AgentRuntimeEventPayload::ApprovalResolved { approval } => {
+                let _ = writeln!(
+                    stderr,
+                    "  approval {}: {:?}",
+                    approval.request.id, approval.decision
+                );
+            }
+            AgentRuntimeEventPayload::ApprovalCanceled { approval } => {
+                let _ = writeln!(stderr, "  approval {}: canceled", approval.request.id);
+            }
+            AgentRuntimeEventPayload::ReasoningUpdated { delta, .. } => {
+                if !delta.is_empty() {
+                    let _ = writeln!(stderr, "\n[reasoning] {}", truncate_preview(&delta, 160));
+                }
+            }
+            AgentRuntimeEventPayload::PlanUpdated { plan } => {
+                let _ = writeln!(stderr, "\n[plan] {}", truncate_preview(&plan.plan, 200));
+            }
+            AgentRuntimeEventPayload::DiffUpdated { diff } => {
+                let _ = writeln!(stderr, "\n[diff]\n{}", truncate_preview(&diff.diff, 400));
+            }
             AgentRuntimeEventPayload::TurnCompleted { .. }
             | AgentRuntimeEventPayload::TurnFailed { .. }
             | AgentRuntimeEventPayload::TurnCanceled { .. } => return true,

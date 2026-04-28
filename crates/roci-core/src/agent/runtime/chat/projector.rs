@@ -3,12 +3,13 @@ use std::collections::{HashMap, VecDeque};
 use chrono::Utc;
 
 use super::{
-    AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, ChatRuntimeConfig, MessageId,
-    MessageSnapshot, MessageStatus, RuntimeCursor, RuntimeSnapshot, ThreadId, ThreadSnapshot,
+    AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, ApprovalSnapshot,
+    ApprovalStatus, ChatRuntimeConfig, DiffSnapshot, MessageId, MessageSnapshot, MessageStatus,
+    PlanSnapshot, ReasoningSnapshot, RuntimeCursor, RuntimeSnapshot, ThreadId, ThreadSnapshot,
     ToolExecutionSnapshot, ToolStatus, TurnId, TurnSnapshot, TurnStatus,
     AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
 };
-use crate::agent_loop::ToolUpdatePayload;
+use crate::agent_loop::{ApprovalDecision, ApprovalRequest, ToolUpdatePayload};
 use crate::types::{AgentToolResult, ModelMessage};
 
 pub type ModelMessages = Vec<ModelMessage>;
@@ -46,6 +47,10 @@ impl ThreadState {
                 turns: Vec::new(),
                 messages: Vec::new(),
                 tools: Vec::new(),
+                approvals: Vec::new(),
+                reasoning: Vec::new(),
+                plans: Vec::new(),
+                diffs: Vec::new(),
             },
             events: VecDeque::new(),
             replay_capacity,
@@ -71,6 +76,10 @@ impl ThreadState {
         self.snapshot.turns.clear();
         self.snapshot.messages.clear();
         self.snapshot.tools.clear();
+        self.snapshot.approvals.clear();
+        self.snapshot.reasoning.clear();
+        self.snapshot.plans.clear();
+        self.snapshot.diffs.clear();
         self.events.clear();
         self.next_turn_ordinal = 1;
         self.next_message_ordinal = 1;
@@ -431,6 +440,220 @@ impl ThreadState {
         ))
     }
 
+    fn require_approval(
+        &mut self,
+        turn_id: TurnId,
+        request: ApprovalRequest,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        if self
+            .snapshot
+            .approvals
+            .iter()
+            .any(|approval| approval.turn_id == turn_id && approval.request.id == request.id)
+        {
+            return Err(AgentRuntimeError::ProjectionFailed {
+                message: format!("approval already requested: {}", request.id),
+            });
+        }
+
+        self.snapshot.approvals.push(ApprovalSnapshot {
+            request: request.clone(),
+            thread_id: self.thread_id(),
+            turn_id,
+            status: ApprovalStatus::Pending,
+            decision: None,
+            requested_at: Utc::now(),
+            resolved_at: None,
+        });
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::ApprovalRequired {
+                approval: self
+                    .approval_snapshot(turn_id, &request.id)
+                    .expect("approval was inserted"),
+            },
+        ))
+    }
+
+    fn resolve_approval(
+        &mut self,
+        turn_id: TurnId,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        let approval = self.approval_mut_or_err(turn_id, request_id)?;
+        approval.status = ApprovalStatus::Resolved;
+        approval.decision = Some(decision);
+        approval.resolved_at = Some(Utc::now());
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::ApprovalResolved {
+                approval: self
+                    .approval_snapshot(turn_id, request_id)
+                    .expect("approval was resolved"),
+            },
+        ))
+    }
+
+    fn cancel_approval(
+        &mut self,
+        turn_id: TurnId,
+        request_id: &str,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        let approval = self.approval_mut_or_err(turn_id, request_id)?;
+        approval.status = ApprovalStatus::Canceled;
+        approval.decision = Some(ApprovalDecision::Cancel);
+        approval.resolved_at = Some(Utc::now());
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::ApprovalCanceled {
+                approval: self
+                    .approval_snapshot(turn_id, request_id)
+                    .expect("approval was canceled"),
+            },
+        ))
+    }
+
+    fn cancel_pending_approvals(
+        &mut self,
+        turn_id: TurnId,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        let request_ids = self
+            .snapshot
+            .approvals
+            .iter()
+            .filter(|approval| {
+                approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending
+            })
+            .map(|approval| approval.request.id.clone())
+            .collect::<Vec<_>>();
+
+        let mut events = Vec::with_capacity(request_ids.len());
+        for request_id in request_ids {
+            events.push(self.cancel_approval(turn_id, &request_id)?);
+        }
+        Ok(events)
+    }
+
+    fn update_reasoning(
+        &mut self,
+        turn_id: TurnId,
+        message_id: Option<MessageId>,
+        delta: impl Into<String>,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        if let Some(message_id) = message_id {
+            let message = self.message_snapshot_or_err(message_id)?;
+            if message.turn_id != turn_id {
+                return Err(AgentRuntimeError::ProjectionFailed {
+                    message: format!("message {message_id} does not belong to turn {turn_id}"),
+                });
+            }
+        }
+
+        let delta = delta.into();
+        let updated_at = Utc::now();
+        if let Some(reasoning) =
+            self.snapshot.reasoning.iter_mut().find(|reasoning| {
+                reasoning.turn_id == turn_id && reasoning.message_id == message_id
+            })
+        {
+            reasoning.text.push_str(&delta);
+            reasoning.updated_at = updated_at;
+        } else {
+            self.snapshot.reasoning.push(ReasoningSnapshot {
+                thread_id: self.thread_id(),
+                turn_id,
+                message_id,
+                text: delta.clone(),
+                updated_at,
+            });
+        }
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::ReasoningUpdated {
+                reasoning: self
+                    .reasoning_snapshot(turn_id, message_id)
+                    .expect("reasoning was updated"),
+                delta,
+            },
+        ))
+    }
+
+    fn update_plan(
+        &mut self,
+        turn_id: TurnId,
+        plan: impl Into<String>,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        let plan = plan.into();
+        let updated_at = Utc::now();
+        if let Some(snapshot) = self
+            .snapshot
+            .plans
+            .iter_mut()
+            .find(|snapshot| snapshot.turn_id == turn_id)
+        {
+            snapshot.plan = plan;
+            snapshot.updated_at = updated_at;
+        } else {
+            self.snapshot.plans.push(PlanSnapshot {
+                thread_id: self.thread_id(),
+                turn_id,
+                plan,
+                updated_at,
+            });
+        }
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::PlanUpdated {
+                plan: self.plan_snapshot(turn_id).expect("plan was updated"),
+            },
+        ))
+    }
+
+    fn update_diff(
+        &mut self,
+        turn_id: TurnId,
+        diff: impl Into<String>,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        let diff = diff.into();
+        let updated_at = Utc::now();
+        if let Some(snapshot) = self
+            .snapshot
+            .diffs
+            .iter_mut()
+            .find(|snapshot| snapshot.turn_id == turn_id)
+        {
+            snapshot.diff = diff;
+            snapshot.updated_at = updated_at;
+        } else {
+            self.snapshot.diffs.push(DiffSnapshot {
+                thread_id: self.thread_id(),
+                turn_id,
+                diff,
+                updated_at,
+            });
+        }
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::DiffUpdated {
+                diff: self.diff_snapshot(turn_id).expect("diff was updated"),
+            },
+        ))
+    }
+
     fn terminal_turn(
         &mut self,
         turn_id: TurnId,
@@ -450,6 +673,9 @@ impl ThreadState {
         turn.error = error.clone();
         if self.snapshot.active_turn_id == Some(turn_id) {
             self.snapshot.active_turn_id = None;
+        }
+        if status == TurnStatus::Canceled {
+            self.cancel_pending_approval_snapshots(turn_id);
         }
 
         let turn = self.turn_snapshot(turn_id).expect("turn was terminal");
@@ -603,6 +829,67 @@ impl ThreadState {
             .ok_or_else(|| AgentRuntimeError::ProjectionFailed {
                 message: format!("tool not found: {tool_call_id}"),
             })
+    }
+
+    fn approval_snapshot(&self, turn_id: TurnId, request_id: &str) -> Option<ApprovalSnapshot> {
+        self.snapshot
+            .approvals
+            .iter()
+            .find(|approval| approval.turn_id == turn_id && approval.request.id == request_id)
+            .cloned()
+    }
+
+    fn approval_mut_or_err(
+        &mut self,
+        turn_id: TurnId,
+        request_id: &str,
+    ) -> Result<&mut ApprovalSnapshot, AgentRuntimeError> {
+        self.snapshot
+            .approvals
+            .iter_mut()
+            .find(|approval| approval.turn_id == turn_id && approval.request.id == request_id)
+            .ok_or_else(|| AgentRuntimeError::ProjectionFailed {
+                message: format!("approval not found: {request_id}"),
+            })
+    }
+
+    fn cancel_pending_approval_snapshots(&mut self, turn_id: TurnId) {
+        let resolved_at = Utc::now();
+        for approval in self.snapshot.approvals.iter_mut().filter(|approval| {
+            approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending
+        }) {
+            approval.status = ApprovalStatus::Canceled;
+            approval.decision = Some(ApprovalDecision::Cancel);
+            approval.resolved_at = Some(resolved_at);
+        }
+    }
+
+    fn reasoning_snapshot(
+        &self,
+        turn_id: TurnId,
+        message_id: Option<MessageId>,
+    ) -> Option<ReasoningSnapshot> {
+        self.snapshot
+            .reasoning
+            .iter()
+            .find(|reasoning| reasoning.turn_id == turn_id && reasoning.message_id == message_id)
+            .cloned()
+    }
+
+    fn plan_snapshot(&self, turn_id: TurnId) -> Option<PlanSnapshot> {
+        self.snapshot
+            .plans
+            .iter()
+            .find(|plan| plan.turn_id == turn_id)
+            .cloned()
+    }
+
+    fn diff_snapshot(&self, turn_id: TurnId) -> Option<DiffSnapshot> {
+        self.snapshot
+            .diffs
+            .iter()
+            .find(|diff| diff.turn_id == turn_id)
+            .cloned()
     }
 }
 
@@ -765,6 +1052,70 @@ impl ChatProjector {
     ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
         self.thread_mut(turn_id.thread_id())?
             .complete_tool(turn_id, tool_call_id, final_result)
+    }
+
+    pub fn require_approval(
+        &mut self,
+        turn_id: TurnId,
+        request: ApprovalRequest,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .require_approval(turn_id, request)
+    }
+
+    pub fn resolve_approval(
+        &mut self,
+        turn_id: TurnId,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .resolve_approval(turn_id, request_id, decision)
+    }
+
+    pub fn cancel_approval(
+        &mut self,
+        turn_id: TurnId,
+        request_id: &str,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .cancel_approval(turn_id, request_id)
+    }
+
+    pub fn cancel_pending_approvals(
+        &mut self,
+        turn_id: TurnId,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .cancel_pending_approvals(turn_id)
+    }
+
+    pub fn update_reasoning(
+        &mut self,
+        turn_id: TurnId,
+        message_id: Option<MessageId>,
+        delta: impl Into<String>,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .update_reasoning(turn_id, message_id, delta)
+    }
+
+    pub fn update_plan(
+        &mut self,
+        turn_id: TurnId,
+        plan: impl Into<String>,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .update_plan(turn_id, plan)
+    }
+
+    pub fn update_diff(
+        &mut self,
+        turn_id: TurnId,
+        diff: impl Into<String>,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .update_diff(turn_id, diff)
     }
 
     fn thread(&self, thread_id: ThreadId) -> Result<&ThreadState, AgentRuntimeError> {

@@ -5,7 +5,8 @@ use crate::provider::{self, ToolDefinition};
 use crate::types::{ModelMessage, Usage};
 
 use super::control::{
-    emit_failed_result, resolve_iteration_limit_approval, AgentEventEmitter, RunEventEmitter,
+    emit_failed_result, resolve_iteration_limit_approval, AgentEventEmitter,
+    IterationLimitApprovalContext, RunEventEmitter,
 };
 use super::limits::RunnerLimits;
 use super::message_events::emit_message_lifecycle;
@@ -184,16 +185,33 @@ impl Runner for LoopRunner {
                             return;
                         }
 
-                        let decision = resolve_iteration_limit_approval(
+                        let approval = resolve_iteration_limit_approval(
                             &emitter,
+                            &agent_emitter,
                             request.approval_handler.as_ref(),
-                            request.run_id,
-                            iteration,
-                            max_iterations,
-                            limits.iteration_extension,
-                            iteration_extensions_used + 1,
-                        )
-                        .await;
+                            IterationLimitApprovalContext {
+                                run_id: request.run_id,
+                                iteration,
+                                current_limit: max_iterations,
+                                extension: limits.iteration_extension,
+                                attempt: iteration_extensions_used + 1,
+                            },
+                        );
+                        tokio::pin!(approval);
+                        let decision = tokio::select! {
+                            _ = &mut abort_rx => {
+                                run_cancel_token.cancel();
+                                let _ = result_tx.send(canceled_result(
+                                    &request,
+                                    &emitter,
+                                    &agent_emitter,
+                                    &messages,
+                                    run_usage,
+                                ));
+                                return;
+                            }
+                            decision = &mut approval => decision,
+                        };
 
                         match decision {
                             ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {

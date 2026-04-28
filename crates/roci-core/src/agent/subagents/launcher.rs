@@ -113,6 +113,8 @@ fn build_child_config(
         system_prompt: None,
         tools,
         event_sink,
+        approval_policy: Default::default(),
+        approval_handler: None,
         #[cfg(feature = "agent")]
         user_input_coordinator: Some(coordinator),
         dynamic_tool_providers: Vec::new(),

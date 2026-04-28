@@ -195,6 +195,7 @@ impl AgentEventEmitter {
 
 pub(super) async fn resolve_approval(
     emitter: &RunEventEmitter,
+    agent_emitter: &AgentEventEmitter,
     policy: &ApprovalPolicy,
     handler: Option<&ApprovalHandler>,
     call: &AgentToolCall,
@@ -224,23 +225,36 @@ pub(super) async fn resolve_approval(
                     request: request.clone(),
                 },
             );
-            let Some(handler) = handler else {
-                return ApprovalDecision::Decline;
+            agent_emitter.emit(AgentEvent::Approval {
+                request: request.clone(),
+            });
+            let decision = if let Some(handler) = handler {
+                handler(request.clone()).await
+            } else {
+                ApprovalDecision::Decline
             };
-            handler(request).await
+            agent_emitter.emit(AgentEvent::ApprovalResolved {
+                request_id: request.id,
+                decision,
+            });
+            decision
         }
     }
 }
 
 pub(super) async fn resolve_iteration_limit_approval(
     emitter: &RunEventEmitter,
+    agent_emitter: &AgentEventEmitter,
     handler: Option<&ApprovalHandler>,
-    run_id: RunId,
-    iteration: usize,
-    current_limit: usize,
-    extension: usize,
-    attempt: usize,
+    context: IterationLimitApprovalContext,
 ) -> ApprovalDecision {
+    let IterationLimitApprovalContext {
+        run_id,
+        iteration,
+        current_limit,
+        extension,
+        attempt,
+    } = context;
     let request = ApprovalRequest {
         id: format!("run-{run_id}-continue-{attempt}"),
         kind: ApprovalKind::Other,
@@ -263,10 +277,28 @@ pub(super) async fn resolve_iteration_limit_approval(
             request: request.clone(),
         },
     );
-    let Some(handler) = handler else {
-        return ApprovalDecision::Decline;
+    agent_emitter.emit(AgentEvent::Approval {
+        request: request.clone(),
+    });
+    let decision = if let Some(handler) = handler {
+        handler(request.clone()).await
+    } else {
+        ApprovalDecision::Decline
     };
-    handler(request).await
+    agent_emitter.emit(AgentEvent::ApprovalResolved {
+        request_id: request.id,
+        decision,
+    });
+    decision
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IterationLimitApprovalContext {
+    pub(super) run_id: RunId,
+    pub(super) iteration: usize,
+    pub(super) current_limit: usize,
+    pub(super) extension: usize,
+    pub(super) attempt: usize,
 }
 
 fn approval_kind_for_tool(call: &AgentToolCall) -> ApprovalKind {
@@ -316,11 +348,19 @@ mod tests {
     #[tokio::test]
     async fn ask_policy_requires_approval_for_shell_and_write_file() {
         let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
 
-        let shell_decision =
-            resolve_approval(&emitter, &ApprovalPolicy::Ask, None, &tool_call("shell")).await;
+        let shell_decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::Ask,
+            None,
+            &tool_call("shell"),
+        )
+        .await;
         let write_decision = resolve_approval(
             &emitter,
+            &agent_emitter,
             &ApprovalPolicy::Ask,
             None,
             &tool_call("write_file"),
@@ -359,9 +399,11 @@ mod tests {
     #[tokio::test]
     async fn ask_policy_auto_accepts_non_mutating_other_tools() {
         let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
 
         let decision = resolve_approval(
             &emitter,
+            &agent_emitter,
             &ApprovalPolicy::Ask,
             None,
             &tool_call("read_file"),

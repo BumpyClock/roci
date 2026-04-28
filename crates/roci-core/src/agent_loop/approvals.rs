@@ -6,10 +6,11 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 /// Tool approval policy for a run.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
     Never,
+    #[default]
     Ask,
     Always,
 }
@@ -24,7 +25,7 @@ pub enum ApprovalKind {
 }
 
 /// An approval request emitted by the agent loop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,
     pub kind: ApprovalKind,
@@ -37,7 +38,7 @@ pub struct ApprovalRequest {
 }
 
 /// Optional execpolicy update suggestion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecPolicyUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
