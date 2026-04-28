@@ -60,6 +60,34 @@ impl ThreadState {
     }
 
     #[must_use]
+    pub fn from_snapshot(snapshot: ThreadSnapshot, replay_capacity: usize) -> Self {
+        let next_turn_ordinal = snapshot
+            .turns
+            .iter()
+            .filter(|turn| turn.turn_id.thread_id() == snapshot.thread_id)
+            .map(|turn| turn.turn_id.ordinal())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let next_message_ordinal = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.message_id.thread_id() == snapshot.thread_id)
+            .map(|message| message.message_id.ordinal())
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        Self {
+            snapshot,
+            events: VecDeque::new(),
+            replay_capacity,
+            next_turn_ordinal,
+            next_message_ordinal,
+        }
+    }
+
+    #[must_use]
     pub fn thread_id(&self) -> ThreadId {
         self.snapshot.thread_id
     }
@@ -902,7 +930,8 @@ pub struct ChatProjector {
 impl ChatProjector {
     #[must_use]
     pub fn new(config: ChatRuntimeConfig) -> Self {
-        Self::with_default_thread(ThreadId::new(), config)
+        let thread_id = config.default_thread_id.unwrap_or_default();
+        Self::with_default_thread(thread_id, config)
     }
 
     #[must_use]
@@ -958,6 +987,25 @@ impl ChatProjector {
     ) -> Result<ThreadSnapshot, AgentRuntimeError> {
         self.thread_mut(thread_id)
             .map(|thread| thread.bootstrap_thread(messages))
+    }
+
+    pub fn import_thread(
+        &mut self,
+        thread: ThreadSnapshot,
+    ) -> Result<ThreadSnapshot, AgentRuntimeError> {
+        let thread_id = thread.thread_id;
+        let replay_capacity = self
+            .threads
+            .get(&thread_id)
+            .or_else(|| self.threads.get(&self.default_thread_id))
+            .map_or(ChatRuntimeConfig::default().replay_capacity, |thread| {
+                thread.replay_capacity
+            });
+        self.threads.insert(
+            thread_id,
+            ThreadState::from_snapshot(thread, replay_capacity),
+        );
+        self.read_thread(thread_id)
     }
 
     pub fn events_after(

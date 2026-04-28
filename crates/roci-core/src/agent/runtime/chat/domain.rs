@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent_loop::{ApprovalDecision, ApprovalRequest, ToolUpdatePayload};
-use crate::types::{AgentToolResult, ModelMessage};
+use crate::types::{AgentToolResult, GenerationSettings, ModelMessage};
 
 use super::store::AgentRuntimeEventStore;
 
@@ -155,6 +155,8 @@ impl fmt::Display for MessageId {
 pub struct ChatRuntimeConfig {
     /// Number of semantic events retained in memory per thread for cursor replay.
     pub replay_capacity: usize,
+    /// Optional stable default thread id used for host reconnects.
+    pub default_thread_id: Option<ThreadId>,
     /// Optional semantic runtime event store used for replay.
     #[serde(default, skip)]
     pub event_store: Option<Arc<dyn AgentRuntimeEventStore>>,
@@ -165,6 +167,7 @@ impl fmt::Debug for ChatRuntimeConfig {
         formatter
             .debug_struct("ChatRuntimeConfig")
             .field("replay_capacity", &self.replay_capacity)
+            .field("default_thread_id", &self.default_thread_id)
             .field(
                 "event_store",
                 &self.event_store.as_ref().map(|_| "<configured>"),
@@ -176,6 +179,7 @@ impl fmt::Debug for ChatRuntimeConfig {
 impl PartialEq for ChatRuntimeConfig {
     fn eq(&self, other: &Self) -> bool {
         self.replay_capacity == other.replay_capacity
+            && self.default_thread_id == other.default_thread_id
     }
 }
 
@@ -185,9 +189,31 @@ impl Default for ChatRuntimeConfig {
     fn default() -> Self {
         Self {
             replay_capacity: 512,
+            default_thread_id: None,
             event_store: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportedThread {
+    pub thread: ThreadSnapshot,
+    pub model_messages: Vec<ModelMessage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationMode {
+    Code,
+    Plan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnqueueTurnRequest {
+    pub messages: Vec<ModelMessage>,
+    pub generation_settings: Option<GenerationSettings>,
+    pub approval_policy: Option<crate::agent_loop::ApprovalPolicy>,
+    pub collaboration_mode: Option<CollaborationMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

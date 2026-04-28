@@ -3,16 +3,26 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::types::drain_queue;
-use super::{AgentRuntime, AgentRuntimeError, TurnId, TurnStatus};
+use super::{AgentRuntime, AgentRuntimeError, CollaborationMode, TurnId, TurnStatus};
 use crate::agent_loop::runner::{
     AutoCompactionConfig, BeforeAgentStartHookPayload, BeforeAgentStartHookResult,
     CompactionHandler, FollowUpMessagesFn, RunHooks, SteeringMessagesFn,
 };
+use crate::agent_loop::ApprovalPolicy;
 use crate::agent_loop::{RunHandle, RunRequest, RunResult, RunStatus, Runner};
 use crate::error::RociError;
 use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
-use crate::types::ModelMessage;
+use crate::types::{
+    GenerationSettings, ModelMessage, OpenAiResponsesOptions, ResponseFormat, Role,
+};
+
+#[derive(Debug, Clone)]
+pub(super) struct TurnRunOptions {
+    pub settings: GenerationSettings,
+    pub approval_policy: ApprovalPolicy,
+    pub collaboration_mode: CollaborationMode,
+}
 
 impl AgentRuntime {
     async fn complete_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
@@ -80,7 +90,7 @@ impl AgentRuntime {
             .map_err(Self::map_chat_projection_error)
     }
 
-    fn chat_turn_status(&self, turn_id: TurnId) -> Result<TurnStatus, RociError> {
+    pub(super) fn chat_turn_status(&self, turn_id: TurnId) -> Result<TurnStatus, RociError> {
         self.chat_projector
             .lock()
             .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
@@ -111,12 +121,35 @@ impl AgentRuntime {
         Ok(static_tools)
     }
 
+    pub(super) async fn current_turn_options(
+        &self,
+        generation_settings: Option<GenerationSettings>,
+        approval_policy: Option<ApprovalPolicy>,
+        collaboration_mode: Option<CollaborationMode>,
+    ) -> TurnRunOptions {
+        let mode = collaboration_mode.unwrap_or(CollaborationMode::Code);
+        let mut settings = match generation_settings {
+            Some(settings) => settings,
+            None => self.generation_settings.lock().await.clone(),
+        };
+        if mode == CollaborationMode::Plan {
+            settings = plan_mode_settings(settings);
+        }
+        let default_approval_policy = *self.approval_policy.lock().await;
+        TurnRunOptions {
+            settings,
+            approval_policy: approval_policy.unwrap_or(default_approval_policy),
+            collaboration_mode: mode,
+        }
+    }
+
     /// Build a [`RunRequest`], start the loop, wait for the result, then
     /// transition back to Idle.
     pub(super) async fn run_loop(
         &self,
         initial_messages: Vec<ModelMessage>,
         turn_id: TurnId,
+        options: TurnRunOptions,
     ) -> Result<RunResult, RociError> {
         *self.is_streaming.lock().await = true;
         *self.last_error.lock().await = None;
@@ -146,8 +179,11 @@ impl AgentRuntime {
             })
         };
 
-        let (intercepting_sink, chat_projection_error) =
-            self.build_intercepting_sink(turn_id, initial_messages.len());
+        let (intercepting_sink, chat_projection_error) = self.build_intercepting_sink(
+            turn_id,
+            initial_messages.len(),
+            options.collaboration_mode,
+        );
 
         if self.chat_turn_status(turn_id)? == TurnStatus::Canceled {
             *self.is_streaming.lock().await = false;
@@ -195,7 +231,7 @@ impl AgentRuntime {
             .with_tools(tools)
             .with_steering_messages(steering_fn)
             .with_follow_up_messages(follow_up_fn)
-            .with_approval_policy(self.config.approval_policy)
+            .with_approval_policy(options.approval_policy)
             .with_agent_event_sink(intercepting_sink)
             .with_prior_session_usage(
                 session_usage_snapshot.input_tokens as usize,
@@ -282,7 +318,7 @@ impl AgentRuntime {
         }
         request = request.with_hooks(run_hooks);
 
-        request.settings = self.config.settings.clone();
+        request.settings = options.settings.clone();
 
         if let Some(ref transform) = self.config.transform_context {
             request = request.with_transform_context(transform.clone());
@@ -349,9 +385,26 @@ impl AgentRuntime {
         self.active_abort_tx.lock().await.take();
         *self.is_streaming.lock().await = false;
 
+        let mut plan_contract_error = None;
         let projection_result = match &run_result {
             Ok(result) => match result.status {
-                RunStatus::Completed => self.complete_chat_turn(turn_id).await,
+                RunStatus::Completed => {
+                    if options.collaboration_mode == CollaborationMode::Plan {
+                        match self
+                            .project_structured_plan(turn_id, &result.messages)
+                            .await
+                        {
+                            Ok(()) => self.complete_chat_turn(turn_id).await,
+                            Err(err) => {
+                                let message = err.to_string();
+                                plan_contract_error = Some(message.clone());
+                                self.fail_chat_turn(turn_id, message).await
+                            }
+                        }
+                    } else {
+                        self.complete_chat_turn(turn_id).await
+                    }
+                }
                 RunStatus::Failed => {
                     self.fail_chat_turn(
                         turn_id,
@@ -368,8 +421,13 @@ impl AgentRuntime {
             Err(err) => self.fail_chat_turn(turn_id, err.to_string()).await,
         };
 
+        let projection_succeeded = projection_result.is_ok();
         match &run_result {
-            Ok(result) => {
+            Ok(result)
+                if projection_succeeded
+                    && plan_contract_error.is_none()
+                    && result.status != RunStatus::Canceled =>
+            {
                 *self.messages.lock().await = result.messages.clone();
                 if result.status == RunStatus::Failed {
                     *self.last_error.lock().await = result.error.clone();
@@ -380,6 +438,16 @@ impl AgentRuntime {
                 if let Some(ref delta) = result.usage_delta {
                     self.session_usage.lock().await.merge(delta);
                 }
+            }
+            Ok(result) if plan_contract_error.is_none() && result.status == RunStatus::Canceled => {
+                *self.last_error.lock().await = None;
+            }
+            Ok(_) if projection_succeeded => {
+                *self.last_error.lock().await = plan_contract_error.clone();
+            }
+            Ok(_) => {
+                *self.last_error.lock().await =
+                    Some("run finished after semantic turn was already terminal".to_string());
             }
             Err(err) => {
                 *self.last_error.lock().await = Some(err.to_string());
@@ -394,6 +462,9 @@ impl AgentRuntime {
         self.idle_notify.notify_waiters();
 
         projection_result?;
+        if let Some(error) = plan_contract_error {
+            return Err(RociError::InvalidState(error));
+        }
         if let Some(err) = chat_projection_error
             .lock()
             .map_err(|_| RociError::InvalidState("chat projection lock poisoned".into()))?
@@ -409,4 +480,92 @@ impl AgentRuntime {
         }
         run_result
     }
+
+    async fn project_structured_plan(
+        &self,
+        turn_id: TurnId,
+        messages: &[ModelMessage],
+    ) -> Result<(), RociError> {
+        let Some(plan) = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .and_then(|message| parse_structured_plan(&message.text()))
+        else {
+            return Err(RociError::InvalidState(
+                "plan mode response did not match structured plan contract".into(),
+            ));
+        };
+
+        let event = {
+            let mut projector = self
+                .chat_projector
+                .lock()
+                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
+            projector.update_plan(turn_id, plan)
+        }
+        .map_err(Self::map_chat_projection_error)?;
+
+        self.publish_runtime_event(event)
+            .await
+            .map(|_| ())
+            .map_err(Self::map_chat_projection_error)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct StructuredPlan {
+    plan: Option<String>,
+    steps: Option<Vec<String>>,
+}
+
+fn parse_structured_plan(text: &str) -> Option<String> {
+    let structured = serde_json::from_str::<StructuredPlan>(text).ok()?;
+    if let Some(plan) = structured.plan.filter(|plan| !plan.trim().is_empty()) {
+        return Some(plan);
+    }
+    let steps = structured.steps?;
+    if steps.is_empty() || steps.iter().any(|step| step.trim().is_empty()) {
+        return None;
+    }
+    Some(
+        steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| format!("{}. {}", index + 1, step))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn plan_mode_settings(mut settings: GenerationSettings) -> GenerationSettings {
+    settings.response_format = Some(ResponseFormat::JsonSchema {
+        name: "roci_plan".to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "plan": { "type": "string" },
+                "steps": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            },
+            "anyOf": [
+                { "required": ["plan"] },
+                { "required": ["steps"] }
+            ]
+        }),
+    });
+    let mut openai = settings.openai_responses.unwrap_or_default();
+    let instruction = "Return only JSON matching the roci_plan schema. Do not include prose outside the JSON object.";
+    openai.instructions = Some(match openai.instructions {
+        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{instruction}"),
+        _ => instruction.to_string(),
+    });
+    settings.openai_responses = Some(OpenAiResponsesOptions {
+        instructions: openai.instructions,
+        ..openai
+    });
+    settings
 }

@@ -12,8 +12,12 @@ runtime state and events.
   turn completion/error/cancel).
 - Host apps should consume:
   - `RuntimeSnapshot` / `ThreadSnapshot` for state sync and rendering
-  - `RuntimeSubscription` events for replay + live updates
+  - `AgentRuntimeEvent` through `RuntimeSubscription` for replay + live updates
   - transport, auth, storage, and UI concerns outside `roci-core`
+
+Hosts should not consume raw `agent_loop` events as chat state, maintain a
+shadow turn queue, synthesize plans from assistant text, or persist host shims as
+runtime state.
 
 ## Public APIs
 
@@ -23,14 +27,31 @@ runtime state and events.
 - `read_thread(thread_id: ThreadId) -> Result<ThreadSnapshot, AgentRuntimeError>` (async)
   - Returns one thread projection.
   - `Err(ThreadNotFound)` when the thread id is unknown.
+- `default_thread_id() -> ThreadId`
+  - Returns the runtime-owned default thread id used for queued turns.
+  - `ChatRuntimeConfig::default_thread_id` may set this id during construction.
 - `subscribe(cursor: Option<RuntimeCursor>) -> RuntimeSubscription` (async)
   - `None`: subscribe only to live semantic runtime events.
   - `Some(cursor)`: replay retained events for that thread cursor, then receive live
     events from `recv`/`next`.
+- `import_thread(imported: ImportedThread) -> Result<(), RociError>` (async)
+  - Imports a full semantic `ThreadSnapshot`.
+  - Replaces provider context from `ImportedThread::model_messages`.
+  - Invalidates retained replay at `imported.thread.last_seq`.
+  - Requires idle runtime state.
+- `enqueue_turn(request: EnqueueTurnRequest) -> Result<TurnId, RociError>` (async)
+  - Returns a stable `TurnId` after semantic queue projection and before provider
+    execution starts.
+  - Runtime serializes queued turns so only one provider run is active at a time.
+- `set_generation_settings(settings: GenerationSettings) -> Result<(), RociError>` (async)
+  - Idle-only default update for later turns.
+- `set_approval_policy(policy: ApprovalPolicy) -> Result<(), RociError>` (async)
+  - Idle-only default update for later turns.
 - `cancel_turn(turn_id: TurnId) -> Result<TurnSnapshot, AgentRuntimeError>` (async)
   - Cancels queued/running turns.
   - Returns `AlreadyTerminal` for completed/failed/canceled turns.
   - Returns `StaleRuntime` when the `turn_id` revision is not current (history reset/rewrite).
+  - Returns `TurnNotFound` or `ThreadNotFound` when the id is unknown.
 - `abort()` remains as compatibility sugar:
   - Resolves active `turn_id` and calls `cancel_turn` when possible.
   - Falls back to legacy abort path when no active turn is currently projected.
@@ -99,6 +120,64 @@ Approval status contract:
 `RuntimeSnapshot` also has `schema_version` so hosts can version full snapshot
 sync separately from individual event cursors.
 
+## Host reconnect contract
+
+Full reconnect uses:
+
+```rust
+pub struct ImportedThread {
+    pub thread: ThreadSnapshot,
+    pub model_messages: Vec<ModelMessage>,
+}
+```
+
+- `thread` is the semantic UI/runtime snapshot. Roci preserves its `revision`,
+  `last_seq`, `active_turn_id`, turns, messages, tools, approvals, reasoning,
+  plans, and diffs.
+- `model_messages` is the provider context ledger. Roci uses only this ledger for
+  the next provider request context.
+- `read_thread(imported.thread.thread_id)` after import returns the imported
+  semantic snapshot.
+- Imported active/running turns preserve semantic state only. Provider execution
+  is not resurrected.
+- Homie should set `AgentConfig.chat.default_thread_id` when reconnecting to a
+  known thread so queued turns continue on that thread.
+
+Incremental updates use `AgentRuntimeEvent` only. `ThreadSnapshot` remains the
+semantic view/runtime state; `model_messages` remains provider context.
+
+## Queue contract
+
+Roci owns queued-turn semantics:
+
+```rust
+pub enum CollaborationMode {
+    Code,
+    Plan,
+}
+
+pub struct EnqueueTurnRequest {
+    pub messages: Vec<ModelMessage>,
+    pub generation_settings: Option<GenerationSettings>,
+    pub approval_policy: Option<ApprovalPolicy>,
+    pub collaboration_mode: Option<CollaborationMode>,
+}
+```
+
+- `CollaborationMode::Code` is the default current behavior.
+- `enqueue_turn` freezes effective generation settings and approval policy for
+  that turn. Per-turn overrides beat runtime defaults.
+- Queued turns emit normal semantic events through the projector, event store,
+  and subscriptions.
+- `cancel_turn(turn_id)` cancels queued turns before provider start. Running
+  turns use the existing abort path.
+- Queue execution remains single active provider run at a time.
+
+`CollaborationMode::Plan` uses a structured response contract. Runtime emits
+`AgentRuntimeEventPayload::PlanUpdated` for plan mode only from parsed structured
+plan data, not from text scraping. If the provider returns malformed structured
+plan output, the turn fails instead of synthesizing a plan from prose.
+
 ## Cancellation semantics
 
 - Turn status set:
@@ -127,7 +206,9 @@ sync separately from individual event cursors.
 ## Reconnect flow
 
 1. Full sync:
-   - call `read_snapshot()` and update local state.
+   - call `import_thread(ImportedThread { thread, model_messages })` when
+     restoring saved host state, or call `read_snapshot()` to render current
+     runtime state.
 2. Incremental resume:
    - keep last seen `RuntimeCursor` (`thread_id`, `seq`)
    - call `subscribe(Some(cursor))`

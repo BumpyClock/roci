@@ -1,6 +1,6 @@
 use super::{
-    AgentRuntime, AgentRuntimeError, AgentRuntimeEventPayload, AgentState, TurnId, TurnSnapshot,
-    TurnStatus,
+    AgentRuntime, AgentRuntimeError, AgentRuntimeEventPayload, AgentState, EnqueueTurnRequest,
+    ImportedThread, QueuedTurn, ThreadId, TurnId, TurnSnapshot, TurnStatus,
 };
 use crate::agent_loop::RunResult;
 use crate::error::RociError;
@@ -18,6 +18,168 @@ impl AgentRuntime {
             .await
             .map_err(Self::map_chat_projection_error)?;
         Ok(turn_id)
+    }
+
+    /// Return the runtime's default semantic thread id.
+    pub fn default_thread_id(&self) -> ThreadId {
+        self.chat_projector
+            .lock()
+            .expect("chat projector mutex poisoned")
+            .default_thread_id()
+    }
+
+    /// Import a full semantic thread snapshot and separate provider ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn import_thread(&self, imported: ImportedThread) -> Result<(), RociError> {
+        let state_guard = self.lock_state_for_idle_mutation()?;
+        let mut existing_messages = self.messages.try_lock().map_err(|_| {
+            RociError::InvalidState("Agent is busy (messages lock contended)".into())
+        })?;
+        let snapshot = self
+            .chat_projector
+            .lock()
+            .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
+            .import_thread(imported.thread)
+            .map_err(Self::map_chat_projection_error)?;
+        self.runtime_event_store
+            .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
+            .await
+            .map_err(Self::map_chat_projection_error)?;
+        *existing_messages = imported.model_messages;
+        drop(existing_messages);
+        drop(state_guard);
+        self.broadcast_snapshot().await;
+        Ok(())
+    }
+
+    /// Queue a typed chat turn and return its stable id before provider execution.
+    ///
+    /// Queued turns execute one at a time. Per-turn settings and approval policy
+    /// are frozen when this method is called.
+    pub async fn enqueue_turn(&self, request: EnqueueTurnRequest) -> Result<TurnId, RociError> {
+        let options = self
+            .current_turn_options(
+                request.generation_settings.clone(),
+                request.approval_policy,
+                request.collaboration_mode,
+            )
+            .await;
+        self.increment_queued_turn_count();
+        let turn_id = match self.queue_chat_turn(request.messages.clone()).await {
+            Ok(turn_id) => turn_id,
+            Err(err) => {
+                self.decrement_queued_turn_count();
+                return Err(err);
+            }
+        };
+        let should_spawn = {
+            let mut state = self.queued_turn_state.lock().await;
+            state.turns.push_back(QueuedTurn {
+                turn_id,
+                messages: request.messages,
+                options,
+            });
+            if state.worker_active {
+                false
+            } else {
+                state.worker_active = true;
+                true
+            }
+        };
+        if should_spawn {
+            let agent = self.clone();
+            tokio::spawn(async move {
+                agent.run_queued_turn_worker().await;
+            });
+        }
+        Ok(turn_id)
+    }
+
+    async fn run_queued_turn_worker(self) {
+        loop {
+            let queued = {
+                let mut state = self.queued_turn_state.lock().await;
+                let Some(queued) = state.turns.pop_front() else {
+                    state.worker_active = false;
+                    return;
+                };
+                queued
+            };
+            self.run_queued_turn(queued).await;
+            self.decrement_queued_turn_count();
+        }
+    }
+
+    async fn run_queued_turn(&self, queued: QueuedTurn) {
+        match self.chat_turn_status(queued.turn_id) {
+            Ok(TurnStatus::Canceled) | Err(_) => return,
+            Ok(_) => {}
+        }
+
+        loop {
+            match self.transition_to_running() {
+                Ok(()) => break,
+                Err(RociError::InvalidState(_)) => {
+                    if matches!(
+                        self.chat_turn_status(queued.turn_id),
+                        Ok(TurnStatus::Canceled) | Err(_)
+                    ) {
+                        return;
+                    }
+                    self.wait_for_current_run_idle().await;
+                }
+                Err(err) => {
+                    self.record_background_error(err.to_string()).await;
+                    return;
+                }
+            }
+        }
+
+        if matches!(
+            self.chat_turn_status(queued.turn_id),
+            Ok(TurnStatus::Canceled) | Err(_)
+        ) {
+            self.restore_idle_after_preflight_error().await;
+            return;
+        }
+
+        let snapshot = {
+            let messages = self.messages.lock().await;
+            let mut snapshot = messages.clone();
+            snapshot.extend(queued.messages);
+            snapshot
+        };
+        if let Err(err) = self
+            .run_loop(snapshot, queued.turn_id, queued.options)
+            .await
+        {
+            self.record_background_error(err.to_string()).await;
+        }
+    }
+
+    fn increment_queued_turn_count(&self) {
+        if let Ok(mut count) = self.queued_turn_count.lock() {
+            *count += 1;
+        }
+    }
+
+    fn decrement_queued_turn_count(&self) {
+        if let Ok(mut count) = self.queued_turn_count.lock() {
+            *count = count.saturating_sub(1);
+        }
+        self.queued_turn_notify.notify_waiters();
+    }
+
+    async fn wait_for_queued_turns_to_drain(&self) {
+        loop {
+            if self.queued_turn_count.lock().map_or(0, |count| *count) == 0 {
+                return;
+            }
+            self.queued_turn_notify.notified().await;
+        }
     }
 
     /// Start a new conversation with a user prompt.
@@ -55,7 +217,8 @@ impl AgentRuntime {
                 return Err(err);
             }
         };
-        self.run_loop(snapshot, turn_id).await
+        let options = self.current_turn_options(None, None, None).await;
+        self.run_loop(snapshot, turn_id, options).await
     }
 
     /// Continue the conversation with additional user input.
@@ -83,7 +246,8 @@ impl AgentRuntime {
                 return Err(err);
             }
         };
-        self.run_loop(snapshot, turn_id).await
+        let options = self.current_turn_options(None, None, None).await;
+        self.run_loop(snapshot, turn_id, options).await
     }
 
     /// Continue the conversation without appending a new user message.
@@ -126,7 +290,8 @@ impl AgentRuntime {
                 return Err(err);
             }
         };
-        self.run_loop(snapshot, turn_id).await
+        let options = self.current_turn_options(None, None, None).await;
+        self.run_loop(snapshot, turn_id, options).await
     }
 
     /// Queue a steering message to interrupt the current tool execution.
@@ -203,9 +368,11 @@ impl AgentRuntime {
             (previous.status, events, canceled)
         };
 
-        let abort_sent = self.abort_active_provider_call().await;
-        if abort_sent || previous_status == TurnStatus::Running {
-            self.transition_running_to_aborting().await;
+        if previous_status == TurnStatus::Running {
+            let abort_sent = self.abort_active_provider_call().await;
+            if abort_sent {
+                self.transition_running_to_aborting().await;
+            }
         }
 
         self.publish_runtime_events(events).await?;
@@ -246,10 +413,26 @@ impl AgentRuntime {
         self.broadcast_snapshot().await;
     }
 
+    pub(super) async fn record_background_error(&self, message: String) {
+        *self.last_error.lock().await = Some(message);
+        self.broadcast_snapshot().await;
+    }
+
+    async fn wait_for_current_run_idle(&self) {
+        loop {
+            if *self.state.lock().await == AgentState::Idle {
+                return;
+            }
+            self.idle_notify.notified().await;
+        }
+    }
+
     /// Reset the agent: abort any in-flight run, then clear messages and queues.
     pub async fn reset(&self) {
+        self.cancel_all_chat_turns().await;
         self.abort().await;
-        self.wait_for_idle().await;
+        self.wait_for_current_run_idle().await;
+        self.wait_for_queued_turns_to_drain().await;
 
         #[cfg(feature = "agent")]
         self.user_input_coordinator.cancel_all().await;
@@ -282,16 +465,42 @@ impl AgentRuntime {
         self.broadcast_snapshot().await;
     }
 
+    async fn cancel_all_chat_turns(&self) {
+        let turn_ids = self
+            .chat_projector
+            .lock()
+            .ok()
+            .map(|projector| {
+                projector
+                    .read_snapshot()
+                    .threads
+                    .into_iter()
+                    .flat_map(|thread| thread.turns)
+                    .filter(|turn| matches!(turn.status, TurnStatus::Queued | TurnStatus::Running))
+                    .map(|turn| turn.turn_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for turn_id in turn_ids {
+            let _ = self.cancel_turn(turn_id).await;
+        }
+    }
+
     /// Wait until the agent is idle.
     ///
     /// Returns immediately if already idle; otherwise blocks until the
     /// current run completes, fails, or is aborted.
     pub async fn wait_for_idle(&self) {
         loop {
-            if *self.state.lock().await == AgentState::Idle {
+            if *self.state.lock().await == AgentState::Idle
+                && self.queued_turn_count.lock().map_or(0, |count| *count) == 0
+            {
                 return;
             }
-            self.idle_notify.notified().await;
+            tokio::select! {
+                () = self.idle_notify.notified() => {}
+                () = self.queued_turn_notify.notified() => {}
+            }
         }
     }
 }

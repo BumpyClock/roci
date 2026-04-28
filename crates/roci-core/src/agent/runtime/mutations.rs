@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use super::AgentRuntime;
+use crate::agent_loop::ApprovalPolicy;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::tools::dynamic::DynamicToolProvider;
 use crate::tools::tool::Tool;
-use crate::types::ModelMessage;
+use crate::types::{GenerationSettings, ModelMessage};
 
 impl AgentRuntime {
     /// Replace the configured system prompt.
@@ -37,6 +38,37 @@ impl AgentRuntime {
             .try_lock()
             .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?;
         *runtime_model = model;
+        Ok(())
+    }
+
+    /// Replace generation settings used by subsequent turns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn set_generation_settings(
+        &self,
+        settings: GenerationSettings,
+    ) -> Result<(), RociError> {
+        let _state_guard = self.lock_state_for_idle_mutation()?;
+        let mut runtime_settings = self.generation_settings.try_lock().map_err(|_| {
+            RociError::InvalidState("Agent is busy (generation settings lock contended)".into())
+        })?;
+        *runtime_settings = settings;
+        Ok(())
+    }
+
+    /// Replace tool approval policy used by subsequent turns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn set_approval_policy(&self, policy: ApprovalPolicy) -> Result<(), RociError> {
+        let _state_guard = self.lock_state_for_idle_mutation()?;
+        let mut runtime_policy = self.approval_policy.try_lock().map_err(|_| {
+            RociError::InvalidState("Agent is busy (approval policy lock contended)".into())
+        })?;
+        *runtime_policy = policy;
         Ok(())
     }
 

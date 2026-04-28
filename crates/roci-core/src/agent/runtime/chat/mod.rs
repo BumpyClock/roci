@@ -11,9 +11,10 @@ pub mod store;
 pub mod subscription;
 
 pub use domain::{
-    ApprovalSnapshot, ApprovalStatus, ChatRuntimeConfig, DiffSnapshot, MessageId, MessageSnapshot,
-    MessageStatus, PlanSnapshot, ReasoningSnapshot, RuntimeSnapshot, ThreadId, ThreadSnapshot,
-    ToolExecutionSnapshot, ToolStatus, TurnId, TurnSnapshot, TurnStatus,
+    ApprovalSnapshot, ApprovalStatus, ChatRuntimeConfig, CollaborationMode, DiffSnapshot,
+    EnqueueTurnRequest, ImportedThread, MessageId, MessageSnapshot, MessageStatus, PlanSnapshot,
+    ReasoningSnapshot, RuntimeSnapshot, ThreadId, ThreadSnapshot, ToolExecutionSnapshot,
+    ToolStatus, TurnId, TurnSnapshot, TurnStatus,
 };
 pub use error::AgentRuntimeError;
 pub use event::{
