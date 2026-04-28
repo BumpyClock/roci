@@ -312,9 +312,7 @@ async fn queued_cancel_prevents_provider_call_and_emits_turn_canceled() {
 
     let running_agent = Arc::clone(&agent);
     let running = tokio::spawn(async move { running_agent.prompt("first").await });
-    while provider_calls.load(Ordering::SeqCst) == 0 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_provider_call(&provider_calls).await;
 
     let queued = agent
         .enqueue_turn(EnqueueTurnRequest {
@@ -354,9 +352,7 @@ async fn canceling_queued_turn_does_not_abort_running_turn() {
     let mut running = Box::pin(tokio::spawn(
         async move { running_agent.prompt("first").await },
     ));
-    while provider_calls.load(Ordering::SeqCst) == 0 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_provider_call(&provider_calls).await;
 
     let queued = agent
         .enqueue_turn(EnqueueTurnRequest {
@@ -709,6 +705,16 @@ async fn wait_for_turn_status(agent: &AgentRuntime, turn_id: TurnId, status: Tur
     })
     .await
     .expect("turn should reach expected status");
+}
+
+async fn wait_for_provider_call(provider_calls: &AtomicUsize) {
+    timeout(Duration::from_secs(2), async {
+        while provider_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider should be called");
 }
 
 async fn events_until_plan(sub: &mut RuntimeSubscription, turn_id: TurnId) -> bool {

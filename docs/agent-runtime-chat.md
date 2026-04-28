@@ -140,8 +140,8 @@ pub struct ImportedThread {
   semantic snapshot.
 - Imported active/running turns preserve semantic state only. Provider execution
   is not resurrected.
-- Homie should set `AgentConfig.chat.default_thread_id` when reconnecting to a
-  known thread so queued turns continue on that thread.
+- Host apps should set `AgentConfig.chat.default_thread_id` when reconnecting to
+  a known thread so queued turns continue on that thread.
 
 Incremental updates use `AgentRuntimeEvent` only. `ThreadSnapshot` remains the
 semantic view/runtime state; `model_messages` remains provider context.

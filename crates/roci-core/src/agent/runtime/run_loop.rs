@@ -514,6 +514,7 @@ impl AgentRuntime {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StructuredPlan {
     plan: Option<String>,
     steps: Option<Vec<String>>,
@@ -521,13 +522,24 @@ struct StructuredPlan {
 
 fn parse_structured_plan(text: &str) -> Option<String> {
     let structured = serde_json::from_str::<StructuredPlan>(text).ok()?;
-    if let Some(plan) = structured.plan.filter(|plan| !plan.trim().is_empty()) {
+    if structured
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.trim().is_empty())
+    {
+        return None;
+    }
+    if structured
+        .steps
+        .as_ref()
+        .is_some_and(|steps| steps.is_empty() || steps.iter().any(|step| step.trim().is_empty()))
+    {
+        return None;
+    }
+    if let Some(plan) = structured.plan {
         return Some(plan);
     }
     let steps = structured.steps?;
-    if steps.is_empty() || steps.iter().any(|step| step.trim().is_empty()) {
-        return None;
-    }
     Some(
         steps
             .iter()
@@ -545,10 +557,19 @@ fn plan_mode_settings(mut settings: GenerationSettings) -> GenerationSettings {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "plan": { "type": "string" },
+                "plan": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                },
                 "steps": {
                     "type": "array",
-                    "items": { "type": "string" }
+                    "minItems": 1,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S"
+                    }
                 }
             },
             "anyOf": [
@@ -568,4 +589,36 @@ fn plan_mode_settings(mut settings: GenerationSettings) -> GenerationSettings {
         ..openai
     });
     settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_plan_rejects_unknown_fields() {
+        assert!(parse_structured_plan(r#"{"plan":"inspect","extra":"ignored?"}"#).is_none());
+    }
+
+    #[test]
+    fn structured_plan_rejects_blank_or_empty_values() {
+        assert!(parse_structured_plan(r#"{"plan":"   "}"#).is_none());
+        assert!(parse_structured_plan(r#"{"steps":[]}"#).is_none());
+        assert!(parse_structured_plan(r#"{"steps":["inspect","  "]}"#).is_none());
+    }
+
+    #[test]
+    fn plan_mode_schema_matches_parser_constraints() {
+        let settings = plan_mode_settings(GenerationSettings::default());
+        let Some(ResponseFormat::JsonSchema { schema, .. }) = settings.response_format else {
+            panic!("plan mode should request JSON schema output");
+        };
+
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["plan"]["minLength"], 1);
+        assert_eq!(schema["properties"]["plan"]["pattern"], "\\S");
+        assert_eq!(schema["properties"]["steps"]["minItems"], 1);
+        assert_eq!(schema["properties"]["steps"]["items"]["minLength"], 1);
+        assert_eq!(schema["properties"]["steps"]["items"]["pattern"], "\\S");
+    }
 }

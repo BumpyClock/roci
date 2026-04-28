@@ -399,4 +399,30 @@ mod tests {
             Some(AgentRuntimeEventPayload::DiffUpdated { .. })
         ));
     }
+
+    #[test]
+    fn suppresses_plan_agent_events_when_configured() {
+        let mut projector = ChatProjector::default();
+        let turn_id = queued_turn(&mut projector);
+        let mut run_state = ChatProjectionRunState {
+            suppress_plan_events: true,
+            ..ChatProjectionRunState::default()
+        };
+
+        let plan = project_agent_event(
+            &mut projector,
+            &mut run_state,
+            turn_id,
+            &AgentEvent::PlanUpdated {
+                plan: "inspect then edit".to_string(),
+            },
+        )
+        .expect("plan suppression should project");
+        let thread = projector
+            .read_thread(projector.default_thread_id())
+            .expect("thread exists");
+
+        assert!(plan.is_empty());
+        assert!(thread.plans.is_empty());
+    }
 }

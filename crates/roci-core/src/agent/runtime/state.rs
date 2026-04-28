@@ -261,7 +261,11 @@ impl AgentRuntime {
                 "Agent is not idle; runtime mutation requires idle state".into(),
             ));
         }
-        if self.queued_turn_count.lock().map_or(0, |count| *count) > 0 {
+        let queued_turn_count = self
+            .queued_turn_count
+            .lock()
+            .map_err(|_| RociError::InvalidState("queued turn count lock poisoned".into()))?;
+        if *queued_turn_count > 0 {
             return Err(RociError::InvalidState(
                 "Agent has queued turns; runtime mutation requires drained queue".into(),
             ));

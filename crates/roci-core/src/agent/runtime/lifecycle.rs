@@ -161,24 +161,38 @@ impl AgentRuntime {
     }
 
     fn increment_queued_turn_count(&self) {
-        if let Ok(mut count) = self.queued_turn_count.lock() {
-            *count += 1;
-        }
+        let mut count = self
+            .queued_turn_count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count += 1;
     }
 
     fn decrement_queued_turn_count(&self) {
-        if let Ok(mut count) = self.queued_turn_count.lock() {
-            *count = count.saturating_sub(1);
-        }
+        let mut count = self
+            .queued_turn_count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_sub(1);
         self.queued_turn_notify.notify_waiters();
+    }
+
+    fn queued_turn_count_for_wait(&self) -> usize {
+        self.queued_turn_count
+            .lock()
+            .map_or_else(|poisoned| *poisoned.into_inner(), |count| *count)
     }
 
     async fn wait_for_queued_turns_to_drain(&self) {
         loop {
-            if self.queued_turn_count.lock().map_or(0, |count| *count) == 0 {
+            let notified = self.queued_turn_notify.notified();
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+
+            if self.queued_turn_count_for_wait() == 0 {
                 return;
             }
-            self.queued_turn_notify.notified().await;
+            notified.as_mut().await;
         }
     }
 
@@ -420,10 +434,14 @@ impl AgentRuntime {
 
     async fn wait_for_current_run_idle(&self) {
         loop {
+            let notified = self.idle_notify.notified();
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+
             if *self.state.lock().await == AgentState::Idle {
                 return;
             }
-            self.idle_notify.notified().await;
+            notified.as_mut().await;
         }
     }
 
@@ -492,14 +510,21 @@ impl AgentRuntime {
     /// current run completes, fails, or is aborted.
     pub async fn wait_for_idle(&self) {
         loop {
+            let idle_notified = self.idle_notify.notified();
+            let queued_turn_notified = self.queued_turn_notify.notified();
+            tokio::pin!(idle_notified);
+            tokio::pin!(queued_turn_notified);
+            let _ = idle_notified.as_mut().enable();
+            let _ = queued_turn_notified.as_mut().enable();
+
             if *self.state.lock().await == AgentState::Idle
-                && self.queued_turn_count.lock().map_or(0, |count| *count) == 0
+                && self.queued_turn_count_for_wait() == 0
             {
                 return;
             }
             tokio::select! {
-                () = self.idle_notify.notified() => {}
-                () = self.queued_turn_notify.notified() => {}
+                () = idle_notified.as_mut() => {}
+                () = queued_turn_notified.as_mut() => {}
             }
         }
     }
