@@ -107,8 +107,34 @@ impl AgentRuntime {
         &self,
         events: Vec<AgentRuntimeEvent>,
     ) -> Result<(), AgentRuntimeError> {
-        for event in events {
-            self.publish_runtime_event(event).await?;
+        self.ensure_runtime_event_publisher().await;
+        let mut ack_receivers = Vec::with_capacity(events.len());
+        {
+            let _send_guard = self.runtime_event_send_lock.lock().map_err(|_| {
+                AgentRuntimeError::ProjectionFailed {
+                    message: "runtime event send lock poisoned".to_string(),
+                }
+            })?;
+            for event in events {
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                self.runtime_event_publish_tx
+                    .send(RuntimeEventPublishRequest {
+                        event,
+                        ack_tx: Some(ack_tx),
+                        error_slot: None,
+                    })
+                    .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                        message: "runtime event publisher closed".to_string(),
+                    })?;
+                ack_receivers.push(ack_rx);
+            }
+        }
+        for ack_rx in ack_receivers {
+            ack_rx
+                .await
+                .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                    message: "runtime event publisher dropped acknowledgement".to_string(),
+                })??;
         }
         Ok(())
     }
@@ -126,15 +152,22 @@ impl AgentRuntime {
     ) -> Result<RuntimeCursor, AgentRuntimeError> {
         self.ensure_runtime_event_publisher().await;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.runtime_event_publish_tx
-            .send(RuntimeEventPublishRequest {
-                event,
-                ack_tx: Some(ack_tx),
-                error_slot: None,
-            })
-            .map_err(|_| AgentRuntimeError::ProjectionFailed {
-                message: "runtime event publisher closed".to_string(),
+        {
+            let _send_guard = self.runtime_event_send_lock.lock().map_err(|_| {
+                AgentRuntimeError::ProjectionFailed {
+                    message: "runtime event send lock poisoned".to_string(),
+                }
             })?;
+            self.runtime_event_publish_tx
+                .send(RuntimeEventPublishRequest {
+                    event,
+                    ack_tx: Some(ack_tx),
+                    error_slot: None,
+                })
+                .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                    message: "runtime event publisher closed".to_string(),
+                })?;
+        }
         ack_rx
             .await
             .map_err(|_| AgentRuntimeError::ProjectionFailed {
@@ -174,9 +207,15 @@ impl AgentRuntime {
 
     pub(super) fn queue_runtime_event_to(
         publish_tx: &tokio::sync::mpsc::UnboundedSender<RuntimeEventPublishRequest>,
+        send_lock: &StdMutex<()>,
         event: AgentRuntimeEvent,
         error_slot: Arc<StdMutex<Option<AgentRuntimeError>>>,
     ) -> Result<(), AgentRuntimeError> {
+        let _send_guard = send_lock
+            .lock()
+            .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                message: "runtime event send lock poisoned".to_string(),
+            })?;
         publish_tx
             .send(RuntimeEventPublishRequest {
                 event,
@@ -220,6 +259,15 @@ impl AgentRuntime {
         if *state != AgentState::Idle {
             return Err(RociError::InvalidState(
                 "Agent is not idle; runtime mutation requires idle state".into(),
+            ));
+        }
+        let queued_turn_count = self
+            .queued_turn_count
+            .lock()
+            .map_err(|_| RociError::InvalidState("queued turn count lock poisoned".into()))?;
+        if *queued_turn_count > 0 {
+            return Err(RociError::InvalidState(
+                "Agent has queued turns; runtime mutation requires drained queue".into(),
             ));
         }
         Ok(state)

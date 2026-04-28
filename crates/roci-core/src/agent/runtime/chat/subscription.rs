@@ -42,6 +42,10 @@ impl RuntimeSubscription {
 
     /// Return retained replay events requested by the subscription cursor.
     ///
+    /// This does not consume live events. Call this first when resuming from a
+    /// cursor, then call [`recv`](Self::recv) or [`next`](Self::next) for fresh
+    /// events.
+    ///
     /// # Errors
     ///
     /// Returns [`AgentRuntimeError::StaleRuntime`] when the requested cursor is
@@ -51,6 +55,10 @@ impl RuntimeSubscription {
     }
 
     /// Receive the next live semantic runtime event.
+    ///
+    /// If the subscription was created with a stale cursor and [`replay`](Self::replay)
+    /// was not checked, the startup replay error is returned before any live
+    /// event is read.
     ///
     /// # Errors
     ///

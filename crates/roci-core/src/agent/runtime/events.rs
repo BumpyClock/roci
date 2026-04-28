@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use super::{
     AgentRuntime, AgentRuntimeError, AgentRuntimeEvent, AgentSnapshot, AgentState, ChatProjector,
-    MessageId, TurnId,
+    CollaborationMode, MessageId, TurnId,
 };
 use crate::agent_loop::approvals::ApprovalDecision;
 use crate::agent_loop::runner::AgentEventSink;
@@ -14,6 +14,7 @@ struct ChatProjectionRunState {
     active_message_id: Option<MessageId>,
     remaining_context_message_lifecycles: usize,
     skipping_context_message: bool,
+    suppress_plan_events: bool,
 }
 
 fn ensure_turn_started(
@@ -163,6 +164,9 @@ fn project_agent_event(
             )?);
         }
         AgentEvent::PlanUpdated { plan } => {
+            if run_state.suppress_plan_events {
+                return Ok(events);
+            }
             events.extend(ensure_turn_started(projector, run_state, turn_id)?);
             events.push(projector.update_plan(turn_id, plan.clone())?);
         }
@@ -188,6 +192,7 @@ impl AgentRuntime {
         &self,
         turn_id: TurnId,
         initial_message_count: usize,
+        collaboration_mode: CollaborationMode,
     ) -> (AgentEventSink, Arc<StdMutex<Option<AgentRuntimeError>>>) {
         let original_sink = self.config.event_sink.clone();
         let turn_index = self.turn_index.clone();
@@ -198,11 +203,13 @@ impl AgentRuntime {
         let snapshot_tx = self.snapshot_tx.clone();
         let chat_projector = self.chat_projector.clone();
         let runtime_event_publish_tx = self.runtime_event_publish_tx.clone();
+        let runtime_event_send_lock = self.runtime_event_send_lock.clone();
         let projection_error = Arc::new(StdMutex::new(None));
         let projection_error_for_sink = projection_error.clone();
         let projection_error_for_publish = projection_error.clone();
         let projection_run_state = Arc::new(StdMutex::new(ChatProjectionRunState {
             remaining_context_message_lifecycles: initial_message_count,
+            suppress_plan_events: collaboration_mode == CollaborationMode::Plan,
             ..ChatProjectionRunState::default()
         }));
 
@@ -216,6 +223,7 @@ impl AgentRuntime {
                             for event in events {
                                 AgentRuntime::queue_runtime_event_to(
                                     &runtime_event_publish_tx,
+                                    &runtime_event_send_lock,
                                     event,
                                     projection_error_for_publish.clone(),
                                 )?;
@@ -390,5 +398,31 @@ mod tests {
             diff.last().map(|event| &event.payload),
             Some(AgentRuntimeEventPayload::DiffUpdated { .. })
         ));
+    }
+
+    #[test]
+    fn suppresses_plan_agent_events_when_configured() {
+        let mut projector = ChatProjector::default();
+        let turn_id = queued_turn(&mut projector);
+        let mut run_state = ChatProjectionRunState {
+            suppress_plan_events: true,
+            ..ChatProjectionRunState::default()
+        };
+
+        let plan = project_agent_event(
+            &mut projector,
+            &mut run_state,
+            turn_id,
+            &AgentEvent::PlanUpdated {
+                plan: "inspect then edit".to_string(),
+            },
+        )
+        .expect("plan suppression should project");
+        let thread = projector
+            .read_thread(projector.default_thread_id())
+            .expect("thread exists");
+
+        assert!(plan.is_empty());
+        assert!(thread.plans.is_empty());
     }
 }

@@ -14,6 +14,7 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
@@ -50,6 +51,7 @@ use crate::agent::message::AgentMessageExt;
 use crate::agent_loop::compaction::{serialize_pi_mono_summary, PiMonoSummary};
 #[cfg(test)]
 use crate::agent_loop::runner::BeforeAgentStartHookResult;
+use crate::agent_loop::ApprovalPolicy;
 use crate::agent_loop::LoopRunner;
 #[cfg(test)]
 use crate::agent_loop::RunStatus;
@@ -67,10 +69,8 @@ use crate::resource::{BranchSummarySettings, CompactionSettings};
 use crate::tools::dynamic::DynamicToolProvider;
 use crate::tools::tool::Tool;
 #[cfg(test)]
-use crate::types::GenerationSettings;
-#[cfg(test)]
 use crate::types::Role;
-use crate::types::{ModelMessage, Usage};
+use crate::types::{GenerationSettings, ModelMessage, Usage};
 
 /// High-level agent runtime wrapping [`LoopRunner`].
 ///
@@ -87,6 +87,7 @@ use crate::types::{ModelMessage, Usage};
 /// let result = agent.continue_without_input().await?;
 /// agent.reset().await;
 /// ```
+#[derive(Clone)]
 pub struct AgentRuntime {
     config: AgentConfig,
     runner: LoopRunner,
@@ -96,6 +97,8 @@ pub struct AgentRuntime {
     state_tx: watch::Sender<AgentState>,
     state_rx: watch::Receiver<AgentState>,
     model: Arc<Mutex<LanguageModel>>,
+    generation_settings: Arc<Mutex<GenerationSettings>>,
+    approval_policy: Arc<Mutex<ApprovalPolicy>>,
     system_prompt: Arc<Mutex<Option<String>>>,
     tools: Arc<Mutex<Vec<Arc<dyn Tool>>>>,
     dynamic_tool_providers: Arc<Mutex<Vec<Arc<dyn DynamicToolProvider>>>>,
@@ -103,6 +106,9 @@ pub struct AgentRuntime {
     steering_queue: Arc<Mutex<Vec<ModelMessage>>>,
     follow_up_queue: Arc<Mutex<Vec<ModelMessage>>>,
     active_abort_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    queued_turn_state: Arc<Mutex<QueuedTurnState>>,
+    queued_turn_count: Arc<StdMutex<usize>>,
+    queued_turn_notify: Arc<Notify>,
     idle_notify: Arc<Notify>,
     turn_index: Arc<Mutex<usize>>,
     is_streaming: Arc<Mutex<bool>>,
@@ -112,6 +118,7 @@ pub struct AgentRuntime {
     chat_projector: Arc<StdMutex<ChatProjector>>,
     runtime_event_tx: broadcast::Sender<AgentRuntimeEvent>,
     runtime_event_store: Arc<dyn AgentRuntimeEventStore>,
+    runtime_event_send_lock: Arc<StdMutex<()>>,
     runtime_event_publish_tx: mpsc::UnboundedSender<RuntimeEventPublishRequest>,
     runtime_event_publish_rx:
         Arc<Mutex<Option<mpsc::UnboundedReceiver<RuntimeEventPublishRequest>>>>,
@@ -119,6 +126,19 @@ pub struct AgentRuntime {
     session_usage: Arc<Mutex<Usage>>,
     #[cfg(feature = "agent")]
     user_input_coordinator: Arc<UserInputCoordinator>,
+}
+
+#[derive(Debug)]
+struct QueuedTurn {
+    turn_id: TurnId,
+    messages: Vec<ModelMessage>,
+    options: run_loop::TurnRunOptions,
+}
+
+#[derive(Debug, Default)]
+struct QueuedTurnState {
+    turns: VecDeque<QueuedTurn>,
+    worker_active: bool,
 }
 
 pub(super) struct RuntimeEventPublishRequest {
@@ -136,6 +156,8 @@ impl AgentRuntime {
     ) -> Self {
         let runner = LoopRunner::with_registry(roci_config.clone(), registry.clone());
         let model = Arc::new(Mutex::new(config.model.clone()));
+        let generation_settings = Arc::new(Mutex::new(config.settings.clone()));
+        let approval_policy = Arc::new(Mutex::new(config.approval_policy));
         let system_prompt = Arc::new(Mutex::new(config.system_prompt.clone()));
         let tools = Arc::new(Mutex::new(config.tools.clone()));
         let dynamic_tool_providers = Arc::new(Mutex::new(config.dynamic_tool_providers.clone()));
@@ -172,6 +194,8 @@ impl AgentRuntime {
             state_tx,
             state_rx,
             model,
+            generation_settings,
+            approval_policy,
             system_prompt,
             tools,
             dynamic_tool_providers,
@@ -179,6 +203,9 @@ impl AgentRuntime {
             steering_queue: Arc::new(Mutex::new(Vec::new())),
             follow_up_queue: Arc::new(Mutex::new(Vec::new())),
             active_abort_tx: Arc::new(Mutex::new(None)),
+            queued_turn_state: Arc::new(Mutex::new(QueuedTurnState::default())),
+            queued_turn_count: Arc::new(StdMutex::new(0)),
+            queued_turn_notify: Arc::new(Notify::new()),
             idle_notify: Arc::new(Notify::new()),
             turn_index: Arc::new(Mutex::new(0)),
             is_streaming: Arc::new(Mutex::new(false)),
@@ -188,6 +215,7 @@ impl AgentRuntime {
             chat_projector,
             runtime_event_tx,
             runtime_event_store,
+            runtime_event_send_lock: Arc::new(StdMutex::new(())),
             runtime_event_publish_tx,
             runtime_event_publish_rx: Arc::new(Mutex::new(Some(runtime_event_publish_rx))),
             session_usage: Arc::new(Mutex::new(Usage::default())),

@@ -28,6 +28,7 @@ use super::types::{GetApiKeyFn, QueueDrainMode, SessionBeforeCompactHook, Sessio
 ///
 /// Set [`get_api_key`](Self::get_api_key) only when you need per-request
 /// dynamic keys (e.g., token rotation or multi-tenant key injection).
+#[derive(Clone)]
 pub struct AgentConfig {
     /// The language model to use for generation.
     pub model: LanguageModel,

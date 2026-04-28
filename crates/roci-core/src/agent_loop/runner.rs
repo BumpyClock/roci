@@ -476,6 +476,7 @@ pub trait Runner: Send + Sync {
 }
 
 /// Default agent-loop runner (tool loop + approvals + event stream).
+#[derive(Clone)]
 pub struct LoopRunner {
     config: RociConfig,
     provider_factory: ProviderFactory,
