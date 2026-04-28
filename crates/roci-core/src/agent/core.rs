@@ -244,7 +244,14 @@ impl Stream for ToolStream<'_> {
         }
 
         match Pin::new(&mut self.rx).poll_next(cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(Some(Ok(delta))) => Poll::Ready(Some(Ok(delta))),
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(tx) = self.abort_tx.take() {
+                    let _ = tx.send(());
+                }
+                self.completed = true;
+                Poll::Ready(Some(Err(error)))
+            }
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => match self.wait.as_mut().poll(cx) {
                 Poll::Pending => Poll::Pending,

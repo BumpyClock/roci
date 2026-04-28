@@ -160,6 +160,7 @@ impl SubagentSupervisor {
             &profile,
             &self.registry,
             &self.roci_config,
+            &self.base_config,
         )?;
         let model = resolved_model.model;
 

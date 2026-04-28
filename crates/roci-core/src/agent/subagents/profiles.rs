@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::agent::runtime::AgentConfig;
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
@@ -118,9 +119,10 @@ impl SubagentProfileRegistry {
 
     /// Pick the first viable model candidate from a resolved profile.
     ///
-    /// A candidate is viable when the provider is registered. Credentialed
-    /// providers may receive request-scoped credentials through the child
-    /// `AgentConfig`; provider creation performs final auth validation.
+    /// A candidate is viable when the provider is registered and either does
+    /// not require credentials or has credentials available in `RociConfig`.
+    /// Request-scoped credentials are considered by the supervisor-facing
+    /// candidate resolver.
     pub fn resolve_model(
         &self,
         profile: &SubagentProfile,
@@ -128,7 +130,7 @@ impl SubagentProfileRegistry {
         config: &RociConfig,
     ) -> Result<LanguageModel, RociError> {
         Ok(self
-            .resolve_model_candidate(profile, registry, config)?
+            .resolve_model_candidate_without_base_config(profile, registry, config)?
             .model)
     }
 
@@ -136,10 +138,30 @@ impl SubagentProfileRegistry {
         &self,
         profile: &SubagentProfile,
         registry: &ProviderRegistry,
-        _config: &RociConfig,
+        config: &RociConfig,
+        base_config: &AgentConfig,
+    ) -> Result<ResolvedSubagentModel, RociError> {
+        self.resolve_model_candidate_with_auth(profile, registry, config, Some(base_config))
+    }
+
+    fn resolve_model_candidate_without_base_config(
+        &self,
+        profile: &SubagentProfile,
+        registry: &ProviderRegistry,
+        config: &RociConfig,
+    ) -> Result<ResolvedSubagentModel, RociError> {
+        self.resolve_model_candidate_with_auth(profile, registry, config, None)
+    }
+
+    fn resolve_model_candidate_with_auth(
+        &self,
+        profile: &SubagentProfile,
+        registry: &ProviderRegistry,
+        config: &RociConfig,
+        base_config: Option<&AgentConfig>,
     ) -> Result<ResolvedSubagentModel, RociError> {
         for candidate in &profile.models {
-            if is_viable_model_candidate(candidate, registry) {
+            if is_viable_model_candidate(candidate, registry, config, base_config) {
                 return Ok(ResolvedSubagentModel {
                     model: LanguageModel::Known {
                         provider_key: candidate.provider.clone(),
@@ -173,10 +195,30 @@ impl SubagentProfileRegistry {
     }
 }
 
-fn is_viable_model_candidate(candidate: &ModelCandidate, registry: &ProviderRegistry) -> bool {
-    // Runtime credentials can arrive through AgentConfig api_key_override or
-    // get_api_key after this selection step, so only registration is gated here.
-    registry.has_provider(&candidate.provider)
+fn is_viable_model_candidate(
+    candidate: &ModelCandidate,
+    registry: &ProviderRegistry,
+    config: &RociConfig,
+    base_config: Option<&AgentConfig>,
+) -> bool {
+    let Some(requires_credentials) = registry.requires_credentials(&candidate.provider) else {
+        return false;
+    };
+    if !requires_credentials {
+        return true;
+    }
+    if config.has_credentials(&candidate.provider) {
+        return true;
+    }
+    base_config.is_some_and(has_request_scoped_credentials)
+}
+
+fn has_request_scoped_credentials(config: &AgentConfig) -> bool {
+    config
+        .api_key_override
+        .as_deref()
+        .is_some_and(|key| !key.is_empty())
+        || config.get_api_key.is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +503,7 @@ model = "claude-opus-4"
         // Use real ProviderRegistry and RociConfig.
         // The default ones have no providers, so we test the error path.
         let provider_reg = ProviderRegistry::new();
-        let config = RociConfig::default();
+        let config = RociConfig::default().with_token_store(None);
 
         let err = reg.resolve_model(&profile, &provider_reg, &config);
         assert!(err.is_err());
@@ -476,7 +518,7 @@ model = "claude-opus-4"
             ..Default::default()
         };
         let provider_reg = ProviderRegistry::new();
-        let config = RociConfig::default();
+        let config = RociConfig::default().with_token_store(None);
         let err = reg.resolve_model(&profile, &provider_reg, &config);
         assert!(err.is_err());
     }
@@ -499,19 +541,19 @@ model = "claude-opus-4"
     }
 
     #[test]
-    fn registered_credentialed_providers_are_viable_without_stored_credentials() {
+    fn registered_credentialed_provider_without_auth_falls_back_to_next_viable_candidate() {
         let reg = SubagentProfileRegistry::new();
         let profile = SubagentProfile {
             name: "remote".into(),
             models: vec![
                 ModelCandidate {
-                    provider: "unavailable".into(),
-                    model: "model-a".into(),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4.5".into(),
                     reasoning_effort: None,
                 },
                 ModelCandidate {
-                    provider: "anthropic".into(),
-                    model: "claude-sonnet-4.5".into(),
+                    provider: "lmstudio".into(),
+                    model: "local-model".into(),
                     reasoning_effort: Some("medium".into()),
                 },
             ],
@@ -519,10 +561,53 @@ model = "claude-opus-4"
         };
         let mut provider_reg = ProviderRegistry::new();
         provider_reg.register(std::sync::Arc::new(CredentialFactory));
-        let config = RociConfig::default();
+        provider_reg.register(std::sync::Arc::new(LocalNoCredentialFactory));
+        let config = RociConfig::default().with_token_store(None);
 
         let resolved = reg
-            .resolve_model_candidate(&profile, &provider_reg, &config)
+            .resolve_model_candidate_without_base_config(&profile, &provider_reg, &config)
+            .unwrap();
+
+        assert_eq!(
+            resolved.model,
+            LanguageModel::Known {
+                provider_key: "lmstudio".into(),
+                model_id: "local-model".into()
+            }
+        );
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn registered_credentialed_provider_is_viable_with_request_scoped_api_key() {
+        let reg = SubagentProfileRegistry::new();
+        let profile = SubagentProfile {
+            name: "remote".into(),
+            models: vec![
+                ModelCandidate {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4.5".into(),
+                    reasoning_effort: Some("medium".into()),
+                },
+                ModelCandidate {
+                    provider: "lmstudio".into(),
+                    model: "local-model".into(),
+                    reasoning_effort: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut provider_reg = ProviderRegistry::new();
+        provider_reg.register(std::sync::Arc::new(CredentialFactory));
+        provider_reg.register(std::sync::Arc::new(LocalNoCredentialFactory));
+        let config = RociConfig::default();
+        let base_config = AgentConfig {
+            api_key_override: Some("request-key".into()),
+            ..AgentConfig::default()
+        };
+
+        let resolved = reg
+            .resolve_model_candidate(&profile, &provider_reg, &config, &base_config)
             .unwrap();
 
         assert_eq!(
@@ -533,6 +618,69 @@ model = "claude-opus-4"
             }
         );
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn registered_credentialed_provider_is_viable_with_request_scoped_callback() {
+        let reg = SubagentProfileRegistry::new();
+        let profile = SubagentProfile {
+            name: "remote".into(),
+            models: vec![ModelCandidate {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4.5".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        };
+        let mut provider_reg = ProviderRegistry::new();
+        provider_reg.register(std::sync::Arc::new(CredentialFactory));
+        let config = RociConfig::default();
+        let base_config = AgentConfig {
+            get_api_key: Some(std::sync::Arc::new(|| {
+                Box::pin(async { Ok("request-key".into()) })
+            })),
+            ..AgentConfig::default()
+        };
+
+        let resolved = reg
+            .resolve_model_candidate(&profile, &provider_reg, &config, &base_config)
+            .unwrap();
+
+        assert_eq!(
+            resolved.model,
+            LanguageModel::Known {
+                provider_key: "anthropic".into(),
+                model_id: "claude-sonnet-4.5".into()
+            }
+        );
+    }
+
+    #[test]
+    fn public_resolve_model_accepts_configured_credentials() {
+        let reg = SubagentProfileRegistry::new();
+        let profile = SubagentProfile {
+            name: "remote".into(),
+            models: vec![ModelCandidate {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4.5".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        };
+        let mut provider_reg = ProviderRegistry::new();
+        provider_reg.register(std::sync::Arc::new(CredentialFactory));
+        let config = RociConfig::default();
+        config.set_api_key("anthropic", "stored-key".into());
+
+        let resolved = reg.resolve_model(&profile, &provider_reg, &config).unwrap();
+
+        assert_eq!(
+            resolved,
+            LanguageModel::Known {
+                provider_key: "anthropic".into(),
+                model_id: "claude-sonnet-4.5".into()
+            }
+        );
     }
 
     struct LocalNoCredentialFactory;
@@ -580,7 +728,7 @@ model = "claude-opus-4"
         let config = RociConfig::default();
 
         let resolved = reg
-            .resolve_model_candidate(&profile, &provider_reg, &config)
+            .resolve_model_candidate(&profile, &provider_reg, &config, &AgentConfig::default())
             .unwrap();
 
         assert_eq!(

@@ -261,10 +261,10 @@ Sub-agent behavior is driven by named profiles (`SubagentProfile`), not ad-hoc p
 
 ### Model fallback
 
-Each profile defines an ordered list of `ModelCandidate`s. At launch time, `resolve_model()` picks the first candidate whose provider is registered (`has_provider()`). Credential validation is deferred to provider creation/execution so child runs can inherit request-scoped auth (`api_key_override` / `get_api_key`) from the parent runtime.
+Each profile defines an ordered list of `ModelCandidate`s. At launch time, model selection picks the first registered provider that is auth-viable: local/no-credential providers are allowed immediately, credentialed providers require either configured `RociConfig` credentials or parent runtime request-scoped auth (`api_key_override` / `get_api_key`) that the child will inherit.
 
 - Fallback is launch-time only. No mid-run model switching.
-- Missing credentials still fail fast when the selected provider is instantiated or called.
+- Missing credentials are skipped during fallback when no inherited auth source exists; provider creation/execution still performs final validation for the selected candidate.
 - The selected model is surfaced in `SubagentEvent::Spawned` and `SubagentSnapshot`.
 
 ### Input modes

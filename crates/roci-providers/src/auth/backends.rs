@@ -93,7 +93,6 @@ impl AuthBackend for GitHubCopilotBackend {
 
     fn logout(&self, store: &Arc<dyn TokenStore>) -> Result<(), AuthError> {
         let primary_token = store.load(self.store_key(), "default")?;
-        let _api_token = store.load("github-copilot-api", "default")?;
 
         store.clear(self.store_key(), "default")?;
         if let Err(clear_error) = store.clear("github-copilot-api", "default") {
@@ -516,6 +515,14 @@ mod tests {
                 .map(|token| token.access_token)
                 .as_deref(),
             Some("primary-token")
+        );
+        assert_eq!(
+            store
+                .load("github-copilot-api", "default")
+                .expect("load api")
+                .map(|token| token.access_token)
+                .as_deref(),
+            Some("api-token")
         );
     }
 }
