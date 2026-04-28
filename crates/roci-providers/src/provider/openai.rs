@@ -173,7 +173,11 @@ impl OpenAiProvider {
         &'a self,
         request: &'a ProviderRequest,
     ) -> Result<Option<&'a str>, RociError> {
-        if let Some(api_key) = request.api_key_override.as_deref() {
+        if let Some(api_key) = request
+            .api_key_override
+            .as_deref()
+            .filter(|api_key| !api_key.is_empty())
+        {
             return Ok(Some(api_key));
         }
         if !self.api_key.is_empty() {
@@ -920,6 +924,32 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer request-key")
         );
+    }
+
+    #[test]
+    fn headers_treat_empty_request_api_key_override_as_missing() {
+        let provider =
+            OpenAiProvider::new(OpenAiModel::Gpt4o, "default-key".to_string(), None, None);
+        let request = request_with_headers(Some(""), HeaderMap::new());
+
+        let headers = provider.build_headers(&request).expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer default-key")
+        );
+    }
+
+    #[test]
+    fn headers_error_when_empty_request_api_key_override_and_no_default_key() {
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, String::new(), None, None);
+        let request = request_with_headers(Some(""), HeaderMap::new());
+
+        let err = provider.build_headers(&request).unwrap_err();
+
+        assert!(matches!(err, RociError::MissingCredential { .. }));
     }
 
     #[test]

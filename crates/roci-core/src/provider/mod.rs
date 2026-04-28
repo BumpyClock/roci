@@ -71,7 +71,10 @@ impl std::fmt::Debug for ProviderRequest {
                 "payload_callback",
                 &self.payload_callback.as_ref().map(|_| "<callback>"),
             )
-            .field("session_id", &self.session_id)
+            .field(
+                "session_id",
+                &self.session_id.as_ref().map(|_| "<redacted>"),
+            )
             .field("transport", &self.transport)
             .finish()
     }
@@ -180,5 +183,33 @@ pub fn classify_overflow_typed(error: &RociError) -> Option<OverflowSignal> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_request_debug_redacts_sensitive_fields() {
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: Some("sk-secret".to_string()),
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: HashMap::new(),
+            payload_callback: None,
+            session_id: Some("session-secret".to_string()),
+            transport: None,
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("api_key_override: Some(\"<redacted>\")"));
+        assert!(debug.contains("session_id: Some(\"<redacted>\")"));
+        assert!(!debug.contains("sk-secret"));
+        assert!(!debug.contains("session-secret"));
     }
 }

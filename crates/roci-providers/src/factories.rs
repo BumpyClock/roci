@@ -14,6 +14,10 @@ fn require_api_key(
     roci_core::provider::require_api_key(config, provider, missing_message)
 }
 
+#[cfg_attr(
+    not(any(feature = "openai", feature = "anthropic", test)),
+    allow(dead_code)
+)]
 fn optional_api_key_for(config: &RociConfig, provider: ProviderKey) -> String {
     config.get_api_key_for(provider).unwrap_or_default()
 }

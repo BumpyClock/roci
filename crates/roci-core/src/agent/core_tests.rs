@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::{future, stream};
+use futures::{future, stream, StreamExt};
 
 use super::*;
 use crate::agent_loop::ApprovalDecision;
@@ -177,6 +177,94 @@ async fn execute_with_tool_uses_runner_tool_path() {
     let response = agent.execute("use the lookup tool").await.unwrap();
 
     assert_eq!(response, "lookup complete");
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn stream_with_tool_emits_deltas_and_updates_conversation() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(ToolLoopFactory {
+        provider_calls: provider_calls.clone(),
+    }));
+
+    let tool_call_counter = tool_calls.clone();
+    let tool = AgentTool::new(
+        "lookup",
+        "lookup",
+        AgentToolParameters::empty(),
+        move |_args, _ctx| {
+            let tool_call_counter = tool_call_counter.clone();
+            async move {
+                tool_call_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "value": 42 }))
+            }
+        },
+    )
+    .with_approval(ToolApproval::safe_read_only());
+    let model: LanguageModel = "stub:test-model".parse().expect("test model parses");
+    let mut agent = Agent::new(model, Arc::new(registry)).with_tool(Box::new(tool));
+
+    let mut stream = agent.stream("use the lookup tool").await.unwrap();
+    let mut text = String::new();
+    while let Some(delta) = stream.next().await {
+        text.push_str(&delta.unwrap().text);
+    }
+    drop(stream);
+
+    assert_eq!(text, "lookup complete");
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        agent
+            .conversation()
+            .messages()
+            .last()
+            .map(ModelMessage::text),
+        Some("lookup complete".to_string())
+    );
+}
+
+#[tokio::test]
+async fn dropping_tool_stream_after_delta_stops_without_extra_provider_calls() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(ToolLoopFactory {
+        provider_calls: provider_calls.clone(),
+    }));
+
+    let tool_call_counter = tool_calls.clone();
+    let tool = AgentTool::new(
+        "lookup",
+        "lookup",
+        AgentToolParameters::empty(),
+        move |_args, _ctx| {
+            let tool_call_counter = tool_call_counter.clone();
+            async move {
+                tool_call_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "value": 42 }))
+            }
+        },
+    )
+    .with_approval(ToolApproval::safe_read_only());
+    let model: LanguageModel = "stub:test-model".parse().expect("test model parses");
+    let mut agent = Agent::new(model, Arc::new(registry)).with_tool(Box::new(tool));
+
+    let mut stream = agent.stream("use the lookup tool").await.unwrap();
+    let mut text = String::new();
+    while let Some(delta) = stream.next().await {
+        let delta = delta.unwrap();
+        text.push_str(&delta.text);
+        if text == "lookup complete" {
+            break;
+        }
+    }
+    drop(stream);
+
+    assert_eq!(text, "lookup complete");
     assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
 }

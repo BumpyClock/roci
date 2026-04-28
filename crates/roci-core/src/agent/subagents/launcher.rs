@@ -159,6 +159,9 @@ pub(super) fn select_child_tools(
             .map(|name| find_parent_tool(parent_tools, name))
             .collect(),
         ToolPolicy::InheritWithOverrides { add, remove } => {
+            for name in remove {
+                find_parent_tool(parent_tools, name)?;
+            }
             let mut selected: Vec<_> = parent_tools
                 .iter()
                 .filter(|tool| !remove.iter().any(|name| name == tool.name()))
@@ -362,6 +365,26 @@ mod tests {
         };
 
         assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn select_child_tools_rejects_unknown_remove_tool() {
+        let parent = vec![dummy_tool("read")];
+        let result = select_child_tools(
+            &parent,
+            &ToolPolicy::InheritWithOverrides {
+                add: Vec::new(),
+                remove: vec!["missing".into()],
+            },
+        );
+        let err = match result {
+            Ok(_) => panic!("expected missing remove tool to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("subagent tool 'missing' is not available"));
     }
 
     fn dummy_tool(name: &str) -> Arc<dyn Tool> {

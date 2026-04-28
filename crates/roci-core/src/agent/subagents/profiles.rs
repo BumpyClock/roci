@@ -118,10 +118,9 @@ impl SubagentProfileRegistry {
 
     /// Pick the first viable model candidate from a resolved profile.
     ///
-    /// A candidate is viable when the provider is registered **and**
-    /// credentials are configured, unless provider metadata marks credentials
-    /// as unnecessary. This is intended for launch-time selection only (no
-    /// runtime fallback).
+    /// A candidate is viable when the provider is registered. Credentialed
+    /// providers may receive request-scoped credentials through the child
+    /// `AgentConfig`; provider creation performs final auth validation.
     pub fn resolve_model(
         &self,
         profile: &SubagentProfile,
@@ -137,10 +136,10 @@ impl SubagentProfileRegistry {
         &self,
         profile: &SubagentProfile,
         registry: &ProviderRegistry,
-        config: &RociConfig,
+        _config: &RociConfig,
     ) -> Result<ResolvedSubagentModel, RociError> {
         for candidate in &profile.models {
-            if is_viable_model_candidate(candidate, registry, config) {
+            if is_viable_model_candidate(candidate, registry) {
                 return Ok(ResolvedSubagentModel {
                     model: LanguageModel::Known {
                         provider_key: candidate.provider.clone(),
@@ -174,16 +173,10 @@ impl SubagentProfileRegistry {
     }
 }
 
-fn is_viable_model_candidate(
-    candidate: &ModelCandidate,
-    registry: &ProviderRegistry,
-    config: &RociConfig,
-) -> bool {
+fn is_viable_model_candidate(candidate: &ModelCandidate, registry: &ProviderRegistry) -> bool {
+    // Runtime credentials can arrive through AgentConfig api_key_override or
+    // get_api_key after this selection step, so only registration is gated here.
     registry.has_provider(&candidate.provider)
-        && (!registry
-            .requires_credentials(&candidate.provider)
-            .unwrap_or(true)
-            || config.has_credentials(&candidate.provider))
 }
 
 // ---------------------------------------------------------------------------
@@ -466,8 +459,7 @@ model = "claude-opus-4"
         };
 
         // Use real ProviderRegistry and RociConfig.
-        // The default ones have no providers/credentials, so we test the
-        // error path.
+        // The default ones have no providers, so we test the error path.
         let provider_reg = ProviderRegistry::new();
         let config = RociConfig::default();
 
@@ -487,6 +479,60 @@ model = "claude-opus-4"
         let config = RociConfig::default();
         let err = reg.resolve_model(&profile, &provider_reg, &config);
         assert!(err.is_err());
+    }
+
+    struct CredentialFactory;
+
+    impl ProviderFactory for CredentialFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["anthropic"]
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn crate::provider::ModelProvider>, RociError> {
+            Err(RociError::Configuration("credential test factory".into()))
+        }
+    }
+
+    #[test]
+    fn registered_credentialed_providers_are_viable_without_stored_credentials() {
+        let reg = SubagentProfileRegistry::new();
+        let profile = SubagentProfile {
+            name: "remote".into(),
+            models: vec![
+                ModelCandidate {
+                    provider: "unavailable".into(),
+                    model: "model-a".into(),
+                    reasoning_effort: None,
+                },
+                ModelCandidate {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4.5".into(),
+                    reasoning_effort: Some("medium".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut provider_reg = ProviderRegistry::new();
+        provider_reg.register(std::sync::Arc::new(CredentialFactory));
+        let config = RociConfig::default();
+
+        let resolved = reg
+            .resolve_model_candidate(&profile, &provider_reg, &config)
+            .unwrap();
+
+        assert_eq!(
+            resolved.model,
+            LanguageModel::Known {
+                provider_key: "anthropic".into(),
+                model_id: "claude-sonnet-4.5".into()
+            }
+        );
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
     }
 
     struct LocalNoCredentialFactory;

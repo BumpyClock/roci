@@ -1,9 +1,13 @@
 //! Core Agent struct with execute/stream capabilities.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use tokio::sync::oneshot;
 
 use crate::agent_loop::{
     ApprovalHandler, ApprovalPolicy, LoopRunner, RunEvent, RunEventPayload, RunEventSink,
@@ -140,7 +144,7 @@ impl Agent {
     pub async fn stream(
         &mut self,
         message: impl Into<String>,
-    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+    ) -> Result<BoxStream<'_, Result<TextStreamDelta, RociError>>, RociError> {
         self.conversation.add_user_message(message);
         let messages = self.messages_for_run();
 
@@ -155,11 +159,16 @@ impl Agent {
                     }
                 })
             };
-            let handle = self.run_with_tools(messages, Some(sink)).await?;
-            tokio::spawn(async move {
-                let _ = handle.wait().await;
-            });
-            return Ok(rx.boxed());
+            let mut handle = self.run_with_tools(messages, Some(sink)).await?;
+            let abort_tx = handle.take_abort_sender();
+            let stream = ToolStream {
+                rx,
+                wait: Box::pin(handle.wait()),
+                abort_tx,
+                conversation: &mut self.conversation,
+                completed: false,
+            };
+            return Ok(stream.boxed());
         }
 
         let provider = self.registry.create_provider(
@@ -215,6 +224,52 @@ impl Agent {
             request = request.with_event_sink(sink);
         }
         runner.start(request).await
+    }
+}
+
+struct ToolStream<'a> {
+    rx: futures::channel::mpsc::UnboundedReceiver<Result<TextStreamDelta, RociError>>,
+    wait: Pin<Box<dyn Future<Output = crate::agent_loop::RunResult> + Send>>,
+    abort_tx: Option<oneshot::Sender<()>>,
+    conversation: &'a mut Conversation,
+    completed: bool,
+}
+
+impl Stream for ToolStream<'_> {
+    type Item = Result<TextStreamDelta, RociError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.completed {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut self.rx).poll_next(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => match self.wait.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    self.abort_tx.take();
+                    if matches!(result.status, RunStatus::Completed) {
+                        if let Some(text) = final_assistant_text(&result.messages) {
+                            self.conversation.add_assistant_message(text);
+                        }
+                    }
+                    self.completed = true;
+                    Poll::Ready(None)
+                }
+            },
+        }
+    }
+}
+
+impl Drop for ToolStream<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Some(tx) = self.abort_tx.take() {
+                let _ = tx.send(());
+            }
+        }
     }
 }
 

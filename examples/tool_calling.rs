@@ -43,4 +43,5 @@ async fn main() -> roci::error::Result<()> {
 #[cfg(not(feature = "agent"))]
 fn main() {
     eprintln!("tool_calling example requires the `agent` feature");
+    std::process::exit(1);
 }

@@ -261,9 +261,10 @@ Sub-agent behavior is driven by named profiles (`SubagentProfile`), not ad-hoc p
 
 ### Model fallback
 
-Each profile defines an ordered list of `ModelCandidate`s. At launch time, `resolve_model()` picks the first candidate whose provider is registered (`has_provider()`) and has credentials configured (`has_credentials()`).
+Each profile defines an ordered list of `ModelCandidate`s. At launch time, `resolve_model()` picks the first candidate whose provider is registered (`has_provider()`). Credential validation is deferred to provider creation/execution so child runs can inherit request-scoped auth (`api_key_override` / `get_api_key`) from the parent runtime.
 
 - Fallback is launch-time only. No mid-run model switching.
+- Missing credentials still fail fast when the selected provider is instantiated or called.
 - The selected model is surfaced in `SubagentEvent::Spawned` and `SubagentSnapshot`.
 
 ### Input modes
