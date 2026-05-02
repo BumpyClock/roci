@@ -1,9 +1,10 @@
 //! User input types for blocking `ask_user` capability.
 //!
-//! Provides canonical types for parent-mediated user input in the agent loop.
-//! The `ask_user` tool is blocking: execution pauses until the parent submits
-//! a response or timeout expires.
+//! Provides canonical semantic prompt types for parent-mediated user input in
+//! the agent loop. The `ask_user` tool is blocking: execution pauses until the
+//! parent submits a response or timeout expires.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,60 +15,189 @@ use uuid::Uuid;
 /// Unique identifier for a user input request.
 pub type UserInputRequestId = Uuid;
 
-/// A request for user input, emitted via `AgentEvent::UserInputRequested`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A semantic user input request carried through the human interaction coordinator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserInputRequest {
     /// Unique identifier for this request.
     pub request_id: UserInputRequestId,
     /// Tool call ID from the model.
     pub tool_call_id: String,
-    /// Questions to ask the user.
-    pub questions: Vec<Question>,
+    /// Prompt to present to the user.
+    pub prompt: AskUserPrompt,
     /// Optional timeout in milliseconds.
     pub timeout_ms: Option<u64>,
 }
 
-/// A single question in a user input request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Question {
-    /// Unique identifier for this question within the request.
-    pub id: String,
-    /// The question text to display to the user.
-    pub text: String,
-    /// Optional predefined options for the user to choose from.
-    #[serde(default)]
-    pub options: Option<Vec<QuestionOption>>,
+/// Semantic prompt variants supported by `ask_user`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AskUserPrompt {
+    /// Free-form text answer.
+    Question {
+        /// Stable prompt id.
+        id: String,
+        /// Question text to display.
+        question: String,
+        /// Optional placeholder text.
+        #[serde(default)]
+        placeholder: Option<String>,
+        /// Optional default answer.
+        #[serde(default)]
+        default: Option<String>,
+        /// Whether the host should allow multiple lines.
+        #[serde(default)]
+        multiline: bool,
+    },
+    /// Boolean confirmation.
+    Confirm {
+        /// Stable prompt id.
+        id: String,
+        /// Confirmation question text.
+        question: String,
+        /// Optional default decision.
+        #[serde(default)]
+        default: Option<bool>,
+    },
+    /// Single choice from a list.
+    Choice {
+        /// Stable prompt id.
+        id: String,
+        /// Choice question text.
+        question: String,
+        /// Available choices.
+        choices: Vec<AskUserChoice>,
+        /// Optional default choice id.
+        #[serde(default)]
+        default: Option<String>,
+    },
+    /// Multiple choices from a list.
+    MultiChoice {
+        /// Stable prompt id.
+        id: String,
+        /// Multi-choice question text.
+        question: String,
+        /// Available choices.
+        choices: Vec<AskUserChoice>,
+        /// Optional default choice ids.
+        #[serde(default)]
+        default: Vec<String>,
+        /// Optional minimum selected count.
+        #[serde(default)]
+        min_selected: Option<usize>,
+        /// Optional maximum selected count.
+        #[serde(default)]
+        max_selected: Option<usize>,
+    },
+    /// Structured form with typed fields.
+    Form {
+        /// Stable prompt id.
+        id: String,
+        /// Optional form title.
+        #[serde(default)]
+        title: Option<String>,
+        /// Form fields.
+        fields: Vec<AskUserFormField>,
+    },
 }
 
-/// A predefined option for a question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuestionOption {
-    /// Unique identifier for this option.
+impl AskUserPrompt {
+    /// Return stable prompt id.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Question { id, .. }
+            | Self::Confirm { id, .. }
+            | Self::Choice { id, .. }
+            | Self::MultiChoice { id, .. }
+            | Self::Form { id, .. } => id,
+        }
+    }
+}
+
+/// Choice option for semantic prompts and form fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskUserChoice {
+    /// Stable choice id.
     pub id: String,
-    /// Display label for this option.
+    /// Display label.
     pub label: String,
+    /// Optional help text.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// A typed form field in an `ask_user` form prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AskUserFormField {
+    /// Stable field id.
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// Input control kind for this field.
+    pub input_kind: AskUserFormInputKind,
+    /// Whether the field must be answered.
+    #[serde(default)]
+    pub required: bool,
+    /// Optional placeholder text.
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    /// Optional default value.
+    #[serde(default)]
+    pub default: Option<UserInputValue>,
+    /// Choices for `choice` and `multi_choice` fields.
+    #[serde(default)]
+    pub choices: Vec<AskUserChoice>,
+}
+
+/// Input kind for a form field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskUserFormInputKind {
+    Text,
+    Boolean,
+    Number,
+    Choice,
+    MultiChoice,
 }
 
 /// Response to a user input request, submitted via `submit_user_input`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserInputResponse {
     /// The request ID this response corresponds to.
     pub request_id: UserInputRequestId,
-    /// Answers to the questions.
-    #[serde(default)]
-    pub answers: Vec<Answer>,
-    /// Whether the user canceled the request.
-    #[serde(default)]
-    pub canceled: bool,
+    /// Typed response payload.
+    pub result: UserInputResult,
 }
 
-/// An answer to a single question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Answer {
-    /// The question ID this answer corresponds to.
-    pub question_id: String,
-    /// The answer content (free text or selected option ID).
-    pub content: String,
+/// Typed `ask_user` response payload returned to the model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UserInputResult {
+    /// Free-form question answer.
+    Question { answer: String },
+    /// Boolean confirmation answer.
+    Confirm { confirmed: bool },
+    /// Selected choice id.
+    Choice { choice: String },
+    /// Selected choice ids.
+    MultiChoice { choices: Vec<String> },
+    /// Form values keyed by field id.
+    Form {
+        values: BTreeMap<String, UserInputValue>,
+    },
+    /// User canceled the prompt.
+    Canceled,
+}
+
+/// Typed value returned by a form prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum UserInputValue {
+    Text(String),
+    Boolean(bool),
+    Number(f64),
+    Choice(String),
+    MultiChoice(Vec<String>),
 }
 
 /// Error returned when submitting a response for an unknown request.
@@ -147,10 +277,6 @@ pub type RequestUserInputFn = Arc<
         + Sync,
 >;
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,77 +286,64 @@ mod tests {
         let request = UserInputRequest {
             request_id: Uuid::nil(),
             tool_call_id: "call_123".to_string(),
-            questions: vec![
-                Question {
-                    id: "q1".to_string(),
-                    text: "What is your name?".to_string(),
-                    options: None,
-                },
-                Question {
-                    id: "q2".to_string(),
-                    text: "Choose an option".to_string(),
-                    options: Some(vec![
-                        QuestionOption {
-                            id: "opt_a".to_string(),
-                            label: "Option A".to_string(),
-                        },
-                        QuestionOption {
-                            id: "opt_b".to_string(),
-                            label: "Option B".to_string(),
-                        },
-                    ]),
-                },
-            ],
+            prompt: AskUserPrompt::Choice {
+                id: "unit".to_string(),
+                question: "C or F?".to_string(),
+                choices: vec![
+                    AskUserChoice {
+                        id: "c".to_string(),
+                        label: "Celsius".to_string(),
+                        description: None,
+                    },
+                    AskUserChoice {
+                        id: "f".to_string(),
+                        label: "Fahrenheit".to_string(),
+                        description: Some("Imperial temperature unit".to_string()),
+                    },
+                ],
+                default: Some("c".to_string()),
+            },
             timeout_ms: Some(30_000),
         };
 
         let json = serde_json::to_string(&request).expect("serialize");
         let decoded: UserInputRequest = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(decoded.request_id, request.request_id);
-        assert_eq!(decoded.tool_call_id, request.tool_call_id);
-        assert_eq!(decoded.questions.len(), 2);
-        assert_eq!(decoded.timeout_ms, Some(30_000));
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.prompt.id(), "unit");
     }
 
     #[test]
-    fn response_serialization_roundtrip() {
+    fn form_response_serialization_roundtrip() {
+        let mut values = BTreeMap::new();
+        values.insert(
+            "name".to_string(),
+            UserInputValue::Text("Alice".to_string()),
+        );
+        values.insert("enabled".to_string(), UserInputValue::Boolean(true));
+
         let response = UserInputResponse {
             request_id: Uuid::nil(),
-            answers: vec![
-                Answer {
-                    question_id: "q1".to_string(),
-                    content: "Alice".to_string(),
-                },
-                Answer {
-                    question_id: "q2".to_string(),
-                    content: "opt_a".to_string(),
-                },
-            ],
-            canceled: false,
+            result: UserInputResult::Form { values },
         };
 
         let json = serde_json::to_string(&response).expect("serialize");
         let decoded: UserInputResponse = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(decoded.request_id, response.request_id);
-        assert_eq!(decoded.answers.len(), 2);
-        assert!(!decoded.canceled);
+        assert_eq!(decoded, response);
     }
 
     #[test]
     fn canceled_response_serialization() {
         let response = UserInputResponse {
             request_id: Uuid::nil(),
-            answers: vec![],
-            canceled: true,
+            result: UserInputResult::Canceled,
         };
 
         let json = serde_json::to_string(&response).expect("serialize");
         let decoded: UserInputResponse = serde_json::from_str(&json).expect("deserialize");
 
-        assert!(decoded.canceled);
-        assert!(decoded.answers.is_empty());
+        assert!(matches!(decoded.result, UserInputResult::Canceled));
     }
 
     #[test]

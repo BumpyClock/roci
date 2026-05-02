@@ -85,6 +85,8 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
             agent_emitter,
             &request.approval_policy,
             request.approval_handler.as_ref(),
+            request.human_interaction_coordinator.as_ref(),
+            &request.tool_permission_session_approvals,
             call,
             approval_tool.as_deref(),
         );

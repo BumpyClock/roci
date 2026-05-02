@@ -5,7 +5,8 @@ use crate::models::ModelCapabilities;
 use crate::provider::{ModelProvider, ProviderFactory, ProviderRequest, ProviderResponse};
 use crate::tools::tool::Tool;
 use crate::tools::{
-    AgentTool, AgentToolParameters, Question, ToolApproval, UserInputRequest, UserInputResponse,
+    AgentTool, AgentToolParameters, AskUserPrompt, ToolApproval, UserInputRequest,
+    UserInputResponse, UserInputResult,
 };
 use crate::types::{AgentToolCall, StreamEventType, TextStreamDelta, Usage};
 use async_trait::async_trait;
@@ -147,18 +148,23 @@ async fn prompt_emits_user_input_event_and_submit_user_input_unblocks_tool() {
                 let response = callback(UserInputRequest {
                     request_id: uuid::Uuid::new_v4(),
                     tool_call_id: "ask-user-call-1".to_string(),
-                    questions: vec![Question {
+                    prompt: AskUserPrompt::Question {
                         id: "temp_unit".to_string(),
-                        text: "C or F?".to_string(),
-                        options: None,
-                    }],
+                        question: "C or F?".to_string(),
+                        placeholder: None,
+                        default: None,
+                        multiline: false,
+                    },
                     timeout_ms: Some(1_000),
                 })
                 .await
                 .map_err(|err| RociError::InvalidState(err.to_string()))?;
-                Ok(serde_json::json!({
-                    "answer": response.answers.first().map(|answer| answer.content.clone())
-                }))
+                let UserInputResult::Question { answer } = response.result else {
+                    return Err(RociError::InvalidState(
+                        "expected question answer".to_string(),
+                    ));
+                };
+                Ok(serde_json::json!({ "answer": answer }))
             },
         )
         .with_approval(ToolApproval::safe_host_input()),
@@ -172,7 +178,10 @@ async fn prompt_emits_user_input_event_and_submit_user_input_unblocks_tool() {
         let event_requests = event_requests.clone();
         let agent_slot = agent_slot.clone();
         Arc::new(move |event| {
-            if let AgentEvent::UserInputRequested { request } = event {
+            if let AgentEvent::HumanInteractionRequested { request } = event {
+                let request = request
+                    .to_user_input()
+                    .expect("human interaction should be ask_user");
                 event_requests
                     .lock()
                     .expect("event lock")
@@ -182,11 +191,9 @@ async fn prompt_emits_user_input_event_and_submit_user_input_unblocks_tool() {
                         let _ = agent
                             .submit_user_input(UserInputResponse {
                                 request_id: request.request_id,
-                                answers: vec![crate::tools::Answer {
-                                    question_id: "temp_unit".to_string(),
-                                    content: "C".to_string(),
-                                }],
-                                canceled: false,
+                                result: UserInputResult::Question {
+                                    answer: "C".to_string(),
+                                },
                             })
                             .await;
                     });
@@ -214,7 +221,7 @@ async fn prompt_emits_user_input_event_and_submit_user_input_unblocks_tool() {
 
     let requests = event_requests.lock().expect("event lock");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].questions[0].id, "temp_unit");
+    assert_eq!(requests[0].prompt.id(), "temp_unit");
 }
 
 #[tokio::test]
@@ -237,18 +244,23 @@ async fn abort_while_waiting_for_user_input_unblocks_run() {
                 let response = callback(UserInputRequest {
                     request_id: uuid::Uuid::new_v4(),
                     tool_call_id: "ask-user-call-1".to_string(),
-                    questions: vec![Question {
+                    prompt: AskUserPrompt::Question {
                         id: "abort_unit".to_string(),
-                        text: "Abort me?".to_string(),
-                        options: None,
-                    }],
+                        question: "Abort me?".to_string(),
+                        placeholder: None,
+                        default: None,
+                        multiline: false,
+                    },
                     timeout_ms: None,
                 })
                 .await
                 .map_err(|err| RociError::InvalidState(err.to_string()))?;
-                Ok(serde_json::json!({
-                    "answer": response.answers.first().map(|answer| answer.content.clone())
-                }))
+                let UserInputResult::Question { answer } = response.result else {
+                    return Err(RociError::InvalidState(
+                        "expected question answer".to_string(),
+                    ));
+                };
+                Ok(serde_json::json!({ "answer": answer }))
             },
         )
         .with_approval(ToolApproval::safe_host_input()),
@@ -263,8 +275,11 @@ async fn abort_while_waiting_for_user_input_unblocks_run() {
     config.event_sink = Some({
         let request_seen_tx = Arc::clone(&request_seen_tx);
         Arc::new(move |event| {
-            if let AgentEvent::UserInputRequested { request } = event {
+            if let AgentEvent::HumanInteractionRequested { request } = event {
                 if let Some(tx) = request_seen_tx.lock().expect("event lock").take() {
+                    let request = request
+                        .to_user_input()
+                        .expect("human interaction should be ask_user");
                     let _ = tx.send(request);
                 }
             }
@@ -279,7 +294,7 @@ async fn abort_while_waiting_for_user_input_unblocks_run() {
         .await
         .expect("user input request should arrive")
         .expect("request sender should not drop");
-    assert_eq!(request.questions[0].id, "abort_unit");
+    assert_eq!(request.prompt.id(), "abort_unit");
 
     sleep(std::time::Duration::from_millis(10)).await;
     assert!(agent.abort().await, "abort should signal running prompt");

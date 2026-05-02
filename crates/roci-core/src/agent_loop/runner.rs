@@ -17,6 +17,7 @@ use crate::context::ContextBudget;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::{self, ProviderRegistry};
+use crate::tools::catalog::ToolVisibilityPolicy;
 use crate::tools::tool::Tool;
 use crate::types::{AgentToolCall, AgentToolResult, GenerationSettings, ModelMessage};
 
@@ -207,6 +208,8 @@ pub struct RunRequest {
     pub messages: Vec<ModelMessage>,
     pub settings: GenerationSettings,
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Policy deciding which tools are visible to provider/tool resolution.
+    pub tool_visibility_policy: ToolVisibilityPolicy,
     pub approval_policy: ApprovalPolicy,
     pub approval_handler: Option<ApprovalHandler>,
     pub metadata: HashMap<String, String>,
@@ -249,6 +252,13 @@ pub struct RunRequest {
     /// Optional callback for requesting user input from tools.
     #[cfg(feature = "agent")]
     pub user_input_callback: Option<crate::tools::user_input::RequestUserInputFn>,
+    /// Optional shared coordinator for tool permission prompts.
+    #[cfg(feature = "agent")]
+    pub human_interaction_coordinator:
+        Option<Arc<crate::human_interaction::HumanInteractionCoordinator>>,
+    /// Exact allow-for-session permission approvals.
+    #[cfg(feature = "agent")]
+    pub tool_permission_session_approvals: crate::human_interaction::ToolPermissionSessionApprovals,
 }
 
 impl RunRequest {
@@ -259,6 +269,7 @@ impl RunRequest {
             messages,
             settings: GenerationSettings::default(),
             tools: Vec::new(),
+            tool_visibility_policy: ToolVisibilityPolicy::default(),
             approval_policy: ApprovalPolicy::Ask,
             approval_handler: None,
             metadata: HashMap::new(),
@@ -283,11 +294,22 @@ impl RunRequest {
             prior_session_output_tokens: 0,
             #[cfg(feature = "agent")]
             user_input_callback: None,
+            #[cfg(feature = "agent")]
+            human_interaction_coordinator: None,
+            #[cfg(feature = "agent")]
+            tool_permission_session_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    pub fn with_tool_visibility_policy(mut self, policy: ToolVisibilityPolicy) -> Self {
+        self.tool_visibility_policy = policy;
         self
     }
 
@@ -401,6 +423,24 @@ impl RunRequest {
         cb: crate::tools::user_input::RequestUserInputFn,
     ) -> Self {
         self.user_input_callback = Some(cb);
+        self
+    }
+
+    #[cfg(feature = "agent")]
+    pub fn with_human_interaction_coordinator(
+        mut self,
+        coordinator: Arc<crate::human_interaction::HumanInteractionCoordinator>,
+    ) -> Self {
+        self.human_interaction_coordinator = Some(coordinator);
+        self
+    }
+
+    #[cfg(feature = "agent")]
+    pub fn with_tool_permission_session_approvals(
+        mut self,
+        approvals: crate::human_interaction::ToolPermissionSessionApprovals,
+    ) -> Self {
+        self.tool_permission_session_approvals = approvals;
         self
     }
 }

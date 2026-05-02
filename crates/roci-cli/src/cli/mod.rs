@@ -175,6 +175,18 @@ pub struct ChatArgs {
     #[arg(long)]
     pub no_skills: bool,
 
+    /// Disable all model-visible tools
+    #[arg(long)]
+    pub no_tools: bool,
+
+    /// Allow only this tool name. Repeatable.
+    #[arg(long = "tool", value_name = "NAME")]
+    pub tools: Vec<String>,
+
+    /// Exclude this tool name. Repeatable.
+    #[arg(long = "exclude-tool", value_name = "NAME")]
+    pub exclude_tools: Vec<String>,
+
     /// Max tokens
     #[arg(long)]
     pub max_tokens: Option<u32>,
@@ -311,6 +323,9 @@ mod tests {
                 assert!(args.skill_path.is_empty());
                 assert!(args.skill_root.is_empty());
                 assert!(!args.no_skills);
+                assert!(!args.no_tools);
+                assert!(args.tools.is_empty());
+                assert!(args.exclude_tools.is_empty());
                 assert!(args.max_tokens.is_none());
                 assert_eq!(args.approval, ChatApprovalArg::Ask);
                 assert!(args.mcp_stdio.is_empty());
@@ -460,6 +475,9 @@ mod tests {
                 assert!(args.skill_path.is_empty());
                 assert!(args.skill_root.is_empty());
                 assert!(!args.no_skills);
+                assert!(!args.no_tools);
+                assert!(args.tools.is_empty());
+                assert!(args.exclude_tools.is_empty());
                 assert_eq!(args.max_tokens, Some(1024));
                 assert_eq!(args.approval, ChatApprovalArg::Always);
                 assert!(args.mcp_stdio.is_empty());
@@ -481,6 +499,32 @@ mod tests {
                 assert!(args.skill_root.is_empty());
                 assert!(args.mcp_stdio.is_empty());
                 assert!(args.mcp_sse.is_empty());
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_tool_visibility_flags() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--no-tools",
+            "--tool",
+            "read_file",
+            "--tool",
+            "grep",
+            "--exclude-tool",
+            "shell",
+            "prompt",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                assert!(args.no_tools);
+                assert_eq!(args.tools, vec!["read_file", "grep"]);
+                assert_eq!(args.exclude_tools, vec!["shell"]);
+                assert_eq!(args.prompt.as_deref(), Some("prompt"));
             }
             other => panic!("expected Chat, got {other:?}"),
         }

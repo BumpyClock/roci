@@ -37,6 +37,17 @@ fn all_tools_contains_expected_names() {
 }
 
 #[test]
+fn tool_catalog_marks_all_tools_as_builtin() {
+    let catalog = tool_catalog();
+    let descriptors = catalog.descriptors();
+
+    assert_eq!(descriptors.len(), 6);
+    assert!(descriptors
+        .iter()
+        .all(|descriptor| descriptor.origin == roci::tools::ToolOrigin::Builtin));
+}
+
+#[test]
 fn builtins_declare_expected_approval_metadata() {
     assert_eq!(read_file_tool().approval(), ToolApproval::safe_read_only());
     assert_eq!(
@@ -520,7 +531,7 @@ fn each_tool_has_object_parameter_schema() {
 // ── ask_user ────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn ask_user_rejects_missing_questions() {
+async fn ask_user_rejects_missing_kind() {
     let tool = ask_user_tool();
     let result = tool
         .execute(&args(serde_json::json!({})), &default_ctx())
@@ -529,23 +540,20 @@ async fn ask_user_rejects_missing_questions() {
 }
 
 #[tokio::test]
-async fn ask_user_rejects_non_object_questions() {
+async fn ask_user_rejects_unsupported_kind() {
     let tool = ask_user_tool();
     let result = tool
-        .execute(
-            &args(serde_json::json!({"questions": [42]})),
-            &default_ctx(),
-        )
+        .execute(&args(serde_json::json!({"kind": "mode"})), &default_ctx())
         .await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
-async fn ask_user_rejects_missing_text() {
+async fn ask_user_rejects_missing_question() {
     let tool = ask_user_tool();
     let result = tool
         .execute(
-            &args(serde_json::json!({"questions": [{"id": "q1"}]})),
+            &args(serde_json::json!({"kind": "question", "id": "q1"})),
             &default_ctx(),
         )
         .await;
@@ -558,7 +566,7 @@ async fn ask_user_returns_error_without_callback() {
     let tool = ask_user_tool();
     let result = tool
         .execute(
-            &args(serde_json::json!({"questions": [{"id": "q1", "text": "Name?"}]})),
+            &args(serde_json::json!({"kind": "question", "id": "q1", "question": "Name?"})),
             &default_ctx(),
         )
         .await;
@@ -575,11 +583,9 @@ async fn ask_user_returns_response_with_callback() {
             Box::pin(async move {
                 Ok(roci::tools::UserInputResponse {
                     request_id: req.request_id,
-                    answers: vec![roci::tools::Answer {
-                        question_id: "q1".into(),
-                        content: "Alice".into(),
-                    }],
-                    canceled: false,
+                    result: roci::tools::UserInputResult::Question {
+                        answer: "Alice".into(),
+                    },
                 })
             })
         })),
@@ -587,12 +593,87 @@ async fn ask_user_returns_response_with_callback() {
     };
     let result = tool
         .execute(
-            &args(serde_json::json!({"questions": [{"id": "q1", "text": "Name?"}]})),
+            &args(serde_json::json!({"kind": "question", "id": "q1", "question": "Name?"})),
             &ctx,
         )
         .await
         .unwrap();
-    assert!(!result["canceled"].as_bool().unwrap());
+    assert_eq!(result["result"]["kind"], "question");
+    assert_eq!(result["result"]["answer"], "Alice");
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn ask_user_parses_all_semantic_prompt_kinds() {
+    use std::sync::Mutex;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let tool = ask_user_tool();
+    let ctx = ToolExecutionContext {
+        request_user_input: Some({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |req| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock().expect("seen lock").push(req.prompt.clone());
+                    Ok(roci::tools::UserInputResponse {
+                        request_id: req.request_id,
+                        result: roci::tools::UserInputResult::Canceled,
+                    })
+                })
+            })
+        }),
+        ..default_ctx()
+    };
+
+    let payloads = [
+        serde_json::json!({"kind": "question", "question": "Name?"}),
+        serde_json::json!({"kind": "confirm", "question": "Continue?", "default": true}),
+        serde_json::json!({
+            "kind": "choice",
+            "question": "Unit?",
+            "choices": [{"id": "c", "label": "Celsius"}]
+        }),
+        serde_json::json!({
+            "kind": "multi_choice",
+            "question": "Tools?",
+            "choices": [{"id": "fmt", "label": "Format"}],
+            "default": ["fmt"]
+        }),
+        serde_json::json!({
+            "kind": "form",
+            "title": "Profile",
+            "fields": [
+                {"id": "name", "label": "Name", "input_kind": "text", "required": true},
+                {
+                    "id": "unit",
+                    "label": "Unit",
+                    "input_kind": "choice",
+                    "choices": [{"id": "c", "label": "Celsius"}]
+                }
+            ]
+        }),
+    ];
+
+    for payload in payloads {
+        tool.execute(&args(payload), &ctx).await.unwrap();
+    }
+
+    let seen = seen.lock().expect("seen lock");
+    assert!(matches!(
+        seen[0],
+        roci::tools::AskUserPrompt::Question { .. }
+    ));
+    assert!(matches!(
+        seen[1],
+        roci::tools::AskUserPrompt::Confirm { .. }
+    ));
+    assert!(matches!(seen[2], roci::tools::AskUserPrompt::Choice { .. }));
+    assert!(matches!(
+        seen[3],
+        roci::tools::AskUserPrompt::MultiChoice { .. }
+    ));
+    assert!(matches!(seen[4], roci::tools::AskUserPrompt::Form { .. }));
 }
 
 #[cfg(feature = "agent")]
@@ -612,7 +693,7 @@ async fn ask_user_surfaces_interactive_prompt_unavailable_error() {
     };
     let result = tool
         .execute(
-            &args(serde_json::json!({"questions": [{"id": "q1", "text": "Name?"}]})),
+            &args(serde_json::json!({"kind": "question", "id": "q1", "question": "Name?"})),
             &ctx,
         )
         .await;

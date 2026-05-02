@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent_loop::{ApprovalDecision, ApprovalRequest, ToolUpdatePayload};
+use crate::human_interaction::{HumanInteractionRequest, HumanInteractionResponse};
 use crate::types::{AgentToolResult, GenerationSettings, ModelMessage};
 
 use super::store::AgentRuntimeEventStore;
@@ -248,6 +249,14 @@ pub enum ApprovalStatus {
     Canceled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanInteractionStatus {
+    Pending,
+    Resolved,
+    Canceled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalSnapshot {
     pub request: ApprovalRequest,
@@ -255,6 +264,18 @@ pub struct ApprovalSnapshot {
     pub turn_id: TurnId,
     pub status: ApprovalStatus,
     pub decision: Option<ApprovalDecision>,
+    pub requested_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HumanInteractionSnapshot {
+    pub request: HumanInteractionRequest,
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub status: HumanInteractionStatus,
+    pub response: Option<HumanInteractionResponse>,
+    pub error: Option<String>,
     pub requested_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
 }
@@ -332,6 +353,7 @@ pub struct ThreadSnapshot {
     pub messages: Vec<MessageSnapshot>,
     pub tools: Vec<ToolExecutionSnapshot>,
     pub approvals: Vec<ApprovalSnapshot>,
+    pub human_interactions: Vec<HumanInteractionSnapshot>,
     pub reasoning: Vec<ReasoningSnapshot>,
     pub plans: Vec<PlanSnapshot>,
     pub diffs: Vec<DiffSnapshot>,

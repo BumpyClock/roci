@@ -4,12 +4,16 @@ use chrono::Utc;
 
 use super::{
     AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, ApprovalSnapshot,
-    ApprovalStatus, ChatRuntimeConfig, DiffSnapshot, MessageId, MessageSnapshot, MessageStatus,
-    PlanSnapshot, ReasoningSnapshot, RuntimeCursor, RuntimeSnapshot, ThreadId, ThreadSnapshot,
+    ApprovalStatus, ChatRuntimeConfig, DiffSnapshot, HumanInteractionSnapshot,
+    HumanInteractionStatus, MessageId, MessageSnapshot, MessageStatus, PlanSnapshot,
+    ReasoningSnapshot, RuntimeCursor, RuntimeSnapshot, ThreadId, ThreadSnapshot,
     ToolExecutionSnapshot, ToolStatus, TurnId, TurnSnapshot, TurnStatus,
     AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
 };
 use crate::agent_loop::{ApprovalDecision, ApprovalRequest, ToolUpdatePayload};
+use crate::human_interaction::{
+    HumanInteractionRequest, HumanInteractionRequestId, HumanInteractionResponse,
+};
 use crate::types::{AgentToolResult, ModelMessage};
 
 pub type ModelMessages = Vec<ModelMessage>;
@@ -48,6 +52,7 @@ impl ThreadState {
                 messages: Vec::new(),
                 tools: Vec::new(),
                 approvals: Vec::new(),
+                human_interactions: Vec::new(),
                 reasoning: Vec::new(),
                 plans: Vec::new(),
                 diffs: Vec::new(),
@@ -105,6 +110,7 @@ impl ThreadState {
         self.snapshot.messages.clear();
         self.snapshot.tools.clear();
         self.snapshot.approvals.clear();
+        self.snapshot.human_interactions.clear();
         self.snapshot.reasoning.clear();
         self.snapshot.plans.clear();
         self.snapshot.diffs.clear();
@@ -570,6 +576,114 @@ impl ThreadState {
         Ok(events)
     }
 
+    fn request_human_interaction(
+        &mut self,
+        turn_id: TurnId,
+        request: HumanInteractionRequest,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        if self.snapshot.human_interactions.iter().any(|interaction| {
+            interaction.turn_id == turn_id && interaction.request.request_id == request.request_id
+        }) {
+            return Err(AgentRuntimeError::ProjectionFailed {
+                message: format!(
+                    "human interaction already requested: {}",
+                    request.request_id
+                ),
+            });
+        }
+
+        self.snapshot
+            .human_interactions
+            .push(HumanInteractionSnapshot {
+                request: request.clone(),
+                thread_id: self.thread_id(),
+                turn_id,
+                status: HumanInteractionStatus::Pending,
+                response: None,
+                error: None,
+                requested_at: Utc::now(),
+                resolved_at: None,
+            });
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::HumanInteractionRequested {
+                interaction: self
+                    .human_interaction_snapshot(turn_id, request.request_id)
+                    .expect("human interaction was inserted"),
+            },
+        ))
+    }
+
+    fn resolve_human_interaction(
+        &mut self,
+        turn_id: TurnId,
+        response: HumanInteractionResponse,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        let request_id = response.request_id;
+        let interaction = self.human_interaction_mut_or_err(turn_id, request_id)?;
+        interaction.status = HumanInteractionStatus::Resolved;
+        interaction.response = Some(response);
+        interaction.error = None;
+        interaction.resolved_at = Some(Utc::now());
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::HumanInteractionResolved {
+                interaction: self
+                    .human_interaction_snapshot(turn_id, request_id)
+                    .expect("human interaction was resolved"),
+            },
+        ))
+    }
+
+    fn cancel_human_interaction(
+        &mut self,
+        turn_id: TurnId,
+        request_id: HumanInteractionRequestId,
+        reason: Option<String>,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        let interaction = self.human_interaction_mut_or_err(turn_id, request_id)?;
+        interaction.status = HumanInteractionStatus::Canceled;
+        interaction.error = reason;
+        interaction.resolved_at = Some(Utc::now());
+
+        Ok(self.event(
+            Some(turn_id),
+            AgentRuntimeEventPayload::HumanInteractionCanceled {
+                interaction: self
+                    .human_interaction_snapshot(turn_id, request_id)
+                    .expect("human interaction was canceled"),
+            },
+        ))
+    }
+
+    fn cancel_pending_human_interactions(
+        &mut self,
+        turn_id: TurnId,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        let request_ids = self
+            .snapshot
+            .human_interactions
+            .iter()
+            .filter(|interaction| {
+                interaction.turn_id == turn_id
+                    && interaction.status == HumanInteractionStatus::Pending
+            })
+            .map(|interaction| interaction.request.request_id)
+            .collect::<Vec<_>>();
+
+        let mut events = Vec::with_capacity(request_ids.len());
+        for request_id in request_ids {
+            events.push(self.cancel_human_interaction(turn_id, request_id, None)?);
+        }
+        Ok(events)
+    }
+
     fn update_reasoning(
         &mut self,
         turn_id: TurnId,
@@ -881,6 +995,36 @@ impl ThreadState {
             })
     }
 
+    fn human_interaction_snapshot(
+        &self,
+        turn_id: TurnId,
+        request_id: HumanInteractionRequestId,
+    ) -> Option<HumanInteractionSnapshot> {
+        self.snapshot
+            .human_interactions
+            .iter()
+            .find(|interaction| {
+                interaction.turn_id == turn_id && interaction.request.request_id == request_id
+            })
+            .cloned()
+    }
+
+    fn human_interaction_mut_or_err(
+        &mut self,
+        turn_id: TurnId,
+        request_id: HumanInteractionRequestId,
+    ) -> Result<&mut HumanInteractionSnapshot, AgentRuntimeError> {
+        self.snapshot
+            .human_interactions
+            .iter_mut()
+            .find(|interaction| {
+                interaction.turn_id == turn_id && interaction.request.request_id == request_id
+            })
+            .ok_or_else(|| AgentRuntimeError::ProjectionFailed {
+                message: format!("human interaction not found: {request_id}"),
+            })
+    }
+
     fn cancel_pending_approval_snapshots(&mut self, turn_id: TurnId) {
         let resolved_at = Utc::now();
         for approval in self.snapshot.approvals.iter_mut().filter(|approval| {
@@ -1136,6 +1280,42 @@ impl ChatProjector {
     ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
         self.thread_mut(turn_id.thread_id())?
             .cancel_pending_approvals(turn_id)
+    }
+
+    pub fn request_human_interaction(
+        &mut self,
+        turn_id: TurnId,
+        request: HumanInteractionRequest,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .request_human_interaction(turn_id, request)
+    }
+
+    pub fn resolve_human_interaction(
+        &mut self,
+        turn_id: TurnId,
+        response: HumanInteractionResponse,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .resolve_human_interaction(turn_id, response)
+    }
+
+    pub fn cancel_human_interaction(
+        &mut self,
+        turn_id: TurnId,
+        request_id: HumanInteractionRequestId,
+        reason: Option<String>,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .cancel_human_interaction(turn_id, request_id, reason)
+    }
+
+    pub fn cancel_pending_human_interactions(
+        &mut self,
+        turn_id: TurnId,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .cancel_pending_human_interactions(turn_id)
     }
 
     pub fn update_reasoning(

@@ -47,6 +47,7 @@ async fn main() {
         model,
         system_prompt: Some("You are a helpful assistant.".into()),
         tools: Vec::new(),
+        tool_visibility_policy: Default::default(),
         dynamic_tool_providers: Vec::new(),
         settings: GenerationSettings::default(),
         transform_context: None,
@@ -74,7 +75,7 @@ async fn main() {
         user_input_timeout_ms: None,
         context_budget: None,
         chat: Default::default(),
-        user_input_coordinator: None,
+        human_interaction_coordinator: None,
     };
 
     // -- 5. Supervisor config

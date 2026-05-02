@@ -1,12 +1,14 @@
 use async_trait::async_trait;
-use rmcp::model::{ClientInfo, ClientJsonRpcMessage, ServerJsonRpcMessage};
+use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::service::{ClientInitializeError, ServiceExt};
 use rmcp::transport::TokioChildProcess;
 use tokio::process::Command;
 
 use super::common::{DynRoleClientTransport, ErasedRoleClientTransport};
-use super::{MCPRunningService, MCPTransport};
 use crate::error::RociError;
+use crate::mcp::elicitation::MCPClientHandler;
+
+use super::{MCPRunningService, MCPTransport};
 
 /// Stdio-based MCP transport (for local MCP servers).
 pub struct StdioTransport {
@@ -67,7 +69,7 @@ impl StdioTransport {
 impl MCPTransport for StdioTransport {
     async fn connect(
         &mut self,
-        client_info: ClientInfo,
+        client_handler: MCPClientHandler,
     ) -> Result<MCPRunningService, ClientInitializeError> {
         if self.closed {
             return Err(ClientInitializeError::ConnectionClosed(
@@ -81,7 +83,7 @@ impl MCPTransport for StdioTransport {
             ClientInitializeError::transport::<TokioChildProcess>(error, "spawn stdio transport")
         })?;
 
-        client_info.into_dyn().serve(transport).await
+        client_handler.into_dyn().serve(transport).await
     }
 
     async fn send(&mut self, message: serde_json::Value) -> Result<(), RociError> {

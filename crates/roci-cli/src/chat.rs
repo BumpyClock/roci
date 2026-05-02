@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use roci::agent::{AgentConfig, AgentRuntime, QueueDrainMode, UserInputCoordinator};
+use roci::agent::{AgentConfig, AgentRuntime, HumanInteractionCoordinator, QueueDrainMode};
 use roci::agent_loop::{ApprovalPolicy, PreToolUseHookResult, RunStatus};
 use roci::config::RociConfig;
 use roci::mcp::{merge_mcp_instructions, MCPInstructionMergePolicy};
 use roci::resource::SkillResourceOptions;
 use roci::skills::merge_system_prompt_with_skills;
+use roci::tools::ToolVisibilityPolicy;
 
 use crate::cli::{ChatApprovalArg, ChatArgs};
 
@@ -29,6 +30,9 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         skill_path,
         skill_root,
         no_skills,
+        no_tools,
+        tools: allowed_tools,
+        exclude_tools,
         max_tokens,
         approval,
         mcp_stdio,
@@ -85,12 +89,17 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         settings.max_tokens = Some(max);
     }
 
-    let coordinator = Arc::new(UserInputCoordinator::new());
+    let coordinator = Arc::new(HumanInteractionCoordinator::new());
     let mut renderer = RuntimeEventRenderer::spawn(coordinator.clone());
     let approval_policy = approval_policy_from_arg(approval);
     let approval_handler =
         (approval == ChatApprovalArg::Ask).then(|| renderer.build_approval_handler());
-    let tools = roci_tools::builtin::all_tools();
+    let tool_visibility_policy = tool_visibility_policy_from_args(
+        no_tools,
+        allowed_tools.iter().map(String::as_str),
+        exclude_tools.iter().map(String::as_str),
+    );
+    let tools = roci_tools::builtin::tool_catalog().resolve(&tool_visibility_policy);
     let agent = Arc::new(AgentRuntime::new(
         registry,
         config,
@@ -98,6 +107,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             model,
             system_prompt,
             tools,
+            tool_visibility_policy,
             dynamic_tool_providers: mcp_runtime.dynamic_tool_providers,
             settings,
             transform_context: None,
@@ -131,7 +141,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             user_input_timeout_ms: None,
             context_budget: None,
             chat: Default::default(),
-            user_input_coordinator: Some(coordinator.clone()),
+            human_interaction_coordinator: Some(coordinator.clone()),
         },
     ));
 
@@ -166,6 +176,18 @@ fn approval_policy_from_arg(arg: ChatApprovalArg) -> ApprovalPolicy {
         ChatApprovalArg::Always => ApprovalPolicy::Always,
         ChatApprovalArg::Never => ApprovalPolicy::Never,
     }
+}
+
+fn tool_visibility_policy_from_args<'a>(
+    no_tools: bool,
+    allowed_tools: impl IntoIterator<Item = &'a str>,
+    excluded_tools: impl IntoIterator<Item = &'a str>,
+) -> ToolVisibilityPolicy {
+    let mut policy = ToolVisibilityPolicy::default();
+    policy.set_no_tools(no_tools);
+    policy.extend_allow(allowed_tools);
+    policy.extend_exclude(excluded_tools);
+    policy
 }
 
 #[cfg(test)]

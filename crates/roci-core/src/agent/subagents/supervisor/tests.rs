@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::agent::runtime::AgentConfig;
 use crate::agent::runtime::AgentRuntime;
 #[cfg(feature = "agent")]
-use crate::agent::runtime::UserInputCoordinator;
+use crate::agent::runtime::HumanInteractionCoordinator;
 use crate::agent::subagents::context::materialize_context;
 use crate::agent::subagents::launcher::LaunchedChild;
 use crate::agent::subagents::launcher::SubagentLauncher;
@@ -106,6 +106,7 @@ fn make_base_config() -> AgentConfig {
         model: make_test_model(),
         system_prompt: None,
         tools: Vec::new(),
+        tool_visibility_policy: Default::default(),
         dynamic_tool_providers: Vec::new(),
         settings: GenerationSettings::default(),
         transform_context: None,
@@ -132,7 +133,7 @@ fn make_base_config() -> AgentConfig {
         post_tool_use: None,
         user_input_timeout_ms: None,
         #[cfg(feature = "agent")]
-        user_input_coordinator: None,
+        human_interaction_coordinator: None,
         context_budget: None,
         chat: Default::default(),
     }
@@ -223,9 +224,9 @@ fn make_supervisor_with_mock_config(
 
     #[cfg(feature = "agent")]
     let coordinator = base_config
-        .user_input_coordinator
+        .human_interaction_coordinator
         .clone()
-        .unwrap_or_else(|| Arc::new(UserInputCoordinator::new()));
+        .unwrap_or_else(|| Arc::new(HumanInteractionCoordinator::new()));
 
     let (event_tx, _) = broadcast::channel(256);
     let semaphore = Arc::new(Semaphore::new(sup_config.max_concurrent));
@@ -516,7 +517,7 @@ async fn system_prompt_appears_exactly_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Backward-compat: spawn() delegates to spawn_with_context
+// spawn() delegates to spawn_with_context with default context.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -526,7 +527,7 @@ async fn spawn_without_context_uses_default() {
         profile: "test:dev".into(),
         label: None,
         input: SubagentInput::Prompt {
-            task: "test backward compat".into(),
+            task: "test default context".into(),
         },
         overrides: Default::default(),
     };
@@ -537,7 +538,7 @@ async fn spawn_without_context_uses_default() {
 
     let msgs = captured.lock().await;
     assert_eq!(msgs.len(), 2);
-    assert_eq!(msgs[1].text(), "test backward compat");
+    assert_eq!(msgs[1].text(), "test default context");
 
     handle.abort().await;
 }
@@ -712,15 +713,16 @@ impl ModelProvider for BlockingStreamProvider {
 #[cfg(feature = "agent")]
 #[tokio::test]
 async fn submit_user_input_delegates_to_coordinator() {
-    use crate::tools::UserInputResponse;
+    use crate::tools::{UserInputResponse, UserInputResult};
 
     let supervisor = make_supervisor();
 
     // Unknown request should error
     let response = UserInputResponse {
         request_id: uuid::Uuid::nil(),
-        answers: vec![],
-        canceled: false,
+        result: UserInputResult::Question {
+            answer: "C".to_string(),
+        },
     };
     let result = supervisor.submit_user_input(response).await;
     assert!(result.is_err());

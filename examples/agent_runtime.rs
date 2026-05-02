@@ -70,6 +70,7 @@ async fn main() {
         model,
         system_prompt: Some("You are a helpful assistant with access to an echo tool.".into()),
         tools: vec![echo_tool],
+        tool_visibility_policy: Default::default(),
         dynamic_tool_providers: Vec::new(),
         settings: GenerationSettings::default(),
         transform_context: None,
@@ -97,7 +98,7 @@ async fn main() {
         user_input_timeout_ms: None,
         context_budget: None,
         chat: Default::default(),
-        user_input_coordinator: None,
+        human_interaction_coordinator: None,
     };
 
     let roci_config = RociConfig::new();

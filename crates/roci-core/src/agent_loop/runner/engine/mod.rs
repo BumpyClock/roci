@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{self, ToolDefinition};
+use crate::tools::{ToolCatalog, ToolOrigin};
 use crate::types::{ModelMessage, Usage};
 
 use super::control::{
@@ -60,7 +61,9 @@ fn failed_result(
 
 #[async_trait]
 impl Runner for LoopRunner {
-    async fn start(&self, request: RunRequest) -> Result<RunHandle, crate::error::RociError> {
+    async fn start(&self, mut request: RunRequest) -> Result<RunHandle, crate::error::RociError> {
+        request.tools = ToolCatalog::from_tools(request.tools, ToolOrigin::Custom)
+            .resolve(&request.tool_visibility_policy);
         let (handle, mut abort_rx, result_tx, mut input_rx) = RunHandle::new(request.run_id);
         let config = self.config.clone();
         let provider_factory = self.provider_factory.clone();

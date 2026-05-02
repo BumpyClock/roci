@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use rmcp::model::{ClientInfo, ClientJsonRpcMessage, ServerJsonRpcMessage};
+use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::service::{ClientInitializeError, ServiceExt};
 use rmcp::transport::{
     common::client_side_sse::ExponentialBackoff,
@@ -9,8 +9,10 @@ use rmcp::transport::{
 };
 
 use super::common::{DynRoleClientTransport, ErasedRoleClientTransport};
-use super::{MCPRunningService, MCPTransport};
 use crate::error::RociError;
+use crate::mcp::elicitation::MCPClientHandler;
+
+use super::{MCPRunningService, MCPTransport};
 
 /// SSE-based MCP transport (for remote MCP servers).
 pub struct SSETransport {
@@ -202,7 +204,7 @@ impl SSETransport {
 impl MCPTransport for SSETransport {
     async fn connect(
         &mut self,
-        client_info: ClientInfo,
+        client_handler: MCPClientHandler,
     ) -> Result<MCPRunningService, ClientInitializeError> {
         if self.closed {
             return Err(ClientInitializeError::ConnectionClosed(
@@ -214,7 +216,7 @@ impl MCPTransport for SSETransport {
             .build_rmcp_config()
             .map_err(|error| ClientInitializeError::ConnectionClosed(error.to_string()))?;
         let transport = StreamableHttpClientTransport::from_config(config);
-        client_info.into_dyn().serve(transport).await
+        client_handler.into_dyn().serve(transport).await
     }
 
     async fn send(&mut self, message: serde_json::Value) -> Result<(), RociError> {

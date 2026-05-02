@@ -112,7 +112,7 @@ async fn submit_user_input_unknown_request_returns_error() {
     use crate::agent::subagents::profiles::SubagentProfileRegistry;
     use crate::agent::subagents::supervisor::SubagentSupervisor;
     use crate::agent::subagents::types::SubagentSupervisorConfig;
-    use crate::tools::UserInputResponse;
+    use crate::tools::{UserInputResponse, UserInputResult};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -129,6 +129,7 @@ async fn submit_user_input_unknown_request_returns_error() {
         model,
         system_prompt: None,
         tools: Vec::new(),
+        tool_visibility_policy: Default::default(),
         dynamic_tool_providers: Vec::new(),
         settings: crate::types::GenerationSettings::default(),
         transform_context: None,
@@ -154,7 +155,7 @@ async fn submit_user_input_unknown_request_returns_error() {
         pre_tool_use: None,
         post_tool_use: None,
         user_input_timeout_ms: None,
-        user_input_coordinator: None,
+        human_interaction_coordinator: None,
         context_budget: None,
         chat: Default::default(),
     };
@@ -169,8 +170,9 @@ async fn submit_user_input_unknown_request_returns_error() {
 
     let response = UserInputResponse {
         request_id: Uuid::nil(),
-        answers: vec![],
-        canceled: false,
+        result: UserInputResult::Question {
+            answer: "C".to_string(),
+        },
     };
     let result = supervisor.submit_user_input(response).await;
     assert!(result.is_err());

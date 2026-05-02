@@ -28,11 +28,9 @@ mod run_loop;
 mod state;
 mod summary;
 mod types;
-#[cfg(feature = "agent")]
-mod user_input;
 
 #[cfg(feature = "agent")]
-pub use self::user_input::UserInputCoordinator;
+pub use crate::human_interaction::HumanInteractionCoordinator;
 
 pub use self::chat::*;
 pub use self::config::AgentConfig;
@@ -125,7 +123,9 @@ pub struct AgentRuntime {
     /// Persistent session usage ledger. Accumulates across runs, cleared on reset.
     session_usage: Arc<Mutex<Usage>>,
     #[cfg(feature = "agent")]
-    user_input_coordinator: Arc<UserInputCoordinator>,
+    human_interaction_coordinator: Arc<HumanInteractionCoordinator>,
+    #[cfg(feature = "agent")]
+    tool_permission_session_approvals: crate::human_interaction::ToolPermissionSessionApprovals,
 }
 
 #[derive(Debug)]
@@ -181,10 +181,13 @@ impl AgentRuntime {
         };
         let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
         #[cfg(feature = "agent")]
-        let user_input_coordinator = config
-            .user_input_coordinator
+        let human_interaction_coordinator = config
+            .human_interaction_coordinator
             .clone()
-            .unwrap_or_else(|| Arc::new(UserInputCoordinator::new()));
+            .unwrap_or_else(|| Arc::new(HumanInteractionCoordinator::new()));
+        #[cfg(feature = "agent")]
+        let tool_permission_session_approvals =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         Self {
             config,
             runner,
@@ -220,20 +223,36 @@ impl AgentRuntime {
             runtime_event_publish_rx: Arc::new(Mutex::new(Some(runtime_event_publish_rx))),
             session_usage: Arc::new(Mutex::new(Usage::default())),
             #[cfg(feature = "agent")]
-            user_input_coordinator,
+            human_interaction_coordinator,
+            #[cfg(feature = "agent")]
+            tool_permission_session_approvals,
         }
     }
 
     /// Submit a user input response.
     ///
-    /// This is called by the CLI/host when a user responds to a `UserInputRequested` event.
+    /// This is called by the CLI/host when a user responds to a human interaction event.
     /// The response will be routed to the waiting tool execution.
     #[cfg(feature = "agent")]
     pub async fn submit_user_input(
         &self,
         response: crate::tools::UserInputResponse,
     ) -> Result<(), crate::tools::UnknownUserInputRequest> {
-        self.user_input_coordinator.submit_response(response).await
+        self.human_interaction_coordinator
+            .submit_user_input_response(response)
+            .await
+    }
+
+    /// Submit a tool permission decision.
+    #[cfg(feature = "agent")]
+    pub async fn submit_tool_permission(
+        &self,
+        request_id: crate::human_interaction::HumanInteractionRequestId,
+        decision: crate::human_interaction::ToolPermissionDecision,
+    ) -> Result<(), crate::human_interaction::UnknownHumanInteractionRequest> {
+        self.human_interaction_coordinator
+            .submit_tool_permission_response(request_id, decision)
+            .await
     }
 }
 

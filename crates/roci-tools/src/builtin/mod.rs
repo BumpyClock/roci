@@ -15,6 +15,7 @@
 //! ```
 
 mod ask_user;
+mod catalog;
 mod common;
 mod grep;
 mod list_directory;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use roci::tools::tool::Tool;
 
 pub use self::ask_user::ask_user_tool;
+pub use self::catalog::tool_catalog;
 pub use self::grep::grep_tool;
 pub use self::list_directory::list_directory_tool;
 pub use self::read_file::read_file_tool;
@@ -38,12 +40,5 @@ pub use self::write_file::write_file_tool;
 
 /// Return all built-in coding tools.
 pub fn all_tools() -> Vec<Arc<dyn Tool>> {
-    vec![
-        shell_tool(),
-        read_file_tool(),
-        write_file_tool(),
-        list_directory_tool(),
-        grep_tool(),
-        ask_user_tool(),
-    ]
+    tool_catalog().resolve(&Default::default())
 }

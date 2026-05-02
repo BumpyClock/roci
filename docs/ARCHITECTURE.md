@@ -141,6 +141,11 @@ Pure library crate. No provider implementations, no `clap`, no terminal I/O.
   - `pre_tool_use` supports continue/block/rewrite-args before tool execution
   - `post_tool_use` can transform tool results (including synthetic error results)
   - legacy `tool_result_persist` has been replaced by `post_tool_use`
+- Tool catalog and visibility policy live in `roci-core::tools`:
+  - `ToolCatalog` deduplicates tools by name with deterministic first-wins behavior.
+  - `ToolVisibilityPolicy` supports hiding all tools, allow-only names, and excluded names after static + dynamic tool discovery and before provider tool definitions are built.
+  - Policy precedence is `no_tools` first, then exclusions, then allow-only.
+  - Built-in tools expose catalog metadata from `roci-tools`; CLI chat maps `--no-tools`, `--tool`, and `--exclude-tool` onto the same policy.
 - Core run lifecycle hooks are surfaced through `AgentConfig`:
   - `before_agent_start` supports continue/cancel/replace-initial-messages before runner startup
   - `transform_context` runs before `convert_to_llm`, with typed payload and continue/cancel/replace semantics
@@ -220,15 +225,15 @@ Standalone crate for agent coding tools. Import path: `roci_tools::builtin`.
 
 #### `ask_user` Tool
 
-The `ask_user` tool enables blocking user input from the agent:
+The `ask_user` tool maps model-visible questions onto the runtime human interaction lifecycle:
 
 - **Purpose**: Request clarification or input from the user during tool execution
-- **Behavior**: Emits `AgentEvent::UserInputRequested`, blocks until response submitted
+- **Behavior**: Emits `AgentEvent::HumanInteractionRequested`, blocks until response submitted
 - **Schema**: `questions` (required array), `timeout_ms` (optional number)
-- **Response**: Routed via `AgentRuntime::submit_user_input()`
+- **Response**: Routed by `HumanInteractionCoordinator` via `request_id`
 - **Error cases**: Missing callback, timeout, cancellation, or non-interactive CLI host → deterministic typed errors
 
-See `docs/architecture/ask-user-v1-peer-bus-seam.md` for full architecture details.
+`ask_user` is one `HumanInteractionPayload`; the same foundation also covers host UI elicitation and tool permission prompts.
 
 ## Sub-Agent Supervisor
 
@@ -242,7 +247,7 @@ with its own model, tools, and conversation state.
 
 The supervisor pattern was chosen over a generic peer message bus because:
 
-- roci already had a working `ask_user` path (`UserInputCoordinator` + `AgentEvent::UserInputRequested`). A bus rewrite would have disrupted it without a second real inter-agent message type to justify the abstraction.
+- roci has a working human interaction path (`HumanInteractionCoordinator` + `AgentEvent::HumanInteractionRequested`). A bus rewrite would disrupt it without a second real inter-agent message type to justify the abstraction.
 - The supervisor keeps parent-to-child lifecycle and event routing in one place, making it easier to reason about concurrency and cleanup.
 - Seams for a future peer bus are preserved (stable child identity, event wrapper, launcher abstraction) without paying for the bus now.
 
@@ -287,16 +292,16 @@ Child `AgentEvent`s are wrapped in `SubagentEvent::AgentEvent { subagent_id, lab
 
 Parent subscribes via `supervisor.subscribe()`. Handle provides `watch_snapshot()` for per-child progress observation.
 
-### ask_user reuse
+### Human interaction reuse
 
-The supervisor shares a `UserInputCoordinator` (from `AgentConfig` or a fresh one) with all children. When a child calls `ask_user`:
+The supervisor shares a `HumanInteractionCoordinator` (from `AgentConfig` or a fresh one) with all children. When a child requests human input:
 
-1. Child runtime emits `AgentEvent::UserInputRequested { request }`
+1. Child runtime emits `AgentEvent::HumanInteractionRequested { request }`
 2. Supervisor forwards as `SubagentEvent::AgentEvent { subagent_id, ... }`
 3. Parent host renders the question and calls `supervisor.submit_user_input(response)`
 4. Coordinator routes the response by `request_id` to the correct child
 
-No generic bus required -- `request_id` correlation handles multi-child routing.
+No generic bus required -- `request_id` correlation handles multi-child routing. Current `ask_user` requests use the `AskUser` payload inside the human interaction envelope.
 
 ### Orchestration
 

@@ -155,6 +155,22 @@ fn project_agent_event(
             };
             events.push(event);
         }
+        AgentEvent::HumanInteractionRequested { request } => {
+            events.extend(ensure_turn_started(projector, run_state, turn_id)?);
+            events.push(projector.request_human_interaction(turn_id, request.clone())?);
+        }
+        AgentEvent::HumanInteractionResolved { response } => {
+            events.extend(ensure_turn_started(projector, run_state, turn_id)?);
+            events.push(projector.resolve_human_interaction(turn_id, response.clone())?);
+        }
+        AgentEvent::HumanInteractionCanceled { request_id, reason } => {
+            events.extend(ensure_turn_started(projector, run_state, turn_id)?);
+            events.push(projector.cancel_human_interaction(
+                turn_id,
+                *request_id,
+                reason.clone(),
+            )?);
+        }
         AgentEvent::Reasoning { text } => {
             events.extend(ensure_turn_started(projector, run_state, turn_id)?);
             events.push(projector.update_reasoning(
@@ -177,7 +193,6 @@ fn project_agent_event(
         AgentEvent::AgentStart { .. }
         | AgentEvent::AgentEnd { .. }
         | AgentEvent::TurnEnd { .. }
-        | AgentEvent::UserInputRequested { .. }
         | AgentEvent::Error { .. }
         | AgentEvent::System { .. } => {}
     }

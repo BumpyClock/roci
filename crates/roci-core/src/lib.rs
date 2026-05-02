@@ -11,6 +11,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod generation;
+pub mod human_interaction;
 pub mod models;
 pub mod prelude;
 pub mod provider;

@@ -4,13 +4,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 
+use chrono::Utc;
 use roci::agent::{
-    AgentRuntime, AgentRuntimeError, AgentRuntimeEventPayload, MessageId, MessageSnapshot,
-    RuntimeCursor, RuntimeSnapshot, RuntimeSubscription, ToolExecutionSnapshot,
-    UserInputCoordinator,
+    AgentRuntime, AgentRuntimeError, AgentRuntimeEventPayload, HumanInteractionCoordinator,
+    MessageId, MessageSnapshot, RuntimeCursor, RuntimeSnapshot, RuntimeSubscription,
+    ToolExecutionSnapshot,
 };
 use roci::agent_loop::{AgentEvent, ApprovalDecision, ApprovalHandler, ApprovalRequest};
-use roci::tools::UserInputRequest;
+use roci::human_interaction::{
+    HumanInteractionPayload, HumanInteractionRequest, HumanInteractionResponse,
+    HumanInteractionResponsePayload, ToolPermissionDecision, UiElicitationField,
+    UiElicitationResponse,
+};
 use roci::types::{ContentPart, Role};
 use tokio::task::JoinHandle as TaskJoinHandle;
 
@@ -21,7 +26,7 @@ type ApprovalPromptFn = Arc<dyn Fn(ApprovalRequest) -> ApprovalDecision + Send +
 
 enum TerminalCommand {
     RuntimeEvent(Box<AgentRuntimeEventPayload>),
-    UserInputRequest(UserInputRequest),
+    HumanInteractionRequest(Box<HumanInteractionRequest>),
     ApprovalRequest {
         request: ApprovalRequest,
         response_tx: tokio::sync::oneshot::Sender<ApprovalDecision>,
@@ -39,7 +44,7 @@ pub(crate) struct RuntimeEventRenderer {
 }
 
 impl RuntimeEventRenderer {
-    pub(crate) fn spawn(coordinator: Arc<UserInputCoordinator>) -> Self {
+    pub(crate) fn spawn(coordinator: Arc<HumanInteractionCoordinator>) -> Self {
         Self::spawn_with_prompt_fns(
             coordinator,
             default_prompt_fn(),
@@ -49,7 +54,7 @@ impl RuntimeEventRenderer {
 
     #[cfg(test)]
     pub(crate) fn spawn_with_prompt_fn(
-        coordinator: Arc<UserInputCoordinator>,
+        coordinator: Arc<HumanInteractionCoordinator>,
         prompt_fn: PromptFn,
     ) -> Self {
         Self::spawn_with_prompt_fns(coordinator, prompt_fn, default_approval_prompt_fn())
@@ -57,7 +62,7 @@ impl RuntimeEventRenderer {
 
     #[cfg(test)]
     pub(crate) fn spawn_with_prompt_fns(
-        coordinator: Arc<UserInputCoordinator>,
+        coordinator: Arc<HumanInteractionCoordinator>,
         prompt_fn: PromptFn,
         approval_prompt_fn: ApprovalPromptFn,
     ) -> Self {
@@ -86,7 +91,7 @@ impl RuntimeEventRenderer {
 
     #[cfg(not(test))]
     fn spawn_with_prompt_fns(
-        coordinator: Arc<UserInputCoordinator>,
+        coordinator: Arc<HumanInteractionCoordinator>,
         prompt_fn: PromptFn,
         approval_prompt_fn: ApprovalPromptFn,
     ) -> Self {
@@ -116,8 +121,9 @@ impl RuntimeEventRenderer {
     pub(crate) fn build_agent_sink(&self) -> Arc<dyn Fn(AgentEvent) + Send + Sync> {
         let command_tx = self.command_tx.clone();
         Arc::new(move |event: AgentEvent| {
-            if let AgentEvent::UserInputRequested { request } = event {
-                let _ = command_tx.send(TerminalCommand::UserInputRequest(request));
+            if let AgentEvent::HumanInteractionRequested { request } = event {
+                let _ =
+                    command_tx.send(TerminalCommand::HumanInteractionRequest(Box::new(request)));
             }
         })
     }
@@ -256,7 +262,7 @@ fn latest_snapshot_cursor(snapshot: &RuntimeSnapshot) -> Option<RuntimeCursor> {
 
 fn drive_terminal(
     command_rx: mpsc::Receiver<TerminalCommand>,
-    coordinator: Arc<UserInputCoordinator>,
+    coordinator: Arc<HumanInteractionCoordinator>,
     prompt_fn: PromptFn,
     approval_prompt_fn: ApprovalPromptFn,
     handle: tokio::runtime::Handle,
@@ -271,11 +277,12 @@ fn drive_terminal(
                     break;
                 }
             }
-            TerminalCommand::UserInputRequest(request) => {
-                handle_prompt_request(
-                    request,
+            TerminalCommand::HumanInteractionRequest(request) => {
+                handle_human_interaction_request(
+                    *request,
                     coordinator.clone(),
                     prompt_fn.clone(),
+                    approval_prompt_fn.clone(),
                     handle.clone(),
                     shutdown.clone(),
                 );
@@ -303,6 +310,45 @@ fn drive_terminal(
 
 fn default_approval_prompt_fn() -> ApprovalPromptFn {
     Arc::new(prompt_for_approval)
+}
+
+fn handle_human_interaction_request(
+    request: HumanInteractionRequest,
+    coordinator: Arc<HumanInteractionCoordinator>,
+    prompt_fn: PromptFn,
+    approval_prompt_fn: ApprovalPromptFn,
+    handle: tokio::runtime::Handle,
+    shutdown: Arc<AtomicBool>,
+) {
+    match &request.payload {
+        HumanInteractionPayload::AskUser(_) => {
+            if let Some(request) = request.to_user_input() {
+                handle_prompt_request(request, coordinator, prompt_fn, handle, shutdown);
+            }
+        }
+        HumanInteractionPayload::UiElicitation(payload) => {
+            let response = if shutdown.load(Ordering::Relaxed) {
+                UiElicitationResponse::Cancel
+            } else {
+                prompt_for_ui_elicitation(payload)
+            };
+            let _ = handle.block_on(coordinator.submit_response(HumanInteractionResponse {
+                request_id: request.request_id,
+                payload: HumanInteractionResponsePayload::UiElicitation(response),
+                resolved_at: Utc::now(),
+            }));
+        }
+        HumanInteractionPayload::ToolPermission(payload) => {
+            let decision = if shutdown.load(Ordering::Relaxed) {
+                ToolPermissionDecision::Cancel
+            } else {
+                ToolPermissionDecision::from(approval_prompt_fn(payload.approval.clone()))
+            };
+            let _ = handle.block_on(
+                coordinator.submit_tool_permission_response(request.request_id, decision),
+            );
+        }
+    }
 }
 
 fn prompt_for_approval(request: ApprovalRequest) -> ApprovalDecision {
@@ -346,6 +392,128 @@ fn prompt_for_approval(request: ApprovalRequest) -> ApprovalDecision {
             _ => eprintln!("  enter y, a, n, or c"),
         }
     }
+}
+
+fn prompt_for_ui_elicitation(
+    request: &roci::human_interaction::UiElicitationRequest,
+) -> UiElicitationResponse {
+    eprintln!(
+        "\n? input required: {}",
+        truncate_preview(&request.message, 200)
+    );
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        eprintln!("  declining: interactive terminal unavailable");
+        return UiElicitationResponse::Decline;
+    }
+
+    let mut content = serde_json::Map::new();
+    for (field_name, field) in &request.requested_schema.properties {
+        match prompt_for_ui_field(field_name, field) {
+            Some(value) => {
+                content.insert(field_name.clone(), value);
+            }
+            None => return UiElicitationResponse::Cancel,
+        }
+    }
+
+    UiElicitationResponse::Accept { content }
+}
+
+fn prompt_for_ui_field(field_name: &str, field: &UiElicitationField) -> Option<serde_json::Value> {
+    loop {
+        match field {
+            UiElicitationField::String {
+                title,
+                default,
+                enum_values,
+                ..
+            } => {
+                let label = title.as_deref().unwrap_or(field_name);
+                if let Some(values) = enum_values {
+                    eprintln!("  {label}");
+                    for (index, value) in values.iter().enumerate() {
+                        eprintln!("    [{}] {value}", index + 1);
+                    }
+                    let input = read_prompt_line("  Enter choice: ")?;
+                    if input.is_empty() {
+                        return default.clone().map(serde_json::Value::String);
+                    }
+                    if let Ok(index) = input.parse::<usize>() {
+                        if (1..=values.len()).contains(&index) {
+                            return Some(serde_json::Value::String(values[index - 1].clone()));
+                        }
+                    }
+                    if values.iter().any(|value| value == &input) {
+                        return Some(serde_json::Value::String(input));
+                    }
+                    eprintln!("  enter number or enum value");
+                    continue;
+                }
+                let input = read_prompt_line(&format!("  {label}: "))?;
+                if input.is_empty() {
+                    return default.clone().map(serde_json::Value::String);
+                }
+                return Some(serde_json::Value::String(input));
+            }
+            UiElicitationField::Boolean { title, default, .. } => {
+                let label = title.as_deref().unwrap_or(field_name);
+                let suffix = match default {
+                    Some(true) => " [Y/n]: ",
+                    Some(false) => " [y/N]: ",
+                    None => " [y/n]: ",
+                };
+                let input = read_prompt_line(&format!("  {label}{suffix}"))?;
+                if input.is_empty() {
+                    return default.map(serde_json::Value::Bool);
+                }
+                match input.to_ascii_lowercase().as_str() {
+                    "y" | "yes" => return Some(serde_json::Value::Bool(true)),
+                    "n" | "no" => return Some(serde_json::Value::Bool(false)),
+                    _ => eprintln!("  enter y or n"),
+                }
+            }
+            UiElicitationField::Number { title, default, .. } => {
+                let label = title.as_deref().unwrap_or(field_name);
+                let input = read_prompt_line(&format!("  {label}: "))?;
+                if input.is_empty() {
+                    return default.and_then(|value| {
+                        serde_json::Number::from_f64(value).map(serde_json::Value::Number)
+                    });
+                }
+                match input.parse::<f64>() {
+                    Ok(value) => {
+                        if let Some(number) = serde_json::Number::from_f64(value) {
+                            return Some(serde_json::Value::Number(number));
+                        }
+                    }
+                    Err(_) => eprintln!("  enter number"),
+                }
+            }
+            UiElicitationField::Integer { title, default, .. } => {
+                let label = title.as_deref().unwrap_or(field_name);
+                let input = read_prompt_line(&format!("  {label}: "))?;
+                if input.is_empty() {
+                    return default.map(|value| serde_json::Value::Number(value.into()));
+                }
+                match input.parse::<i64>() {
+                    Ok(value) => return Some(serde_json::Value::Number(value.into())),
+                    Err(_) => eprintln!("  enter integer"),
+                }
+            }
+        }
+    }
+}
+
+fn read_prompt_line(prompt: &str) -> Option<String> {
+    eprint!("{prompt}");
+    let _ = io::stderr().flush();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok()?;
+    let input = input.trim().to_string();
+    if matches!(input.as_str(), "/cancel" | "cancel") {
+        return None;
+    }
+    Some(input)
 }
 
 #[derive(Default)]
@@ -432,6 +600,27 @@ impl ChatRenderer {
             }
             AgentRuntimeEventPayload::ApprovalCanceled { approval } => {
                 let _ = writeln!(stderr, "  approval {}: canceled", approval.request.id);
+            }
+            AgentRuntimeEventPayload::HumanInteractionRequested { interaction } => {
+                let _ = writeln!(
+                    stderr,
+                    "\n? input {}",
+                    truncate_preview(&interaction.request.request_id.to_string(), 120)
+                );
+            }
+            AgentRuntimeEventPayload::HumanInteractionResolved { interaction } => {
+                let _ = writeln!(
+                    stderr,
+                    "  input {}: resolved",
+                    interaction.request.request_id
+                );
+            }
+            AgentRuntimeEventPayload::HumanInteractionCanceled { interaction } => {
+                let _ = writeln!(
+                    stderr,
+                    "  input {}: canceled",
+                    interaction.request.request_id
+                );
             }
             AgentRuntimeEventPayload::ReasoningUpdated { delta, .. } => {
                 if !delta.is_empty() {
@@ -541,7 +730,9 @@ mod tests {
     use super::*;
     use roci::agent::{MessageStatus, ThreadId, ToolStatus, TurnId, TurnSnapshot, TurnStatus};
     use roci::agent_loop::{ApprovalKind, ToolUpdatePayload};
-    use roci::tools::{Answer, UserInputRequest, UserInputRequestId, UserInputResponse};
+    use roci::tools::{
+        AskUserPrompt, UserInputRequest, UserInputRequestId, UserInputResponse, UserInputResult,
+    };
     use roci::types::{AgentToolResult, ModelMessage};
 
     fn assistant_message(
@@ -608,11 +799,13 @@ mod tests {
         UserInputRequest {
             request_id: UserInputRequestId::new_v4(),
             tool_call_id: "call_1".to_string(),
-            questions: vec![roci::tools::Question {
+            prompt: AskUserPrompt::Question {
                 id: "q1".to_string(),
-                text: "Need input".to_string(),
-                options: None,
-            }],
+                question: "Need input".to_string(),
+                placeholder: None,
+                default: None,
+                multiline: false,
+            },
             timeout_ms: None,
         }
     }
@@ -730,9 +923,12 @@ mod tests {
 
     #[tokio::test]
     async fn raw_agent_sink_forwards_user_input_into_terminal_actor() {
-        let coordinator = Arc::new(UserInputCoordinator::new());
+        let coordinator = Arc::new(HumanInteractionCoordinator::new());
         let request = user_input_request();
-        let pending = coordinator.create_request(request.clone()).await.unwrap();
+        let pending = coordinator
+            .create_user_input_request(request.clone())
+            .await
+            .unwrap();
         let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let renderer = RuntimeEventRenderer::spawn_with_prompt_fn(
             coordinator.clone(),
@@ -742,11 +938,9 @@ mod tests {
                     prompt_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(Some(UserInputResponse {
                         request_id: request.request_id,
-                        answers: vec![Answer {
-                            question_id: "q1".to_string(),
-                            content: "yes".to_string(),
-                        }],
-                        canceled: false,
+                        result: UserInputResult::Question {
+                            answer: "yes".to_string(),
+                        },
                     }))
                 }
             }),
@@ -756,11 +950,13 @@ mod tests {
         sink(AgentEvent::MessageStart {
             message: ModelMessage::assistant("ignore"),
         });
-        sink(AgentEvent::UserInputRequested {
-            request: request.clone(),
+        sink(AgentEvent::HumanInteractionRequested {
+            request: roci::human_interaction::HumanInteractionRequest::from_user_input(
+                request.clone(),
+            ),
         });
 
-        let response = pending.wait(Some(100)).await.unwrap();
+        let response = pending.wait_user_input(Some(100)).await.unwrap();
         assert_eq!(response.request_id, request.request_id);
         assert_eq!(prompt_calls.load(Ordering::Relaxed), 1);
 
@@ -769,7 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_handler_forwards_request_into_terminal_actor() {
-        let coordinator = Arc::new(UserInputCoordinator::new());
+        let coordinator = Arc::new(HumanInteractionCoordinator::new());
         let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let renderer = RuntimeEventRenderer::spawn_with_prompt_fns(
             coordinator,

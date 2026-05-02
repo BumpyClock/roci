@@ -81,6 +81,9 @@ pub enum ToolSafety {
 pub enum ToolApprovalKind {
     CommandExecution,
     FileChange,
+    Read,
+    Mcp,
+    CustomTool,
     Other,
 }
 

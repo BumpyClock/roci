@@ -11,6 +11,7 @@ use crate::agent_loop::runner::{
 use crate::agent_loop::ApprovalPolicy;
 use crate::agent_loop::{RunHandle, RunRequest, RunResult, RunStatus, Runner};
 use crate::error::RociError;
+use crate::tools::catalog::{ToolCatalog, ToolOrigin};
 use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::types::{
@@ -58,6 +59,9 @@ impl AgentRuntime {
             } else {
                 Ok(Vec::new())
             }?;
+            if status == TurnStatus::Canceled {
+                events.extend(projector.cancel_pending_human_interactions(turn_id)?);
+            }
             let event = match status {
                 TurnStatus::Completed => projector.complete_turn(turn_id),
                 TurnStatus::Failed => projector.fail_turn(
@@ -102,23 +106,25 @@ impl AgentRuntime {
     pub(super) async fn resolve_tools_for_run(&self) -> Result<Vec<Arc<dyn Tool>>, RociError> {
         let static_tools = self.tools.lock().await.clone();
         let providers = self.dynamic_tool_providers.lock().await.clone();
-        Self::merge_static_and_dynamic_tools(static_tools, providers).await
+        let catalog = Self::merge_static_and_dynamic_tools(static_tools, providers).await?;
+        Ok(catalog.resolve(&self.config.tool_visibility_policy))
     }
 
     async fn merge_static_and_dynamic_tools(
-        mut static_tools: Vec<Arc<dyn Tool>>,
+        static_tools: Vec<Arc<dyn Tool>>,
         providers: Vec<Arc<dyn DynamicToolProvider>>,
-    ) -> Result<Vec<Arc<dyn Tool>>, RociError> {
+    ) -> Result<ToolCatalog, RociError> {
+        let mut catalog = ToolCatalog::from_tools(static_tools, ToolOrigin::Custom);
         for provider in providers {
             let discovered = provider.list_tools().await?;
             for tool in discovered {
-                static_tools.push(Arc::new(DynamicToolAdapter::new(
-                    Arc::clone(&provider),
-                    tool,
-                )));
+                catalog.insert_first_wins(
+                    Arc::new(DynamicToolAdapter::new(Arc::clone(&provider), tool)),
+                    ToolOrigin::Dynamic,
+                );
             }
         }
-        Ok(static_tools)
+        Ok(catalog)
     }
 
     pub(super) async fn current_turn_options(
@@ -193,22 +199,47 @@ impl AgentRuntime {
 
         #[cfg(feature = "agent")]
         let user_input_callback = {
-            let coordinator = self.user_input_coordinator.clone();
+            let coordinator = self.human_interaction_coordinator.clone();
             let ui_event_sink = intercepting_sink.clone();
             let config_timeout = self.config.user_input_timeout_ms;
-            let cb: crate::tools::user_input::RequestUserInputFn =
-                Arc::new(move |request: crate::tools::UserInputRequest| {
+            let cb: crate::tools::user_input::RequestUserInputFn = Arc::new(
+                move |request: crate::tools::UserInputRequest| {
                     let coordinator = coordinator.clone();
                     let sink = ui_event_sink.clone();
                     Box::pin(async move {
-                        let rx = coordinator.create_request(request.clone()).await?;
-                        sink(crate::agent_loop::AgentEvent::UserInputRequested {
-                            request: request.clone(),
+                        let human_request =
+                            crate::human_interaction::HumanInteractionRequest::from_user_input(
+                                request.clone(),
+                            );
+                        let rx = coordinator
+                            .create_request(human_request.clone())
+                            .await
+                            .map_err(crate::tools::UserInputError::from)?;
+                        sink(crate::agent_loop::AgentEvent::HumanInteractionRequested {
+                            request: human_request,
                         });
                         let effective_timeout = request.timeout_ms.or(config_timeout);
-                        rx.wait(effective_timeout).await
+                        match rx.wait_user_input(effective_timeout).await {
+                            Ok(response) => {
+                                sink(crate::agent_loop::AgentEvent::HumanInteractionResolved {
+                                    response:
+                                        crate::human_interaction::HumanInteractionResponse::from_user_input(
+                                            response.clone(),
+                                        ),
+                                });
+                                Ok(response)
+                            }
+                            Err(error) => {
+                                sink(crate::agent_loop::AgentEvent::HumanInteractionCanceled {
+                                    request_id: request.request_id,
+                                    reason: Some(error.to_string()),
+                                });
+                                Err(error)
+                            }
+                        }
                     })
-                });
+                },
+            );
             cb
         };
 
@@ -247,7 +278,12 @@ impl AgentRuntime {
 
         #[cfg(feature = "agent")]
         {
-            request = request.with_user_input_callback(user_input_callback);
+            request = request
+                .with_user_input_callback(user_input_callback)
+                .with_human_interaction_coordinator(self.human_interaction_coordinator.clone())
+                .with_tool_permission_session_approvals(
+                    self.tool_permission_session_approvals.clone(),
+                );
         }
 
         if let Some(hook) = self.config.before_agent_start.clone() {

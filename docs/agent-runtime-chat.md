@@ -52,9 +52,9 @@ runtime state.
   - Returns `AlreadyTerminal` for completed/failed/canceled turns.
   - Returns `StaleRuntime` when the `turn_id` revision is not current (history reset/rewrite).
   - Returns `TurnNotFound` or `ThreadNotFound` when the id is unknown.
-- `abort()` remains as compatibility sugar:
+- `abort()`:
   - Resolves active `turn_id` and calls `cancel_turn` when possible.
-  - Falls back to legacy abort path when no active turn is currently projected.
+  - Uses the runtime abort path when no active turn is currently projected.
 
 ## Event contract
 
@@ -82,6 +82,9 @@ Payloads:
 - `approval_required`
 - `approval_resolved`
 - `approval_canceled`
+- `human_interaction_requested`
+- `human_interaction_resolved`
+- `human_interaction_canceled`
 - `reasoning_updated`
 - `plan_updated`
 - `diff_updated`
@@ -95,6 +98,8 @@ Approval, reasoning, plan, and diff payloads carry runtime-owned snapshots:
 
 - `ApprovalSnapshot`
   - request, status (`pending`, `resolved`, `canceled`), decision, timestamps
+- `HumanInteractionSnapshot`
+  - request, status (`pending`, `resolved`, `canceled`), response/error, timestamps
 - `ReasoningSnapshot`
   - `turn_id`, optional `message_id`, accumulated text snapshot
   - `reasoning_updated` also includes the incremental `delta`
@@ -117,6 +122,13 @@ Approval status contract:
 - `resolved`: host returned an approval decision other than cancel
 - `canceled`: host returned cancel; this is distinct from declined
 
+Human interaction contract:
+
+- Raw loop events use `AgentEvent::HumanInteractionRequested`,
+  `AgentEvent::HumanInteractionResolved`, and `AgentEvent::HumanInteractionCanceled`.
+- `ask_user` is represented as an `AskUser` payload in the human interaction envelope.
+- Hosts render pending `HumanInteractionSnapshot`s and resolve them through the runtime or shared coordinator by `request_id`.
+
 `RuntimeSnapshot` also has `schema_version` so hosts can version full snapshot
 sync separately from individual event cursors.
 
@@ -133,7 +145,7 @@ pub struct ImportedThread {
 
 - `thread` is the semantic UI/runtime snapshot. Roci preserves its `revision`,
   `last_seq`, `active_turn_id`, turns, messages, tools, approvals, reasoning,
-  plans, and diffs.
+  plans, diffs, and human interactions.
 - `model_messages` is the provider context ledger. Roci uses only this ledger for
   the next provider request context.
 - `read_thread(imported.thread.thread_id)` after import returns the imported

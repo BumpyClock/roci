@@ -1,11 +1,15 @@
 //! MCP client for connecting to MCP servers.
 
+use std::sync::Arc;
+
 use crate::error::RociError;
+use crate::human_interaction::HumanInteractionCoordinator;
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult, JsonObject, ProtocolVersion},
     service::{ClientInitializeError, ServiceError},
 };
 
+use super::elicitation::MCPClientHandler;
 use super::error::{map_client_initialize_error, map_service_error};
 use super::mapping::{coerce_tool_arguments, map_call_result, map_mcp_tool_schema};
 use super::transport::MCPTransport;
@@ -44,6 +48,8 @@ pub struct MCPClient {
     transport: Option<Box<dyn MCPTransport>>,
     session: Option<MCPRunningService>,
     state: MCPConnectionState,
+    server_id: String,
+    human_interaction_coordinator: Option<Arc<HumanInteractionCoordinator>>,
 }
 
 impl MCPClient {
@@ -53,6 +59,8 @@ impl MCPClient {
             transport: Some(transport),
             session: None,
             state: MCPConnectionState::Disconnected,
+            server_id: "mcp".to_string(),
+            human_interaction_coordinator: None,
         }
     }
 
@@ -64,7 +72,26 @@ impl MCPClient {
             transport: None,
             session: Some(session),
             state: MCPConnectionState::Connected,
+            server_id: "mcp".to_string(),
+            human_interaction_coordinator: None,
         }
+    }
+
+    /// Set the MCP server identifier used in human interaction source metadata.
+    #[must_use]
+    pub fn with_server_id(mut self, server_id: impl Into<String>) -> Self {
+        self.server_id = server_id.into();
+        self
+    }
+
+    /// Enable host-mediated UI elicitation through the shared human interaction coordinator.
+    #[must_use]
+    pub fn with_human_interaction_coordinator(
+        mut self,
+        coordinator: Arc<HumanInteractionCoordinator>,
+    ) -> Self {
+        self.human_interaction_coordinator = Some(coordinator);
+        self
     }
 
     /// Convert an rmcp initialization result into an MCP client.
@@ -182,30 +209,41 @@ impl MCPClient {
     }
 
     async fn connect_with_protocol_fallback(&mut self) -> Result<MCPRunningService, RociError> {
-        let transport = self
-            .transport
-            .as_mut()
-            .ok_or_else(|| RociError::Configuration("Missing MCP session".into()))?;
+        let latest_client_handler = self.client_handler(ProtocolVersion::LATEST);
 
-        let latest_client_info = rmcp::model::ClientInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            ..Default::default()
+        let latest_result = {
+            let transport = self
+                .transport
+                .as_mut()
+                .ok_or_else(|| RociError::Configuration("Missing MCP session".into()))?;
+            transport.connect(latest_client_handler).await
         };
 
-        match transport.connect(latest_client_info).await {
+        match latest_result {
             Ok(session) => return Ok(session),
             Err(error) if Self::should_retry_protocol_fallback(&error) => {}
             Err(error) => return Err(map_client_initialize_error(error)),
         }
 
-        let fallback_client_info = rmcp::model::ClientInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            ..Default::default()
-        };
-        transport
-            .connect(fallback_client_info)
-            .await
-            .map_err(map_client_initialize_error)
+        let fallback_client_handler = self.client_handler(ProtocolVersion::V_2024_11_05);
+        {
+            let transport = self
+                .transport
+                .as_mut()
+                .ok_or_else(|| RociError::Configuration("Missing MCP session".into()))?;
+            transport.connect(fallback_client_handler).await
+        }
+        .map_err(map_client_initialize_error)
+    }
+
+    fn client_handler(&self, protocol_version: ProtocolVersion) -> MCPClientHandler {
+        let handler = MCPClientHandler::new(protocol_version);
+        match &self.human_interaction_coordinator {
+            Some(coordinator) => {
+                handler.with_ui_elicitation(self.server_id.clone(), Arc::clone(coordinator))
+            }
+            None => handler,
+        }
     }
 
     async fn list_tools_from_active_session(
@@ -422,12 +460,12 @@ mod tests {
         #[allow(clippy::result_large_err)]
         async fn connect(
             &mut self,
-            client_info: rmcp::model::ClientInfo,
+            client_handler: MCPClientHandler,
         ) -> Result<MCPRunningService, ClientInitializeError> {
             self.attempted_protocols
                 .lock()
                 .expect("protocol mutex should lock")
-                .push(client_info.protocol_version);
+                .push(client_handler.client_info().protocol_version.clone());
 
             self.connect_results.pop_front().unwrap_or_else(|| {
                 Err(ClientInitializeError::ConnectionClosed(

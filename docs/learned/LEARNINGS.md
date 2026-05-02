@@ -24,7 +24,7 @@
 - Model fallback is launch-time only. Candidate selection requires a registered provider plus usable auth: no-credential provider, `RociConfig` credential, or inherited parent `AgentConfig` request auth (`api_key_override` / `get_api_key`). There is no mid-run failover.
 - Profile inheritance is single-parent only. Child scalars replace parent scalars. `models` replaces wholesale (no merge). `tools` uses `ToolPolicy` (Inherit / Replace / InheritWithOverrides).
 - TOML profiles support both single-file (top-level fields) and multi-profile (`[[profiles]]`) formats. `TomlProfileFile::parse()` tries multi first, falls back to single.
-- `ask_user` routing across multiple children uses the same `UserInputCoordinator` -- `request_id` correlation already handles multi-child dispatch without a generic bus.
+- Human interaction routing across multiple children uses the same `HumanInteractionCoordinator` -- `request_id` correlation handles multi-child dispatch without a generic bus. `ask_user` is the current model-tool payload.
 - Supervisor concurrency is bounded by `Semaphore` (max_concurrent, default 4). `max_active_children` is a separate hard cap that rejects spawns.
 - `abort_on_drop` (default true) cancels all children via `CancellationToken` in the `Drop` impl. Uses `try_lock()` since `Drop` is synchronous.
 - Launcher seam (`SubagentLauncher` trait) is `pub(super)` -- not part of the public API. Exists for testability and future out-of-process extensibility.

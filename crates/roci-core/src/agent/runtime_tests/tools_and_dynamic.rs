@@ -1,7 +1,7 @@
 use super::support::*;
 use super::*;
 use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
-use crate::tools::{AgentToolParameters, ToolApproval, ToolApprovalKind};
+use crate::tools::{AgentToolParameters, ToolApproval, ToolApprovalKind, ToolVisibilityPolicy};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -59,6 +59,35 @@ async fn resolve_tools_for_run_merges_static_and_dynamic_tools() {
 
     assert!(names.contains(&"static".to_string()));
     assert!(names.contains(&"dynamic".to_string()));
+}
+
+#[tokio::test]
+async fn resolve_tools_for_run_applies_visibility_policy_to_static_and_dynamic_tools() {
+    let provider: Arc<dyn DynamicToolProvider> =
+        Arc::new(MockDynamicToolProvider::new(vec![DynamicTool {
+            name: "dynamic".into(),
+            description: "dynamic tool".into(),
+            parameters: AgentToolParameters::empty(),
+            approval: ToolApproval::requires_approval(ToolApprovalKind::Other),
+        }]));
+
+    let mut config = test_agent_config();
+    config.tools = vec![dummy_tool("static")];
+    config.dynamic_tool_providers = vec![Arc::clone(&provider)];
+    config.tool_visibility_policy = ToolVisibilityPolicy::allow_only(["dynamic"]);
+
+    let agent = AgentRuntime::new(test_registry(), test_config(), config);
+
+    let tools = agent
+        .resolve_tools_for_run()
+        .await
+        .expect("tools should resolve");
+    let names = tools
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["dynamic".to_string()]);
 }
 
 #[tokio::test]

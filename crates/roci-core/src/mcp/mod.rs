@@ -4,6 +4,7 @@ pub mod aggregate;
 pub mod bridge;
 pub mod client;
 mod client_ops;
+pub mod elicitation;
 mod error;
 pub mod instructions;
 mod mapping;

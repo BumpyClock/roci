@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 #[cfg(feature = "agent")]
-use crate::agent::runtime::UserInputCoordinator;
+use crate::agent::runtime::HumanInteractionCoordinator;
 use crate::agent::runtime::{AgentConfig, AgentRuntime};
 use crate::agent_loop::runner::AgentEventSink;
 use crate::config::RociConfig;
@@ -100,7 +100,7 @@ pub(super) fn build_child_config(
     tools: Vec<Arc<dyn Tool>>,
     reasoning_effort: Option<&str>,
     event_sink: Option<AgentEventSink>,
-    #[cfg(feature = "agent")] coordinator: Arc<UserInputCoordinator>,
+    #[cfg(feature = "agent")] coordinator: Arc<HumanInteractionCoordinator>,
 ) -> Result<AgentConfig, RociError> {
     let mut settings = parent.settings.clone();
     if let Some(reasoning_effort) = reasoning_effort {
@@ -116,11 +116,12 @@ pub(super) fn build_child_config(
         model,
         system_prompt: None,
         tools,
+        tool_visibility_policy: parent.tool_visibility_policy.clone(),
         event_sink,
         approval_policy: parent.approval_policy,
         approval_handler: parent.approval_handler.clone(),
         #[cfg(feature = "agent")]
-        user_input_coordinator: Some(coordinator),
+        human_interaction_coordinator: Some(coordinator),
         dynamic_tool_providers: Vec::new(),
         settings,
         transform_context: None,
@@ -218,7 +219,7 @@ mod tests {
             None,
             None,
             #[cfg(feature = "agent")]
-            Arc::new(UserInputCoordinator::new()),
+            Arc::new(HumanInteractionCoordinator::new()),
         )
         .unwrap();
         assert_eq!(cfg.model, model);
@@ -271,7 +272,7 @@ mod tests {
             Some("medium"),
             None,
             #[cfg(feature = "agent")]
-            Arc::new(UserInputCoordinator::new()),
+            Arc::new(HumanInteractionCoordinator::new()),
         )
         .unwrap();
 
@@ -311,7 +312,7 @@ mod tests {
             Some("maximum"),
             None,
             #[cfg(feature = "agent")]
-            Arc::new(UserInputCoordinator::new()),
+            Arc::new(HumanInteractionCoordinator::new()),
         );
         let err = match result {
             Ok(_) => panic!("expected invalid reasoning_effort to fail"),

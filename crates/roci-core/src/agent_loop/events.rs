@@ -156,12 +156,18 @@ pub enum AgentEvent {
         is_error: bool,
     },
 
-    // -- User input --
-    UserInputRequested {
-        request: crate::tools::user_input::UserInputRequest,
+    HumanInteractionRequested {
+        request: crate::human_interaction::HumanInteractionRequest,
+    },
+    HumanInteractionResolved {
+        response: crate::human_interaction::HumanInteractionResponse,
+    },
+    HumanInteractionCanceled {
+        request_id: crate::human_interaction::HumanInteractionRequestId,
+        reason: Option<String>,
     },
 
-    // -- Roci-specific events (kept for backward compat) --
+    // -- Roci-specific events --
     Approval {
         request: ApprovalRequest,
     },

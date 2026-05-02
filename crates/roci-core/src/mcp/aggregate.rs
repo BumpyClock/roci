@@ -69,7 +69,9 @@ impl MCPAggregateServer {
     }
 
     /// Register an MCP server with full metadata.
-    pub fn with_metadata(metadata: MCPServerMetadata, client: MCPClient) -> Self {
+    pub fn with_metadata(mut metadata: MCPServerMetadata, client: MCPClient) -> Self {
+        metadata.id = metadata.id.trim().to_owned();
+        let client = client.with_server_id(metadata.id.clone());
         Self {
             metadata,
             client: Box::new(client),

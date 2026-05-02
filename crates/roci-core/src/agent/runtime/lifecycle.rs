@@ -453,7 +453,7 @@ impl AgentRuntime {
         self.wait_for_queued_turns_to_drain().await;
 
         #[cfg(feature = "agent")]
-        self.user_input_coordinator.cancel_all().await;
+        self.human_interaction_coordinator.cancel_all().await;
 
         self.messages.lock().await.clear();
         self.steering_queue.lock().await.clear();

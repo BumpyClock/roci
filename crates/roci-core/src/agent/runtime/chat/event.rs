@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::domain::{
-    ApprovalSnapshot, DiffSnapshot, MessageSnapshot, PlanSnapshot, ReasoningSnapshot, ThreadId,
-    ToolExecutionSnapshot, TurnId, TurnSnapshot,
+    ApprovalSnapshot, DiffSnapshot, HumanInteractionSnapshot, MessageSnapshot, PlanSnapshot,
+    ReasoningSnapshot, ThreadId, ToolExecutionSnapshot, TurnId, TurnSnapshot,
 };
 
 pub const AGENT_RUNTIME_EVENT_SCHEMA_VERSION: u16 = 1;
@@ -95,6 +95,15 @@ pub enum AgentRuntimeEventPayload {
     ApprovalCanceled {
         approval: ApprovalSnapshot,
     },
+    HumanInteractionRequested {
+        interaction: HumanInteractionSnapshot,
+    },
+    HumanInteractionResolved {
+        interaction: HumanInteractionSnapshot,
+    },
+    HumanInteractionCanceled {
+        interaction: HumanInteractionSnapshot,
+    },
     ReasoningUpdated {
         reasoning: ReasoningSnapshot,
         delta: String,
@@ -171,6 +180,21 @@ impl AgentRuntimeEventPayload {
     #[must_use]
     pub const fn approval_canceled_name() -> &'static str {
         "approval_canceled"
+    }
+
+    #[must_use]
+    pub const fn human_interaction_requested_name() -> &'static str {
+        "human_interaction_requested"
+    }
+
+    #[must_use]
+    pub const fn human_interaction_resolved_name() -> &'static str {
+        "human_interaction_resolved"
+    }
+
+    #[must_use]
+    pub const fn human_interaction_canceled_name() -> &'static str {
+        "human_interaction_canceled"
     }
 
     #[must_use]

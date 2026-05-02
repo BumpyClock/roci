@@ -10,6 +10,7 @@ use crate::context::ContextBudget;
 use crate::models::LanguageModel;
 use crate::provider::ProviderPayloadCallback;
 use crate::resource::CompactionSettings;
+use crate::tools::catalog::ToolVisibilityPolicy;
 use crate::tools::dynamic::DynamicToolProvider;
 use crate::tools::tool::Tool;
 use crate::types::GenerationSettings;
@@ -23,8 +24,8 @@ use super::types::{GetApiKeyFn, QueueDrainMode, SessionBeforeCompactHook, Sessio
 ///
 /// By default, the agent resolves API keys automatically through the
 /// [`crate::config::RociConfig`] passed to [`super::AgentRuntime::new`].
-/// `crate::config::RociConfig` checks (in order): environment variables →
-/// `credentials.json` → OAuth token store (from `roci auth login`).
+/// `crate::config::RociConfig` checks explicit API keys loaded from
+/// environment or `.env`, then OAuth tokens saved via `roci auth login`.
 ///
 /// Set [`get_api_key`](Self::get_api_key) only when you need per-request
 /// dynamic keys (e.g., token rotation or multi-tenant key injection).
@@ -36,6 +37,8 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     /// Tools available for tool-use loops.
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Policy deciding which resolved tools are visible to the model.
+    pub tool_visibility_policy: ToolVisibilityPolicy,
     /// Dynamic tool providers queried at run start.
     pub dynamic_tool_providers: Vec<Arc<dyn DynamicToolProvider>>,
     /// Generation settings (temperature, max_tokens, etc.).
@@ -78,8 +81,9 @@ pub struct AgentConfig {
     /// Precedence is: request override -> provider/config key -> this callback.
     ///
     /// When `None` (the default), the agent resolves keys automatically
-    /// through [`crate::config::RociConfig`] which checks: environment variables →
-    /// `credentials.json` → OAuth token store (from `roci auth login`).
+    /// through [`crate::config::RociConfig`] which checks explicit API keys
+    /// loaded from environment or `.env`, then OAuth tokens saved via
+    /// `roci auth login`.
     /// No explicit key configuration is needed if any of those sources
     /// has a valid credential for the provider.
     pub get_api_key: Option<GetApiKeyFn>,
@@ -104,13 +108,14 @@ pub struct AgentConfig {
     pub context_budget: Option<ContextBudget>,
     /// Chat runtime contract and event configuration.
     pub chat: ChatRuntimeConfig,
-    /// Optional shared coordinator for user input requests.
+    /// Optional shared coordinator for human interaction requests.
     ///
     /// When provided, the runtime uses this coordinator instead of creating
     /// its own. This allows the CLI/host to share the coordinator and submit
     /// responses directly.
     #[cfg(feature = "agent")]
-    pub user_input_coordinator: Option<std::sync::Arc<super::UserInputCoordinator>>,
+    pub human_interaction_coordinator:
+        Option<std::sync::Arc<crate::human_interaction::HumanInteractionCoordinator>>,
 }
 
 impl Default for AgentConfig {
@@ -122,6 +127,7 @@ impl Default for AgentConfig {
             },
             system_prompt: None,
             tools: Vec::new(),
+            tool_visibility_policy: ToolVisibilityPolicy::default(),
             dynamic_tool_providers: Vec::new(),
             settings: GenerationSettings::default(),
             transform_context: None,
@@ -150,7 +156,7 @@ impl Default for AgentConfig {
             context_budget: None,
             chat: ChatRuntimeConfig::default(),
             #[cfg(feature = "agent")]
-            user_input_coordinator: None,
+            human_interaction_coordinator: None,
         }
     }
 }

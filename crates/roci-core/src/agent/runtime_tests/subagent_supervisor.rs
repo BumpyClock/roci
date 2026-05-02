@@ -28,7 +28,9 @@ use crate::provider::{
     ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
 };
 use crate::tools::tool::Tool;
-use crate::tools::{AgentTool, AgentToolParameters, Question, ToolApproval, UserInputRequest};
+use crate::tools::{
+    AgentTool, AgentToolParameters, AskUserPrompt, ToolApproval, UserInputRequest, UserInputResult,
+};
 use crate::types::{ModelMessage, Role, StreamEventType, TextStreamDelta, Usage};
 
 // ---------------------------------------------------------------------------
@@ -52,6 +54,7 @@ fn make_base_config() -> AgentConfig {
         model: make_test_model(),
         system_prompt: None,
         tools: Vec::new(),
+        tool_visibility_policy: Default::default(),
         dynamic_tool_providers: Vec::new(),
         settings: GenerationSettings::default(),
         transform_context: None,
@@ -78,7 +81,7 @@ fn make_base_config() -> AgentConfig {
         post_tool_use: None,
         user_input_timeout_ms: None,
         #[cfg(feature = "agent")]
-        user_input_coordinator: None,
+        human_interaction_coordinator: None,
         context_budget: None,
         chat: Default::default(),
     }
@@ -361,18 +364,23 @@ fn make_blocking_ask_user_supervisor() -> SubagentSupervisor {
                 let response = callback(UserInputRequest {
                     request_id: uuid::Uuid::new_v4(),
                     tool_call_id: "ask-user-call-1".to_string(),
-                    questions: vec![Question {
+                    prompt: AskUserPrompt::Question {
                         id: "abort_unit".to_string(),
-                        text: "Abort me?".to_string(),
-                        options: None,
-                    }],
+                        question: "Abort me?".to_string(),
+                        placeholder: None,
+                        default: None,
+                        multiline: false,
+                    },
                     timeout_ms: None,
                 })
                 .await
                 .map_err(|err| RociError::InvalidState(err.to_string()))?;
-                Ok(serde_json::json!({
-                    "answer": response.answers.first().map(|answer| answer.content.clone())
-                }))
+                let UserInputResult::Question { answer } = response.result else {
+                    return Err(RociError::InvalidState(
+                        "expected question answer".to_string(),
+                    ));
+                };
+                Ok(serde_json::json!({ "answer": answer }))
             },
         )
         .with_approval(ToolApproval::safe_host_input()),
@@ -705,13 +713,13 @@ async fn spawn_with_context_prompt_plus_snapshot_preserves_order_end_to_end() {
 }
 
 #[tokio::test]
-async fn spawn_backward_compat_path_still_runs() {
+async fn spawn_default_context_path_still_runs() {
     let (supervisor, requests) = make_recording_supervisor("spawn complete");
     let spec = SubagentSpec {
         profile: "test:dev".into(),
-        label: Some("backward-compat".into()),
+        label: Some("default-context".into()),
         input: SubagentInput::Prompt {
-            task: "test backward compat".into(),
+            task: "test default context".into(),
         },
         overrides: Default::default(),
     };
@@ -723,7 +731,7 @@ async fn spawn_backward_compat_path_still_runs() {
     let request_messages = captured_request_messages(&requests);
     assert_eq!(request_messages.len(), 2);
     assert_test_system_prompt(&request_messages[0]);
-    assert_eq!(request_messages[1].text(), "test backward compat");
+    assert_eq!(request_messages[1].text(), "test default context");
     assert_eq!(result.messages[2].text(), "spawn complete");
 }
 
@@ -785,8 +793,11 @@ async fn abort_while_child_waits_for_user_input_completes() {
         loop {
             match events.recv().await {
                 Ok(SubagentEvent::AgentEvent { event, .. }) => {
-                    if let AgentEvent::UserInputRequested { request } = *event {
-                        assert_eq!(request.questions[0].id, "abort_unit");
+                    if let AgentEvent::HumanInteractionRequested { request } = *event {
+                        let request = request
+                            .to_user_input()
+                            .expect("human interaction should be ask_user");
+                        assert_eq!(request.prompt.id(), "abort_unit");
                         break;
                     }
                 }
@@ -821,8 +832,9 @@ async fn submit_user_input_unknown_request_returns_error() {
     let supervisor = make_supervisor();
     let response = UserInputResponse {
         request_id: Uuid::nil(),
-        answers: vec![],
-        canceled: false,
+        result: crate::tools::UserInputResult::Question {
+            answer: "C".to_string(),
+        },
     };
     let result = supervisor.submit_user_input(response).await;
     assert!(result.is_err());

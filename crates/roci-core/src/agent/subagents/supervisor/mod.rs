@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::agent::runtime::AgentConfig;
 #[cfg(feature = "agent")]
-use crate::agent::runtime::UserInputCoordinator;
+use crate::agent::runtime::HumanInteractionCoordinator;
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::provider::ProviderRegistry;
@@ -60,7 +60,7 @@ pub struct SubagentSupervisor {
     base_config: AgentConfig,
     launcher: Box<dyn SubagentLauncher>,
     #[cfg(feature = "agent")]
-    coordinator: Arc<UserInputCoordinator>,
+    coordinator: Arc<HumanInteractionCoordinator>,
     event_tx: broadcast::Sender<SubagentEvent>,
     children: Arc<Mutex<HashMap<SubagentId, ChildEntry>>>,
     concurrency_semaphore: Arc<Semaphore>,
@@ -80,9 +80,9 @@ impl SubagentSupervisor {
     ) -> Self {
         #[cfg(feature = "agent")]
         let coordinator = base_config
-            .user_input_coordinator
+            .human_interaction_coordinator
             .clone()
-            .unwrap_or_else(|| Arc::new(UserInputCoordinator::new()));
+            .unwrap_or_else(|| Arc::new(HumanInteractionCoordinator::new()));
 
         let launcher = Box::new(InProcessLauncher {
             registry: registry.clone(),
@@ -319,14 +319,14 @@ impl SubagentSupervisor {
 
     /// Submit a user input response for a child's `ask_user` request.
     ///
-    /// Delegates to the shared [`UserInputCoordinator`]. The response is
+    /// Delegates to the shared [`HumanInteractionCoordinator`]. The response is
     /// routed by `request_id` to the correct child.
     #[cfg(feature = "agent")]
     pub async fn submit_user_input(
         &self,
         response: crate::tools::UserInputResponse,
     ) -> Result<(), crate::tools::UnknownUserInputRequest> {
-        self.coordinator.submit_response(response).await
+        self.coordinator.submit_user_input_response(response).await
     }
 }
 

@@ -1,9 +1,15 @@
 use super::chat::{
-    AgentRuntimeError, AgentRuntimeEventPayload, ApprovalStatus, ChatProjector, MessageStatus,
-    RuntimeCursor, ToolStatus, TurnStatus,
+    AgentRuntimeError, AgentRuntimeEventPayload, ApprovalStatus, ChatProjector,
+    HumanInteractionStatus, MessageStatus, RuntimeCursor, ToolStatus, TurnStatus,
 };
 use crate::agent_loop::{ApprovalDecision, ApprovalKind, ApprovalRequest, ToolUpdatePayload};
+use crate::human_interaction::{
+    AskUserRequest, HumanInteractionPayload, HumanInteractionRequest, HumanInteractionResponse,
+    HumanInteractionResponsePayload, HumanInteractionSource,
+};
+use crate::tools::AskUserPrompt;
 use crate::types::{AgentToolCall, AgentToolResult, ContentPart, ModelMessage, Role};
+use chrono::Utc;
 
 #[test]
 fn projector_defaults_to_one_thread_snapshot() {
@@ -253,6 +259,134 @@ fn cancel_turn_marks_pending_approvals_canceled() {
     ));
     assert_eq!(thread.approvals[0].status, ApprovalStatus::Canceled);
     assert_eq!(thread.approvals[0].decision, Some(ApprovalDecision::Cancel));
+}
+
+#[test]
+fn human_interaction_lifecycle_projects_requested_resolved_and_canceled_snapshots() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).expect("turn starts");
+    let request = HumanInteractionRequest {
+        request_id: uuid::Uuid::new_v4(),
+        source: HumanInteractionSource::ModelTool {
+            tool_call_id: "ask-user-call-1".to_string(),
+            tool_name: "ask_user".to_string(),
+        },
+        payload: HumanInteractionPayload::AskUser(AskUserRequest {
+            prompt: AskUserPrompt::Question {
+                id: "unit".to_string(),
+                question: "C or F?".to_string(),
+                placeholder: None,
+                default: None,
+                multiline: false,
+            },
+        }),
+        timeout_ms: Some(1_000),
+        created_at: Utc::now(),
+    };
+
+    let requested = projector
+        .request_human_interaction(queued.turn_id, request.clone())
+        .expect("human interaction request projects");
+    let resolved = projector
+        .resolve_human_interaction(
+            queued.turn_id,
+            HumanInteractionResponse {
+                request_id: request.request_id,
+                payload: HumanInteractionResponsePayload::Declined,
+                resolved_at: Utc::now(),
+            },
+        )
+        .expect("human interaction response projects");
+    let cancel_request = HumanInteractionRequest {
+        request_id: uuid::Uuid::new_v4(),
+        ..request
+    };
+    projector
+        .request_human_interaction(queued.turn_id, cancel_request.clone())
+        .expect("second human interaction request projects");
+    let canceled = projector
+        .cancel_human_interaction(
+            queued.turn_id,
+            cancel_request.request_id,
+            Some("turn canceled".to_string()),
+        )
+        .expect("human interaction cancel projects");
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert_eq!(thread.human_interactions.len(), 2);
+    assert_eq!(
+        thread.human_interactions[0].status,
+        HumanInteractionStatus::Resolved
+    );
+    assert!(thread.human_interactions[0].response.is_some());
+    assert_eq!(
+        thread.human_interactions[1].status,
+        HumanInteractionStatus::Canceled
+    );
+    assert_eq!(
+        thread.human_interactions[1].error.as_deref(),
+        Some("turn canceled")
+    );
+
+    assert!(matches!(
+        requested.payload,
+        AgentRuntimeEventPayload::HumanInteractionRequested { .. }
+    ));
+    assert!(matches!(
+        resolved.payload,
+        AgentRuntimeEventPayload::HumanInteractionResolved { .. }
+    ));
+    assert!(matches!(
+        canceled.payload,
+        AgentRuntimeEventPayload::HumanInteractionCanceled { .. }
+    ));
+}
+
+#[test]
+fn cancel_turn_marks_pending_human_interactions_canceled() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).expect("turn starts");
+    let request = HumanInteractionRequest {
+        request_id: uuid::Uuid::new_v4(),
+        source: HumanInteractionSource::Host,
+        payload: HumanInteractionPayload::AskUser(AskUserRequest {
+            prompt: AskUserPrompt::Confirm {
+                id: "continue".to_string(),
+                question: "Continue?".to_string(),
+                default: None,
+            },
+        }),
+        timeout_ms: None,
+        created_at: Utc::now(),
+    };
+    projector
+        .request_human_interaction(queued.turn_id, request)
+        .expect("human interaction request projects");
+
+    let interaction_canceled = projector
+        .cancel_pending_human_interactions(queued.turn_id)
+        .expect("pending human interactions cancel");
+    let turn_canceled = projector.cancel_turn(queued.turn_id).expect("turn cancels");
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert!(matches!(
+        interaction_canceled[0].payload,
+        AgentRuntimeEventPayload::HumanInteractionCanceled { .. }
+    ));
+    assert!(matches!(
+        turn_canceled.payload,
+        AgentRuntimeEventPayload::TurnCanceled { .. }
+    ));
+    assert_eq!(
+        thread.human_interactions[0].status,
+        HumanInteractionStatus::Canceled
+    );
 }
 
 #[test]

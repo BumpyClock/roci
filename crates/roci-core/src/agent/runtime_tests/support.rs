@@ -115,6 +115,7 @@ pub(super) fn test_agent_config() -> AgentConfig {
         model,
         system_prompt: None,
         tools: Vec::new(),
+        tool_visibility_policy: Default::default(),
         dynamic_tool_providers: Vec::new(),
         settings: GenerationSettings::default(),
         transform_context: None,
@@ -143,7 +144,7 @@ pub(super) fn test_agent_config() -> AgentConfig {
         context_budget: None,
         chat: Default::default(),
         #[cfg(feature = "agent")]
-        user_input_coordinator: None,
+        human_interaction_coordinator: None,
     }
 }
 

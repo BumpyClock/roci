@@ -82,7 +82,7 @@ mod tests {
     impl MCPTransport for NoopTransport {
         async fn connect(
             &mut self,
-            _client_info: rmcp::model::ClientInfo,
+            _client_handler: crate::mcp::elicitation::MCPClientHandler,
         ) -> Result<crate::mcp::transport::MCPRunningService, rmcp::service::ClientInitializeError>
         {
             Err(rmcp::service::ClientInitializeError::ConnectionClosed(

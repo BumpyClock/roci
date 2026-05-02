@@ -1,6 +1,91 @@
 use super::*;
 
 #[tokio::test]
+async fn tool_visibility_policy_filters_provider_tool_definitions() {
+    let (runner, requests) = test_runner(ProviderScenario::TextOnlyWithUsage);
+    let active_calls = Arc::new(AtomicUsize::new(0));
+    let max_active_calls = Arc::new(AtomicUsize::new(0));
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")])
+        .with_tools(vec![
+            tracked_success_tool(
+                "read",
+                Duration::from_millis(0),
+                active_calls.clone(),
+                max_active_calls.clone(),
+            ),
+            tracked_success_tool(
+                "write",
+                Duration::from_millis(0),
+                active_calls,
+                max_active_calls,
+            ),
+        ])
+        .with_tool_visibility_policy(ToolVisibilityPolicy::allow_only(["read"]))
+        .with_approval_policy(ApprovalPolicy::Always);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let requests = requests.lock().expect("request lock");
+    let tools = requests[0].tools.as_ref().expect("provider tools");
+    let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    assert_eq!(tool_names, vec!["read"]);
+}
+
+#[tokio::test]
+async fn tool_visibility_policy_can_hide_all_provider_tools() {
+    let (runner, requests) = test_runner(ProviderScenario::TextOnlyWithUsage);
+    let active_calls = Arc::new(AtomicUsize::new(0));
+    let max_active_calls = Arc::new(AtomicUsize::new(0));
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")])
+        .with_tools(vec![tracked_success_tool(
+            "read",
+            Duration::from_millis(0),
+            active_calls,
+            max_active_calls,
+        )])
+        .with_tool_visibility_policy(ToolVisibilityPolicy::no_tools())
+        .with_approval_policy(ApprovalPolicy::Always);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let requests = requests.lock().expect("request lock");
+    assert!(requests[0].tools.is_none());
+}
+
+fn tool_permission_responder(
+    decision: ToolPermissionDecision,
+) -> (
+    Arc<HumanInteractionCoordinator>,
+    AgentEventSink,
+    Arc<std::sync::Mutex<Vec<AgentEvent>>>,
+) {
+    let coordinator = Arc::new(HumanInteractionCoordinator::new());
+    let (agent_sink, agent_events) = capture_agent_events();
+    let sink_coordinator = coordinator.clone();
+    let sink: AgentEventSink = Arc::new(move |event| {
+        if let AgentEvent::HumanInteractionRequested { request } = &event {
+            let coordinator = sink_coordinator.clone();
+            let request_id = request.request_id;
+            tokio::spawn(async move {
+                let _ = coordinator
+                    .submit_tool_permission_response(request_id, decision)
+                    .await;
+            });
+        }
+        agent_sink(event);
+    });
+    (coordinator, sink, agent_events)
+}
+
+#[tokio::test]
 async fn steering_skip_emits_tool_and_message_lifecycle_for_skipped_calls() {
     let (runner, _requests) = test_runner(ProviderScenario::MutatingBatchThenComplete);
     let (agent_sink, agent_events) = capture_agent_events();
@@ -402,6 +487,76 @@ async fn approval_uses_same_duplicate_named_tool_instance_as_execution() {
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].result["error"], "approval declined");
     assert!(tool_results[0].result.get("executed").is_none());
+}
+
+#[tokio::test]
+async fn tool_permission_denial_returns_tool_denial_result() {
+    let (runner, _requests) = test_runner(ProviderScenario::DuplicateToolCallDeltaThenComplete);
+    let (coordinator, agent_sink, _agent_events) =
+        tool_permission_responder(ToolPermissionDecision::Deny);
+    let (sink, events) = capture_events();
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("deny tool")]);
+    request.tools = vec![Arc::new(AgentTool::new(
+        "read",
+        "unsafe read",
+        AgentToolParameters::empty(),
+        |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({ "executed": true })) },
+    ))];
+    request.approval_policy = ApprovalPolicy::Ask;
+    request.event_sink = Some(sink);
+    request.agent_event_sink = Some(agent_sink);
+    request.human_interaction_coordinator = Some(coordinator);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let events = events.lock().expect("event lock");
+    let tool_results = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            RunEventPayload::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0].result["error"], "approval declined");
+    assert!(tool_results[0].is_error);
+}
+
+#[tokio::test]
+async fn tool_permission_cancel_aborts_run() {
+    let (runner, _requests) = test_runner(ProviderScenario::DuplicateToolCallDeltaThenComplete);
+    let (coordinator, agent_sink, _agent_events) =
+        tool_permission_responder(ToolPermissionDecision::Cancel);
+    let (sink, events) = capture_events();
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("cancel tool")]);
+    request.tools = vec![Arc::new(AgentTool::new(
+        "read",
+        "unsafe read",
+        AgentToolParameters::empty(),
+        |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({ "executed": true })) },
+    ))];
+    request.approval_policy = ApprovalPolicy::Ask;
+    request.event_sink = Some(sink);
+    request.agent_event_sink = Some(agent_sink);
+    request.human_interaction_coordinator = Some(coordinator);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Canceled);
+    let events = events.lock().expect("event lock");
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.payload, RunEventPayload::ToolResult { .. })),
+        "canceled permission should abort before tool result"
+    );
 }
 
 #[tokio::test]

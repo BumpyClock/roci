@@ -1,10 +1,11 @@
 //! MCP transport layer.
 
 use async_trait::async_trait;
-use rmcp::model::ClientInfo;
 use rmcp::service::{ClientInitializeError, DynService, RoleClient, RunningService};
 
 use crate::error::RociError;
+
+use super::elicitation::MCPClientHandler;
 
 pub type DynClientService = Box<dyn DynService<RoleClient>>;
 pub type MCPRunningService = RunningService<RoleClient, DynClientService>;
@@ -15,7 +16,7 @@ pub trait MCPTransport: Send {
     /// Create and initialize a new rmcp running service for this transport.
     async fn connect(
         &mut self,
-        client_info: ClientInfo,
+        client_handler: MCPClientHandler,
     ) -> Result<MCPRunningService, ClientInitializeError>;
 
     /// Send a JSON-RPC message.
