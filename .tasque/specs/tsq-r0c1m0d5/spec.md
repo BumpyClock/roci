@@ -1,11 +1,12 @@
 ## Overview
-Add provider-neutral model catalog and model switching surface: core model metadata DTOs, registry listing API, static provider catalogs, authenticated GitHub Copilot dynamic discovery, CLI `models list`, and runtime current/switch helpers.
+Add provider-neutral model catalog and model switching surface: core model metadata DTOs, registry listing API, static provider catalogs, authenticated/available provider discovery, CLI `models list`, and runtime current/switch helpers.
 
 ## Constraints / Non-goals
 - Active development: breaking API changes allowed; no compatibility shims.
 - Pricing is not core Roci scope now; ignore exact pricing and billing metadata in V1.
 - Static catalogs may be incomplete; dynamic listing only where provider supports it.
-- Show/list only authenticated providers for provider-facing dynamic CLI calls.
+- CLI lists only available providers: registered + compiled local/no-credential providers, and credentialed remote providers with auth/config available.
+- Unauthenticated explicit `--provider <remote>` returns typed auth/config error; unauthenticated remotes are hidden from all-provider list.
 - Runtime model switching remains idle-only; no validation/network call in `switch_model`.
 
 ## Interfaces (CLI/API)
@@ -17,6 +18,7 @@ Add provider-neutral model catalog and model switching surface: core model metad
 
 ## Data model / schema changes
 - `ModelInfo` includes provider key, model id, display name, capabilities, policy, source, and metadata.
+- Capability shape waits on attachment media/file limit contract so catalogs do not freeze stale schema.
 - `ModelCatalog` dedupes by `(provider_key, model_id)` with deterministic first/priority wins.
 - Provider static catalogs derive capabilities from existing provider model enums where possible.
 - Copilot parser accepts OpenAI-style `{ data: [...] }` and raw array model lists.
@@ -25,7 +27,7 @@ Add provider-neutral model catalog and model switching surface: core model metad
 - Core catalog serde/dedupe tests pass.
 - Provider static catalog snapshot tests pass.
 - Copilot mock `/models` tests pass.
-- CLI parse/JSON tests pass.
+- CLI JSON test proves unauthenticated remotes are hidden from all-provider listing and explicit unauth remote returns typed auth/config error.
 - Runtime current/switch model tests pass.
 - Docs and Copilot model-list live tmux smoke complete when provider auth available.
 
