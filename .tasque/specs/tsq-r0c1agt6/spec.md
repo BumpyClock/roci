@@ -1,11 +1,12 @@
 ## Overview
-Add session-level subagent routing on top of the existing supervisor: profile display/routing fields, selectable current subagent set, per-subagent isolation, delegate_subagent tool, semantic events, and CLI profile loading/rendering.
+Add session-level subagent routing on top of the existing supervisor: profile display/routing fields, selectable current subagent set, per-subagent MCP/tool isolation, delegate_subagent tool, semantic events, and CLI profile loading/rendering.
 
 ## Constraints / Non-goals
 - Active development: breaking API changes allowed; no compatibility shims.
 - `infer` is `Option<String>`: model-facing routing hint text, not bool.
-- Do not expose raw child `AgentEvent` as stable public runtime API; project semantic subagent events.
-- Plan and implement per-subagent MCP/tool isolation in V1, not parse-only placeholder.
+- Public runtime/subagent events must be semantic DTOs, not raw child `AgentEvent` exposure.
+- Existing `SubagentEvent::AgentEvent` can stay crate-internal/unstable implementation detail only if not projected as public runtime contract.
+- Per-subagent MCP/tool isolation is V1 scope. It depends on MCP multi-server identity/namespacing contract (`tsq-p4cpczyg.6`) or must copy that final contract before coding.
 - Preserve supervisor-first architecture; no peer bus rewrite.
 
 ## Interfaces (CLI/API)
@@ -20,11 +21,13 @@ Add session-level subagent routing on top of the existing supervisor: profile di
 - Profile resolution merges scalar fields, model list, tools, skills, MCP server refs, and default-agent exclusions with documented precedence.
 - Runtime chat events add semantic subagent lifecycle/update payloads with stable DTOs.
 - Child runtime receives only tools, skills, and MCP servers allowed by resolved profile isolation.
+- MCP references use stable server identity/namespacing from `tsq-p4cpczyg.6`; no ad hoc tool-name parsing.
 
 ## Acceptance criteria
 - TOML parse tests cover all new fields.
 - Registry/controller tests cover list/current/select/deselect and unknown profile errors.
 - Runtime tests prove delegate injection, default-agent exclusion, `--no-tools` behavior, and semantic subagent event projection.
+- Test proves public runtime event contract does not expose raw child `AgentEvent`.
 - Fake-provider delegate test proves parent can delegate and receive structured result.
 - CLI tests cover profile load, list, select, and no-subagents.
 - Docs and live tmux smoke updated/run.
