@@ -7,11 +7,12 @@ Add first-class host-facing attachments for prompt inputs and CLI chat. V1 suppo
 - Only text and image attachments for now.
 - MIME detection uses `mime_guess` plus UTF-8 fallback; no deep content sniffing.
 - Attachment text is model-visible; hosts must avoid attaching secrets.
+- Sessioned attachments do not make host cwd into session workspace.
 
 ## Interfaces (CLI/API)
 - New `roci_core::attachments` module.
 - Types: `Attachment`, `FileAttachment`, `BlobAttachment`, `SelectionAttachment`, `ResolvedAttachment`, `AttachmentMetadata`, `AttachmentResolver`, `AttachmentResolveOptions`, `PromptInput`.
-- `ModelCapabilities` gains `VisionLimits` and `FileInputLimits` for preflight.
+- `ModelCapabilities` gains final media/file limit shape used by both attachments and model catalog.
 - `ModelMessage` gains attachment metadata.
 - Runtime prompt APIs accept `impl Into<PromptInput>`; steer/follow_up return `Result<(), RociError>` because resolution can fail.
 - CLI: `roci-agent chat --attach <path>` repeatable.
@@ -22,6 +23,7 @@ Add first-class host-facing attachments for prompt inputs and CLI chat. V1 suppo
 - Unsupported blobs/native files return preflight errors before provider call.
 - Token estimation accounts for rendered text and conservative image placeholders.
 - Provider payload mappings rely on existing image serialization for OpenAI Chat/Responses, Anthropic, and Google.
+- In a durable session, `--attach <host_path>` is ephemeral prompt input with source metadata. Explicit import/copy into session `files/` is separate session/workspace API behavior.
 
 ## Acceptance criteria
 - Resolver tests cover file/blob/selection, size/count limits, MIME, UTF-8 fallback, unsupported opaque blobs.
@@ -29,6 +31,7 @@ Add first-class host-facing attachments for prompt inputs and CLI chat. V1 suppo
 - Runtime queue tests prove PromptInput flows through prompt/continue/steer/follow-up and chat metadata.
 - Provider JSON assertions prove image/text payload shape.
 - CLI parse and chat wiring tests pass.
+- Sessioned CLI test proves `--attach` never turns host cwd into session workspace implicitly.
 - Docs and live tmux text+vision smoke complete or clearly report missing vision-capable provider/auth.
 
 ## Test plan
