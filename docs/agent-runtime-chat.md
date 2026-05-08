@@ -239,6 +239,33 @@ Malformed nonblank committed lines fail replay with a visible error. Hosts that
 need salvage behavior should use a separate tolerant history/repair layer, not
 runtime event replay.
 
+`roci-agent session` manages durable local sessions. Session commands default to
+the app data session root and accept `--root <PATH>` when a host wants explicit
+storage:
+
+```bash
+roci-agent session create --title "Feature investigation"
+roci-agent session list
+roci-agent session export <session-id> --output session.snapshot.json
+roci-agent session import --input session.snapshot.json --id restored-session
+roci-agent session delete restored-session
+```
+
+For a project-local or test root:
+
+```bash
+roci-agent session create --root .roci/sessions --id local-session --json
+roci-agent session export --root .roci/sessions local-session --output local-session.json --json
+roci-agent session import --root .roci/sessions --input local-session.json
+```
+
+Chat keeps explicit session storage so provider runs do not write durable state
+unless opted in:
+
+```bash
+roci-agent chat --session-root .roci/sessions --session-id local-session "Continue"
+```
+
 ### Durable session resume
 
 `LocalSessionStore` owns local session create/open/import/export. Runtime

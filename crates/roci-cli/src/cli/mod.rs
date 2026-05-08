@@ -23,6 +23,8 @@ pub enum Commands {
     Audio(AudioArgs),
     /// Chat with an AI model
     Chat(ChatArgs),
+    /// Manage durable agent sessions
+    Session(SessionArgs),
     /// Manage installed skills
     Skills(SkillsArgs),
 }
@@ -227,6 +229,110 @@ pub enum ChatApprovalArg {
     Never,
 }
 
+/// Arguments for the `session` subcommand group.
+#[derive(Parser, Debug)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommands,
+}
+
+/// Durable session subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SessionCommands {
+    /// Create a durable session
+    Create(SessionCreateArgs),
+    /// List durable sessions
+    List(SessionListArgs),
+    /// Delete a durable session
+    Delete(SessionDeleteArgs),
+    /// Export a durable session snapshot
+    Export(SessionExportArgs),
+    /// Import a durable session snapshot
+    Import(SessionImportArgs),
+}
+
+/// Arguments for `roci-agent session create`.
+#[derive(Parser, Debug)]
+pub struct SessionCreateArgs {
+    /// Session root directory. Defaults to the app data session directory.
+    #[arg(long, value_name = "PATH")]
+    pub root: Option<PathBuf>,
+
+    /// Session id. Defaults to a generated UUID.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
+
+    /// Human-readable session title.
+    #[arg(long)]
+    pub title: Option<String>,
+
+    /// Print a JSON summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `roci-agent session list`.
+#[derive(Parser, Debug)]
+pub struct SessionListArgs {
+    /// Session root directory. Defaults to the app data session directory.
+    #[arg(long, value_name = "PATH")]
+    pub root: Option<PathBuf>,
+
+    /// Print sessions as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `roci-agent session delete`.
+#[derive(Parser, Debug)]
+pub struct SessionDeleteArgs {
+    /// Session root directory. Defaults to the app data session directory.
+    #[arg(long, value_name = "PATH")]
+    pub root: Option<PathBuf>,
+
+    /// Session id to delete.
+    pub id: String,
+}
+
+/// Arguments for `roci-agent session export`.
+#[derive(Parser, Debug)]
+pub struct SessionExportArgs {
+    /// Session root directory. Defaults to the app data session directory.
+    #[arg(long, value_name = "PATH")]
+    pub root: Option<PathBuf>,
+
+    /// Session id to export.
+    pub id: String,
+
+    /// Output snapshot JSON path.
+    #[arg(long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// Print a JSON summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `roci-agent session import`.
+#[derive(Parser, Debug)]
+pub struct SessionImportArgs {
+    /// Session root directory. Defaults to the app data session directory.
+    #[arg(long, value_name = "PATH")]
+    pub root: Option<PathBuf>,
+
+    /// Input snapshot JSON path.
+    #[arg(long, value_name = "PATH")]
+    pub input: PathBuf,
+
+    /// Imported session id. Defaults to a generated UUID.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
+
+    /// Print a JSON summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for the `skills` subcommand group.
 #[derive(Parser, Debug)]
 pub struct SkillsArgs {
@@ -336,6 +442,8 @@ mod tests {
                 assert!(args.exclude_tools.is_empty());
                 assert!(args.max_tokens.is_none());
                 assert_eq!(args.approval, ChatApprovalArg::Ask);
+                assert!(args.session_root.is_none());
+                assert!(args.session_id.is_none());
                 assert!(args.mcp_stdio.is_empty());
                 assert!(args.mcp_sse.is_empty());
                 assert!(args.prompt.is_none());
@@ -546,6 +654,123 @@ mod tests {
             "prompt"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parse_session_create_with_all_options() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "session",
+            "create",
+            "--root",
+            "/tmp/roci-sessions",
+            "--id",
+            "session-live",
+            "--title",
+            "Live session",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Session(session) => match session.command {
+                SessionCommands::Create(args) => {
+                    assert_eq!(args.root, Some(PathBuf::from("/tmp/roci-sessions")));
+                    assert_eq!(args.id.as_deref(), Some("session-live"));
+                    assert_eq!(args.title.as_deref(), Some("Live session"));
+                    assert!(args.json);
+                }
+                other => panic!("expected Create, got {other:?}"),
+            },
+            other => panic!("expected Session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_list_with_root() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "session",
+            "list",
+            "--root",
+            "/tmp/roci-sessions",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Session(session) => match session.command {
+                SessionCommands::List(args) => {
+                    assert_eq!(args.root, Some(PathBuf::from("/tmp/roci-sessions")));
+                    assert!(args.json);
+                }
+                other => panic!("expected List, got {other:?}"),
+            },
+            other => panic!("expected Session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_delete_with_id() {
+        let cli = Cli::try_parse_from(["roci-agent", "session", "delete", "session-live"]).unwrap();
+        match cli.command {
+            Commands::Session(session) => match session.command {
+                SessionCommands::Delete(args) => {
+                    assert!(args.root.is_none());
+                    assert_eq!(args.id, "session-live");
+                }
+                other => panic!("expected Delete, got {other:?}"),
+            },
+            other => panic!("expected Session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_export_with_output_and_json() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "session",
+            "export",
+            "session-live",
+            "--output",
+            "/tmp/session.json",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Session(session) => match session.command {
+                SessionCommands::Export(args) => {
+                    assert_eq!(args.id, "session-live");
+                    assert_eq!(args.output, PathBuf::from("/tmp/session.json"));
+                    assert!(args.json);
+                }
+                other => panic!("expected Export, got {other:?}"),
+            },
+            other => panic!("expected Session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_import_with_input_and_id() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "session",
+            "import",
+            "--input",
+            "/tmp/session.json",
+            "--id",
+            "imported-session",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Session(session) => match session.command {
+                SessionCommands::Import(args) => {
+                    assert_eq!(args.input, PathBuf::from("/tmp/session.json"));
+                    assert_eq!(args.id.as_deref(), Some("imported-session"));
+                    assert!(!args.json);
+                }
+                other => panic!("expected Import, got {other:?}"),
+            },
+            other => panic!("expected Session, got {other:?}"),
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod audio_cmd;
 mod chat;
 mod cli;
 mod errors;
+mod session_cmd;
 mod skills_cmd;
 
 use clap::Parser;
@@ -25,6 +26,7 @@ async fn main() {
             AudioCommands::Speak(args) => audio_cmd::handle_speak(args).await,
         },
         Commands::Chat(chat_args) => chat::handle_chat(chat_args).await,
+        Commands::Session(session_args) => session_cmd::handle_session(session_args).await,
         Commands::Skills(skills_args) => skills_cmd::handle_skills(skills_args).await,
     };
 

@@ -1640,6 +1640,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "directories",
  "roci",
  "roci-tools",
  "serde_json",
