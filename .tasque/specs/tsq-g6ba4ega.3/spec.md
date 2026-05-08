@@ -25,6 +25,11 @@ pub enum HealthSignal {
     Success,
     TransientFailure { category: FailureCategory },
     NonRetryableFailure { category: FailureCategory },
+    RetryExhausted {
+        candidate_index: usize,
+        key: ModelHealthKey,
+        category: FailureCategory,
+    },
     CandidateAdvanced {
         from_index: usize,
         to_index: usize,
@@ -51,12 +56,22 @@ Derived state guidance:
 - `degraded`: one or two consecutive transient failures
 - `unhealthy`: repeated transient failures or recent candidate exhaustion for the same key
 
+Health status rules:
+- no observations -> `Unknown`
+- `Success` -> `Healthy` and resets transient count
+- 1-2 consecutive transient failures -> `Degraded`
+- >=3 consecutive transient failures or transient `RetryExhausted` -> `Unhealthy`
+- non-retryable failures and cancellation are recorded but do not degrade provider/model health
+
 ## Data model / schema changes
 
 - Record candidate movement with `HealthSignal::CandidateAdvanced` instead of binary primary/fallback terminology.
+- Record retry exhaustion with `HealthSignal::RetryExhausted { candidate_index, key, category }`; runtime emits it when retry control flow exhausts retry for a candidate.
 - Include source/target candidate indices so health observations line up with the shared ordered candidate abstraction.
 - Keep session-local mutable state plus shared in-process global snapshots keyed by `provider + model`.
 - Treat recent signal history as observational data only; the registry does not trigger candidate advancement itself.
+- Shared snapshot merge is last-observation-wins by observation timestamp.
+- Current-run session-local state overlays the shared global snapshot for reads in the same run.
 
 Candidate-advance signal contract:
 - runtime writes `CandidateAdvanced` when advancing from one ordered candidate to the next
