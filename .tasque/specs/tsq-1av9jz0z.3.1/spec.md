@@ -15,10 +15,33 @@ Define the reusable secret redaction API for text and JSON payloads used by appr
 ## Match semantics
 Text ranges are UTF-8 byte offsets into original input. JSON paths use RFC 6901 JSON Pointer. V1 scans/redacts string values only; object keys are preserved. Overlaps resolve by start ascending, end descending, then kind priority: `PrivateKey`, `AuthHeader`, `BearerToken`, `ApiKey`, `EnvSecret`, `GenericSecret`. Keep first non-overlapping match.
 
-## Non-goals
+## Constraints / Non-goals
 - No secret storage/key management.
 - No telemetry pipeline implementation.
 - No runner/tool integration beyond defining the API in this task.
+
+## Interfaces (CLI/API)
+```rust
+pub struct SecretRedactor {
+    // default pattern set
+}
+
+pub struct SecretMatch {
+    pub kind: SecretKind,
+    pub location: SecretLocation,
+    pub replacement: String,
+}
+
+pub enum SecretLocation {
+    TextRange { start: usize, end: usize },
+    JsonPointer(String),
+}
+```
+
+## Data model / schema changes
+- Add `SecretRedactor`, `SecretMatch`, `SecretKind`, and `SecretLocation` to `roci-core`.
+- Add default kind-specific replacement tokens.
+- Add deterministic overlap resolution and JSON Pointer reporting.
 
 ## Acceptance criteria
 1. Text scanning returns stable matches with secret kind and byte range.
@@ -27,7 +50,7 @@ Text ranges are UTF-8 byte offsets into original input. JSON paths use RFC 6901 
 4. Default patterns cover common API keys, bearer tokens, auth headers, private key blocks, and env-style secret assignments.
 5. Tests prove non-secret text remains unchanged and overlapping matches are handled deterministically.
 
-## Validation
+## Test plan
 - Unit tests for scan/redact text.
 - Unit tests for nested JSON redaction and path reporting.
 - Fixture tests for common token/key/header/private-key shapes.
