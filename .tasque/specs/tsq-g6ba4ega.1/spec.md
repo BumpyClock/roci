@@ -37,6 +37,9 @@ Contract:
 - `candidates[i + 1]` is the next candidate after candidate `i` becomes eligible for advancement.
 - Duplicates are removed while preserving first-seen order.
 - The normalized candidate list is never empty.
+- Explicit empty `candidates` returns `RociError::Configuration` before provider creation.
+- Migration constructors from old single `model` produce `candidates = [model]`.
+- Dedup key is normalized `(provider, model_id)` from `LanguageModel`; first occurrence wins.
 
 Sub-agent mapping contract:
 
