@@ -1,10 +1,19 @@
 ## Goal
 Plan and lock the next MCP SDK layer for Roci without changing implementation yet.
 
+## Overview
+This epic defines the MCP SDK layer for Roci: typed transports, auth/resource boundaries, reconnect semantics, aggregate identity, and server-mode scope. Child tasks implement these contracts incrementally without re-deciding naming, ownership, or protocol boundaries.
+
 ## Product stance
 - Roci is in active development with no external SDK users yet.
 - Breaking MCP API changes are acceptable when they improve the long-term SDK shape.
 - Prefer clean public naming and module boundaries over compatibility shims.
+
+## Constraints / Non-goals
+- Do not preserve old MCP remote-transport names as long-term public API when the new name is clearer.
+- Do not let hosts parse exposed tool names for routing; structured identity is canonical.
+- Do not move app-owned UX such as browser launches, prompts, or account selection into core SDK primitives.
+- Do not proxy upstream MCP servers through Roci server mode in v1 unless a child task explicitly adds that scope later.
 
 ## Current baseline
 - Existing Roci support already covers feature-gated MCP client wiring for stdio + rmcp streamable HTTP/SSE, single-server tool calls, multi-server tool aggregation, and instruction merging.
@@ -56,6 +65,13 @@ Plan and lock the next MCP SDK layer for Roci without changing implementation ye
   - user approval prompts and account selection.
 - Required SDK contract: auth flows must work with callback traits so CLI/TUI/GUI hosts can plug in UX without forking protocol logic.
 
+## Interfaces (CLI/API)
+- `StdioTransport`, `StreamableHttpTransport`, and `WebSocketTransport` are the public transport vocabulary.
+- `MCPClient` owns initialize, tools/list, tools/call, resource list/read, capability inspection, and session reset.
+- `MCPResourceDescriptor` carries structured `{ server_id, uri }` provenance.
+- Aggregated MCP tools expose `mcp__<server_id>__<tool_name>` while routing uses structured identity.
+- MCP server mode exposes Roci tools through a transport-agnostic server core plus thin stdio/HTTP/WebSocket host adapters.
+
 ## Resource model
 - Add typed client APIs for:
   - `list_resources()` -> `Vec<MCPResourceDescriptor>`
@@ -63,6 +79,13 @@ Plan and lock the next MCP SDK layer for Roci without changing implementation ye
 - `MCPResourceDescriptor` should include at minimum: `server_id`, `server_label`, `uri`, `name`, `description`, `mime_type`, and optional annotations.
 - Aggregation rule: preserve upstream `uri` unchanged and attach server identity as sidecar metadata. Do **not** rewrite URIs globally in v1.
 - Optional helper methods may expose synthetic lookup keys for UI use, but canonical read calls must still accept `(server_id, uri)`.
+
+## Data model / schema changes
+- Add explicit MCP server identity fields: stable `server_id` and display-only `server_label`.
+- Add aggregate tool metadata that preserves raw `{ server_id, tool_name }` beside exposed names.
+- Add resource descriptors with sidecar server provenance instead of URI rewriting.
+- Add typed transport configs and shared remote auth/header/timeout fields.
+- Add server-core request/response mapping types reusable by stdio, HTTP, and WebSocket hosts.
 
 ## Reconnection lifecycle
 - Scope reconnect logic to remote transports only (`streamable-http`, `ws`).
@@ -100,6 +123,13 @@ Plan and lock the next MCP SDK layer for Roci without changing implementation ye
 2. Child tasks have explicit dependency edges and planning state `planned`.
 3. Rollout order is clear enough for parallel implementation without re-deciding core contracts.
 4. Open questions are isolated to true product/host decisions, not missing technical detail.
+
+## Test plan
+- Contract tests for exposed MCP naming, collision policies, and structured route identity.
+- Transport tests for stdio, Streamable HTTP, and WebSocket initialize/list/call paths.
+- Resource aggregation tests proving URI preservation plus server provenance.
+- Server-core tests proving host adapters share listing, dispatch, and error mapping behavior.
+- Regression tests proving stale remote transport names do not remain as long-term public API.
 
 ## Open questions
 1. Should auth UX stay entirely host-provided, or does Roci need a default local callback helper for CLI apps?
