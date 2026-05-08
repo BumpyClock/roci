@@ -39,7 +39,7 @@ pub struct AgentConfig {
     pub retry_mode: RetryMode,
     pub retry_backoff: RetryBackoffPolicy,
     pub max_retry_delay_ms: Option<u64>,
-    pub retry_heartbeat: Option<RetryHeartbeatFn>,
+    pub retry_events: Option<RetryEventFn>,
     pub health_registry: Option<std::sync::Arc<HealthRegistry>>,
 }
 
@@ -48,11 +48,20 @@ pub struct RunRequest {
     pub retry_mode: RetryMode,
     pub retry_backoff: RetryBackoffPolicy,
     pub max_retry_delay_ms: Option<u64>,
-    pub retry_heartbeat: Option<RetryHeartbeatFn>,
+    pub retry_events: Option<RetryEventFn>,
     pub health_registry: Option<std::sync::Arc<HealthRegistry>>,
 }
 
-pub struct RetryHeartbeat {
+pub enum RetryEventKind {
+    RetryScheduled,
+    RetryResuming,
+    RetryCanceled,
+    CandidateAdvancing,
+    RetryExhausted,
+}
+
+pub struct RetryEvent {
+    pub kind: RetryEventKind,
     pub run_id: String,
     pub provider: String,
     pub model_id: String,
@@ -60,24 +69,28 @@ pub struct RetryHeartbeat {
     pub attempt: u32,
     pub retry_mode: RetryMode,
     pub failure_category: FailureCategory,
-    pub sleep_ms: u64,
+    pub sleep_ms: Option<u64>,
     pub elapsed_retry_ms: u64,
     pub candidates_remaining: usize,
     pub partial_output_seen: bool,
     pub next_action: RetryNextAction,
 }
 
-pub type RetryHeartbeatFn = std::sync::Arc<dyn Fn(&RetryHeartbeat) + Send + Sync>;
+pub type RetryEventFn = std::sync::Arc<dyn Fn(&RetryEvent) + Send + Sync>;
 ```
 
 Retry scope contract:
 - runtime/supervisor config establishes the default `RetryMode` for descendant runs
 - an individual run may override that default before execution without mutating the supervisor baseline
-- retry / heartbeat / health logic reads the run's effective ordered `candidates` list and effective `retry_mode`
+- retry event / health logic reads the run's effective ordered `candidates` list and effective `retry_mode`
+- `RetryMode::Bounded { max_attempts }` counts total provider attempts per candidate, including the initial attempt; `max_attempts = 1` disables same-candidate retry
+- persistent retry never advances candidates and remains interruptible
 
 Typed host-facing events should align with ordered candidates:
 - `run.retry_scheduled`
-- `run.retry_heartbeat`
+- `run.retry_resuming`
+- `run.retry_canceled`
+- `run.retry_exhausted`
 - `run.candidate_advanced`
 - `run.candidate_advance_suppressed`
 - `run.health_updated`
@@ -88,7 +101,7 @@ Typed host-facing events should align with ordered candidates:
 - Validate `candidates` as non-empty, normalize once, and deduplicate while preserving first-seen order.
 - Treat request-level candidate overrides as whole-list replacement, not per-field merging.
 - Resolve each run's effective retry mode from runtime/supervisor default plus optional per-run override before execution starts; the override replaces the inherited mode for that run only.
-- Rename retry heartbeat field `fallbacks_remaining` -> `candidates_remaining`.
+- Retry observability uses `RetryEvent`, not provider heartbeat/ping calls; no periodic cadence events in G3.
 - Record health candidate movement with a `CandidateAdvanced` signal instead of binary primary/fallback terminology.
 - Pass resolved `profile.models` directly into child `AgentConfig.candidates` with inherited retry/health defaults and no adapter layer.
 
@@ -126,7 +139,7 @@ Adopt a single ordered runtime candidate abstraction on both `AgentConfig` and `
 Immediate candidate advancement can hide transient provider issues and makes behavior harder to reason about. Roci already has bounded retry and a separate overflow compaction lane.
 
 ### Decision
-Persistent retry is configured at runtime/supervisor scope by default and may be overridden per run. Retry the same candidate first. Advance only after the retry path is exhausted for transient capacity/server/network failures that occur before any streamed output or tool delta is emitted. Keep overflow compaction as the first recovery path. Do not auto-advance for auth/config/invalid-request/tool/cancel categories.
+Persistent retry is configured at runtime/supervisor scope by default and may be overridden per run. Retry the same candidate first. Advance only after the retry path is exhausted for transient capacity/server/network failures that occur before any streamed output or tool delta is emitted. Keep overflow compaction as the first recovery path. Do not auto-advance for auth/config/invalid-request/tool/cancel categories. If only one candidate is configured, retry that candidate according to the effective policy and then return the classified/original failure when retry is exhausted.
 
 ### Consequences
 - behavior stays deterministic and aligned with configured candidate order
@@ -190,11 +203,12 @@ Trigger rules:
 - define boundary with `tsq-tb6qdmqm.9`
 - map resolved `profile.models` directly into child `candidates`
 
-### `tsq-g6ba4ega.2` — retry defaults, per-run override, and retry heartbeat callbacks
+### `tsq-g6ba4ega.2` — retry defaults, per-run override, and retry events
 - define runtime/supervisor retry defaults plus per-run override semantics
 - retry same candidate first for eligible transient failures
 - gate candidate advancement on retry exhaustion, eligibility, and no partial output/tool deltas
 - keep cancellation authoritative during retry sleeps and persistent waits
+- emit `RetryEvent` values for schedule, resume, cancel, candidate advancement, and exhaustion without provider heartbeat/ping calls
 
 ### `tsq-g6ba4ega.3` — provider/model health registry over ordered candidates
 - implement session-local tracker plus shared in-process global snapshot
@@ -234,12 +248,12 @@ Integration thread across all workstreams:
 | Cross-provider credential ambiguity | candidate advancement may pick a provider without valid runtime credentials | keep resolution scoped to already-configured providers; surface credential failures as non-advancing auth/config errors |
 | Duplicate output after partial stream failure | retry/advancement could duplicate visible text or tool side effects | hard-stop auto advancement after any emitted text/tool delta in G3 default |
 | Health poisoning from non-transient errors | one bad request could incorrectly mark a model unhealthy | count only transient retry/advance-eligible failures toward degraded health |
-| Hidden infinite waits | persistent retry can stall without visibility | require explicit persistent mode plus heartbeat events/callbacks |
+| Hidden infinite waits | persistent retry can stall without visibility | require explicit persistent mode plus retry events/callbacks |
 | Nondeterministic health-driven behavior | global state could implicitly reorder candidates | keep configured order authoritative; treat health as advisory only |
 
 ## Open questions
 
 1. Should provider-specific credential lookup stay as-is and rely on already-resolved config, or become more explicitly provider-aware for cross-provider candidate advancement?
-2. Should persistent retry require a configured heartbeat sink, or only recommend one?
+2. Should persistent retry require a configured retry-event sink, or only recommend one?
 3. Should the global health snapshot remain purely advisory in G3 default, or ever pre-skip candidate `0` in a future opt-in mode?
 4. Should run snapshots/results expose the final active candidate and candidate-advance history directly, or keep that information event-only for now?
