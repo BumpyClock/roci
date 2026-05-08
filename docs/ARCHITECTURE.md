@@ -194,11 +194,12 @@ Provider-specific model enums (`OpenAiModel`, `AnthropicModel`, etc.) live in
 
 Produces the `roci-agent` binary. Owns all terminal concerns:
 
-- command surface: `roci-agent auth ...`, `roci-agent chat ...`, and `roci-agent skills ...`
+- command surface: `roci-agent auth ...`, `roci-agent chat ...`, `roci-agent session ...`, and `roci-agent skills ...`
 - `clap` argument parsing
 - stdout/stderr output, spinners, interactive prompts
 - Exit codes and `process::exit`
 - User-facing error messages (maps core typed errors to help text)
+- Durable session management commands (create/list/delete/export/import) backed by `roci-core::session::LocalSessionStore`
 - Auth flow orchestration (maps `AuthStep`/`AuthPollResult` to interactive prompts)
 - PKCE flow handoff (preserves `session_data` from `start_login` through `complete_pkce`)
 - Resource diagnostics rendering (surfaces loader warnings from `roci-core::resource`)
@@ -211,7 +212,7 @@ Resource loading behavior used by CLI chat:
 - Builds final system prompt as: CLI `--system` (or discovered `SYSTEM.md`) + discovered `APPEND_SYSTEM.md` + rendered project context section.
 - Loads skills from roots in precedence order: `.roci/skills`, `.agents/skills`, `~/.roci/agent/skills`, `~/.agents/skills` (plus explicit paths/roots from CLI flags).
 
-**Dependencies**: `roci` (with `agent` feature), `roci-tools`, `clap`, `tokio`, `chrono`.
+**Dependencies**: `roci` (with `agent` feature), `roci-tools`, `clap`, `tokio`, `chrono`, `directories`.
 
 ### `roci-tools` -- Built-in Coding Tools
 

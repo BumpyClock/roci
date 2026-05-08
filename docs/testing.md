@@ -13,7 +13,7 @@ cargo test -p roci-core       # Core SDK kernel (traits, types, config, auth)
 cargo test -p roci-core --features agent "agent::runtime::tests::"  # AgentRuntime tests in crates/roci-core/src/agent/runtime_tests
 cargo test -p roci-providers  # Provider transports
 cargo test -p roci            # Meta-crate integration tests
-cargo test -p roci-cli        # CLI tests (arg parsing, error formatting)
+cargo test -p roci-cli        # CLI tests (arg parsing, error formatting, session commands)
 cargo test -p roci-tools      # Tool tests (25 tests covering all tools)
 ```
 
@@ -54,6 +54,43 @@ echo "attach: tmux attach -t roci-live-provider"
 Use `curl http://127.0.0.1:1234/api/v0/models` to confirm at least one local model is `loaded`. If local models are unavailable or not loaded, say so and use the configured remote provider most relevant to the change.
 
 Remote provider smoke tests must not print secrets. Pass credentials through the environment or existing auth store, print only whether a credential is configured, and keep the prompt/token budget small.
+
+## Durable session verification
+
+Session storage must stay under the host-selected root. Do not treat the
+project cwd as implicit session storage.
+
+CLI session management smoke:
+
+```bash
+ROOT=/tmp/roci-session-smoke
+cargo run -q -p roci-cli -- session create --root "$ROOT" --id smoke --title Smoke --json
+cargo run -q -p roci-cli -- session list --root "$ROOT" --json
+cargo run -q -p roci-cli -- session export smoke --root "$ROOT" --output "$ROOT/export.json" --json
+cargo run -q -p roci-cli -- session import --root "$ROOT" --input "$ROOT/export.json" --id smoke-import --json
+cargo run -q -p roci-cli -- session delete smoke-import --root "$ROOT"
+test -f "$ROOT/smoke/metadata.json"
+test -f "$ROOT/export.json"
+test ! -e "$ROOT/smoke-import"
+```
+
+Provider-facing durable resume smoke should run in tmux and exercise chat with
+an explicit session root:
+
+```bash
+tmux new-session -d -s roci-session-resume \
+  'cd /path/to/roci && \
+   ROOT=/tmp/roci-session-resume && \
+   LMSTUDIO_BASE_URL=http://127.0.0.1:1234 \
+   cargo run -q -p roci-cli --features roci/lmstudio -- \
+   chat --no-skills --model "lmstudio:<model-id>" \
+   --temperature 0 --max-tokens 32 \
+   --session-root "$ROOT" --session-id live-resume \
+   "Reply exactly: roci session live ok"; \
+   status=$?; printf "\n[roci session smoke exit=%s]\n" "$status"; \
+   ls -la "$ROOT/live-resume"; exec zsh'
+echo "attach: tmux attach -t roci-session-resume"
+```
 
 ## Environment
 
