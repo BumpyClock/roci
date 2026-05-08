@@ -88,10 +88,12 @@ Plan and lock the next MCP SDK layer for Roci without changing implementation ye
 - HTTP/WS hosting should be designed as thin adapters over the same server core, not parallel implementations.
 
 ## Namespacing contract
-- Canonical tool exposure format remains `<server_id>__<tool_name>`.
+- Canonical MCP aggregate tool exposure is `mcp__<server_id>__<tool_name>`.
+- Native Roci tools stay plain unless a host explicitly namespaces them.
 - This is a fresh long-term decision, not a compatibility concession: it keeps names model/provider-safe while remaining readable and deterministic.
 - Introduce explicit metadata structs so callers do not need to parse tool names for routing.
 - Resource routing should use structured identity (`server_id`, `uri`) instead of encoded name strings.
+- Collision policy defaults to `DenyOnCollision`, with optional deterministic suffixing for hosts that prefer graceful name disambiguation.
 
 ## Acceptance criteria
 1. Epic child specs define contracts for transports, auth, resources, reconnect, server mode, and namespacing with no major ambiguity left for implementers.
