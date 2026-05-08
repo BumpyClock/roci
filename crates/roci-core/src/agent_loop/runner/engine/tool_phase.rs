@@ -13,7 +13,7 @@ use super::super::tooling::{
     append_skipped_tool_call, append_tool_result, apply_post_tool_use_hook, canceled_tool_result,
     declined_tool_result, emit_tool_execution_end, emit_tool_execution_start,
     execute_parallel_tool_calls, execute_tool_call, resolve_tool_call, ResolvedToolCall,
-    ToolExecutionOutcome,
+    ToolExecutionInputs, ToolExecutionOutcome,
 };
 use super::super::{AgentEvent, ApprovalDecision, RunRequest};
 
@@ -76,6 +76,13 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
     let mut turn_tool_results: Vec<AgentToolResult> = Vec::new();
     let mut steering_interrupted = false;
     let mut pending_parallel_calls: Vec<ResolvedToolCall> = Vec::new();
+    let tool_inputs = ToolExecutionInputs::new(
+        request.session_fs.clone(),
+        request.session_cwd.clone(),
+        request.sandbox_provider.clone(),
+        #[cfg(feature = "agent")]
+        request.user_input_callback.as_ref(),
+    );
 
     for (call_idx, call) in tool_calls.iter().enumerate() {
         let resolved_call = resolve_tool_call(&request.tools, call);
@@ -137,8 +144,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     &pending_parallel_calls,
                     agent_emitter,
                     run_cancel_token.child_token(),
-                    #[cfg(feature = "agent")]
-                    request.user_input_callback.as_ref(),
+                    tool_inputs.clone(),
                 ) => results,
             };
             pending_parallel_calls.clear();
@@ -205,8 +211,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     resolved_call,
                     agent_emitter,
                     run_cancel_token.child_token(),
-                    #[cfg(feature = "agent")]
-                    request.user_input_callback.as_ref(),
+                    tool_inputs.clone(),
                 ) => outcome,
             }
         } else {
@@ -289,8 +294,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                 &pending_parallel_calls,
                 agent_emitter,
                 run_cancel_token.child_token(),
-                #[cfg(feature = "agent")]
-                request.user_input_callback.as_ref(),
+                tool_inputs.clone(),
             ) => results,
         };
         pending_parallel_calls.clear();

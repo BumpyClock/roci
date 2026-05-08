@@ -74,13 +74,24 @@ pub enum ToolPolicy {
 pub struct SubagentProfile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<SubagentKind>,
+    /// Routing hint text for controllers that infer an appropriate profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub tools: ToolPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_agent_excluded_tools: Vec<String>,
     #[serde(default)]
     pub models: Vec<ModelCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,10 +112,15 @@ impl Default for SubagentProfile {
     fn default() -> Self {
         Self {
             name: String::new(),
+            display_name: None,
             description: None,
             kind: None,
+            infer: None,
             system_prompt: None,
             tools: ToolPolicy::default(),
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
+            default_agent_excluded_tools: Vec::new(),
             models: Vec::new(),
             inherits: None,
             default_timeout_ms: None,
@@ -123,8 +139,10 @@ impl SubagentProfile {
     pub fn builtin_developer() -> Self {
         Self {
             name: "builtin:developer".into(),
+            display_name: Some("Developer".into()),
             description: Some("General-purpose coding sub-agent".into()),
             kind: Some(SubagentKind::Developer),
+            infer: Some("implementation, debugging, refactoring, tests, code review".into()),
             system_prompt: Some(
                 "You are a coding sub-agent. Write clean, correct code. \
                  Use `ask_user` when user input is required. \
@@ -139,8 +157,10 @@ impl SubagentProfile {
     pub fn builtin_planner() -> Self {
         Self {
             name: "builtin:planner".into(),
+            display_name: Some("Planner".into()),
             description: Some("Planning and architecture sub-agent".into()),
             kind: Some(SubagentKind::Planner),
+            infer: Some("planning, architecture, decomposition, tradeoffs".into()),
             system_prompt: Some(
                 "You are a planning sub-agent. Analyze requirements, \
                  propose designs, and break work into steps. \
@@ -155,14 +175,62 @@ impl SubagentProfile {
     pub fn builtin_explorer() -> Self {
         Self {
             name: "builtin:explorer".into(),
+            display_name: Some("Explorer".into()),
             description: Some("Codebase exploration and research sub-agent".into()),
             kind: Some(SubagentKind::Explorer),
+            infer: Some("codebase search, discovery, research, reading files".into()),
             system_prompt: Some(
                 "You are an exploration sub-agent. Search the codebase, \
                  read files, and report findings. Do not modify code."
                     .into(),
             ),
             ..Default::default()
+        }
+    }
+}
+
+/// Compact, controller-facing profile data for registry listings.
+///
+/// Summaries intentionally omit `system_prompt` and `metadata`; callers that
+/// need the full executable profile should use profile resolution instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentProfileSummary {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SubagentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_agent_excluded_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_timeout_ms: Option<u64>,
+    pub version: u32,
+}
+
+impl From<&SubagentProfile> for SubagentProfileSummary {
+    fn from(profile: &SubagentProfile) -> Self {
+        Self {
+            name: profile.name.clone(),
+            display_name: profile.display_name.clone(),
+            description: profile.description.clone(),
+            kind: profile.kind.clone(),
+            infer: profile.infer.clone(),
+            skills: profile.skills.clone(),
+            mcp_servers: profile.mcp_servers.clone(),
+            default_agent_excluded_tools: profile.default_agent_excluded_tools.clone(),
+            models: profile.models.clone(),
+            default_timeout_ms: profile.default_timeout_ms,
+            version: profile.version,
         }
     }
 }
@@ -387,7 +455,12 @@ mod tests {
         let profile = SubagentProfile::default();
         assert_eq!(profile.version, 1);
         assert!(profile.name.is_empty());
+        assert!(profile.display_name.is_none());
+        assert!(profile.infer.is_none());
         assert_eq!(profile.tools, ToolPolicy::Inherit);
+        assert!(profile.skills.is_empty());
+        assert!(profile.mcp_servers.is_empty());
+        assert!(profile.default_agent_excluded_tools.is_empty());
         assert!(profile.models.is_empty());
     }
 
@@ -415,6 +488,17 @@ mod tests {
         assert!(SubagentProfile::builtin_developer().system_prompt.is_some());
         assert!(SubagentProfile::builtin_planner().system_prompt.is_some());
         assert!(SubagentProfile::builtin_explorer().system_prompt.is_some());
+    }
+
+    #[test]
+    fn builtin_profiles_have_listing_fields() {
+        let developer = SubagentProfile::builtin_developer();
+        assert_eq!(developer.display_name.as_deref(), Some("Developer"));
+        assert!(developer
+            .infer
+            .as_deref()
+            .unwrap()
+            .contains("implementation"));
     }
 
     #[test]
@@ -512,10 +596,34 @@ mod tests {
 
     #[test]
     fn subagent_profile_serde_roundtrip() {
-        let profile = SubagentProfile::builtin_developer();
+        let profile = SubagentProfile {
+            skills: vec!["rust-skills".into()],
+            mcp_servers: vec!["github".into()],
+            default_agent_excluded_tools: vec!["dangerous-delete".into()],
+            ..SubagentProfile::builtin_developer()
+        };
         let json = serde_json::to_string(&profile).unwrap();
         let deserialized: SubagentProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, profile);
+    }
+
+    #[test]
+    fn profile_summary_omits_runtime_prompt_fields() {
+        let profile = SubagentProfile {
+            skills: vec!["rust-skills".into()],
+            mcp_servers: vec!["github".into()],
+            default_agent_excluded_tools: vec!["dangerous-delete".into()],
+            ..SubagentProfile::builtin_developer()
+        };
+        let summary = SubagentProfileSummary::from(&profile);
+        assert_eq!(summary.name, "builtin:developer");
+        assert_eq!(summary.display_name.as_deref(), Some("Developer"));
+        assert_eq!(summary.skills, vec!["rust-skills"]);
+        assert_eq!(summary.mcp_servers, vec!["github"]);
+        assert_eq!(
+            summary.default_agent_excluded_tools,
+            vec!["dangerous-delete"]
+        );
     }
 
     #[test]
@@ -558,5 +666,16 @@ mod tests {
         let json = r#"{"name":"test","tools":{"mode":"inherit"},"models":[]}"#;
         let profile: SubagentProfile = serde_json::from_str(json).unwrap();
         assert_eq!(profile.version, 1);
+    }
+
+    #[test]
+    fn profile_new_fields_default_from_json() {
+        let json = r#"{"name":"test"}"#;
+        let profile: SubagentProfile = serde_json::from_str(json).unwrap();
+        assert!(profile.display_name.is_none());
+        assert!(profile.infer.is_none());
+        assert!(profile.skills.is_empty());
+        assert!(profile.mcp_servers.is_empty());
+        assert!(profile.default_agent_excluded_tools.is_empty());
     }
 }

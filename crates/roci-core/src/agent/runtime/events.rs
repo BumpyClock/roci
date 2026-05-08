@@ -7,6 +7,31 @@ use super::{
 use crate::agent_loop::approvals::ApprovalDecision;
 use crate::agent_loop::runner::AgentEventSink;
 use crate::agent_loop::AgentEvent;
+use crate::session::LocalSessionResources;
+
+pub(super) fn project_plan_update_and_mirror(
+    projector: &mut ChatProjector,
+    turn_id: TurnId,
+    plan: String,
+    session_resources: Option<&LocalSessionResources>,
+) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+    let mut events = vec![projector.update_plan(turn_id, plan.clone())?];
+    if let Some(resources) = session_resources {
+        let metadata =
+            resources
+                .write_plan(&plan)
+                .map_err(|err| AgentRuntimeError::ProjectionFailed {
+                    message: err.to_string(),
+                })?;
+        let resource =
+            super::chat::resource_snapshot_from_metadata(metadata, serde_json::Value::Null);
+        events.push(projector.record_session_resource(
+            turn_id,
+            super::chat::AgentRuntimeEventPayload::PlanWritten { resource },
+        )?);
+    }
+    Ok(events)
+}
 
 #[derive(Debug, Default)]
 struct ChatProjectionRunState {
@@ -36,6 +61,7 @@ fn project_agent_event(
     run_state: &mut ChatProjectionRunState,
     turn_id: TurnId,
     event: &AgentEvent,
+    session_resources: Option<&LocalSessionResources>,
 ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
     let mut events = Vec::new();
     match event {
@@ -184,7 +210,12 @@ fn project_agent_event(
                 return Ok(events);
             }
             events.extend(ensure_turn_started(projector, run_state, turn_id)?);
-            events.push(projector.update_plan(turn_id, plan.clone())?);
+            events.extend(project_plan_update_and_mirror(
+                projector,
+                turn_id,
+                plan.clone(),
+                session_resources,
+            )?);
         }
         AgentEvent::DiffUpdated { diff } => {
             events.extend(ensure_turn_started(projector, run_state, turn_id)?);
@@ -219,6 +250,7 @@ impl AgentRuntime {
         let chat_projector = self.chat_projector.clone();
         let runtime_event_publish_tx = self.runtime_event_publish_tx.clone();
         let runtime_event_send_lock = self.runtime_event_send_lock.clone();
+        let session_resources = self.session_resources.clone();
         let projection_error = Arc::new(StdMutex::new(None));
         let projection_error_for_sink = projection_error.clone();
         let projection_error_for_publish = projection_error.clone();
@@ -232,20 +264,24 @@ impl AgentRuntime {
             if let (Ok(mut projector), Ok(mut run_state)) =
                 (chat_projector.lock(), projection_run_state.lock())
             {
-                let projection_result =
-                    project_agent_event(&mut projector, &mut run_state, turn_id, &event).and_then(
-                        |events| {
-                            for event in events {
-                                AgentRuntime::queue_runtime_event_to(
-                                    &runtime_event_publish_tx,
-                                    &runtime_event_send_lock,
-                                    event,
-                                    projection_error_for_publish.clone(),
-                                )?;
-                            }
-                            Ok(())
-                        },
-                    );
+                let projection_result = project_agent_event(
+                    &mut projector,
+                    &mut run_state,
+                    turn_id,
+                    &event,
+                    session_resources.as_deref(),
+                )
+                .and_then(|events| {
+                    for event in events {
+                        AgentRuntime::queue_runtime_event_to(
+                            &runtime_event_publish_tx,
+                            &runtime_event_send_lock,
+                            event,
+                            projection_error_for_publish.clone(),
+                        )?;
+                    }
+                    Ok(())
+                });
                 if let Err(err) = projection_result {
                     if let Ok(mut stored_error) = projection_error_for_sink.lock() {
                         if stored_error.is_none() {
@@ -320,6 +356,7 @@ mod tests {
             &AgentEvent::Approval {
                 request: approval_request("approval-1"),
             },
+            None,
         )
         .expect("approval projects");
         let resolved = project_agent_event(
@@ -330,6 +367,7 @@ mod tests {
                 request_id: "approval-1".to_string(),
                 decision: ApprovalDecision::Decline,
             },
+            None,
         )
         .expect("approval resolution projects");
         let thread = projector
@@ -364,6 +402,7 @@ mod tests {
             &AgentEvent::MessageStart {
                 message: ModelMessage::assistant(""),
             },
+            None,
         )
         .expect("message starts");
         let reasoning = project_agent_event(
@@ -373,6 +412,7 @@ mod tests {
             &AgentEvent::Reasoning {
                 text: "analysis".to_string(),
             },
+            None,
         )
         .expect("reasoning projects");
         let plan = project_agent_event(
@@ -382,6 +422,7 @@ mod tests {
             &AgentEvent::PlanUpdated {
                 plan: "inspect then edit".to_string(),
             },
+            None,
         )
         .expect("plan projects");
         let diff = project_agent_event(
@@ -391,6 +432,7 @@ mod tests {
             &AgentEvent::DiffUpdated {
                 diff: "+line".to_string(),
             },
+            None,
         )
         .expect("diff projects");
         let thread = projector
@@ -431,6 +473,7 @@ mod tests {
             &AgentEvent::PlanUpdated {
                 plan: "inspect then edit".to_string(),
             },
+            None,
         )
         .expect("plan suppression should project");
         let thread = projector

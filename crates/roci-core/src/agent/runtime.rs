@@ -56,7 +56,6 @@ use crate::agent_loop::RunStatus;
 use crate::config::RociConfig;
 #[cfg(test)]
 use crate::context::estimate_message_tokens;
-#[cfg(test)]
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
@@ -64,8 +63,10 @@ use crate::provider::ProviderRegistry;
 use crate::provider::ProviderRequest;
 #[cfg(test)]
 use crate::resource::{BranchSummarySettings, CompactionSettings};
+use crate::session::{LocalSessionFs, LocalSessionResources, SessionMetadata};
 use crate::tools::dynamic::DynamicToolProvider;
 use crate::tools::tool::Tool;
+use crate::tools::SandboxProvider;
 #[cfg(test)]
 use crate::types::Role;
 use crate::types::{GenerationSettings, ModelMessage, Usage};
@@ -120,6 +121,10 @@ pub struct AgentRuntime {
     runtime_event_publish_tx: mpsc::UnboundedSender<RuntimeEventPublishRequest>,
     runtime_event_publish_rx:
         Arc<Mutex<Option<mpsc::UnboundedReceiver<RuntimeEventPublishRequest>>>>,
+    session_config: Option<crate::session::SessionConfig>,
+    session_fs: Option<Arc<LocalSessionFs>>,
+    session_resources: Option<Arc<LocalSessionResources>>,
+    sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     /// Persistent session usage ledger. Accumulates across runs, cleared on reset.
     session_usage: Arc<Mutex<Usage>>,
     #[cfg(feature = "agent")]
@@ -154,6 +159,25 @@ impl AgentRuntime {
         roci_config: RociConfig,
         config: AgentConfig,
     ) -> Self {
+        Self::new_inner(registry, roci_config, config).expect(
+            "AgentRuntime::new failed; use AgentRuntime::try_new for fallible session setup",
+        )
+    }
+
+    /// Try to create a new agent runtime with fallible session setup.
+    pub fn try_new(
+        registry: Arc<ProviderRegistry>,
+        roci_config: RociConfig,
+        config: AgentConfig,
+    ) -> Result<Self, RociError> {
+        Self::new_inner(registry, roci_config, config)
+    }
+
+    fn new_inner(
+        registry: Arc<ProviderRegistry>,
+        roci_config: RociConfig,
+        config: AgentConfig,
+    ) -> Result<Self, RociError> {
         let runner = LoopRunner::with_registry(roci_config.clone(), registry.clone());
         let model = Arc::new(Mutex::new(config.model.clone()));
         let generation_settings = Arc::new(Mutex::new(config.settings.clone()));
@@ -162,11 +186,37 @@ impl AgentRuntime {
         let tools = Arc::new(Mutex::new(config.tools.clone()));
         let dynamic_tool_providers = Arc::new(Mutex::new(config.dynamic_tool_providers.clone()));
         let replay_capacity = normalized_replay_capacity(config.chat.replay_capacity);
-        let runtime_event_store = config.chat.event_store.clone().unwrap_or_else(|| {
-            Arc::new(InMemoryAgentRuntimeEventStore::with_replay_capacity(
-                replay_capacity,
-            ))
-        });
+        let session_conventions = config.session.as_ref().map(|session| session.conventions());
+        let session_resources = session_conventions
+            .clone()
+            .map(LocalSessionResources::with_conventions)
+            .transpose()
+            .map_err(|err| RociError::InvalidState(err.to_string()))?
+            .map(Arc::new);
+        let session_fs = session_conventions
+            .clone()
+            .map(LocalSessionFs::with_conventions)
+            .transpose()
+            .map_err(|err| RociError::InvalidState(err.to_string()))?
+            .map(Arc::new);
+        if let (Some(session), Some(conventions)) = (&config.session, &session_conventions) {
+            SessionMetadata::new(session.id.clone(), std::env::current_dir().ok(), None)
+                .write_to_path(conventions.metadata_file())
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
+        }
+        let runtime_event_store: Arc<dyn AgentRuntimeEventStore> = match session_conventions {
+            Some(conventions) => Arc::new(
+                JsonlAgentRuntimeEventStore::open(conventions.events_file())
+                    .map_err(Self::map_chat_projection_error)?,
+            ),
+            None => config.chat.event_store.clone().unwrap_or_else(|| {
+                Arc::new(InMemoryAgentRuntimeEventStore::with_replay_capacity(
+                    replay_capacity,
+                ))
+            }),
+        };
+        let session_config = config.session.clone();
+        let sandbox_provider = config.sandbox_provider.clone();
         let (runtime_event_tx, _) = broadcast::channel(replay_capacity.get());
         let (runtime_event_publish_tx, runtime_event_publish_rx) =
             mpsc::unbounded_channel::<RuntimeEventPublishRequest>();
@@ -188,7 +238,7 @@ impl AgentRuntime {
         #[cfg(feature = "agent")]
         let tool_permission_session_approvals =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
-        Self {
+        Ok(Self {
             config,
             runner,
             roci_config,
@@ -221,12 +271,16 @@ impl AgentRuntime {
             runtime_event_send_lock: Arc::new(StdMutex::new(())),
             runtime_event_publish_tx,
             runtime_event_publish_rx: Arc::new(Mutex::new(Some(runtime_event_publish_rx))),
+            session_config,
+            session_fs,
+            session_resources,
+            sandbox_provider,
             session_usage: Arc::new(Mutex::new(Usage::default())),
             #[cfg(feature = "agent")]
             human_interaction_coordinator,
             #[cfg(feature = "agent")]
             tool_permission_session_approvals,
-        }
+        })
     }
 
     /// Submit a user input response.

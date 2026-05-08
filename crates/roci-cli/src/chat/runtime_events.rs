@@ -633,6 +633,13 @@ impl ChatRenderer {
             AgentRuntimeEventPayload::DiffUpdated { diff } => {
                 let _ = writeln!(stderr, "\n[diff]\n{}", truncate_preview(&diff.diff, 400));
             }
+            AgentRuntimeEventPayload::PlanWritten { .. }
+            | AgentRuntimeEventPayload::WorkspaceUpdated { .. }
+            | AgentRuntimeEventPayload::ArtifactCreated { .. }
+            | AgentRuntimeEventPayload::TempFileWritten { .. }
+            | AgentRuntimeEventPayload::CheckpointCreated { .. }
+            | AgentRuntimeEventPayload::SessionFileWritten { .. }
+            | AgentRuntimeEventPayload::SessionFileDeleted { .. } => {}
             AgentRuntimeEventPayload::TurnCompleted { .. }
             | AgentRuntimeEventPayload::TurnFailed { .. }
             | AgentRuntimeEventPayload::TurnCanceled { .. } => return true,

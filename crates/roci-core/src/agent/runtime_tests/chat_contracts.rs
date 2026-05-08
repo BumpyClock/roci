@@ -1,7 +1,19 @@
 use super::chat::{
     AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, ChatRuntimeConfig, MessageId,
-    MessageStatus, RuntimeCursor, ThreadId, TurnId, TurnSnapshot, TurnStatus,
+    MessageStatus, RuntimeCursor, SessionResourceSnapshot, ThreadId, TurnId, TurnSnapshot,
+    TurnStatus,
 };
+use crate::session::{LogicalPath, SessionResourceNamespace};
+
+fn test_resource(namespace: SessionResourceNamespace) -> SessionResourceSnapshot {
+    SessionResourceSnapshot {
+        namespace,
+        path: Some(LogicalPath::parse("notes/today.md").expect("path parses")),
+        len: 42,
+        updated_at: chrono::Utc::now(),
+        metadata: serde_json::json!({ "source": "test" }),
+    }
+}
 
 fn test_turn(thread_id: ThreadId) -> TurnSnapshot {
     let now = chrono::Utc::now();
@@ -82,6 +94,13 @@ fn semantic_payload_set_matches_target_contract() {
         AgentRuntimeEventPayload::reasoning_updated_name(),
         AgentRuntimeEventPayload::plan_updated_name(),
         AgentRuntimeEventPayload::diff_updated_name(),
+        AgentRuntimeEventPayload::plan_written_name(),
+        AgentRuntimeEventPayload::workspace_updated_name(),
+        AgentRuntimeEventPayload::artifact_created_name(),
+        AgentRuntimeEventPayload::temp_file_written_name(),
+        AgentRuntimeEventPayload::checkpoint_created_name(),
+        AgentRuntimeEventPayload::session_file_written_name(),
+        AgentRuntimeEventPayload::session_file_deleted_name(),
         AgentRuntimeEventPayload::turn_completed_name(),
         AgentRuntimeEventPayload::turn_failed_name(),
         AgentRuntimeEventPayload::turn_canceled_name(),
@@ -104,11 +123,72 @@ fn semantic_payload_set_matches_target_contract() {
             "reasoning_updated",
             "plan_updated",
             "diff_updated",
+            "plan_written",
+            "workspace_updated",
+            "artifact_created",
+            "temp_file_written",
+            "checkpoint_created",
+            "session_file_written",
+            "session_file_deleted",
             "turn_completed",
             "turn_failed",
             "turn_canceled",
         ]
     );
+}
+
+#[test]
+fn resource_event_payloads_have_stable_names() {
+    let cases = [
+        (
+            AgentRuntimeEventPayload::PlanWritten {
+                resource: test_resource(SessionResourceNamespace::Plan),
+            },
+            "plan_written",
+        ),
+        (
+            AgentRuntimeEventPayload::WorkspaceUpdated {
+                resource: test_resource(SessionResourceNamespace::Workspace),
+            },
+            "workspace_updated",
+        ),
+        (
+            AgentRuntimeEventPayload::ArtifactCreated {
+                resource: test_resource(SessionResourceNamespace::Artifacts),
+            },
+            "artifact_created",
+        ),
+        (
+            AgentRuntimeEventPayload::TempFileWritten {
+                resource: test_resource(SessionResourceNamespace::Temp),
+            },
+            "temp_file_written",
+        ),
+        (
+            AgentRuntimeEventPayload::CheckpointCreated {
+                resource: test_resource(SessionResourceNamespace::Checkpoints),
+            },
+            "checkpoint_created",
+        ),
+        (
+            AgentRuntimeEventPayload::SessionFileWritten {
+                resource: test_resource(SessionResourceNamespace::Files),
+            },
+            "session_file_written",
+        ),
+        (
+            AgentRuntimeEventPayload::SessionFileDeleted {
+                resource: test_resource(SessionResourceNamespace::Files),
+            },
+            "session_file_deleted",
+        ),
+    ];
+
+    for (payload, expected) in cases {
+        let encoded = serde_json::to_value(payload).expect("payload serializes");
+
+        assert_eq!(encoded["type"], expected);
+    }
 }
 
 #[test]

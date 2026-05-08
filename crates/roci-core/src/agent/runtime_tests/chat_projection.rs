@@ -1,15 +1,31 @@
 use super::chat::{
     AgentRuntimeError, AgentRuntimeEventPayload, ApprovalStatus, ChatProjector,
-    HumanInteractionStatus, MessageStatus, RuntimeCursor, ToolStatus, TurnStatus,
+    HumanInteractionStatus, MessageStatus, RuntimeCursor, SessionResourceSnapshot, ToolStatus,
+    TurnStatus,
 };
 use crate::agent_loop::{ApprovalDecision, ApprovalKind, ApprovalRequest, ToolUpdatePayload};
 use crate::human_interaction::{
     AskUserRequest, HumanInteractionPayload, HumanInteractionRequest, HumanInteractionResponse,
     HumanInteractionResponsePayload, HumanInteractionSource,
 };
+use crate::session::{LogicalPath, SessionResourceNamespace};
 use crate::tools::AskUserPrompt;
 use crate::types::{AgentToolCall, AgentToolResult, ContentPart, ModelMessage, Role};
 use chrono::Utc;
+
+fn resource(
+    namespace: SessionResourceNamespace,
+    path: Option<&str>,
+    len: u64,
+) -> SessionResourceSnapshot {
+    SessionResourceSnapshot {
+        namespace,
+        path: path.map(|path| LogicalPath::parse(path).expect("path parses")),
+        len,
+        updated_at: Utc::now(),
+        metadata: serde_json::json!({ "origin": "projection-test" }),
+    }
+}
 
 #[test]
 fn projector_defaults_to_one_thread_snapshot() {
@@ -442,6 +458,168 @@ fn reasoning_plan_and_diff_project_latest_turn_state() {
         diff.payload,
         AgentRuntimeEventPayload::DiffUpdated { .. }
     ));
+}
+
+#[test]
+fn record_session_resource_records_event_and_updates_snapshot_resources() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).expect("turn starts");
+
+    let plan = resource(SessionResourceNamespace::Plan, None, 10);
+    let workspace = resource(SessionResourceNamespace::Workspace, None, 20);
+    let artifact = resource(
+        SessionResourceNamespace::Artifacts,
+        Some("reports/out.md"),
+        30,
+    );
+    let temp_file = resource(
+        SessionResourceNamespace::Temp,
+        Some("scratch/cache.bin"),
+        40,
+    );
+    let checkpoint = resource(
+        SessionResourceNamespace::Checkpoints,
+        Some("turn-1/state.json"),
+        50,
+    );
+    let file = resource(SessionResourceNamespace::Files, Some("notes/today.md"), 60);
+    let deleted_file = resource(SessionResourceNamespace::Files, Some("notes/today.md"), 0);
+
+    let plan_event = projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::PlanWritten {
+                resource: plan.clone(),
+            },
+        )
+        .expect("plan resource projects");
+    projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::WorkspaceUpdated {
+                resource: workspace.clone(),
+            },
+        )
+        .expect("workspace resource projects");
+    projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::ArtifactCreated {
+                resource: artifact.clone(),
+            },
+        )
+        .expect("artifact resource projects");
+    projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::TempFileWritten {
+                resource: temp_file.clone(),
+            },
+        )
+        .expect("temp resource projects");
+    projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::CheckpointCreated {
+                resource: checkpoint.clone(),
+            },
+        )
+        .expect("checkpoint resource projects");
+    projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::SessionFileWritten {
+                resource: file.clone(),
+            },
+        )
+        .expect("session file resource projects");
+    let delete_event = projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::SessionFileDeleted {
+                resource: deleted_file,
+            },
+        )
+        .expect("session file delete projects");
+
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert!(matches!(
+        plan_event.payload,
+        AgentRuntimeEventPayload::PlanWritten { .. }
+    ));
+    assert!(matches!(
+        delete_event.payload,
+        AgentRuntimeEventPayload::SessionFileDeleted { .. }
+    ));
+    assert_eq!(thread.resources.plan, Some(plan));
+    assert_eq!(thread.resources.workspace, Some(workspace));
+    assert_eq!(thread.resources.artifacts, vec![artifact]);
+    assert_eq!(thread.resources.temp_files, vec![temp_file]);
+    assert_eq!(thread.resources.checkpoints, vec![checkpoint]);
+    assert!(thread.resources.files.is_empty());
+    assert_eq!(thread.last_seq, delete_event.seq);
+}
+
+#[test]
+fn record_session_resource_rejects_wrong_namespace_without_mutation() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).expect("turn starts");
+    let before = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+    let invalid = resource(
+        SessionResourceNamespace::Files,
+        Some("reports/wrong-namespace.md"),
+        10,
+    );
+
+    let err = projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::ArtifactCreated { resource: invalid },
+        )
+        .expect_err("wrong namespace rejected");
+    let after = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert!(matches!(err, AgentRuntimeError::ProjectionFailed { .. }));
+    assert!(err.to_string().contains("artifact_created"));
+    assert!(err.to_string().contains("namespace mismatch"));
+    assert_eq!(after.resources, before.resources);
+    assert_eq!(after.last_seq, before.last_seq);
+}
+
+#[test]
+fn record_session_resource_rejects_missing_path_without_mutation() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).expect("turn starts");
+    let before = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+    let invalid = resource(SessionResourceNamespace::Temp, None, 10);
+
+    let err = projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::TempFileWritten { resource: invalid },
+        )
+        .expect_err("missing path rejected");
+    let after = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert!(matches!(err, AgentRuntimeError::ProjectionFailed { .. }));
+    assert!(err.to_string().contains("temp_file_written"));
+    assert!(err.to_string().contains("path is required"));
+    assert_eq!(after.resources, before.resources);
+    assert_eq!(after.last_seq, before.last_seq);
 }
 
 #[test]

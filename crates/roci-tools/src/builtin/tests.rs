@@ -1,7 +1,9 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use roci::error::RociError;
+use roci::prelude::{LocalSessionFs, LogicalPath};
 use roci::tools::arguments::ToolArguments;
 use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
@@ -11,6 +13,14 @@ use super::*;
 
 fn default_ctx() -> ToolExecutionContext {
     ToolExecutionContext::default()
+}
+
+fn session_ctx(root: &Path) -> ToolExecutionContext {
+    ToolExecutionContext {
+        session_fs: Some(Arc::new(LocalSessionFs::new(root.join("session")).unwrap())),
+        session_cwd: Some(LogicalPath::parse("work").unwrap()),
+        ..ToolExecutionContext::default()
+    }
 }
 
 fn args(json: serde_json::Value) -> ToolArguments {
@@ -202,6 +212,53 @@ async fn shell_times_out_on_long_running_command() {
     );
 }
 
+#[tokio::test]
+async fn session_shell_runs_in_session_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = session_ctx(temp.path());
+
+    let result = shell_tool()
+        .execute(&args(serde_json::json!({"command": "pwd"})), &ctx)
+        .await
+        .unwrap();
+
+    assert!(result["output"].as_str().unwrap().contains("/files/work"));
+}
+
+#[tokio::test]
+async fn session_shell_rejects_obvious_escape_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = session_ctx(temp.path());
+
+    for command in [
+        "/bin/cat file.txt",
+        "cat /etc/passwd",
+        "cat ../secret",
+        "cd /",
+        "echo hi > /tmp/out",
+        "echo hi >/tmp/out",
+        "echo hi 2>/tmp/err",
+        "cat </etc/passwd",
+        "--output=/tmp/x",
+        "echo --output=/tmp/x",
+        "sudo",
+        "sudo ls",
+        "chmod",
+        "chmod 777 file",
+        "chown",
+        "chown me file",
+    ] {
+        let err = shell_tool()
+            .execute(&args(serde_json::json!({"command": command})), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("session shell command denied"),
+            "{command} was not denied: {err}"
+        );
+    }
+}
+
 // ── read_file ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -259,6 +316,41 @@ async fn read_file_truncates_large_content() {
         .unwrap()
         .ends_with("... (truncated)"));
     assert_eq!(result["bytes"].as_u64().unwrap(), content.len() as u64);
+}
+
+#[tokio::test]
+async fn read_file_uses_session_cwd_when_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = session_ctx(dir.path());
+    let fs = ctx.session_fs.as_ref().unwrap();
+    fs.write(&LogicalPath::parse("work/in.txt").unwrap(), b"hello")
+        .unwrap();
+
+    let tool = read_file_tool();
+    let result = tool
+        .execute(&args(serde_json::json!({"path": "in.txt"})), &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["content"], "hello");
+}
+
+#[tokio::test]
+async fn read_file_keeps_host_absolute_paths_without_session_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("absolute.txt");
+    std::fs::write(&file_path, "host").unwrap();
+
+    let tool = read_file_tool();
+    let result = tool
+        .execute(
+            &args(serde_json::json!({"path": file_path.to_str().unwrap()})),
+            &default_ctx(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["content"], "host");
 }
 
 // ── write_file ─────────────────────────────────────────────────────
@@ -322,6 +414,48 @@ async fn write_file_returns_path_in_response() {
         .unwrap();
 
     assert_eq!(result["path"].as_str().unwrap(), path_str);
+}
+
+#[tokio::test]
+async fn write_file_uses_session_cwd_when_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = session_ctx(dir.path());
+
+    let tool = write_file_tool();
+    let result = tool
+        .execute(
+            &args(serde_json::json!({"path": "out.txt", "content": "ok"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["success"], true);
+    let fs = ctx.session_fs.as_ref().unwrap();
+    assert_eq!(
+        fs.read(&LogicalPath::parse("work/out.txt").unwrap())
+            .unwrap(),
+        b"ok"
+    );
+}
+
+#[tokio::test]
+async fn session_file_tools_reject_absolute_and_parent_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = session_ctx(dir.path());
+
+    let read_result = read_file_tool()
+        .execute(&args(serde_json::json!({"path": "/etc/passwd"})), &ctx)
+        .await;
+    let write_result = write_file_tool()
+        .execute(
+            &args(serde_json::json!({"path": "../out.txt", "content": "no"})),
+            &ctx,
+        )
+        .await;
+
+    assert!(read_result.is_err());
+    assert!(write_result.is_err());
 }
 
 // ── list_directory ─────────────────────────────────────────────────
@@ -415,6 +549,33 @@ async fn list_directory_returns_error_for_nonexistent_path() {
     assert!(result.is_err());
 }
 
+#[tokio::test]
+async fn list_directory_uses_session_cwd_when_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = session_ctx(dir.path());
+    let fs = ctx.session_fs.as_ref().unwrap();
+    fs.write(&LogicalPath::parse("work/a.txt").unwrap(), b"a")
+        .unwrap();
+    fs.write(&LogicalPath::parse("work/nested/b.txt").unwrap(), b"b")
+        .unwrap();
+
+    let tool = list_directory_tool();
+    let result = tool
+        .execute(&args(serde_json::json!({"path": "."})), &ctx)
+        .await
+        .unwrap();
+
+    let entries = result["entries"].as_array().unwrap();
+    assert_eq!(result["path"], "work");
+    assert_eq!(result["count"], 2);
+    assert!(entries
+        .iter()
+        .any(|entry| entry["name"] == "a.txt" && entry["type"] == "file"));
+    assert!(entries
+        .iter()
+        .any(|entry| entry["name"] == "nested" && entry["type"] == "dir"));
+}
+
 // ── grep ───────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -501,6 +662,58 @@ async fn grep_treats_dash_prefixed_pattern_as_pattern_not_flag() {
 
     assert_eq!(result["exit_code"], 0);
     assert!(result["output"].as_str().unwrap().contains("-foo"));
+}
+
+#[tokio::test]
+async fn grep_keeps_host_absolute_paths_without_session_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("host.txt");
+    std::fs::write(&file_path, "host needle\n").unwrap();
+
+    let tool = grep_tool();
+    let result = tool
+        .execute(
+            &args(serde_json::json!({
+                "pattern": "needle",
+                "path": file_path.to_str().unwrap(),
+            })),
+            &default_ctx(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["exit_code"], 0);
+    assert!(result["output"].as_str().unwrap().contains("host needle"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_grep_does_not_follow_symlink_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "secret needle\n").unwrap();
+    let ctx = session_ctx(dir.path());
+    let fs = ctx.session_fs.as_ref().unwrap();
+    fs.write(&LogicalPath::parse("work/visible.txt").unwrap(), b"plain\n")
+        .unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        dir.path()
+            .join("session")
+            .join("files")
+            .join("work")
+            .join("escape.txt"),
+    )
+    .unwrap();
+
+    let tool = grep_tool();
+    let result = tool
+        .execute(&args(serde_json::json!({"pattern": "needle"})), &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["exit_code"], 1);
+    assert!(!result["output"].as_str().unwrap().contains("secret"));
 }
 
 // ── tool metadata ──────────────────────────────────────────────────

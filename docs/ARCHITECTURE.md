@@ -92,6 +92,11 @@ Re-exports `roci_core::*` so import paths like `roci::prelude::*`,
 
 Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 
+Durable sessions are opt-in and host-rooted. Roci does not write session data
+into project cwd unless the host explicitly chooses that directory as the
+session root. `host_cwd` is metadata/import context; tool filesystem operations
+use logical paths under `files/`.
+
 | Module | Purpose |
 |--------|---------|
 | `provider` | `ModelProvider` trait, `ProviderFactory` trait, `ProviderRegistry`, `ProviderRequest`/`ProviderResponse`, `ToolDefinition` |

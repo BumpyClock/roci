@@ -3,6 +3,8 @@ use std::sync::Arc;
 use futures::future;
 use tokio_util::sync::CancellationToken;
 
+use crate::session::{LogicalPath, SessionFs};
+use crate::tools::SandboxProvider;
 use crate::tools::{tool::Tool, ToolUpdateCallback};
 use crate::types::{AgentToolCall, AgentToolResult, ModelMessage};
 
@@ -37,6 +39,34 @@ pub(super) struct ToolExecutionOutcome {
 pub(super) struct ResolvedToolCall {
     pub(super) call: AgentToolCall,
     pub(super) tool: Option<Arc<dyn Tool>>,
+}
+
+#[derive(Clone)]
+pub(super) struct ToolExecutionInputs<'a> {
+    session_fs: Option<Arc<dyn SessionFs + Send + Sync>>,
+    session_cwd: Option<LogicalPath>,
+    sandbox_provider: Option<Arc<dyn SandboxProvider>>,
+    #[cfg(feature = "agent")]
+    user_input_callback: Option<&'a crate::tools::user_input::RequestUserInputFn>,
+}
+
+impl<'a> ToolExecutionInputs<'a> {
+    pub(super) fn new(
+        session_fs: Option<Arc<dyn SessionFs + Send + Sync>>,
+        session_cwd: Option<LogicalPath>,
+        sandbox_provider: Option<Arc<dyn SandboxProvider>>,
+        #[cfg(feature = "agent")] user_input_callback: Option<
+            &'a crate::tools::user_input::RequestUserInputFn,
+        >,
+    ) -> Self {
+        Self {
+            session_fs,
+            session_cwd,
+            sandbox_provider,
+            #[cfg(feature = "agent")]
+            user_input_callback,
+        }
+    }
 }
 
 pub(super) fn resolve_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -> ResolvedToolCall {
@@ -140,9 +170,7 @@ pub(super) async fn execute_tool_call(
     resolved: ResolvedToolCall,
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
-    #[cfg(feature = "agent")] user_input_callback: Option<
-        &crate::tools::user_input::RequestUserInputFn,
-    >,
+    inputs: ToolExecutionInputs<'_>,
 ) -> ToolExecutionOutcome {
     let ResolvedToolCall { call, tool } = resolved;
     let call = match apply_pre_tool_use_hook(hooks, &call, cancel.child_token()).await {
@@ -174,8 +202,11 @@ pub(super) async fn execute_tool_call(
                 metadata: serde_json::Value::Null,
                 tool_call_id: Some(call.id.clone()),
                 tool_name: Some(call.name.clone()),
+                session_fs: inputs.session_fs,
+                session_cwd: inputs.session_cwd,
+                sandbox_provider: inputs.sandbox_provider,
                 #[cfg(feature = "agent")]
-                request_user_input: user_input_callback.cloned(),
+                request_user_input: inputs.user_input_callback.cloned(),
             };
             let call_id = call.id.clone();
             let call_name = call.name.clone();
@@ -220,9 +251,7 @@ pub(super) async fn execute_parallel_tool_calls(
     calls: &[ResolvedToolCall],
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
-    #[cfg(feature = "agent")] user_input_callback: Option<
-        &crate::tools::user_input::RequestUserInputFn,
-    >,
+    inputs: ToolExecutionInputs<'_>,
 ) -> Vec<ToolExecutionOutcome> {
     let futures = calls
         .iter()
@@ -233,8 +262,7 @@ pub(super) async fn execute_parallel_tool_calls(
                 resolved,
                 agent_emitter,
                 cancel.child_token(),
-                #[cfg(feature = "agent")]
-                user_input_callback,
+                inputs.clone(),
             )
         })
         .collect::<Vec<_>>();

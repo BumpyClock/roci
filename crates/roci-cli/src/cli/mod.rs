@@ -195,6 +195,14 @@ pub struct ChatArgs {
     #[arg(long, value_enum, default_value_t = ChatApprovalArg::Ask)]
     pub approval: ChatApprovalArg,
 
+    /// Durable session root directory. When set, chat events/resources are stored under <root>/<session-id>.
+    #[arg(long, value_name = "PATH")]
+    pub session_root: Option<PathBuf>,
+
+    /// Durable session id to use with --session-root. Defaults to a new UUID when omitted.
+    #[arg(long, value_name = "ID", requires = "session_root")]
+    pub session_id: Option<String>,
+
     /// MCP stdio server spec (repeatable). Format: `key=value` pairs separated by commas.
     /// Keys: `id`, `label`, `command`, `arg` (repeat for multiple args).
     /// Example: `--mcp-stdio 'id=local,label=Local Files,command=npx,arg=-y,arg=@modelcontextprotocol/server-filesystem,arg=.'`
@@ -480,6 +488,8 @@ mod tests {
                 assert!(args.exclude_tools.is_empty());
                 assert_eq!(args.max_tokens, Some(1024));
                 assert_eq!(args.approval, ChatApprovalArg::Always);
+                assert!(args.session_root.is_none());
+                assert!(args.session_id.is_none());
                 assert!(args.mcp_stdio.is_empty());
                 assert!(args.mcp_sse.is_empty());
                 assert_eq!(args.prompt.as_deref(), Some("Hello world"));
@@ -502,6 +512,40 @@ mod tests {
             }
             other => panic!("expected Chat, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_chat_with_session_options() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--session-root",
+            "/tmp/roci-sessions",
+            "--session-id",
+            "session-live",
+            "prompt",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.session_root, Some(PathBuf::from("/tmp/roci-sessions")));
+                assert_eq!(args.session_id.as_deref(), Some("session-live"));
+                assert_eq!(args.prompt.as_deref(), Some("prompt"));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_session_id_requires_session_root() {
+        assert!(Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--session-id",
+            "session-live",
+            "prompt"
+        ])
+        .is_err());
     }
 
     #[test]

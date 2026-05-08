@@ -4,6 +4,8 @@ use roci::error::RociError;
 use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 
+use super::common::resolve_session_path;
+
 /// Create the `write_file` tool — writes content to a file.
 ///
 /// Creates parent directories when they do not exist. Returns the written
@@ -16,9 +18,27 @@ pub fn write_file_tool() -> Arc<dyn Tool> {
             .string("path", "Path to the file to write", true)
             .string("content", "Content to write to the file", true)
             .build(),
-        |args_val, _ctx: ToolExecutionContext| async move {
+        |args_val, ctx: ToolExecutionContext| async move {
             let path = args_val.get_str("path")?;
             let content = args_val.get_str("content")?;
+
+            if let (Some(session_fs), Some(logical_path)) =
+                (ctx.session_fs.as_ref(), resolve_session_path(&ctx, path)?)
+            {
+                let bytes = content.len();
+                session_fs
+                    .write(&logical_path, content.as_bytes())
+                    .map_err(|e| RociError::ToolExecution {
+                        tool_name: "write_file".into(),
+                        message: format!("{logical_path}: {e}"),
+                    })?;
+
+                return Ok(serde_json::json!({
+                    "success": true,
+                    "path": logical_path.to_string(),
+                    "bytes_written": bytes,
+                }));
+            }
 
             if let Some(parent) = std::path::Path::new(path).parent() {
                 if !parent.as_os_str().is_empty() {

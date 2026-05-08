@@ -10,6 +10,7 @@ mod chat_runtime;
 mod chat_subscription;
 mod compaction_and_branch_summary;
 mod queue_and_continue;
+mod session;
 mod session_before_compact;
 mod session_before_tree;
 mod snapshot;

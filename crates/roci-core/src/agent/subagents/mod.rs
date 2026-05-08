@@ -22,6 +22,6 @@ pub use supervisor::SubagentSupervisor;
 pub use types::{
     ModelCandidate, SnapshotMode, SubagentCompletion, SubagentContext, SubagentEvent, SubagentId,
     SubagentInput, SubagentKind, SubagentOverrides, SubagentProfile, SubagentProfileRef,
-    SubagentRunResult, SubagentSnapshot, SubagentSpec, SubagentStatus, SubagentSummary,
-    SubagentSupervisorConfig, ToolPolicy,
+    SubagentProfileSummary, SubagentRunResult, SubagentSnapshot, SubagentSpec, SubagentStatus,
+    SubagentSummary, SubagentSupervisorConfig, ToolPolicy,
 };

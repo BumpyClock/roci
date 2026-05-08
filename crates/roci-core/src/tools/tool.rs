@@ -9,6 +9,17 @@ use async_trait::async_trait;
 use super::arguments::ToolArguments;
 use super::types::AgentToolParameters;
 use crate::error::RociError;
+use crate::session::{LogicalPath, SessionFs};
+
+/// Validates sandbox-sensitive tool operations before execution.
+#[async_trait]
+pub trait SandboxProvider: Send + Sync {
+    async fn validate_shell_command(
+        &self,
+        command: &str,
+        cwd: &LogicalPath,
+    ) -> Result<(), RociError>;
+}
 
 /// Context available during tool execution.
 #[derive(Clone)]
@@ -19,6 +30,12 @@ pub struct ToolExecutionContext {
     pub tool_call_id: Option<String>,
     /// Tool name as requested by the model.
     pub tool_name: Option<String>,
+    /// Session-owned filesystem for tools that operate on durable files.
+    pub session_fs: Option<Arc<dyn SessionFs + Send + Sync>>,
+    /// Logical current working directory inside the session filesystem.
+    pub session_cwd: Option<LogicalPath>,
+    /// Optional sandbox validator for command-capable tools.
+    pub sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     /// Callback to request user input. None if not configured.
     #[cfg(feature = "agent")]
     pub request_user_input: Option<super::user_input::RequestUserInputFn>,
@@ -30,6 +47,9 @@ impl Default for ToolExecutionContext {
             metadata: serde_json::Value::Null,
             tool_call_id: None,
             tool_name: None,
+            session_fs: None,
+            session_cwd: None,
+            sandbox_provider: None,
             #[cfg(feature = "agent")]
             request_user_input: None,
         }
@@ -43,6 +63,15 @@ impl std::fmt::Debug for ToolExecutionContext {
             .field("metadata", &self.metadata)
             .field("tool_call_id", &self.tool_call_id)
             .field("tool_name", &self.tool_name)
+            .field(
+                "session_fs",
+                &self.session_fs.as_ref().map(|_| "<session_fs>"),
+            )
+            .field("session_cwd", &self.session_cwd)
+            .field(
+                "sandbox_provider",
+                &self.sandbox_provider.as_ref().map(|_| "<sandbox_provider>"),
+            )
             .field(
                 "request_user_input",
                 &self.request_user_input.as_ref().map(|_| "<callback>"),
@@ -58,6 +87,15 @@ impl std::fmt::Debug for ToolExecutionContext {
             .field("metadata", &self.metadata)
             .field("tool_call_id", &self.tool_call_id)
             .field("tool_name", &self.tool_name)
+            .field(
+                "session_fs",
+                &self.session_fs.as_ref().map(|_| "<session_fs>"),
+            )
+            .field("session_cwd", &self.session_cwd)
+            .field(
+                "sandbox_provider",
+                &self.sandbox_provider.as_ref().map(|_| "<sandbox_provider>"),
+            )
             .finish()
     }
 }

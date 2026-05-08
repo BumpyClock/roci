@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
+use roci::prelude::SessionFileKind;
 use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
+
+use super::common::resolve_session_path;
 
 /// Create the `list_directory` tool — lists directory entries.
 ///
@@ -15,8 +18,56 @@ pub fn list_directory_tool() -> Arc<dyn Tool> {
         AgentToolParameters::object()
             .string("path", "Path to the directory to list", true)
             .build(),
-        |args_val, _ctx: ToolExecutionContext| async move {
+        |args_val, ctx: ToolExecutionContext| async move {
             let path = args_val.get_str("path")?;
+
+            if let (Some(session_fs), Some(logical_path)) =
+                (ctx.session_fs.as_ref(), resolve_session_path(&ctx, path)?)
+            {
+                let mut entries =
+                    session_fs
+                        .list(&logical_path)
+                        .map_err(|e| RociError::ToolExecution {
+                            tool_name: "list_directory".into(),
+                            message: format!("{logical_path}: {e}"),
+                        })?;
+
+                let mut entries = entries
+                    .drain(..)
+                    .map(|entry| {
+                        let entry_type = match entry.metadata.kind {
+                            SessionFileKind::Directory => "dir",
+                            SessionFileKind::File => "file",
+                            SessionFileKind::Symlink => "other",
+                        };
+                        let name = entry
+                            .path
+                            .as_str()
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(entry.path.as_str());
+
+                        serde_json::json!({
+                            "name": name,
+                            "type": entry_type,
+                            "size": entry.metadata.len,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                entries.sort_by(|a, b| {
+                    let a_name = a["name"].as_str().unwrap_or("");
+                    let b_name = b["name"].as_str().unwrap_or("");
+                    a_name.cmp(b_name)
+                });
+
+                let count = entries.len();
+                return Ok(serde_json::json!({
+                    "path": logical_path.to_string(),
+                    "entries": entries,
+                    "count": count,
+                }));
+            }
 
             let mut read_dir =
                 tokio::fs::read_dir(path)

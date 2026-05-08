@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use super::domain::{
     ApprovalSnapshot, DiffSnapshot, HumanInteractionSnapshot, MessageSnapshot, PlanSnapshot,
-    ReasoningSnapshot, ThreadId, ToolExecutionSnapshot, TurnId, TurnSnapshot,
+    ReasoningSnapshot, SessionResourceSnapshot, ThreadId, ToolExecutionSnapshot, TurnId,
+    TurnSnapshot,
 };
 
 pub const AGENT_RUNTIME_EVENT_SCHEMA_VERSION: u16 = 1;
@@ -114,6 +115,27 @@ pub enum AgentRuntimeEventPayload {
     DiffUpdated {
         diff: DiffSnapshot,
     },
+    PlanWritten {
+        resource: SessionResourceSnapshot,
+    },
+    WorkspaceUpdated {
+        resource: SessionResourceSnapshot,
+    },
+    ArtifactCreated {
+        resource: SessionResourceSnapshot,
+    },
+    TempFileWritten {
+        resource: SessionResourceSnapshot,
+    },
+    CheckpointCreated {
+        resource: SessionResourceSnapshot,
+    },
+    SessionFileWritten {
+        resource: SessionResourceSnapshot,
+    },
+    SessionFileDeleted {
+        resource: SessionResourceSnapshot,
+    },
     TurnCompleted {
         turn: TurnSnapshot,
     },
@@ -210,6 +232,41 @@ impl AgentRuntimeEventPayload {
     #[must_use]
     pub const fn diff_updated_name() -> &'static str {
         "diff_updated"
+    }
+
+    #[must_use]
+    pub const fn plan_written_name() -> &'static str {
+        "plan_written"
+    }
+
+    #[must_use]
+    pub const fn workspace_updated_name() -> &'static str {
+        "workspace_updated"
+    }
+
+    #[must_use]
+    pub const fn artifact_created_name() -> &'static str {
+        "artifact_created"
+    }
+
+    #[must_use]
+    pub const fn temp_file_written_name() -> &'static str {
+        "temp_file_written"
+    }
+
+    #[must_use]
+    pub const fn checkpoint_created_name() -> &'static str {
+        "checkpoint_created"
+    }
+
+    #[must_use]
+    pub const fn session_file_written_name() -> &'static str {
+        "session_file_written"
+    }
+
+    #[must_use]
+    pub const fn session_file_deleted_name() -> &'static str {
+        "session_file_deleted"
     }
 
     #[must_use]

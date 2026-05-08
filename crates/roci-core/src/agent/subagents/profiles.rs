@@ -10,7 +10,10 @@ use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
 
 use super::config::{TomlProfile, TomlProfileFile};
-use super::types::{ModelCandidate, SubagentKind, SubagentOverrides, SubagentProfile, ToolPolicy};
+use super::types::{
+    ModelCandidate, SubagentKind, SubagentOverrides, SubagentProfile, SubagentProfileSummary,
+    ToolPolicy,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResolvedSubagentModel {
@@ -46,6 +49,27 @@ impl SubagentProfileRegistry {
     /// same name.
     pub fn register(&mut self, profile: SubagentProfile) {
         self.profiles.insert(profile.name.clone(), profile);
+    }
+
+    /// Return registered profile names in deterministic order.
+    pub fn list_profile_refs(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.profiles.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Return resolved summaries for all registered profiles in name order.
+    ///
+    /// The summaries include inherited scalar and list fields after merge, but
+    /// intentionally omit full runtime prompt content and arbitrary metadata.
+    pub fn profile_summaries(&self) -> Result<Vec<SubagentProfileSummary>, RociError> {
+        self.list_profile_refs()
+            .into_iter()
+            .map(|name| {
+                self.resolve(&name)
+                    .map(|profile| SubagentProfileSummary::from(&profile))
+            })
+            .collect()
     }
 
     /// Parse a TOML string and register all contained profiles.
@@ -236,9 +260,13 @@ fn has_auth_provider_headers(headers: &reqwest::header::HeaderMap) -> bool {
 ///
 /// Rules:
 /// - Child scalar fields replace parent scalar fields when present.
+/// - `skills`, `mcp_servers`, and `default_agent_excluded_tools` are inherited
+///   additively from root to child with duplicates removed at first occurrence.
 /// - `models` replaces wholesale (not merged).
 /// - `tools` uses the child's policy directly (ToolPolicy handles semantics).
 /// - `metadata` is merged with child keys winning.
+/// - Empty child lists mean "no additions"; TOML cannot express "clear parent
+///   list" for these fields because the public schema uses `Vec<String>`.
 fn merge_chain(chain: &[SubagentProfile]) -> SubagentProfile {
     debug_assert!(!chain.is_empty());
 
@@ -250,15 +278,27 @@ fn merge_chain(chain: &[SubagentProfile]) -> SubagentProfile {
     for child in chain.iter().rev().skip(1) {
         // Name always comes from the requested (first) profile.
         result.name = child.name.clone();
+        if child.display_name.is_some() {
+            result.display_name.clone_from(&child.display_name);
+        }
         if child.description.is_some() {
             result.description.clone_from(&child.description);
         }
         if child.kind.is_some() {
             result.kind.clone_from(&child.kind);
         }
+        if child.infer.is_some() {
+            result.infer.clone_from(&child.infer);
+        }
         if child.system_prompt.is_some() {
             result.system_prompt.clone_from(&child.system_prompt);
         }
+        append_unique(&mut result.skills, &child.skills);
+        append_unique(&mut result.mcp_servers, &child.mcp_servers);
+        append_unique(
+            &mut result.default_agent_excluded_tools,
+            &child.default_agent_excluded_tools,
+        );
         if !child.models.is_empty() {
             result.models.clone_from(&child.models);
         }
@@ -276,6 +316,14 @@ fn merge_chain(chain: &[SubagentProfile]) -> SubagentProfile {
         result.version = child.version;
     }
     result
+}
+
+fn append_unique(target: &mut Vec<String>, source: &[String]) {
+    for item in source {
+        if !target.contains(item) {
+            target.push(item.clone());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +352,7 @@ fn apply_overrides(profile: &mut SubagentProfile, overrides: &SubagentOverrides)
 fn toml_profile_to_subagent_profile(tp: TomlProfile) -> SubagentProfile {
     SubagentProfile {
         name: tp.name,
+        display_name: tp.display_name,
         description: tp.description,
         kind: tp.kind.map(|k| match k.as_str() {
             "developer" => SubagentKind::Developer,
@@ -311,8 +360,12 @@ fn toml_profile_to_subagent_profile(tp: TomlProfile) -> SubagentProfile {
             "explorer" => SubagentKind::Explorer,
             other => SubagentKind::Custom(other.to_string()),
         }),
+        infer: tp.infer,
         system_prompt: tp.system_prompt,
         tools: tp.tools.unwrap_or_default(),
+        skills: tp.skills,
+        mcp_servers: tp.mcp_servers,
+        default_agent_excluded_tools: tp.default_agent_excluded_tools,
         models: tp.models,
         inherits: tp.inherits,
         default_timeout_ms: tp.default_timeout_ms,
@@ -337,8 +390,13 @@ mod tests {
     fn toml_parse_single_profile_roundtrip() {
         let toml_str = r#"
 name = "my-dev"
+display_name = "My Dev"
 description = "Custom developer"
 inherits = "builtin:developer"
+infer = "Use for implementation and tests"
+skills = ["programming", "rust-skills"]
+mcp_servers = ["github"]
+default_agent_excluded_tools = ["web_search"]
 
 [[models]]
 provider = "anthropic"
@@ -352,7 +410,15 @@ mode = "inherit"
         reg.load_toml(toml_str).unwrap();
         let profile = reg.profiles.get("my-dev").unwrap();
         assert_eq!(profile.name, "my-dev");
+        assert_eq!(profile.display_name.as_deref(), Some("My Dev"));
         assert_eq!(profile.inherits.as_deref(), Some("builtin:developer"));
+        assert_eq!(
+            profile.infer.as_deref(),
+            Some("Use for implementation and tests")
+        );
+        assert_eq!(profile.skills, vec!["programming", "rust-skills"]);
+        assert_eq!(profile.mcp_servers, vec!["github"]);
+        assert_eq!(profile.default_agent_excluded_tools, vec!["web_search"]);
         assert_eq!(profile.models.len(), 1);
         assert_eq!(profile.models[0].provider, "anthropic");
     }
@@ -362,6 +428,11 @@ mode = "inherit"
         let toml_str = r#"
 [[profiles]]
 name = "alpha"
+display_name = "Alpha"
+infer = "Use for alpha tasks"
+skills = ["programming"]
+mcp_servers = ["filesystem"]
+default_agent_excluded_tools = ["dangerous-delete"]
 
 [[profiles.models]]
 provider = "openai"
@@ -375,6 +446,12 @@ description = "Beta agent"
         reg.load_toml(toml_str).unwrap();
         assert!(reg.profiles.contains_key("alpha"));
         assert!(reg.profiles.contains_key("beta"));
+        let alpha = reg.profiles.get("alpha").unwrap();
+        assert_eq!(alpha.display_name.as_deref(), Some("Alpha"));
+        assert_eq!(alpha.infer.as_deref(), Some("Use for alpha tasks"));
+        assert_eq!(alpha.skills, vec!["programming"]);
+        assert_eq!(alpha.mcp_servers, vec!["filesystem"]);
+        assert_eq!(alpha.default_agent_excluded_tools, vec!["dangerous-delete"]);
         assert_eq!(
             reg.profiles.get("beta").unwrap().description.as_deref(),
             Some("Beta agent")
@@ -413,7 +490,12 @@ description = "Beta agent"
             r#"
 name = "child"
 inherits = "builtin:developer"
+display_name = "Child"
 description = "Child description"
+infer = "Use for child work"
+skills = ["programming"]
+mcp_servers = ["github"]
+default_agent_excluded_tools = ["dangerous-delete"]
 
 [[models]]
 provider = "openai"
@@ -424,7 +506,15 @@ model = "gpt-4o"
 
         let resolved = reg.resolve("child").unwrap();
         // Child scalar replaces parent
+        assert_eq!(resolved.display_name.as_deref(), Some("Child"));
         assert_eq!(resolved.description.as_deref(), Some("Child description"));
+        assert_eq!(resolved.infer.as_deref(), Some("Use for child work"));
+        assert_eq!(resolved.skills, vec!["programming"]);
+        assert_eq!(resolved.mcp_servers, vec!["github"]);
+        assert_eq!(
+            resolved.default_agent_excluded_tools,
+            vec!["dangerous-delete"]
+        );
         // Models replace wholesale
         assert_eq!(resolved.models.len(), 1);
         assert_eq!(resolved.models[0].provider, "openai");
@@ -443,6 +533,9 @@ model = "gpt-4o"
 name = "mid"
 inherits = "builtin:developer"
 description = "Middle layer"
+skills = ["programming", "rust-skills"]
+mcp_servers = ["github"]
+default_agent_excluded_tools = ["delete_repo"]
 "#,
         )
         .unwrap();
@@ -450,6 +543,9 @@ description = "Middle layer"
             r#"
 name = "leaf"
 inherits = "mid"
+skills = ["rust-skills", "coderabbit-review-skill"]
+mcp_servers = ["github", "figma"]
+default_agent_excluded_tools = ["delete_repo", "reset_hard"]
 
 [[models]]
 provider = "anthropic"
@@ -462,6 +558,15 @@ model = "claude-opus-4"
         assert_eq!(resolved.name, "leaf");
         // description from mid (leaf has none)
         assert_eq!(resolved.description.as_deref(), Some("Middle layer"));
+        assert_eq!(
+            resolved.skills,
+            vec!["programming", "rust-skills", "coderabbit-review-skill"]
+        );
+        assert_eq!(resolved.mcp_servers, vec!["github", "figma"]);
+        assert_eq!(
+            resolved.default_agent_excluded_tools,
+            vec!["delete_repo", "reset_hard"]
+        );
         // models from leaf
         assert_eq!(resolved.models[0].model, "claude-opus-4");
         // system_prompt from builtin:developer
@@ -483,6 +588,54 @@ model = "claude-opus-4"
         });
         let err = reg.resolve("a").unwrap_err();
         assert!(err.to_string().contains("circular"));
+    }
+
+    #[test]
+    fn profile_summaries_are_resolved_and_sorted() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.register(SubagentProfile {
+            name: "z-parent".into(),
+            display_name: Some("Parent".into()),
+            description: Some("Parent desc".into()),
+            kind: Some(SubagentKind::Developer),
+            infer: Some("Use for parent work".into()),
+            skills: vec!["programming".into()],
+            mcp_servers: vec!["github".into()],
+            default_agent_excluded_tools: vec!["delete_repo".into()],
+            models: vec![ModelCandidate {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        });
+        reg.register(SubagentProfile {
+            name: "a-child".into(),
+            inherits: Some("z-parent".into()),
+            display_name: Some("Child".into()),
+            skills: vec!["rust-skills".into()],
+            mcp_servers: vec!["github".into(), "filesystem".into()],
+            default_agent_excluded_tools: vec!["reset_hard".into()],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            reg.list_profile_refs(),
+            vec!["a-child".to_string(), "z-parent".to_string()]
+        );
+        let summaries = reg.profile_summaries().unwrap();
+        assert_eq!(summaries[0].name, "a-child");
+        assert_eq!(summaries[0].display_name.as_deref(), Some("Child"));
+        assert_eq!(summaries[0].description.as_deref(), Some("Parent desc"));
+        assert_eq!(summaries[0].infer.as_deref(), Some("Use for parent work"));
+        assert_eq!(summaries[0].skills, vec!["programming", "rust-skills"]);
+        assert_eq!(summaries[0].mcp_servers, vec!["github", "filesystem"]);
+        assert_eq!(
+            summaries[0].default_agent_excluded_tools,
+            vec!["delete_repo", "reset_hard"]
+        );
+        assert_eq!(summaries[0].models[0].provider, "openai");
+        assert_eq!(summaries[1].name, "z-parent");
     }
 
     // -- Model candidate fallback -------------------------------------------

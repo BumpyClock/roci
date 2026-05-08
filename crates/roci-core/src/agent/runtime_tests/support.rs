@@ -125,6 +125,8 @@ pub(super) fn test_agent_config() -> AgentConfig {
         approval_policy: Default::default(),
         approval_handler: None,
         session_id: None,
+        session: None,
+        sandbox_provider: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,
         transport: None,
@@ -244,6 +246,11 @@ struct ReasoningTextFactory {
     provider_key: &'static str,
 }
 
+struct PlanJsonFactory {
+    provider_key: &'static str,
+    plan: String,
+}
+
 impl ProviderFactory for StreamingTextFactory {
     fn provider_keys(&self) -> &[&str] {
         std::slice::from_ref(&self.provider_key)
@@ -323,6 +330,33 @@ struct ReasoningTextProvider {
     provider_key: String,
     model_id: String,
     capabilities: ModelCapabilities,
+}
+
+struct PlanJsonProvider {
+    provider_key: String,
+    model_id: String,
+    capabilities: ModelCapabilities,
+    plan: String,
+}
+
+impl ProviderFactory for PlanJsonFactory {
+    fn provider_keys(&self) -> &[&str] {
+        std::slice::from_ref(&self.provider_key)
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        _provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(PlanJsonProvider {
+            provider_key: self.provider_key.to_string(),
+            model_id: model_id.to_string(),
+            capabilities: ModelCapabilities::default(),
+            plan: self.plan.clone(),
+        }))
+    }
 }
 
 #[async_trait]
@@ -523,6 +557,60 @@ impl ModelProvider for ReasoningTextProvider {
     }
 }
 
+#[async_trait]
+impl ModelProvider for PlanJsonProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "stream-only test provider".to_string(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        let text = serde_json::json!({ "plan": self.plan }).to_string();
+        let events: Vec<Result<TextStreamDelta, RociError>> = vec![
+            Ok(TextStreamDelta {
+                text,
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(crate::types::Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
 pub(super) fn registry_with_streaming_provider(
     provider_key: &'static str,
     input_tokens: u32,
@@ -554,5 +642,17 @@ pub(super) fn registry_with_reasoning_provider(
 ) -> Arc<ProviderRegistry> {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(ReasoningTextFactory { provider_key }));
+    Arc::new(registry)
+}
+
+pub(super) fn registry_with_plan_json_provider(
+    provider_key: &'static str,
+    plan: &str,
+) -> Arc<ProviderRegistry> {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(PlanJsonFactory {
+        provider_key,
+        plan: plan.to_string(),
+    }));
     Arc::new(registry)
 }

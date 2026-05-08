@@ -16,7 +16,10 @@ pub use catalog::{
 pub use dynamic::{DynamicTool, DynamicToolAdapter, DynamicToolProvider};
 #[cfg(feature = "agent")]
 pub use tool::ToolUpdateCallback;
-pub use tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext, ToolSafety};
+pub use tool::{
+    AgentTool, SandboxProvider, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext,
+    ToolSafety,
+};
 pub use types::AgentToolParameters;
 pub use user_input::{
     AskUserChoice, AskUserFormField, AskUserFormInputKind, AskUserPrompt, RequestUserInputFn,

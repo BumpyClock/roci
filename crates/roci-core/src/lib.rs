@@ -6,6 +6,7 @@
 //! Concrete provider implementations live in `roci-providers`.
 //! The `roci` meta-crate re-exports both with default wiring.
 
+pub mod attachments;
 pub mod auth;
 pub mod config;
 pub mod context;
@@ -16,6 +17,7 @@ pub mod models;
 pub mod prelude;
 pub mod provider;
 pub mod resource;
+pub mod session;
 pub mod skills;
 pub mod stop;
 pub mod tools;

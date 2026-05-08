@@ -97,6 +97,8 @@ async fn main() {
         post_tool_use: None,
         user_input_timeout_ms: None,
         context_budget: None,
+        session: None,
+        sandbox_provider: None,
         chat: Default::default(),
         human_interaction_coordinator: None,
     };

@@ -6,14 +6,15 @@ use super::{
     AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, ApprovalSnapshot,
     ApprovalStatus, ChatRuntimeConfig, DiffSnapshot, HumanInteractionSnapshot,
     HumanInteractionStatus, MessageId, MessageSnapshot, MessageStatus, PlanSnapshot,
-    ReasoningSnapshot, RuntimeCursor, RuntimeSnapshot, ThreadId, ThreadSnapshot,
-    ToolExecutionSnapshot, ToolStatus, TurnId, TurnSnapshot, TurnStatus,
+    ReasoningSnapshot, RuntimeCursor, RuntimeSnapshot, SessionResourceSnapshot, ThreadId,
+    ThreadSnapshot, ToolExecutionSnapshot, ToolStatus, TurnId, TurnSnapshot, TurnStatus,
     AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
 };
 use crate::agent_loop::{ApprovalDecision, ApprovalRequest, ToolUpdatePayload};
 use crate::human_interaction::{
     HumanInteractionRequest, HumanInteractionRequestId, HumanInteractionResponse,
 };
+use crate::session::SessionResourceNamespace;
 use crate::types::{AgentToolResult, ModelMessage};
 
 pub type ModelMessages = Vec<ModelMessage>;
@@ -56,6 +57,7 @@ impl ThreadState {
                 reasoning: Vec::new(),
                 plans: Vec::new(),
                 diffs: Vec::new(),
+                resources: Default::default(),
             },
             events: VecDeque::new(),
             replay_capacity,
@@ -114,6 +116,7 @@ impl ThreadState {
         self.snapshot.reasoning.clear();
         self.snapshot.plans.clear();
         self.snapshot.diffs.clear();
+        self.snapshot.resources = Default::default();
         self.events.clear();
         self.next_turn_ordinal = 1;
         self.next_message_ordinal = 1;
@@ -796,6 +799,65 @@ impl ThreadState {
         ))
     }
 
+    fn record_session_resource(
+        &mut self,
+        turn_id: TurnId,
+        payload: AgentRuntimeEventPayload,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        validate_session_resource_payload(&payload)?;
+        self.apply_session_resource(&payload)?;
+        Ok(self.event(Some(turn_id), payload))
+    }
+
+    fn record_session_resource_for_thread(
+        &mut self,
+        payload: AgentRuntimeEventPayload,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        validate_session_resource_payload(&payload)?;
+        self.apply_session_resource(&payload)?;
+        Ok(self.event(None, payload))
+    }
+
+    fn apply_session_resource(
+        &mut self,
+        payload: &AgentRuntimeEventPayload,
+    ) -> Result<(), AgentRuntimeError> {
+        match payload {
+            AgentRuntimeEventPayload::PlanWritten { resource } => {
+                self.snapshot.resources.plan = Some(resource.clone());
+            }
+            AgentRuntimeEventPayload::WorkspaceUpdated { resource } => {
+                self.snapshot.resources.workspace = Some(resource.clone());
+            }
+            AgentRuntimeEventPayload::ArtifactCreated { resource } => {
+                upsert_resource(&mut self.snapshot.resources.artifacts, resource);
+            }
+            AgentRuntimeEventPayload::TempFileWritten { resource } => {
+                upsert_resource(&mut self.snapshot.resources.temp_files, resource);
+            }
+            AgentRuntimeEventPayload::CheckpointCreated { resource } => {
+                upsert_resource(&mut self.snapshot.resources.checkpoints, resource);
+            }
+            AgentRuntimeEventPayload::SessionFileWritten { resource } => {
+                upsert_resource(&mut self.snapshot.resources.files, resource);
+            }
+            AgentRuntimeEventPayload::SessionFileDeleted { resource } => {
+                self.snapshot
+                    .resources
+                    .files
+                    .retain(|candidate| candidate.path != resource.path);
+            }
+            _ => {
+                return Err(AgentRuntimeError::ProjectionFailed {
+                    message: "payload is not a session resource event".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     fn terminal_turn(
         &mut self,
         turn_id: TurnId,
@@ -1346,6 +1408,24 @@ impl ChatProjector {
             .update_diff(turn_id, diff)
     }
 
+    pub fn record_session_resource(
+        &mut self,
+        turn_id: TurnId,
+        payload: AgentRuntimeEventPayload,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .record_session_resource(turn_id, payload)
+    }
+
+    pub fn record_session_resource_for_thread(
+        &mut self,
+        thread_id: ThreadId,
+        payload: AgentRuntimeEventPayload,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(thread_id)?
+            .record_session_resource_for_thread(payload)
+    }
+
     fn thread(&self, thread_id: ThreadId) -> Result<&ThreadState, AgentRuntimeError> {
         self.threads
             .get(&thread_id)
@@ -1376,4 +1456,100 @@ fn is_terminal(status: TurnStatus) -> bool {
         status,
         TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Canceled
     )
+}
+
+fn upsert_resource(
+    resources: &mut Vec<SessionResourceSnapshot>,
+    resource: &SessionResourceSnapshot,
+) {
+    if let Some(existing) = resources
+        .iter_mut()
+        .find(|candidate| candidate.path == resource.path)
+    {
+        *existing = resource.clone();
+    } else {
+        resources.push(resource.clone());
+    }
+}
+
+fn validate_session_resource_payload(
+    payload: &AgentRuntimeEventPayload,
+) -> Result<(), AgentRuntimeError> {
+    match payload {
+        AgentRuntimeEventPayload::PlanWritten { resource } => validate_resource(
+            "plan_written",
+            resource,
+            SessionResourceNamespace::Plan,
+            false,
+        ),
+        AgentRuntimeEventPayload::WorkspaceUpdated { resource } => validate_resource(
+            "workspace_updated",
+            resource,
+            SessionResourceNamespace::Workspace,
+            false,
+        ),
+        AgentRuntimeEventPayload::ArtifactCreated { resource } => validate_resource(
+            "artifact_created",
+            resource,
+            SessionResourceNamespace::Artifacts,
+            true,
+        ),
+        AgentRuntimeEventPayload::TempFileWritten { resource } => validate_resource(
+            "temp_file_written",
+            resource,
+            SessionResourceNamespace::Temp,
+            true,
+        ),
+        AgentRuntimeEventPayload::CheckpointCreated { resource } => validate_resource(
+            "checkpoint_created",
+            resource,
+            SessionResourceNamespace::Checkpoints,
+            true,
+        ),
+        AgentRuntimeEventPayload::SessionFileWritten { resource } => validate_resource(
+            "session_file_written",
+            resource,
+            SessionResourceNamespace::Files,
+            true,
+        ),
+        AgentRuntimeEventPayload::SessionFileDeleted { resource } => validate_resource(
+            "session_file_deleted",
+            resource,
+            SessionResourceNamespace::Files,
+            true,
+        ),
+        _ => Err(AgentRuntimeError::ProjectionFailed {
+            message: "payload is not a session resource event".to_string(),
+        }),
+    }
+}
+
+fn validate_resource(
+    event_name: &str,
+    resource: &SessionResourceSnapshot,
+    expected_namespace: SessionResourceNamespace,
+    requires_path: bool,
+) -> Result<(), AgentRuntimeError> {
+    if resource.namespace != expected_namespace {
+        return Err(AgentRuntimeError::ProjectionFailed {
+            message: format!(
+                "{event_name} resource namespace mismatch: expected {expected_namespace:?}, got {:?}",
+                resource.namespace
+            ),
+        });
+    }
+
+    if requires_path && resource.path.is_none() {
+        return Err(AgentRuntimeError::ProjectionFailed {
+            message: format!("{event_name} resource path is required"),
+        });
+    }
+
+    if !requires_path && resource.path.is_some() {
+        return Err(AgentRuntimeError::ProjectionFailed {
+            message: format!("{event_name} resource path must be absent"),
+        });
+    }
+
+    Ok(())
 }

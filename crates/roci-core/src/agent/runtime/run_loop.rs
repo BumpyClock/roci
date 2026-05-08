@@ -271,6 +271,13 @@ impl AgentRuntime {
         if let Some(ref approval_handler) = self.config.approval_handler {
             request = request.with_approval_handler(approval_handler.clone());
         }
+        if let (Some(session_config), Some(session_fs)) = (&self.session_config, &self.session_fs) {
+            let session_fs: Arc<dyn crate::session::SessionFs + Send + Sync> = session_fs.clone();
+            request = request.with_session_context(session_fs, session_config.cwd.clone());
+        }
+        if let Some(sandbox_provider) = &self.sandbox_provider {
+            request = request.with_sandbox_provider(sandbox_provider.clone());
+        }
 
         if let Some(ref budget) = self.config.context_budget {
             request = request.with_context_budget(budget.clone());
@@ -533,16 +540,21 @@ impl AgentRuntime {
             ));
         };
 
-        let event = {
+        let events = {
             let mut projector = self
                 .chat_projector
                 .lock()
                 .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
-            projector.update_plan(turn_id, plan)
+            super::events::project_plan_update_and_mirror(
+                &mut projector,
+                turn_id,
+                plan,
+                self.session_resources.as_deref(),
+            )
         }
         .map_err(Self::map_chat_projection_error)?;
 
-        self.publish_runtime_event(event)
+        self.publish_runtime_events(events)
             .await
             .map(|_| ())
             .map_err(Self::map_chat_projection_error)

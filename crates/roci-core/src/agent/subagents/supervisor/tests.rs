@@ -116,6 +116,8 @@ fn make_base_config() -> AgentConfig {
         approval_policy: Default::default(),
         approval_handler: None,
         session_id: None,
+        session: None,
+        sandbox_provider: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,
         transport: None,

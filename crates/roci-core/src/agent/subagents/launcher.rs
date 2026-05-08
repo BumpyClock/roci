@@ -128,6 +128,8 @@ pub(super) fn build_child_config(
         convert_to_llm: None,
         before_agent_start: None,
         session_id: None,
+        session: parent.session.clone(),
+        sandbox_provider: parent.sandbox_provider.clone(),
         steering_mode: parent.steering_mode,
         follow_up_mode: parent.follow_up_mode,
         transport: parent.transport.clone(),

@@ -88,13 +88,21 @@ Payloads:
 - `reasoning_updated`
 - `plan_updated`
 - `diff_updated`
+- `plan_written`
+- `workspace_updated`
+- `artifact_created`
+- `temp_file_written`
+- `checkpoint_created`
+- `session_file_written`
+- `session_file_deleted`
 - `turn_completed`
 - `turn_failed`
 - `turn_canceled`
 
 No `SnapshotUpdated` (or raw `AgentEvent`) payload is part of this public contract.
 
-Approval, reasoning, plan, and diff payloads carry runtime-owned snapshots:
+Approval, reasoning, plan, diff, and resource payloads carry runtime-owned
+snapshots:
 
 - `ApprovalSnapshot`
   - request, status (`pending`, `resolved`, `canceled`), decision, timestamps
@@ -107,14 +115,20 @@ Approval, reasoning, plan, and diff payloads carry runtime-owned snapshots:
   - latest plan text for the turn
 - `DiffSnapshot`
   - latest diff text for the turn
+- `SessionResourceSnapshot`
+  - namespace, logical path, byte length, update timestamp, metadata
+
+Resource payloads update `ThreadSnapshot.resources`: latest plan/workspace,
+created artifacts, temp files, checkpoints, and session files. Deleted session
+files are removed from the projected file list.
 
 Plan/diff updates are semantic runtime inputs. When the loop or host integration
 emits `AgentEvent::PlanUpdated` / `AgentEvent::DiffUpdated`, chat projection owns
 the stable event/store/replay shape; hosts still consume only `AgentRuntimeEvent`.
 
-`ThreadSnapshot` includes projected `approvals`, `reasoning`, `plans`, and `diffs`
-so reconnecting hosts can recover current semantic state without reading raw loop
-events.
+`ThreadSnapshot` includes projected `approvals`, `reasoning`, `plans`, `diffs`,
+and `ThreadSnapshot.resources` so reconnecting hosts can recover current
+semantic state without reading raw loop events.
 
 Approval status contract:
 
@@ -145,7 +159,7 @@ pub struct ImportedThread {
 
 - `thread` is the semantic UI/runtime snapshot. Roci preserves its `revision`,
   `last_seq`, `active_turn_id`, turns, messages, tools, approvals, reasoning,
-  plans, diffs, and human interactions.
+  plans, diffs, resources, and human interactions.
 - `model_messages` is the provider context ledger. Roci uses only this ledger for
   the next provider request context.
 - `read_thread(imported.thread.thread_id)` after import returns the imported
@@ -157,6 +171,8 @@ pub struct ImportedThread {
 
 Incremental updates use `AgentRuntimeEvent` only. `ThreadSnapshot` remains the
 semantic view/runtime state; `model_messages` remains provider context.
+Resource snapshots are replayed from semantic resource events and cover
+plan/workspace/artifacts/temp/checkpoints/files across reconnects.
 
 ## Queue contract
 
@@ -214,6 +230,14 @@ plan output, the turn fails instead of synthesizing a plan from prose.
   - bounded by replay capacity (default: `ChatRuntimeConfig::default().replay_capacity = 512`)
 - Event store contract is only for replaying semantic `AgentRuntimeEvent`.
 - Raw `AgentEvent` stream is not intended as public persistence/replay API.
+
+### Durable session event store
+
+When `AgentConfig.session` is configured, Roci uses a strict JSONL
+`JsonlAgentRuntimeEventStore` at `<session_root>/<session_id>/events.jsonl`.
+Malformed nonblank committed lines fail replay with a visible error. Hosts that
+need salvage behavior should use a separate tolerant history/repair layer, not
+runtime event replay.
 
 ## Reconnect flow
 

@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::agent_loop::{ApprovalDecision, ApprovalRequest, ToolUpdatePayload};
 use crate::human_interaction::{HumanInteractionRequest, HumanInteractionResponse};
+use crate::session::{LogicalPath, SessionResourceMetadata, SessionResourceNamespace};
 use crate::types::{AgentToolResult, GenerationSettings, ModelMessage};
 
 use super::store::AgentRuntimeEventStore;
@@ -306,6 +307,39 @@ pub struct DiffSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionResourceSnapshot {
+    pub namespace: SessionResourceNamespace,
+    pub path: Option<LogicalPath>,
+    pub len: u64,
+    pub updated_at: DateTime<Utc>,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SessionResourcesSnapshot {
+    pub plan: Option<SessionResourceSnapshot>,
+    pub workspace: Option<SessionResourceSnapshot>,
+    pub artifacts: Vec<SessionResourceSnapshot>,
+    pub temp_files: Vec<SessionResourceSnapshot>,
+    pub checkpoints: Vec<SessionResourceSnapshot>,
+    pub files: Vec<SessionResourceSnapshot>,
+}
+
+#[must_use]
+pub fn resource_snapshot_from_metadata(
+    metadata: SessionResourceMetadata,
+    metadata_json: serde_json::Value,
+) -> SessionResourceSnapshot {
+    SessionResourceSnapshot {
+        namespace: metadata.namespace,
+        path: metadata.path,
+        len: metadata.len,
+        updated_at: metadata.updated_at.unwrap_or_else(Utc::now),
+        metadata: metadata_json,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageSnapshot {
     pub message_id: MessageId,
     pub thread_id: ThreadId,
@@ -357,6 +391,8 @@ pub struct ThreadSnapshot {
     pub reasoning: Vec<ReasoningSnapshot>,
     pub plans: Vec<PlanSnapshot>,
     pub diffs: Vec<DiffSnapshot>,
+    #[serde(default)]
+    pub resources: SessionResourcesSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

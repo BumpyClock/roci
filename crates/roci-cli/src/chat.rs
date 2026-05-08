@@ -6,6 +6,7 @@ use roci::agent_loop::{ApprovalPolicy, PreToolUseHookResult, RunStatus};
 use roci::config::RociConfig;
 use roci::mcp::{merge_mcp_instructions, MCPInstructionMergePolicy};
 use roci::resource::SkillResourceOptions;
+use roci::session::{SessionConfig, SessionId};
 use roci::skills::merge_system_prompt_with_skills;
 use roci::tools::ToolVisibilityPolicy;
 
@@ -35,6 +36,8 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         exclude_tools,
         max_tokens,
         approval,
+        session_root,
+        session_id,
         mcp_stdio,
         mcp_sse,
         prompt,
@@ -99,8 +102,17 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         allowed_tools.iter().map(String::as_str),
         exclude_tools.iter().map(String::as_str),
     );
+    let session = session_root
+        .map(|root| {
+            let id = match session_id {
+                Some(id) => SessionId::parse(id),
+                None => Ok(SessionId::new_v4()),
+            }?;
+            Ok::<_, roci::session::SessionError>(SessionConfig::new(id, root))
+        })
+        .transpose()?;
     let tools = roci_tools::builtin::tool_catalog().resolve(&tool_visibility_policy);
-    let agent = Arc::new(AgentRuntime::new(
+    let agent = Arc::new(AgentRuntime::try_new(
         registry,
         config,
         AgentConfig {
@@ -117,6 +129,8 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             approval_policy,
             approval_handler,
             session_id: None,
+            session,
+            sandbox_provider: None,
             steering_mode: QueueDrainMode::All,
             follow_up_mode: QueueDrainMode::All,
             transport: None,
@@ -143,7 +157,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             chat: Default::default(),
             human_interaction_coordinator: Some(coordinator.clone()),
         },
-    ));
+    )?);
 
     let subscription = agent.subscribe(None).await;
     renderer.subscribe(subscription, agent.clone());

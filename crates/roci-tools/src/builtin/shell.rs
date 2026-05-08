@@ -4,7 +4,9 @@ use roci::error::RociError;
 use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
 use roci::tools::types::AgentToolParameters;
 
-use super::common::{truncate_utf8, SHELL_OUTPUT_MAX_BYTES, SHELL_TIMEOUT};
+use super::common::{
+    truncate_utf8, validate_session_shell_command, SHELL_OUTPUT_MAX_BYTES, SHELL_TIMEOUT,
+};
 
 /// Create the `shell` tool — executes a shell command via `sh -c`.
 ///
@@ -17,17 +19,39 @@ pub fn shell_tool() -> Arc<dyn Tool> {
         AgentToolParameters::object()
             .string("command", "The shell command to execute", true)
             .build(),
-        |args_val, _ctx: ToolExecutionContext| async move {
+        |args_val, ctx: ToolExecutionContext| async move {
             let command = args_val.get_str("command")?;
 
-            let result = tokio::time::timeout(
-                SHELL_TIMEOUT,
-                tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .output(),
-            )
-            .await;
+            let mut process = tokio::process::Command::new("sh");
+            process.arg("-c").arg(command);
+
+            if let (Some(session_fs), Some(session_cwd)) =
+                (ctx.session_fs.as_ref(), ctx.session_cwd.as_ref())
+            {
+                if let Some(provider) = ctx.sandbox_provider.as_ref() {
+                    provider
+                        .validate_shell_command(command, session_cwd)
+                        .await?;
+                }
+
+                validate_session_shell_command(command).map_err(|reason| {
+                    RociError::ToolExecution {
+                        tool_name: "shell".into(),
+                        message: format!("session shell command denied: {reason}"),
+                    }
+                })?;
+
+                let cwd = session_fs.files_root().join(session_cwd.to_path_buf());
+                tokio::fs::create_dir_all(&cwd)
+                    .await
+                    .map_err(|e| RociError::ToolExecution {
+                        tool_name: "shell".into(),
+                        message: format!("{}: {e}", cwd.display()),
+                    })?;
+                process.current_dir(cwd);
+            }
+
+            let result = tokio::time::timeout(SHELL_TIMEOUT, process.output()).await;
 
             let output = match result {
                 Ok(Ok(output)) => output,

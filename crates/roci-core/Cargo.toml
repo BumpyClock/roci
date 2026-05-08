@@ -26,6 +26,7 @@ dotenvy = "0.15"
 toml = "0.9"
 directories = "6"
 ignore = "0.4"
+mime_guess = "2"
 serde_yaml = "0.9"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
 tokio-util = { version = "0.7", optional = true }

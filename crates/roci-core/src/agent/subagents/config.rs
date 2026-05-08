@@ -18,13 +18,23 @@ use super::types::{ModelCandidate, SubagentProfileRef, ToolPolicy};
 pub struct TomlProfile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherits: Option<SubagentProfileRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_agent_excluded_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,8 +106,13 @@ mod tests {
     fn parse_single_profile_toml() {
         let toml_str = r#"
 name = "developer"
+display_name = "Developer"
 description = "General coding agent"
 inherits = "builtin:developer"
+infer = "Use for coding work"
+skills = ["rust-skills", "programming"]
+mcp_servers = ["github"]
+default_agent_excluded_tools = ["delete_repo"]
 
 [[models]]
 provider = "anthropic"
@@ -111,7 +126,18 @@ mode = "inherit"
         let profiles = file.into_profiles();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].name, "developer");
+        assert_eq!(profiles[0].display_name.as_deref(), Some("Developer"));
         assert_eq!(profiles[0].inherits.as_deref(), Some("builtin:developer"));
+        assert_eq!(profiles[0].infer.as_deref(), Some("Use for coding work"));
+        assert_eq!(
+            profiles[0].skills,
+            vec!["rust-skills".to_string(), "programming".to_string()]
+        );
+        assert_eq!(profiles[0].mcp_servers, vec!["github"]);
+        assert_eq!(
+            profiles[0].default_agent_excluded_tools,
+            vec!["delete_repo"]
+        );
         assert_eq!(profiles[0].models.len(), 1);
         assert_eq!(profiles[0].models[0].provider, "anthropic");
         assert_eq!(profiles[0].models[0].model, "claude-sonnet-4.5");
@@ -127,7 +153,12 @@ mode = "inherit"
         let toml_str = r#"
 [[profiles]]
 name = "custom-dev"
+display_name = "Custom Dev"
 inherits = "builtin:developer"
+infer = "Use for implementation"
+skills = ["programming"]
+mcp_servers = ["filesystem"]
+default_agent_excluded_tools = ["ask_user"]
 
 [[profiles.models]]
 provider = "anthropic"
@@ -137,13 +168,20 @@ model = "claude-sonnet-4.5"
 name = "custom-planner"
 inherits = "builtin:planner"
 description = "My planner"
+skills = ["ux-designer"]
 "#;
         let file = TomlProfileFile::parse(toml_str).unwrap();
         let profiles = file.into_profiles();
         assert_eq!(profiles.len(), 2);
         assert_eq!(profiles[0].name, "custom-dev");
+        assert_eq!(profiles[0].display_name.as_deref(), Some("Custom Dev"));
+        assert_eq!(profiles[0].infer.as_deref(), Some("Use for implementation"));
+        assert_eq!(profiles[0].skills, vec!["programming"]);
+        assert_eq!(profiles[0].mcp_servers, vec!["filesystem"]);
+        assert_eq!(profiles[0].default_agent_excluded_tools, vec!["ask_user"]);
         assert_eq!(profiles[1].name, "custom-planner");
         assert_eq!(profiles[1].description.as_deref(), Some("My planner"));
+        assert_eq!(profiles[1].skills, vec!["ux-designer"]);
     }
 
     #[test]
@@ -176,6 +214,11 @@ name = "bare"
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].name, "bare");
         assert!(profiles[0].inherits.is_none());
+        assert!(profiles[0].display_name.is_none());
+        assert!(profiles[0].infer.is_none());
+        assert!(profiles[0].skills.is_empty());
+        assert!(profiles[0].mcp_servers.is_empty());
+        assert!(profiles[0].default_agent_excluded_tools.is_empty());
         assert!(profiles[0].models.is_empty());
         assert!(profiles[0].tools.is_none());
     }

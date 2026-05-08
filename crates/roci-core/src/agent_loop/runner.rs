@@ -17,8 +17,9 @@ use crate::context::ContextBudget;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::{self, ProviderRegistry};
+use crate::session::{LogicalPath, SessionFs};
 use crate::tools::catalog::ToolVisibilityPolicy;
-use crate::tools::tool::Tool;
+use crate::tools::tool::{SandboxProvider, Tool};
 use crate::types::{AgentToolCall, AgentToolResult, GenerationSettings, ModelMessage};
 
 use super::approvals::{ApprovalDecision, ApprovalHandler, ApprovalPolicy};
@@ -208,6 +209,12 @@ pub struct RunRequest {
     pub messages: Vec<ModelMessage>,
     pub settings: GenerationSettings,
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Optional durable session filesystem exposed to tools.
+    pub session_fs: Option<Arc<dyn SessionFs + Send + Sync>>,
+    /// Optional logical current directory inside the durable session filesystem.
+    pub session_cwd: Option<LogicalPath>,
+    /// Optional sandbox provider exposed to command-capable tools.
+    pub sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     /// Policy deciding which tools are visible to provider/tool resolution.
     pub tool_visibility_policy: ToolVisibilityPolicy,
     pub approval_policy: ApprovalPolicy,
@@ -269,6 +276,9 @@ impl RunRequest {
             messages,
             settings: GenerationSettings::default(),
             tools: Vec::new(),
+            session_fs: None,
+            session_cwd: None,
+            sandbox_provider: None,
             tool_visibility_policy: ToolVisibilityPolicy::default(),
             approval_policy: ApprovalPolicy::Ask,
             approval_handler: None,
@@ -305,6 +315,21 @@ impl RunRequest {
 
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    pub fn with_session_context(
+        mut self,
+        session_fs: Arc<dyn SessionFs + Send + Sync>,
+        session_cwd: LogicalPath,
+    ) -> Self {
+        self.session_fs = Some(session_fs);
+        self.session_cwd = Some(session_cwd);
+        self
+    }
+
+    pub fn with_sandbox_provider(mut self, provider: Arc<dyn SandboxProvider>) -> Self {
+        self.sandbox_provider = Some(provider);
         self
     }
 

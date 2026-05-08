@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{watch, MutexGuard};
 
 use super::{
-    AgentRuntime, AgentRuntimeError, AgentRuntimeEvent, AgentSnapshot, AgentState, RuntimeCursor,
-    RuntimeEventPublishRequest, RuntimeSnapshot, RuntimeSubscription, ThreadId, ThreadSnapshot,
+    AgentRuntime, AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, AgentSnapshot,
+    AgentState, RuntimeCursor, RuntimeEventPublishRequest, RuntimeSnapshot, RuntimeSubscription,
+    SessionResourceSnapshot, ThreadId, ThreadSnapshot,
 };
 use crate::error::RociError;
+use crate::session::{LogicalPath, SessionResourceMetadata};
 use crate::types::{ModelMessage, Usage};
 
 impl AgentRuntime {
@@ -97,10 +99,144 @@ impl AgentRuntime {
             .read_thread(thread_id)
     }
 
+    /// Write session workspace YAML and publish a resource event.
+    pub async fn write_workspace_yaml(
+        &self,
+        workspace: impl AsRef<str>,
+    ) -> Result<SessionResourceSnapshot, RociError> {
+        let resources = self.session_resources()?;
+        let metadata = resources
+            .write_workspace_yaml(workspace)
+            .map_err(Self::map_session_error)?;
+        self.record_session_resource(metadata, |resource| {
+            AgentRuntimeEventPayload::WorkspaceUpdated { resource }
+        })
+        .await
+    }
+
+    /// Write a session artifact and publish a resource event.
+    pub async fn write_artifact(
+        &self,
+        path: LogicalPath,
+        bytes: &[u8],
+    ) -> Result<SessionResourceSnapshot, RociError> {
+        let resources = self.session_resources()?;
+        let metadata = resources
+            .write_artifact(path, bytes)
+            .map_err(Self::map_session_error)?;
+        self.record_session_resource(metadata, |resource| {
+            AgentRuntimeEventPayload::ArtifactCreated { resource }
+        })
+        .await
+    }
+
+    /// Write a session temp file and publish a resource event.
+    pub async fn write_temp_file(
+        &self,
+        path: LogicalPath,
+        bytes: &[u8],
+    ) -> Result<SessionResourceSnapshot, RociError> {
+        let resources = self.session_resources()?;
+        let metadata = resources
+            .write_temp(path, bytes)
+            .map_err(Self::map_session_error)?;
+        self.record_session_resource(metadata, |resource| {
+            AgentRuntimeEventPayload::TempFileWritten { resource }
+        })
+        .await
+    }
+
+    /// Write a session checkpoint and publish a resource event.
+    pub async fn write_checkpoint(
+        &self,
+        path: LogicalPath,
+        bytes: &[u8],
+    ) -> Result<SessionResourceSnapshot, RociError> {
+        let resources = self.session_resources()?;
+        let metadata = resources
+            .write_checkpoint(path, bytes)
+            .map_err(Self::map_session_error)?;
+        self.record_session_resource(metadata, |resource| {
+            AgentRuntimeEventPayload::CheckpointCreated { resource }
+        })
+        .await
+    }
+
+    /// Write a session workspace file and publish a resource event.
+    pub async fn write_session_file(
+        &self,
+        path: LogicalPath,
+        bytes: &[u8],
+    ) -> Result<SessionResourceSnapshot, RociError> {
+        let resources = self.session_resources()?;
+        let metadata = resources
+            .write_file(path, bytes)
+            .map_err(Self::map_session_error)?;
+        self.record_session_resource(metadata, |resource| {
+            AgentRuntimeEventPayload::SessionFileWritten { resource }
+        })
+        .await
+    }
+
+    /// Delete a session workspace file and publish a resource event.
+    pub async fn delete_session_file(
+        &self,
+        path: LogicalPath,
+    ) -> Result<SessionResourceSnapshot, RociError> {
+        let resources = self.session_resources()?;
+        let metadata = resources
+            .delete_file(&path)
+            .map_err(Self::map_session_error)?;
+        self.record_session_resource(metadata, |resource| {
+            AgentRuntimeEventPayload::SessionFileDeleted { resource }
+        })
+        .await
+    }
+
     /// Broadcast the current snapshot to all watchers.
     pub(super) async fn broadcast_snapshot(&self) {
         let snapshot = self.snapshot().await;
         let _ = self.snapshot_tx.send(snapshot);
+    }
+
+    fn session_resources(&self) -> Result<Arc<crate::session::LocalSessionResources>, RociError> {
+        self.session_resources
+            .clone()
+            .ok_or_else(|| RociError::InvalidState("session resources are not configured".into()))
+    }
+
+    fn map_session_error(err: crate::session::SessionError) -> RociError {
+        RociError::InvalidState(err.to_string())
+    }
+
+    async fn record_session_resource(
+        &self,
+        metadata: SessionResourceMetadata,
+        payload: impl FnOnce(SessionResourceSnapshot) -> AgentRuntimeEventPayload,
+    ) -> Result<SessionResourceSnapshot, RociError> {
+        let resource =
+            super::chat::resource_snapshot_from_metadata(metadata, serde_json::Value::Null);
+        let event = {
+            let mut projector = self
+                .chat_projector
+                .lock()
+                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
+            let thread_id = projector.default_thread_id();
+            let active_turn_id = projector
+                .read_thread(thread_id)
+                .map_err(Self::map_chat_projection_error)?
+                .active_turn_id;
+            let event_payload = payload(resource.clone());
+            match active_turn_id {
+                Some(turn_id) => projector.record_session_resource(turn_id, event_payload),
+                None => projector.record_session_resource_for_thread(thread_id, event_payload),
+            }
+            .map_err(Self::map_chat_projection_error)?
+        };
+        self.publish_runtime_event(event)
+            .await
+            .map_err(Self::map_chat_projection_error)?;
+        Ok(resource)
     }
 
     pub(super) async fn publish_runtime_events(

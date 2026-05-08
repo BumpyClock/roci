@@ -139,6 +139,8 @@ async fn submit_user_input_unknown_request_returns_error() {
         approval_policy: Default::default(),
         approval_handler: None,
         session_id: None,
+        session: None,
+        sandbox_provider: None,
         steering_mode: crate::agent::runtime::QueueDrainMode::All,
         follow_up_mode: crate::agent::runtime::QueueDrainMode::All,
         transport: None,

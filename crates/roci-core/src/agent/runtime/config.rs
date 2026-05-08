@@ -10,9 +10,10 @@ use crate::context::ContextBudget;
 use crate::models::LanguageModel;
 use crate::provider::ProviderPayloadCallback;
 use crate::resource::CompactionSettings;
+use crate::session::SessionConfig;
 use crate::tools::catalog::ToolVisibilityPolicy;
 use crate::tools::dynamic::DynamicToolProvider;
-use crate::tools::tool::Tool;
+use crate::tools::tool::{SandboxProvider, Tool};
 use crate::types::GenerationSettings;
 
 use super::chat::ChatRuntimeConfig;
@@ -57,6 +58,10 @@ pub struct AgentConfig {
     pub approval_handler: Option<ApprovalHandler>,
     /// Optional session ID for provider-side prompt caching.
     pub session_id: Option<String>,
+    /// Optional durable local session configuration.
+    pub session: Option<SessionConfig>,
+    /// Optional sandbox provider exposed to command-capable tools.
+    pub sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     /// Drain mode for steering queue retrieval.
     pub steering_mode: QueueDrainMode,
     /// Drain mode for follow-up queue retrieval.
@@ -137,6 +142,8 @@ impl Default for AgentConfig {
             approval_policy: ApprovalPolicy::Ask,
             approval_handler: None,
             session_id: None,
+            session: None,
+            sandbox_provider: None,
             steering_mode: QueueDrainMode::All,
             follow_up_mode: QueueDrainMode::All,
             transport: None,

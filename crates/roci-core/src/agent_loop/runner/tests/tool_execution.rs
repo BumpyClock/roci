@@ -1,5 +1,112 @@
 use super::*;
 
+use crate::session::{LocalSessionFs, LogicalPath, SessionFs};
+use crate::tools::SandboxProvider;
+
+#[derive(Debug, Default)]
+struct RecordingSandboxProvider {
+    calls: std::sync::Mutex<Vec<(String, LogicalPath)>>,
+}
+
+#[async_trait]
+impl SandboxProvider for RecordingSandboxProvider {
+    async fn validate_shell_command(
+        &self,
+        command: &str,
+        cwd: &LogicalPath,
+    ) -> Result<(), RociError> {
+        self.calls
+            .lock()
+            .expect("sandbox calls lock")
+            .push((command.to_string(), cwd.clone()));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn run_request_threads_session_context_to_tools() {
+    let (runner, _requests) = test_runner(ProviderScenario::ToolCallWithUsageThenTextWithUsage);
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let session_fs: Arc<dyn SessionFs + Send + Sync> =
+        Arc::new(LocalSessionFs::new(temp.path().join("session")).expect("session fs"));
+    let session_cwd = LogicalPath::parse("work").expect("logical path");
+    let observed_context = Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, bool)>::new()));
+    let tool_observed_context = observed_context.clone();
+    let noop_tool: Arc<dyn Tool> = Arc::new(AgentTool::new(
+        "noop_tool",
+        "records tool context",
+        AgentToolParameters::empty(),
+        move |_args, ctx: ToolExecutionContext| {
+            let tool_observed_context = tool_observed_context.clone();
+            async move {
+                tool_observed_context.lock().expect("context lock").push((
+                    ctx.session_cwd.as_ref().map(|cwd| cwd.as_str().to_string()),
+                    ctx.session_fs.is_some(),
+                ));
+                Ok(serde_json::json!({ "ok": true }))
+            }
+        },
+    ));
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("run tool")])
+        .with_tools(vec![noop_tool])
+        .with_approval_policy(ApprovalPolicy::Always)
+        .with_session_context(session_fs, session_cwd);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let contexts = observed_context.lock().expect("context lock");
+    assert_eq!(contexts.as_slice(), &[(Some("work".to_string()), true)]);
+}
+
+#[tokio::test]
+async fn run_request_threads_sandbox_provider_to_tools() {
+    let (runner, _requests) = test_runner(ProviderScenario::ToolCallWithUsageThenTextWithUsage);
+    let sandbox_provider = Arc::new(RecordingSandboxProvider::default());
+    let observed_context = Arc::new(std::sync::Mutex::new(Vec::<(bool, Option<String>)>::new()));
+    let tool_observed_context = observed_context.clone();
+    let noop_tool: Arc<dyn Tool> = Arc::new(AgentTool::new(
+        "noop_tool",
+        "records sandbox context",
+        AgentToolParameters::empty(),
+        move |_args, ctx: ToolExecutionContext| {
+            let tool_observed_context = tool_observed_context.clone();
+            async move {
+                let cwd = ctx.session_cwd.unwrap_or_else(LogicalPath::root);
+                if let Some(provider) = ctx.sandbox_provider.as_ref() {
+                    provider.validate_shell_command("echo ok", &cwd).await?;
+                }
+                tool_observed_context.lock().expect("context lock").push((
+                    ctx.sandbox_provider.is_some(),
+                    Some(cwd.as_str().to_string()),
+                ));
+                Ok(serde_json::json!({ "ok": true }))
+            }
+        },
+    ));
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("run tool")])
+        .with_tools(vec![noop_tool])
+        .with_approval_policy(ApprovalPolicy::Always)
+        .with_sandbox_provider(sandbox_provider.clone());
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let contexts = observed_context.lock().expect("context lock");
+    assert_eq!(contexts.as_slice(), &[(true, Some("".to_string()))]);
+    let sandbox_calls = sandbox_provider.calls.lock().expect("sandbox calls lock");
+    assert_eq!(
+        sandbox_calls.as_slice(),
+        &[("echo ok".to_string(), LogicalPath::root())]
+    );
+}
+
 #[tokio::test]
 async fn tool_visibility_policy_filters_provider_tool_definitions() {
     let (runner, requests) = test_runner(ProviderScenario::TextOnlyWithUsage);
