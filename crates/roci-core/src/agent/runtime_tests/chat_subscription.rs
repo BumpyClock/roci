@@ -248,15 +248,17 @@ impl AgentRuntimeEventStore for FailingAppendStore {
         &self,
         events: Vec<AgentRuntimeEvent>,
     ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
-        for _ in &events {
-            let append_count = self.append_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if append_count == self.fail_on_append {
-                return Err(AgentRuntimeError::ProjectionFailed {
-                    message: format!("injected append failure at {append_count}"),
-                });
-            }
+        let current_count = self.append_count.load(Ordering::Relaxed);
+        let next_count = current_count + events.len();
+        if (current_count + 1..=next_count).contains(&self.fail_on_append) {
+            return Err(AgentRuntimeError::ProjectionFailed {
+                message: format!("injected append failure at {}", self.fail_on_append),
+            });
         }
-        self.inner.append_batch(events).await
+        let cursors = self.inner.append_batch(events).await?;
+        self.append_count
+            .fetch_add(cursors.len(), Ordering::Relaxed);
+        Ok(cursors)
     }
 
     async fn events_after(

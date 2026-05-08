@@ -44,3 +44,64 @@ pub trait ProviderFactory: Send + Sync {
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DefaultFactory {
+        requires_credentials: bool,
+    }
+
+    impl ProviderFactory for DefaultFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["default"]
+        }
+
+        fn requires_credentials(&self, _provider_key: &str) -> bool {
+            self.requires_credentials
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            panic!("default list_models tests must not create providers")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_list_models_requires_credentials_when_unavailable_hidden() {
+        let config = RociConfig::new().with_token_store(None);
+        let options = ModelListOptions::default();
+
+        let err = DefaultFactory {
+            requires_credentials: true,
+        }
+        .list_models(&config, "default", &options)
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RociError::MissingCredential { provider } if provider == "default"
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_list_models_returns_empty_catalog_when_available() {
+        let config = RociConfig::new().with_token_store(None);
+        let options = ModelListOptions::default();
+
+        let catalog = DefaultFactory {
+            requires_credentials: false,
+        }
+        .list_models(&config, "default", &options)
+        .await
+        .unwrap();
+
+        assert!(catalog.models().is_empty());
+    }
+}

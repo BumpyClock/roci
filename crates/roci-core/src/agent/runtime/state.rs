@@ -303,10 +303,13 @@ impl AgentRuntime {
             .map_err(|_| AgentRuntimeError::ProjectionFailed {
                 message: "runtime event publisher dropped acknowledgement".to_string(),
             })?
-            .map(|mut cursors| {
+            .and_then(|mut cursors| {
                 cursors
                     .pop()
-                    .expect("batch ack for single-event publish must return exactly one cursor")
+                    .ok_or_else(|| AgentRuntimeError::ProjectionFailed {
+                        message: "batch ack for single-event publish returned no cursor"
+                            .to_string(),
+                    })
             })
     }
 

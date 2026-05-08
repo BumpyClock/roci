@@ -137,18 +137,6 @@ pub(crate) async fn run_switch_chat_smoke(
     let previous = agent.switch_model(to).await?;
     let current = agent.current_model().await;
     let result = agent.prompt(args.prompt).await?;
-    let response = result
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == Role::Assistant)
-        .map(|message| message.text())
-        .ok_or_else(|| {
-            format!(
-                "switched model prompt returned no assistant message; status={:?} error={:?}",
-                result.status, result.error
-            )
-        })?;
 
     if result.status != RunStatus::Completed {
         return Err(format!(
@@ -157,6 +145,14 @@ pub(crate) async fn run_switch_chat_smoke(
         )
         .into());
     }
+
+    let response = result
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+        .map(|message| message.text())
+        .ok_or_else(|| "completed run returned no assistant message".to_string())?;
 
     if let Some(expected) = &args.expect {
         if !response.contains(expected) {

@@ -135,10 +135,11 @@ tmux new-session -d -s roci-live-attach-unsupported \
    roci_status=$?; printf "\n[roci-agent chat --attach exit=%s]\n" "$roci_status"; exec zsh'
 echo "attach: tmux attach -t roci-live-attach-unsupported"
 rg -n '/tmp/roci-unsupported-media.pdf|/tmp/roci-attach-smoke' /tmp/roci-attach-smoke/unsupported-media
+rg -n 'roci-unsupported-media.pdf|application/pdf' /tmp/roci-attach-smoke/unsupported-media
 ```
 
-The final `rg` should exit `1`; marker text may include only the attachment
-basename, MIME type, and size.
+The raw-path `rg` should exit `1`; marker text may include only the attachment
+basename, MIME type, and size, which the second `rg` should find.
 
 Session verification must inspect persisted snapshots/files and assert sanitized
 attachment metadata has no raw host paths:

@@ -142,6 +142,7 @@ pub(crate) async fn list_copilot_models(
     let response = shared_client()
         .get(url)
         .headers(headers)
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(RociError::Network)?;

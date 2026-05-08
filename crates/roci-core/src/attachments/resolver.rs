@@ -247,7 +247,7 @@ fn unsupported_media_text(
     let Some(mime_type) = safe_unsupported_media_mime(mime_type.as_deref()) else {
         return Err(AttachmentResolveError::UnsupportedMime {
             name: safe_name,
-            mime_type: mime_type.unwrap_or_default(),
+            mime_type: mime_type.unwrap_or_else(|| "<unknown>".to_string()),
         });
     };
 

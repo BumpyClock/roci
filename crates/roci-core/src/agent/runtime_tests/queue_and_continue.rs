@@ -87,19 +87,25 @@ async fn steer_and_follow_up_accept_prompt_input_attachments() {
 
     agent
         .steer(
-            PromptInput::new("steer")
-                .with_attachment(Attachment::Selection(SelectionAttachment::new("s"))),
+            PromptInput::new("steer").with_attachment(Attachment::Selection(
+                SelectionAttachment::new("steer-selection-marker"),
+            )),
         )
         .await
         .expect("steer should queue");
     agent
         .follow_up(
-            PromptInput::new("follow")
-                .with_attachment(Attachment::Selection(SelectionAttachment::new("f"))),
+            PromptInput::new("follow").with_attachment(Attachment::Selection(
+                SelectionAttachment::new("follow-selection-marker"),
+            )),
         )
         .await
         .expect("follow-up should queue");
 
-    assert!(agent.steering_queue.lock().await[0].text().contains("s"));
-    assert!(agent.follow_up_queue.lock().await[0].text().contains("f"));
+    assert!(agent.steering_queue.lock().await[0]
+        .text()
+        .contains("steer-selection-marker"));
+    assert!(agent.follow_up_queue.lock().await[0]
+        .text()
+        .contains("follow-selection-marker"));
 }
