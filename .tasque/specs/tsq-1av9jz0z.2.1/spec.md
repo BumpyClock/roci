@@ -13,6 +13,9 @@ Define the reusable command classification contract and normalized command input
 - Keep Pi-style event extensibility for later host integration, but do not make extension hooks the only security boundary.
 - No full shell parser in v1; normalize enough for deterministic categories and testable reasons.
 
+## Normalization details
+Minimum v1 normalization inspects leading env assignments, common wrappers (`sudo`, `doas`, `command`, `builtin`, `time`, `env`, `xargs`), and shell connectors (`;`, `&&`, `||`, `|`). Multi-command input returns union categories. If any segment is unknown, include `Unknown`; unknown/risky categories cannot be silently allowed by default policy.
+
 ## Non-goals
 - No approval engine implementation in this task.
 - No OS sandboxing or command execution changes.
