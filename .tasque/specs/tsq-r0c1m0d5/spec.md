@@ -100,26 +100,40 @@ ModelInfo {
 - `include_static`,
 - `include_unavailable`.
 
+`ModelListOptions::default()` should be:
+
+```text
+provider_key: None
+include_dynamic: true
+include_static: true
+include_unavailable: false
+```
+
+`include_unavailable=false` hides remote providers requiring credentials when
+credentials/config are absent. `include_unavailable=true` may include static
+remote entries marked `requires_credentials=true`, but must not call provider
+endpoints without credentials.
+
 `ModelCatalog` should dedupe by `(provider_key, model_id)` with deterministic
 ordering. Dynamic entries win over static entries for the same pair because they
 represent provider-reported availability.
 
 ## Provider And Registry Contracts
 
-Extend `ProviderFactory` with an async listing API:
+Extend `ProviderFactory` with an object-safe listing API:
 
 ```text
-async fn list_models(
+fn list_models<'a>(
     &self,
-    config: &RociConfig,
-    provider_key: &str,
-    options: &ModelListOptions,
-) -> Result<ModelCatalog, RociError>
+    config: &'a RociConfig,
+    provider_key: &'a str,
+    options: &'a ModelListOptions,
+) -> BoxFuture<'a, Result<ModelCatalog, RociError>>
 ```
 
 Default implementation may return an empty catalog so custom providers do not
-need immediate work. Keep the trait object-safe via the repo's existing async
-trait pattern or an explicit boxed future.
+need immediate work. Do not use native `async fn` in this dyn trait because
+`ProviderFactory` is stored as `Arc<dyn ProviderFactory>`.
 
 `ProviderRegistry::list_models(config, options)` should:
 
@@ -155,10 +169,15 @@ Behavior:
 - All-provider list without Copilot auth hides Copilot remote dynamic results.
 - Explicit `--provider github-copilot` tries dynamic discovery when auth/config exists.
 - Dynamic parser accepts OpenAI-style `{ "data": [...] }` and raw array responses.
-- If dynamic discovery is unavailable but static Copilot fallback exists, explicit
-  Copilot listing returns static entries with `source=Static`.
 - Unauthenticated all-provider listing does not include Copilot static fallback;
   hiding unauthenticated remote providers takes priority for broad discovery.
+- Missing credentials/config: explicit provider may return static fallback;
+  all-provider hides Copilot.
+- 404/405 from `/models`: explicit provider returns static fallback.
+- 401/403 with credentials: return typed auth error, no fallback.
+- 2xx parse error: return typed provider/config error, no fallback.
+- network timeout/5xx: return static fallback only when `include_static=true`,
+  and attach warning metadata to the returned static entries.
 - If neither dynamic credentials nor static fallback can produce entries, return
   typed auth/config error for explicit provider listing.
 
@@ -170,9 +189,10 @@ when authenticated provider access is available.
 
 Add runtime helpers:
 
-- `AgentRuntime::current_model() -> LanguageModel`
-- `AgentRuntime::switch_model(model: LanguageModel) -> Result<LanguageModel, RociError>`
-- `AgentRuntime::set_model(model)` delegates to `switch_model(model)` and discards previous model.
+- `pub async fn current_model(&self) -> LanguageModel`
+- `pub async fn switch_model(&self, model: LanguageModel) -> Result<LanguageModel, RociError>`
+- `pub async fn set_model(&self, model: LanguageModel) -> Result<(), RociError>`
+  delegates to `switch_model(model)` and discards previous model.
 
 Switch semantics:
 
@@ -199,10 +219,25 @@ PROVIDER        MODEL                         CONTEXT   TOOLS   VISION   SOURCE
 openai          gpt-4o                        128000    yes     yes      static
 ```
 
-JSON output should serialize `ModelCatalog` or an equivalent stable wrapper.
+JSON output should use a stable wrapper:
+
+```json
+{
+  "models": []
+}
+```
 
 `roci-cli` must call the real `ProviderRegistry::list_models` API. Parser-only
 tests are insufficient because CLI exists here to prove actual SDK behavior.
+Add an injectable runner shape so tests can prove this:
+
+```text
+models_cmd::run(args, registry: Arc<ProviderRegistry>, config: RociConfig, writer)
+```
+
+CLI tests should pass a stub `ProviderFactory::list_models` that records
+invocation and returns sentinel catalog data. Assertions must check that JSON
+contains the sentinel model from registry output, not hard-coded fixture text.
 
 ## Error Handling
 
@@ -262,10 +297,15 @@ cargo test -p roci-cli models
 cargo test --workspace --all-targets
 ```
 
-Live verification:
+Live verification must run in tmux and print the attach command before the
+provider-facing run.
 
-- run `roci-agent models list --provider lmstudio --json` against local LM Studio when available,
-- run `roci-agent models list --provider github-copilot --json` in tmux when authenticated,
+Live checks:
+
+- run `cargo run -q -p roci-cli -- models list --provider openai --json`
+  to prove static registry listing,
+- run `cargo run -q -p roci-cli --features roci/github-copilot -- models list --provider github-copilot --json`
+  in tmux when authenticated,
 - if Copilot auth is unavailable, record that live dynamic smoke was unavailable
   and prove static/local catalog via `roci-agent models list --json`.
 
@@ -274,8 +314,10 @@ Live verification:
 Order:
 
 1. `.1` core API and registry listing contract first.
-2. `.2`, `.3`, `.4`, and `.5` can run mostly in parallel after `.1`.
-3. `.6` docs and verification last.
+2. `.2`, `.3`, and `.5` can run mostly in parallel after `.1`.
+3. `.4a` CLI parser and injectable handler can start after `.1` using a stub registry.
+4. `.4b` built-in provider CLI behavior follows `.2`; Copilot CLI behavior follows `.3`.
+5. `.6` docs and verification last.
 
 Suggested ownership:
 
