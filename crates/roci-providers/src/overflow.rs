@@ -18,10 +18,12 @@
 //! - **Google Gemini**: text-based matching today because the transport does
 //!   not yet preserve Gemini-specific structured error details.
 
+use futures::future::BoxFuture;
 use roci_core::context::overflow::{
     OverflowDetectionInput, OverflowDetector, OverflowKind, OverflowRetryHint, OverflowSignal,
 };
 use roci_core::error::{ErrorCode, RociError};
+use roci_core::models::{ModelCatalog, ModelListOptions};
 
 // ---------------------------------------------------------------------------
 // OpenAI family detector
@@ -417,6 +419,19 @@ impl OverflowClassifyingFactory {
 impl roci_core::provider::ProviderFactory for OverflowClassifyingFactory {
     fn provider_keys(&self) -> &[&str] {
         self.inner.provider_keys()
+    }
+
+    fn requires_credentials(&self, provider_key: &str) -> bool {
+        self.inner.requires_credentials(provider_key)
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        config: &'a roci_core::config::RociConfig,
+        provider_key: &'a str,
+        options: &'a ModelListOptions,
+    ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
+        self.inner.list_models(config, provider_key, options)
     }
 
     fn create(

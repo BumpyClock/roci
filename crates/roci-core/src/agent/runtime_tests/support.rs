@@ -150,6 +150,18 @@ pub(super) fn test_agent_config() -> AgentConfig {
     }
 }
 
+pub(super) fn runtime_with_streaming_model(
+    provider_key: &'static str,
+    model_id: &str,
+) -> AgentRuntime {
+    let registry = registry_with_streaming_provider(provider_key, 8, 3);
+    let mut config = test_agent_config();
+    config.model = format!("{provider_key}:{model_id}")
+        .parse()
+        .expect("stub model should parse");
+    AgentRuntime::new(registry, test_config(), config)
+}
+
 pub(super) fn registry_with_summary_provider(
     provider_key: &'static str,
     summary_text: &str,
@@ -188,6 +200,7 @@ pub(super) fn assistant_tool_call(
         })],
         name: None,
         timestamp: None,
+        metadata: None,
     }
 }
 

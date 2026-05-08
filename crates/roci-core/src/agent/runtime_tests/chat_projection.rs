@@ -674,6 +674,7 @@ fn bootstrap_thread_projects_exact_history_as_completed_messages() {
             }],
             name: Some("policy".to_string()),
             timestamp: None,
+            metadata: None,
         },
         ModelMessage::user("find docs"),
         ModelMessage {
@@ -691,6 +692,7 @@ fn bootstrap_thread_projects_exact_history_as_completed_messages() {
             ],
             name: None,
             timestamp: None,
+            metadata: None,
         },
         ModelMessage::tool_result("call-1", serde_json::json!({ "ok": true }), false),
     ];
@@ -1111,7 +1113,7 @@ fn normalize_for_resume_finishes_active_tool_with_error_result() {
         })
         .expect("tool completion emitted");
     assert_eq!(completed.status, ToolStatus::Completed);
-    assert_eq!(completed.final_result.as_ref().unwrap().is_error, true);
+    assert!(completed.final_result.as_ref().unwrap().is_error);
     assert_eq!(thread.tools[0].status, ToolStatus::Completed);
     assert!(thread.turns[0].active_tool_call_ids.is_empty());
 }

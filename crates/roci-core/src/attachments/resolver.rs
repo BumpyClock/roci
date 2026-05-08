@@ -8,6 +8,9 @@ use super::types::{
 };
 
 const FALLBACK_TEXT_MIME: &str = "text/plain; charset=utf-8";
+pub(super) const UNSUPPORTED_MEDIA_MIME: &str = "application/octet-stream";
+const MAX_ATTACHMENT_DISPLAY_NAME_CHARS: usize = 128;
+const MAX_UNSUPPORTED_MEDIA_MIME_CHARS: usize = 128;
 
 /// Default synchronous V1 attachment resolver.
 #[derive(Debug, Default, Clone, Copy)]
@@ -156,11 +159,15 @@ fn resolve_blob(
     blob: &BlobAttachment,
     options: &AttachmentResolveOptions,
 ) -> Result<ResolvedAttachment, AttachmentResolveError> {
-    let name = blob.name.clone().unwrap_or_else(|| "blob".to_string());
+    let name = blob
+        .name
+        .as_deref()
+        .map(sanitize_display_name)
+        .unwrap_or_else(|| "blob".to_string());
     validate_attachment_size(&name, blob.data.len(), options.max_attachment_bytes)?;
     let metadata = AttachmentMetadata {
         source: AttachmentSource::Blob,
-        name: blob.name.clone(),
+        name: blob.name.as_deref().map(sanitize_display_name),
         mime_type: normalize_mime(blob.mime_type.as_deref()),
         size_bytes: blob.data.len(),
     };
@@ -174,7 +181,8 @@ fn resolve_selection(
 ) -> Result<ResolvedAttachment, AttachmentResolveError> {
     let name = selection
         .name
-        .clone()
+        .as_deref()
+        .map(sanitize_display_name)
         .unwrap_or_else(|| "selection".to_string());
     validate_attachment_size(&name, selection.text.len(), options.max_attachment_bytes)?;
 
@@ -182,7 +190,7 @@ fn resolve_selection(
         text: selection.text.clone(),
         metadata: AttachmentMetadata {
             source: AttachmentSource::Selection,
-            name: selection.name.clone(),
+            name: selection.name.as_deref().map(sanitize_display_name),
             mime_type: Some(FALLBACK_TEXT_MIME.to_string()),
             size_bytes: selection.text.len(),
         },
@@ -208,10 +216,7 @@ fn resolve_data(
         }
 
         if !allows_utf8_fallback(&mime_type) {
-            return Err(AttachmentResolveError::UnsupportedMime {
-                name: name.to_string(),
-                mime_type,
-            });
+            return unsupported_media_text(metadata, name, Some(mime_type));
         }
     }
 
@@ -220,16 +225,40 @@ fn resolve_data(
             metadata.mime_type = Some(FALLBACK_TEXT_MIME.to_string());
             Ok(ResolvedAttachment::Text { text, metadata })
         }
-        Err(_) => match metadata.mime_type {
-            Some(mime_type) => Err(AttachmentResolveError::UnsupportedMime {
-                name: name.to_string(),
-                mime_type,
-            }),
-            None => Err(AttachmentResolveError::UnsupportedBinary {
-                name: name.to_string(),
-            }),
-        },
+        Err(_) => {
+            let mime_type = metadata.mime_type.clone();
+            unsupported_media_text(metadata, name, mime_type)
+        }
     }
+}
+
+pub(super) fn unsupported_media_marker(name: &str, mime_type: &str, size_bytes: usize) -> String {
+    format!(
+        "User attached unsupported media: {name} ({mime_type}, {size_bytes} bytes). Content omitted."
+    )
+}
+
+fn unsupported_media_text(
+    metadata: AttachmentMetadata,
+    name: &str,
+    mime_type: Option<String>,
+) -> Result<ResolvedAttachment, AttachmentResolveError> {
+    let safe_name = sanitize_display_name(name);
+    let Some(mime_type) = safe_unsupported_media_mime(mime_type.as_deref()) else {
+        return Err(AttachmentResolveError::UnsupportedMime {
+            name: safe_name,
+            mime_type: mime_type.unwrap_or_default(),
+        });
+    };
+
+    Ok(ResolvedAttachment::Text {
+        text: unsupported_media_marker(&safe_name, &mime_type, metadata.size_bytes),
+        metadata: AttachmentMetadata {
+            name: Some(safe_name),
+            mime_type: Some(mime_type),
+            ..metadata
+        },
+    })
 }
 
 fn normalize_mime(mime_type: Option<&str>) -> Option<String> {
@@ -282,13 +311,82 @@ fn allows_utf8_fallback(mime_type: &str) -> bool {
 }
 
 fn file_name(file: &FileAttachment) -> String {
-    file.name.clone().unwrap_or_else(|| {
-        file.path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file")
-            .to_string()
-    })
+    file.name
+        .as_deref()
+        .map(sanitize_display_name)
+        .unwrap_or_else(|| {
+            file.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file")
+                .to_string()
+        })
+}
+
+pub(super) fn safe_attachment_name(metadata: &AttachmentMetadata) -> String {
+    metadata
+        .name
+        .as_deref()
+        .map(sanitize_display_name)
+        .unwrap_or_else(|| match &metadata.source {
+            AttachmentSource::File { path } => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(sanitize_display_name)
+                .unwrap_or_else(|| "file".to_string()),
+            AttachmentSource::Blob => "blob".to_string(),
+            AttachmentSource::Selection => "selection".to_string(),
+        })
+}
+
+pub(super) fn safe_unsupported_media_mime(mime_type: Option<&str>) -> Option<String> {
+    let mime_type = mime_type.unwrap_or(UNSUPPORTED_MEDIA_MIME);
+    let base = mime_type
+        .split(';')
+        .next()
+        .unwrap_or(mime_type)
+        .trim()
+        .to_ascii_lowercase();
+    if base.is_empty()
+        || base.len() > MAX_UNSUPPORTED_MEDIA_MIME_CHARS
+        || base.chars().any(|c| c.is_control() || c.is_whitespace())
+        || base.split('/').count() != 2
+    {
+        return None;
+    }
+
+    let (kind, subtype) = base.split_once('/')?;
+    let valid_token = |token: &str| {
+        !token.is_empty()
+            && token.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '!' | '#' | '$' | '&' | '^' | '_' | '.' | '+' | '-')
+            })
+    };
+    valid_token(kind).then_some(())?;
+    valid_token(subtype).then_some(())?;
+
+    Some(base)
+}
+
+fn sanitize_display_name(name: &str) -> String {
+    let basename = name
+        .trim()
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("attachment");
+    let sanitized = basename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_ATTACHMENT_DISPLAY_NAME_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        "attachment".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn display_path(path: &Path) -> String {

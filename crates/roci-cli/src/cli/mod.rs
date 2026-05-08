@@ -23,6 +23,8 @@ pub enum Commands {
     Audio(AudioArgs),
     /// Chat with an AI model
     Chat(ChatArgs),
+    /// Inspect available models
+    Models(ModelsArgs),
     /// Manage durable agent sessions
     Session(SessionArgs),
     /// Manage installed skills
@@ -231,6 +233,78 @@ pub enum ChatApprovalArg {
     Ask,
     Always,
     Never,
+}
+
+/// Arguments for the `models` subcommand group.
+#[derive(Parser, Debug)]
+pub struct ModelsArgs {
+    #[command(subcommand)]
+    pub command: ModelsCommands,
+}
+
+/// Model catalog subcommands.
+#[derive(Subcommand, Debug)]
+pub enum ModelsCommands {
+    /// List available models
+    List(ModelsListArgs),
+    /// Exercise runtime model switching without starting a provider call.
+    #[command(hide = true)]
+    SwitchSmoke(ModelsSwitchSmokeArgs),
+    /// Exercise runtime model switching and send a prompt through the switched model.
+    #[command(hide = true)]
+    SwitchChatSmoke(ModelsSwitchChatSmokeArgs),
+}
+
+/// Arguments for `roci-agent models list`.
+#[derive(Parser, Debug)]
+pub struct ModelsListArgs {
+    /// Provider key to list models for
+    #[arg(long, value_name = "PROVIDER")]
+    pub provider: Option<String>,
+
+    /// Print models as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for hidden `roci-agent models switch-smoke`.
+#[derive(Parser, Debug)]
+pub struct ModelsSwitchSmokeArgs {
+    /// Initial runtime model as provider:model.
+    #[arg(long, value_name = "MODEL")]
+    pub from: String,
+
+    /// Replacement runtime model as provider:model.
+    #[arg(long, value_name = "MODEL")]
+    pub to: String,
+
+    /// Print switch result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for hidden `roci-agent models switch-chat-smoke`.
+#[derive(Parser, Debug)]
+pub struct ModelsSwitchChatSmokeArgs {
+    /// Initial runtime model as provider:model.
+    #[arg(long, value_name = "MODEL")]
+    pub from: String,
+
+    /// Replacement runtime model as provider:model.
+    #[arg(long, value_name = "MODEL")]
+    pub to: String,
+
+    /// Prompt sent after switching.
+    #[arg(long, value_name = "TEXT")]
+    pub prompt: String,
+
+    /// Required substring in the assistant response.
+    #[arg(long, value_name = "TEXT")]
+    pub expect: Option<String>,
+
+    /// Print result as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the `session` subcommand group.
@@ -453,6 +527,104 @@ mod tests {
                 assert!(args.prompt.is_none());
             }
             other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_models_list_with_defaults() {
+        let cli = Cli::try_parse_from(["roci-agent", "models", "list"]).unwrap();
+        match cli.command {
+            Commands::Models(models) => match models.command {
+                ModelsCommands::List(args) => {
+                    assert!(args.provider.is_none());
+                    assert!(!args.json);
+                }
+                other => panic!("expected List, got {other:?}"),
+            },
+            other => panic!("expected Models, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_models_list_with_provider_and_json() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "models",
+            "list",
+            "--provider",
+            "openai",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Models(models) => match models.command {
+                ModelsCommands::List(args) => {
+                    assert_eq!(args.provider.as_deref(), Some("openai"));
+                    assert!(args.json);
+                }
+                other => panic!("expected List, got {other:?}"),
+            },
+            other => panic!("expected Models, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_models_switch_smoke_hidden_command() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "models",
+            "switch-smoke",
+            "--from",
+            "openai:gpt-4o",
+            "--to",
+            "openai:gpt-4.1",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Models(models) => match models.command {
+                ModelsCommands::SwitchSmoke(args) => {
+                    assert_eq!(args.from, "openai:gpt-4o");
+                    assert_eq!(args.to, "openai:gpt-4.1");
+                    assert!(args.json);
+                }
+                other => panic!("expected SwitchSmoke, got {other:?}"),
+            },
+            other => panic!("expected Models, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_models_switch_chat_smoke_hidden_command() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "models",
+            "switch-chat-smoke",
+            "--from",
+            "openai:gpt-4o",
+            "--to",
+            "openai:gpt-4.1",
+            "--prompt",
+            "Reply ok",
+            "--expect",
+            "ok",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Models(models) => match models.command {
+                ModelsCommands::SwitchChatSmoke(args) => {
+                    assert_eq!(args.from, "openai:gpt-4o");
+                    assert_eq!(args.to, "openai:gpt-4.1");
+                    assert_eq!(args.prompt, "Reply ok");
+                    assert_eq!(args.expect.as_deref(), Some("ok"));
+                    assert!(args.json);
+                }
+                other => panic!("expected SwitchChatSmoke, got {other:?}"),
+            },
+            other => panic!("expected Models, got {other:?}"),
         }
     }
 

@@ -155,6 +155,20 @@ impl AgentRuntimeEventStore for BlockOnAppendStore {
         self.inner.append(event).await
     }
 
+    async fn append_batch(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
+        for _ in &events {
+            let append_count = self.append_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if append_count == self.block_on_append {
+                self.append_started.notify_waiters();
+                self.release_append.notified().await;
+            }
+        }
+        self.inner.append_batch(events).await
+    }
+
     async fn events_after(
         &self,
         cursor: RuntimeCursor,
@@ -186,6 +200,22 @@ impl AgentRuntimeEventStore for DelayedAppendStore {
         self.inner.append(event).await
     }
 
+    async fn append_batch(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
+        for _ in &events {
+            let mut count = self.append_count.lock().await;
+            *count += 1;
+            if *count == 1 {
+                self.append_started.notify_waiters();
+                drop(count);
+                self.release_append.notified().await;
+            }
+        }
+        self.inner.append_batch(events).await
+    }
+
     async fn events_after(
         &self,
         cursor: RuntimeCursor,
@@ -212,6 +242,21 @@ impl AgentRuntimeEventStore for FailingAppendStore {
             });
         }
         self.inner.append(event).await
+    }
+
+    async fn append_batch(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
+        for _ in &events {
+            let append_count = self.append_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if append_count == self.fail_on_append {
+                return Err(AgentRuntimeError::ProjectionFailed {
+                    message: format!("injected append failure at {append_count}"),
+                });
+            }
+        }
+        self.inner.append_batch(events).await
     }
 
     async fn events_after(

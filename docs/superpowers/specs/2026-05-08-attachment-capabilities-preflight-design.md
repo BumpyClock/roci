@@ -12,7 +12,7 @@ Current roci state:
 - Provider payload mapping for existing `ContentPart::Image` exists, but later task `tsq-r0c1att8.4` owns provider attachment assertions.
 - V1 has no native `ContentPart::File`; files are resolver inputs that become text/image or fail.
 
-Pi and Codex both keep user input separate from provider content and expose coarse text/image model modalities. Both silently degrade unsupported images. roci should keep the boundary but reject unsupported attachments during preflight so SDK behavior is deterministic.
+Pi and Codex both keep user input separate from provider content and expose coarse text/image model modalities. Both degrade unsupported images into model-visible text. roci should keep the boundary, fail resource and malformed-metadata errors during preflight, and degrade safe unsupported media into bounded marker text so the agent can explain the limitation.
 
 ## Goals
 
@@ -135,7 +135,7 @@ pub enum AttachmentPreflightError {
 }
 ```
 
-The function validates only resolved text/image attachments. Resolver errors still own filesystem, MIME detection, UTF-8, generic byte/count limits, and unsupported binary data.
+The function validates only resolved text/image attachments. Resolver errors still own filesystem, MIME detection, UTF-8, generic byte/count limits, and malformed metadata that cannot produce a bounded unsupported-media marker. Safe unsupported media resolves to bounded marker text.
 
 ## Token Accounting
 
@@ -152,7 +152,8 @@ Host app:
 1. Builds `PromptInput` with prompt text and attachments.
 2. Resolver converts attachments into `ResolvedAttachment`.
 3. Runtime calls shared preflight with provider `ModelCapabilities`.
-4. Runtime renders text attachments and passes image attachments to provider mapping in later tasks.
+4. Runtime degrades safe unsupported media and unsupported image inputs into bounded marker text.
+5. Runtime renders text attachments and passes supported image attachments to provider mapping.
 
 CLI chat:
 
@@ -161,7 +162,8 @@ CLI chat:
 3. Calls shared preflight with the selected provider capabilities.
 4. Renders text attachments into the user prompt.
 5. Encodes image attachments as `ContentPart::Image` for providers whose capabilities allow images.
-6. Fails before provider execution when selected model capabilities reject the attachment.
+6. Degrades safe unsupported media and unsupported image inputs into bounded marker text.
+7. Fails before provider execution for unreadable paths, invalid text UTF-8, malformed marker metadata, and resource limits.
 
 Provider/catalog:
 
@@ -174,7 +176,7 @@ Core tests should cover:
 
 - `ModelCapabilities::default()` has text enabled, image disabled, native file disabled.
 - Vision helper/default populates image support and allowed MIME types.
-- Non-vision model rejects image attachments.
+- Non-vision model degrades image attachments into bounded marker text.
 - Vision model accepts allowed image MIME.
 - Image count, per-image bytes, total image bytes, and MIME failures.
 - Text byte cap failure.
@@ -191,14 +193,14 @@ CLI/runtime tests should cover:
 
 - Repeatable `--attach` parsing.
 - Text file attachment rendering into the model-visible prompt.
-- Image rejection for text-only model capabilities.
+- Unsupported image fallback for text-only model capabilities.
 - Image encoding into `ContentPart::Image` for vision-capable model capabilities.
 - Runtime `prompt_message` preserving multipart image content through to provider requests.
 
 Live verification should cover:
 
 - `roci-agent chat --attach <text-file>` against a local LM Studio model and assert the model sees attached text.
-- `roci-agent chat --attach <image-file>` against the same text-only local model and assert preflight rejects before provider execution.
+- `roci-agent chat --attach <image-file>` against the same text-only local model and assert image content degrades into an unsupported-media marker unless resource limits fail.
 
 ## Acceptance
 
@@ -207,6 +209,6 @@ Live verification should cover:
 - `roci-agent chat --attach` uses the shared resolver/preflight path.
 - Attachment preflight tests pass.
 - Existing attachment resolver tests keep passing.
-- Live CLI attachment smoke proves text attachments reach the provider and image preflight rejection fires.
+- Live CLI attachment smoke proves text attachments reach the provider and unsupported media markers reach the provider when content is unsupported.
 - No native file content part is introduced.
 - Later tasks `tsq-r0c1att8.3`, `tsq-r0c1att8.4`, and `tsq-r0c1m0d5.1` can build on this shape.

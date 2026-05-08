@@ -219,6 +219,18 @@ impl PromptInput {
     }
 }
 
+impl From<String> for PromptInput {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for PromptInput {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
 /// Resolves host attachments into model-safe V1 attachment data.
 pub trait AttachmentResolver {
     type Error;

@@ -383,9 +383,12 @@ async fn session_config_uses_jsonl_store_without_project_cwd_storage() {
     let project = tempdir().expect("project tempdir should be created");
     let sessions = tempdir().expect("session tempdir should be created");
     let session_id = session_id("session-jsonl");
-    let agent = {
+    let host_cwd = {
         let _cwd_lock = CWD_LOCK.lock().expect("cwd lock should not be poisoned");
         let _cwd_guard = CwdGuard::change_to(project.path().to_path_buf());
+        std::env::current_dir().ok()
+    };
+    let agent = {
         let registry = registry_with_streaming_provider("stub", 1, 1);
         let mut config = test_agent_config();
         config.model = "stub:session".parse().expect("stub model should parse");
@@ -393,7 +396,7 @@ async fn session_config_uses_jsonl_store_without_project_cwd_storage() {
         let state = store
             .create(CreateSessionOptions {
                 id: Some(session_id.clone()),
-                host_cwd: std::env::current_dir().ok(),
+                host_cwd,
                 ..CreateSessionOptions::default()
             })
             .await

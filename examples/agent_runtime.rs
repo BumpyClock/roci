@@ -147,8 +147,14 @@ async fn main() {
     // Steering messages are injected between tool batches during a run,
     // allowing you to redirect the agent mid-execution. They accumulate
     // and are drained on the next inner-loop iteration.
-    agent.steer("Focus on Rust code only").await;
-    agent.steer("Keep responses concise").await;
+    agent
+        .steer("Focus on Rust code only")
+        .await
+        .expect("text steering should queue");
+    agent
+        .steer("Keep responses concise")
+        .await
+        .expect("text steering should queue");
     println!("Queued 2 steering messages");
 
     // -- 8. Queue follow-up messages
@@ -158,7 +164,8 @@ async fn main() {
     // without the caller needing to issue another prompt().
     agent
         .follow_up("Also explain the performance implications")
-        .await;
+        .await
+        .expect("text follow-up should queue");
     println!("Queued 1 follow-up message");
 
     // -- 9. Start a prompt (requires valid API key)

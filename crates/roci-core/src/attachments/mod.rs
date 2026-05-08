@@ -1,10 +1,15 @@
 //! Host-facing attachment contract and V1 resolver.
 
+mod compiler;
 mod preflight;
 mod renderer;
 mod resolver;
 mod types;
 
+pub use compiler::{
+    compile_prompt_input, AttachmentContentKind, AttachmentDisplayMetadata, AttachmentSourceKind,
+    CompiledPromptInput,
+};
 pub use preflight::{
     preflight_resolved_attachments, AttachmentPreflightError, AttachmentPreflightReport,
 };

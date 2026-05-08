@@ -1,9 +1,16 @@
-use super::chat::{MessageStatus, TurnStatus};
+use super::chat::{
+    AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventStore, MessageStatus, RuntimeCursor,
+    ThreadId, TurnStatus,
+};
 use super::support::*;
 use super::*;
 use crate::agent_loop::runner::BeforeAgentStartHookResult;
 use crate::agent_loop::{ApprovalPolicy, RunStatus};
-use crate::models::ModelCapabilities;
+use crate::attachments::{
+    Attachment, AttachmentContentKind, AttachmentSourceKind, BlobAttachment, PromptInput,
+    SelectionAttachment,
+};
+use crate::models::{ModelCapabilities, ModelInputCapabilities};
 use crate::provider::{ModelProvider, ProviderFactory, ProviderRequest, ProviderResponse};
 use crate::types::{
     ContentPart, FinishReason, GenerationSettings, ImageContent, ModelMessage, ResponseFormat,
@@ -169,6 +176,7 @@ async fn prompt_message_preserves_image_parts_in_provider_request() {
         ],
         name: None,
         timestamp: None,
+        metadata: None,
     };
 
     let result = agent
@@ -188,6 +196,128 @@ async fn prompt_message_preserves_image_parts_in_provider_request() {
         ContentPart::Image(image)
             if image.data == "AQIDBA==" && image.mime_type == "image/png"
     ));
+}
+
+#[tokio::test]
+async fn prompt_input_preserves_attachment_metadata_in_chat_snapshot() {
+    let agent = runtime_with_chat_provider();
+    let input = PromptInput::new("Inspect").with_attachment(Attachment::Selection(
+        SelectionAttachment::new("selected text").with_name("Selection A"),
+    ));
+
+    agent.prompt(input).await.expect("prompt should run");
+
+    let thread = agent.read_snapshot().await.threads[0].clone();
+    let user = thread
+        .messages
+        .iter()
+        .find(|message| message.payload.role == Role::User)
+        .expect("user message");
+    let metadata = user.payload.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata.attachments.len(), 1);
+    assert_eq!(
+        metadata.attachments[0].source_kind,
+        AttachmentSourceKind::Selection
+    );
+    assert_eq!(
+        metadata.attachments[0].content_kind,
+        AttachmentContentKind::Text
+    );
+    assert_eq!(metadata.attachments[0].name.as_deref(), Some("Selection A"));
+}
+
+#[tokio::test]
+async fn continue_run_accepts_prompt_input_attachments() {
+    let agent = runtime_with_chat_provider();
+    agent.prompt("hello").await.expect("first run");
+
+    let input = PromptInput::new("Continue").with_attachment(Attachment::Selection(
+        SelectionAttachment::new("extra context"),
+    ));
+    agent
+        .continue_run(input)
+        .await
+        .expect("continue should run");
+
+    let user_messages = agent
+        .messages()
+        .await
+        .into_iter()
+        .filter(|message| message.role == Role::User)
+        .collect::<Vec<_>>();
+    assert!(user_messages
+        .last()
+        .expect("last user")
+        .text()
+        .contains("extra context"));
+}
+
+#[tokio::test]
+async fn prompt_input_preflight_failure_does_not_mutate_messages_or_chat() {
+    let agent = runtime_with_chat_provider();
+    let input = PromptInput::new("Describe").with_attachment(Attachment::Blob(
+        BlobAttachment::new([0xff]).with_mime_type("text/plain"),
+    ));
+
+    let err = agent.prompt(input).await.expect_err("input should fail");
+
+    assert!(err.to_string().contains("not valid UTF-8"));
+    assert!(agent.messages().await.is_empty());
+    let thread = agent.read_snapshot().await.threads[0].clone();
+    assert!(thread.messages.is_empty());
+    assert!(thread.turns.is_empty());
+    assert_eq!(agent.state().await, AgentState::Idle);
+}
+
+#[tokio::test]
+async fn prompt_input_sends_image_parts_in_provider_request() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(FullMessageRecordingFactory {
+        provider_key: "stub",
+        requests: requests.clone(),
+    }));
+    let mut config = test_agent_config();
+    config.model = "stub:vision".parse().expect("stub model should parse");
+    let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
+    let input = PromptInput::new("describe image").with_attachment(Attachment::Blob(
+        BlobAttachment::new([137, 80, 78, 71]).with_mime_type("image/png"),
+    ));
+
+    agent.prompt(input).await.expect("vision prompt should run");
+
+    let recorded = requests.lock().expect("requests lock");
+    let user_message = recorded[0]
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("provider request should include user message");
+    assert!(matches!(
+        &user_message.content[1],
+        ContentPart::Image(image) if image.mime_type == "image/png"
+    ));
+}
+
+#[tokio::test]
+async fn event_publish_failure_rolls_back_messages_and_chat_turn() {
+    let registry = registry_with_streaming_provider("stub", 8, 3);
+    let mut config = test_agent_config();
+    config.model = "stub:event-failure"
+        .parse()
+        .expect("stub model should parse");
+    config.chat.event_store = Some(Arc::new(FailingRuntimeEventStore::new()));
+    let agent = AgentRuntime::new(registry, test_config(), config);
+
+    let err = agent
+        .prompt("hello")
+        .await
+        .expect_err("event publish should fail");
+
+    assert!(err.to_string().contains("injected append failure"));
+    assert!(agent.messages().await.is_empty());
+    let thread = agent.read_snapshot().await.threads[0].clone();
+    assert!(thread.messages.is_empty());
+    assert!(thread.turns.is_empty());
+    assert_eq!(agent.state().await, AgentState::Idle);
 }
 
 #[tokio::test]
@@ -954,6 +1084,15 @@ impl ProviderFactory for FullMessageRecordingFactory {
             provider_key: provider_key.to_string(),
             model_id: model_id.to_string(),
             requests: self.requests.clone(),
+            capabilities: if model_id == "vision" {
+                ModelCapabilities {
+                    supports_vision: true,
+                    input: ModelInputCapabilities::from_vision_support(true),
+                    ..ModelCapabilities::default()
+                }
+            } else {
+                ModelCapabilities::default()
+            },
         }))
     }
 }
@@ -962,6 +1101,7 @@ struct FullMessageRecordingProvider {
     provider_key: String,
     model_id: String,
     requests: Arc<Mutex<Vec<Vec<ModelMessage>>>>,
+    capabilities: ModelCapabilities,
 }
 
 #[async_trait]
@@ -975,8 +1115,7 @@ impl ModelProvider for FullMessageRecordingProvider {
     }
 
     fn capabilities(&self) -> &ModelCapabilities {
-        static CAPABILITIES: std::sync::OnceLock<ModelCapabilities> = std::sync::OnceLock::new();
-        CAPABILITIES.get_or_init(ModelCapabilities::default)
+        &self.capabilities
     }
 
     async fn generate_text(
@@ -1019,6 +1158,47 @@ impl ModelProvider for FullMessageRecordingProvider {
             }),
         ];
         Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+struct FailingRuntimeEventStore;
+
+impl FailingRuntimeEventStore {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl AgentRuntimeEventStore for FailingRuntimeEventStore {
+    async fn append(&self, _event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
+        Err(AgentRuntimeError::ProjectionFailed {
+            message: "injected append failure".to_string(),
+        })
+    }
+
+    async fn append_batch(
+        &self,
+        _events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
+        Err(AgentRuntimeError::ProjectionFailed {
+            message: "injected append failure".to_string(),
+        })
+    }
+
+    async fn events_after(
+        &self,
+        _cursor: RuntimeCursor,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        Ok(Vec::new())
+    }
+
+    async fn invalidate_thread(
+        &self,
+        _thread_id: ThreadId,
+        _latest_seq: u64,
+    ) -> Result<(), AgentRuntimeError> {
+        Ok(())
     }
 }
 

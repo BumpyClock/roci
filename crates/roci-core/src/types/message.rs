@@ -3,6 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::attachments::AttachmentDisplayMetadata;
+
 /// A message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelMessage {
@@ -12,6 +14,27 @@ pub struct ModelMessage {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "ModelMessageMetadata::is_none_or_empty"
+    )]
+    pub metadata: Option<ModelMessageMetadata>,
+}
+
+/// Metadata attached to a model message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ModelMessageMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentDisplayMetadata>,
+}
+
+impl ModelMessageMetadata {
+    fn is_none_or_empty(metadata: &Option<Self>) -> bool {
+        match metadata {
+            Some(metadata) => metadata.attachments.is_empty(),
+            None => true,
+        }
+    }
 }
 
 impl ModelMessage {
@@ -22,6 +45,7 @@ impl ModelMessage {
             content: vec![ContentPart::Text { text: text.into() }],
             name: None,
             timestamp: Some(Utc::now()),
+            metadata: None,
         }
     }
 
@@ -32,6 +56,7 @@ impl ModelMessage {
             content: vec![ContentPart::Text { text: text.into() }],
             name: None,
             timestamp: Some(Utc::now()),
+            metadata: None,
         }
     }
 
@@ -42,6 +67,7 @@ impl ModelMessage {
             content: vec![ContentPart::Text { text: text.into() }],
             name: None,
             timestamp: Some(Utc::now()),
+            metadata: None,
         }
     }
 
@@ -60,6 +86,7 @@ impl ModelMessage {
             })],
             name: None,
             timestamp: Some(Utc::now()),
+            metadata: None,
         }
     }
 

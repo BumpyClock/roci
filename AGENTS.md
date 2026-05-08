@@ -19,5 +19,6 @@ roci notes:
 - Along with automated tests always run live tests in an interactive tmux terminal to ensure everything is working correctly end to end.
 - Do not call provider-facing work done until it has passed the live tmux/provider verification in `docs/testing.md`.
 - use local models running at `http://127.0.0.1:1234` if not available, inform user.
+- Use OpenAI-compatible live endpoint `http://framed:4001/v1` with API key `sk-local-dummy` as an additional provider smoke target when reachable.
 - test configured providers as well. work with user to trigger and validate auth flows and make sure calls can be made successfully for OpenAI, OpenAI Codex, Gemini, Anthropic Claude Code, Github Copilot.
 - When running test with tmux, always show user the tmux attach command so they can attach to the same tmux session to interact/watch/co-develop or debug

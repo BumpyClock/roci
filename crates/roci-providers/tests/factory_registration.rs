@@ -10,6 +10,8 @@ use tempfile::TempDir;
 
 use roci_core::auth::{AuthService, FileTokenStore, TokenStoreConfig};
 use roci_core::provider::ProviderRegistry;
+#[cfg(feature = "ollama")]
+use roci_core::{config::RociConfig, models::ModelListOptions};
 
 // ---------------------------------------------------------------------------
 // register_default_providers
@@ -106,6 +108,24 @@ fn register_default_providers_registers_ollama_when_feature_enabled() {
     let mut registry = ProviderRegistry::new();
     roci_providers::register_default_providers(&mut registry);
     assert!(registry.has_provider("ollama"));
+}
+
+#[cfg(feature = "ollama")]
+#[tokio::test]
+async fn register_default_providers_all_catalog_keeps_local_ollama_without_credentials() {
+    let config = RociConfig::new().with_token_store(None);
+    let mut registry = ProviderRegistry::new();
+    roci_providers::register_default_providers(&mut registry);
+
+    let catalog = registry
+        .list_models(&config, &ModelListOptions::default())
+        .await
+        .unwrap();
+
+    assert!(catalog
+        .models()
+        .iter()
+        .any(|model| model.provider_key == "ollama" && model.model_id == "llama3.3"));
 }
 
 // ---------------------------------------------------------------------------

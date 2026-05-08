@@ -867,6 +867,78 @@ mod tests {
     }
 
     #[test]
+    fn provider_attachment_payload_openai_chat_maps_text_and_image_parts() {
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "test-key".to_string(), None, None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage {
+                role: Role::User,
+                content: vec![
+                    ContentPart::Text {
+                        text: "Inspect attachment".to_string(),
+                    },
+                    ContentPart::Image(ImageContent {
+                        data: "aW1hZ2U=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ],
+                name: None,
+                timestamp: None,
+                metadata: None,
+            }],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        let content = &body["messages"][0]["content"];
+
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Inspect attachment");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        assert!(content[1].get("file").is_none());
+        assert!(content[1].get("file_id").is_none());
+        assert!(content[1].get("input_file").is_none());
+        assert!(content[1].get("document").is_none());
+    }
+
+    #[test]
+    fn provider_attachment_payload_openai_chat_preserves_unsupported_media_marker_text() {
+        let marker =
+            "User attached unsupported media: doc.pdf (application/pdf, 7 bytes). Content omitted.";
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "test-key".to_string(), None, None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user(marker)],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["messages"][0]["content"].as_str(), Some(marker));
+        assert!(!body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/"));
+    }
+
+    #[test]
     fn chat_url_without_extra_query() {
         let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "k".to_string(), None, None);
         assert_eq!(

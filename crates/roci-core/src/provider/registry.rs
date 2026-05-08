@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::{ModelProvider, ProviderFactory};
 use crate::config::RociConfig;
 use crate::error::RociError;
+use crate::models::{ModelCatalog, ModelListOptions};
 
 /// Registry mapping provider keys to their factories.
 ///
@@ -57,10 +58,63 @@ impl ProviderRegistry {
             .map(|factory| factory.requires_credentials(provider_key))
     }
 
+    /// List models for one provider or all registered providers.
+    pub async fn list_models(
+        &self,
+        config: &RociConfig,
+        options: &ModelListOptions,
+    ) -> Result<ModelCatalog, RociError> {
+        if let Some(provider_key) = options.provider_key.as_deref() {
+            let factory = self.factories.get(provider_key).ok_or_else(|| {
+                RociError::ModelNotFound(format!(
+                    "No provider factory registered for '{provider_key}'"
+                ))
+            })?;
+
+            return factory.list_models(config, provider_key, options).await;
+        }
+
+        let mut catalog = ModelCatalog::default();
+        let keys = self.provider_keys();
+        for provider_key in keys {
+            let factory = self
+                .factories
+                .get(provider_key)
+                .expect("provider key came from registry");
+
+            if !options.include_unavailable
+                && factory.requires_credentials(provider_key)
+                && !has_credentials(config, provider_key)
+            {
+                continue;
+            }
+
+            match factory.list_models(config, provider_key, options).await {
+                Ok(provider_catalog) => catalog.extend(provider_catalog),
+                Err(
+                    RociError::MissingCredential { .. } | RociError::MissingConfiguration { .. },
+                ) if !options.include_unavailable => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(catalog)
+    }
+
     /// List all registered provider keys.
     pub fn provider_keys(&self) -> Vec<&str> {
-        self.factories.keys().map(|s| s.as_str()).collect()
+        let mut keys = self
+            .factories
+            .keys()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
     }
+}
+
+fn has_credentials(config: &RociConfig, provider_key: &str) -> bool {
+    config.get_api_key(provider_key).is_some()
 }
 
 impl Default for ProviderRegistry {
@@ -75,15 +129,32 @@ mod tests {
     use crate::config::RociConfig;
     use crate::error::RociError;
     use crate::models::capabilities::{ModelCapabilities, ModelInputCapabilities};
+    use crate::models::{ModelCatalogSource, ModelInfo, ModelListOptions, ModelPolicy};
     use crate::provider::{ModelProvider, ProviderRequest, ProviderResponse};
     use crate::types::{TextStreamDelta, Usage};
     use async_trait::async_trait;
+    use futures::future::BoxFuture;
     use futures::stream::BoxStream;
     struct StubFactory;
 
     impl ProviderFactory for StubFactory {
         fn provider_keys(&self) -> &[&str] {
             &["stub", "stub-alias"]
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _config: &'a RociConfig,
+            provider_key: &'a str,
+            _options: &'a ModelListOptions,
+        ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
+            Box::pin(async move {
+                Ok(ModelCatalog::from_models([catalog_model(
+                    provider_key,
+                    "stub-model",
+                    false,
+                )]))
+            })
         }
 
         fn create(
@@ -107,6 +178,23 @@ mod tests {
                     input: ModelInputCapabilities::default(),
                 },
             }))
+        }
+    }
+
+    fn catalog_model(provider_key: &str, model_id: &str, requires_credentials: bool) -> ModelInfo {
+        ModelInfo {
+            provider_key: provider_key.to_string(),
+            model_id: model_id.to_string(),
+            display_name: None,
+            capabilities: ModelCapabilities::default(),
+            policy: ModelPolicy {
+                requires_credentials,
+                local: !requires_credentials,
+                deprecated: false,
+                default_for_provider: false,
+            },
+            source: ModelCatalogSource::Static,
+            metadata: Default::default(),
         }
     }
 
@@ -235,9 +323,87 @@ mod tests {
         registry.register(Arc::new(StubFactory));
         registry.register(Arc::new(AnotherFactory));
 
-        let mut keys = registry.provider_keys();
-        keys.sort();
-        assert_eq!(keys, vec!["another", "stub", "stub-alias"]);
+        assert_eq!(
+            registry.provider_keys(),
+            vec!["another", "stub", "stub-alias"]
+        );
+    }
+
+    #[test]
+    fn provider_keys_are_sorted_for_deterministic_listing() {
+        let factory = CustomFactory {
+            keys: vec!["zeta", "alpha"],
+            provider_name: "custom",
+        };
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(factory));
+        registry.register(Arc::new(StubFactory));
+
+        assert_eq!(
+            registry.provider_keys(),
+            vec!["alpha", "stub", "stub-alias", "zeta"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_filters_by_provider_key() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(StubFactory));
+        let config = RociConfig::new().with_token_store(None);
+        let options = ModelListOptions {
+            provider_key: Some("stub".to_string()),
+            ..ModelListOptions::default()
+        };
+
+        let catalog = registry.list_models(&config, &options).await.unwrap();
+
+        assert_eq!(catalog.models().len(), 1);
+        assert_eq!(catalog.models()[0].provider_key, "stub");
+    }
+
+    #[tokio::test]
+    async fn list_models_hides_unavailable_remote_in_all_provider_mode() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CredentialedCatalogFactory));
+        let config = RociConfig::new().with_token_store(None);
+
+        let catalog = registry
+            .list_models(&config, &ModelListOptions::default())
+            .await
+            .unwrap();
+
+        assert!(catalog.models().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_unavailable_remote_returns_auth_error() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CredentialedCatalogFactory));
+        let config = RociConfig::new().with_token_store(None);
+        let options = ModelListOptions {
+            provider_key: Some("remote".to_string()),
+            ..ModelListOptions::default()
+        };
+
+        let err = registry.list_models(&config, &options).await.unwrap_err();
+
+        assert!(matches!(err, RociError::MissingCredential { provider } if provider == "remote"));
+    }
+
+    #[tokio::test]
+    async fn credentialed_remote_appears_in_all_provider_mode() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CredentialedCatalogFactory));
+        let config = RociConfig::new().with_token_store(None);
+        config.set_api_key("remote", "token".to_string());
+
+        let catalog = registry
+            .list_models(&config, &ModelListOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(catalog.models().len(), 1);
+        assert_eq!(catalog.models()[0].provider_key, "remote");
     }
 
     struct LocalFactory;
@@ -401,5 +567,43 @@ mod tests {
         let registry = ProviderRegistry::new();
         assert!(registry.provider_keys().is_empty());
         assert!(!registry.has_provider("anything"));
+    }
+
+    struct CredentialedCatalogFactory;
+
+    impl ProviderFactory for CredentialedCatalogFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["remote"]
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            config: &'a RociConfig,
+            provider_key: &'a str,
+            _options: &'a ModelListOptions,
+        ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
+            Box::pin(async move {
+                if config.get_api_key(provider_key).is_none() {
+                    return Err(RociError::MissingCredential {
+                        provider: provider_key.to_string(),
+                    });
+                }
+
+                Ok(ModelCatalog::from_models([catalog_model(
+                    provider_key,
+                    "remote-model",
+                    true,
+                )]))
+            })
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            unreachable!("catalog tests must not create providers")
+        }
     }
 }

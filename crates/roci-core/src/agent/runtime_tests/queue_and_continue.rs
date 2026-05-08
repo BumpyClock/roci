@@ -1,12 +1,17 @@
 use super::support::*;
 use super::*;
+use crate::attachments::{Attachment, PromptInput, SelectionAttachment};
+
+fn queue_agent() -> AgentRuntime {
+    runtime_with_streaming_model("stub", "queue")
+}
 
 #[tokio::test]
 async fn clear_queue_apis_and_has_queued_messages_behave_consistently() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+    let agent = queue_agent();
     assert!(!agent.has_queued_messages().await);
 
-    agent.steer("s1").await;
+    agent.steer("s1").await.expect("steer should queue");
     assert!(agent.has_queued_messages().await);
     assert_eq!(agent.steering_queue.lock().await.len(), 1);
     assert_eq!(agent.follow_up_queue.lock().await.len(), 0);
@@ -15,8 +20,8 @@ async fn clear_queue_apis_and_has_queued_messages_behave_consistently() {
     assert!(!agent.has_queued_messages().await);
     assert!(agent.steering_queue.lock().await.is_empty());
 
-    agent.follow_up("f1").await;
-    agent.follow_up("f2").await;
+    agent.follow_up("f1").await.expect("follow-up should queue");
+    agent.follow_up("f2").await.expect("follow-up should queue");
     assert!(agent.has_queued_messages().await);
     assert_eq!(agent.follow_up_queue.lock().await.len(), 2);
 
@@ -24,8 +29,8 @@ async fn clear_queue_apis_and_has_queued_messages_behave_consistently() {
     assert!(!agent.has_queued_messages().await);
     assert!(agent.follow_up_queue.lock().await.is_empty());
 
-    agent.steer("s2").await;
-    agent.follow_up("f3").await;
+    agent.steer("s2").await.expect("steer should queue");
+    agent.follow_up("f3").await.expect("follow-up should queue");
     assert!(agent.has_queued_messages().await);
 
     agent.clear_all_queues().await;
@@ -36,13 +41,16 @@ async fn clear_queue_apis_and_has_queued_messages_behave_consistently() {
 
 #[tokio::test]
 async fn clearing_queues_restores_continue_without_input_assistant_guard() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+    let agent = queue_agent();
     agent
         .messages
         .lock()
         .await
         .push(ModelMessage::assistant("done"));
-    agent.steer("queued steer").await;
+    agent
+        .steer("queued steer")
+        .await
+        .expect("steer should queue");
 
     assert!(agent.has_queued_messages().await);
     agent.clear_all_queues().await;
@@ -58,17 +66,40 @@ async fn clearing_queues_restores_continue_without_input_assistant_guard() {
 
 #[tokio::test]
 async fn multiple_steers_accumulate() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
-    agent.steer("a").await;
-    agent.steer("b").await;
-    agent.steer("c").await;
+    let agent = queue_agent();
+    agent.steer("a").await.expect("steer should queue");
+    agent.steer("b").await.expect("steer should queue");
+    agent.steer("c").await.expect("steer should queue");
     assert_eq!(agent.steering_queue.lock().await.len(), 3);
 }
 
 #[tokio::test]
 async fn multiple_follow_ups_accumulate() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
-    agent.follow_up("x").await;
-    agent.follow_up("y").await;
+    let agent = queue_agent();
+    agent.follow_up("x").await.expect("follow-up should queue");
+    agent.follow_up("y").await.expect("follow-up should queue");
     assert_eq!(agent.follow_up_queue.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn steer_and_follow_up_accept_prompt_input_attachments() {
+    let agent = queue_agent();
+
+    agent
+        .steer(
+            PromptInput::new("steer")
+                .with_attachment(Attachment::Selection(SelectionAttachment::new("s"))),
+        )
+        .await
+        .expect("steer should queue");
+    agent
+        .follow_up(
+            PromptInput::new("follow")
+                .with_attachment(Attachment::Selection(SelectionAttachment::new("f"))),
+        )
+        .await
+        .expect("follow-up should queue");
+
+    assert!(agent.steering_queue.lock().await[0].text().contains("s"));
+    assert!(agent.follow_up_queue.lock().await[0].text().contains("f"));
 }

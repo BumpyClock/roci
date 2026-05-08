@@ -722,6 +722,77 @@ mod tests {
     }
 
     #[test]
+    fn provider_attachment_payload_openai_responses_maps_text_and_image_parts() {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage {
+                role: Role::User,
+                content: vec![
+                    ContentPart::Text {
+                        text: "Inspect attachment".to_string(),
+                    },
+                    ContentPart::Image(ImageContent {
+                        data: "aW1hZ2U=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ],
+                name: None,
+                timestamp: None,
+                metadata: None,
+            }],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        let content = &body["input"][0]["content"];
+
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "Inspect attachment");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
+        assert!(content[1].get("file").is_none());
+        assert!(content[1].get("file_id").is_none());
+        assert!(content[1].get("input_file").is_none());
+        assert!(content[1].get("document").is_none());
+    }
+
+    #[test]
+    fn provider_attachment_payload_openai_responses_preserves_unsupported_media_marker_text() {
+        let marker =
+            "User attached unsupported media: doc.pdf (application/pdf, 7 bytes). Content omitted.";
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user(marker)],
+            settings: settings(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        assert_eq!(body["input"][0]["content"].as_str(), Some(marker));
+        assert!(!body["input"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/"));
+    }
+
+    #[test]
     fn request_body_defaults_reasoning_and_text_for_gpt5() {
         let provider =
             OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);

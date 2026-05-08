@@ -1,5 +1,7 @@
 //! Provider-specific model enums.
 
+pub mod catalog;
+
 #[cfg(feature = "openai")]
 pub mod openai;
 

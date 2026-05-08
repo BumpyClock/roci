@@ -19,6 +19,9 @@ enum JsonlRuntimeRecord {
     Event {
         event: AgentRuntimeEvent,
     },
+    EventBatch {
+        events: Vec<AgentRuntimeEvent>,
+    },
     ThreadInvalidated {
         thread_id: ThreadId,
         latest_seq: u64,
@@ -131,6 +134,26 @@ impl AgentRuntimeEventStore for JsonlAgentRuntimeEventStore {
         inner.apply_event(event);
 
         Ok(cursor)
+    }
+
+    async fn append_batch(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
+        let mut inner = self.inner.lock().await;
+        inner.validate_events(&events)?;
+
+        let cursors = events
+            .iter()
+            .map(AgentRuntimeEvent::cursor)
+            .collect::<Vec<_>>();
+        self.append_record(&JsonlRuntimeRecord::EventBatch {
+            events: events.clone(),
+        })
+        .await?;
+        inner.apply_events(events);
+
+        Ok(cursors)
     }
 
     async fn events_after(
@@ -250,6 +273,10 @@ impl JsonlEventStoreState {
                 self.validate_event(&event)?;
                 self.apply_event(event);
             }
+            JsonlRuntimeRecord::EventBatch { events } => {
+                self.validate_events(&events)?;
+                self.apply_events(events);
+            }
             JsonlRuntimeRecord::ThreadInvalidated {
                 thread_id,
                 latest_seq,
@@ -259,10 +286,48 @@ impl JsonlEventStoreState {
         Ok(())
     }
 
+    fn validate_events(&self, events: &[AgentRuntimeEvent]) -> Result<(), AgentRuntimeError> {
+        let mut latest_by_thread = events
+            .iter()
+            .map(|event| {
+                (
+                    event.thread_id,
+                    self.threads
+                        .get(&event.thread_id)
+                        .map_or(0, |thread| thread.latest_seq),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for event in events {
+            let latest_seq = latest_by_thread
+                .get(&event.thread_id)
+                .copied()
+                .unwrap_or_default();
+            if event.seq <= latest_seq {
+                return Err(AgentRuntimeError::ProjectionFailed {
+                    message: format!(
+                        "runtime event seq must increase for thread {}: received {}, latest {}",
+                        event.thread_id, event.seq, latest_seq
+                    ),
+                });
+            }
+            latest_by_thread.insert(event.thread_id, event.seq);
+        }
+
+        Ok(())
+    }
+
     fn apply_event(&mut self, event: AgentRuntimeEvent) {
         let thread = self.threads.entry(event.thread_id).or_default();
         thread.latest_seq = event.seq;
         thread.events.push_back(event);
+    }
+
+    fn apply_events(&mut self, events: Vec<AgentRuntimeEvent>) {
+        for event in events {
+            self.apply_event(event);
+        }
     }
 
     fn events_after(
@@ -359,6 +424,34 @@ mod tests {
         store.append(test_event(thread_id, 1)).await.unwrap();
         store.append(test_event(thread_id, 2)).await.unwrap();
         drop(store);
+
+        let reopened = JsonlAgentRuntimeEventStore::open(path).unwrap();
+        let events = reopened
+            .events_after(RuntimeCursor::new(thread_id, 0))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_batch_reopens_and_replays_as_one_committed_record() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let path = test_path(&temp);
+        let thread_id = ThreadId::new();
+        let store = JsonlAgentRuntimeEventStore::open(path.clone()).unwrap();
+
+        store
+            .append_batch(vec![test_event(thread_id, 1), test_event(thread_id, 2)])
+            .await
+            .unwrap();
+        drop(store);
+
+        let contents = std::fs::read_to_string(&path).expect("jsonl should be readable");
+        assert_eq!(contents.lines().count(), 1);
 
         let reopened = JsonlAgentRuntimeEventStore::open(path).unwrap();
         let events = reopened

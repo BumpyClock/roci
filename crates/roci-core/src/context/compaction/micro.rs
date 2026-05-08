@@ -122,6 +122,7 @@ fn compact_message(message: &ModelMessage, config: &MicroCompactionConfig) -> Mo
         content: compacted_content,
         name: message.name.clone(),
         timestamp: message.timestamp,
+        metadata: message.metadata.clone(),
     }
 }
 
@@ -283,6 +284,7 @@ mod tests {
             content: vec![make_image_part("image/png")],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg]));
 
@@ -303,6 +305,7 @@ mod tests {
             content: vec![make_image_part("image/jpeg")],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let first = compact_micro(&request_from_messages(vec![msg]));
         let second = compact_micro(&request_from_messages(first.messages.clone()));
@@ -323,6 +326,7 @@ mod tests {
             ],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg]));
 
@@ -345,6 +349,7 @@ mod tests {
             content: vec![make_thinking_part("deep thought")],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let first = compact_micro(&request_from_messages(vec![msg]));
         let second = compact_micro(&request_from_messages(first.messages.clone()));
@@ -360,6 +365,7 @@ mod tests {
             content: vec![make_redacted_thinking_part("encrypted-blob-data")],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg]));
 
@@ -376,6 +382,7 @@ mod tests {
             content: vec![make_redacted_thinking_part("encrypted-blob-data")],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let first = compact_micro(&request_from_messages(vec![msg]));
         let second = compact_micro(&request_from_messages(first.messages.clone()));
@@ -392,6 +399,7 @@ mod tests {
             content: vec![make_tool_result("call_1", payload, false)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg.clone()]));
 
@@ -406,6 +414,7 @@ mod tests {
             content: vec![make_tool_result("call_2", &big_payload, false)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg]));
 
@@ -435,6 +444,7 @@ mod tests {
             content: vec![make_tool_result("call_err", &big_payload, true)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg]));
 
@@ -455,6 +465,7 @@ mod tests {
             content: vec![make_tool_result("call_3", &big_payload, false)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let first = compact_micro(&request_from_messages(vec![msg]));
         let second = compact_micro(&request_from_messages(first.messages.clone()));
@@ -471,6 +482,7 @@ mod tests {
             content: vec![make_tool_result("call_utf8", &emoji_payload, false)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let config = MicroCompactionConfig {
             tool_result_char_limit: 500,
@@ -507,6 +519,7 @@ mod tests {
             content: vec![make_tool_result("call_suffix", &payload, false)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let config = MicroCompactionConfig {
             tool_result_char_limit: 100,
@@ -557,6 +570,7 @@ mod tests {
             content: vec![ContentPart::ToolResult(tr)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let config = MicroCompactionConfig {
             tool_result_char_limit: 10, // aggressively low — must still not touch it
@@ -585,6 +599,7 @@ mod tests {
             content: vec![ContentPart::ToolResult(tr)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg]));
 
@@ -615,6 +630,7 @@ mod tests {
                 content: vec![ContentPart::ToolResult(tr)],
                 name: None,
                 timestamp: None,
+                metadata: None,
             };
             let out = compact_micro(&request_from_messages(vec![msg]));
             match &out.messages[0].content[0] {
@@ -639,6 +655,7 @@ mod tests {
             content: vec![tc.clone()],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg]));
         assert_eq!(result.messages[0].content[0], tc);
@@ -654,6 +671,7 @@ mod tests {
                 content: vec![make_image_part("image/png")],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
             ModelMessage {
                 role: Role::Assistant,
@@ -665,12 +683,14 @@ mod tests {
                 ],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
             ModelMessage {
                 role: Role::Tool,
                 content: vec![make_tool_result("call_big", &"z".repeat(5_000), false)],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
         ];
         let result = compact_micro(&request_from_messages(messages));
@@ -727,12 +747,14 @@ mod tests {
                 content: vec![make_image_part("image/png")],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
             ModelMessage {
                 role: Role::Tool,
                 content: vec![make_tool_result("c", &"a".repeat(5_000), false)],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
         ];
         let result = compact_micro(&request_from_messages(messages));
@@ -754,6 +776,7 @@ mod tests {
             ],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let result = compact_micro(&request_from_messages(vec![msg]));
         let parts = &result.messages[0].content;
@@ -779,6 +802,7 @@ mod tests {
             content: vec![make_tool_result("c1", &payload, false)],
             name: None,
             timestamp: None,
+            metadata: None,
         };
         let config = MicroCompactionConfig {
             tool_result_char_limit: 100,
@@ -805,18 +829,21 @@ mod tests {
                     content: vec![make_image_part("image/png")],
                     name: None,
                     timestamp: None,
+                    metadata: None,
                 }],
                 turn_prefix_messages: vec![ModelMessage {
                     role: Role::Assistant,
                     content: vec![make_thinking_part("thought")],
                     name: None,
                     timestamp: None,
+                    metadata: None,
                 }],
                 kept_messages: vec![ModelMessage {
                     role: Role::Tool,
                     content: vec![make_tool_result("c", &"b".repeat(5_000), false)],
                     name: None,
                     timestamp: None,
+                    metadata: None,
                 }],
                 split_turn: true,
                 cut_index: 1,
@@ -862,6 +889,7 @@ mod tests {
                 ],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
             ModelMessage {
                 role: Role::Assistant,
@@ -874,12 +902,14 @@ mod tests {
                 ],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
             ModelMessage {
                 role: Role::Tool,
                 content: vec![make_tool_result("c1", &"data".repeat(2_000), false)],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
             ModelMessage::user("thanks"),
         ];

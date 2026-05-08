@@ -82,9 +82,13 @@ use crate::types::{GenerationSettings, ModelMessage, Usage};
 /// # Example
 ///
 /// ```ignore
+/// use roci_core::attachments::{Attachment, PromptInput};
+///
 /// let agent = AgentRuntime::new(registry, roci_config, config);
 /// let result = agent.prompt("Hello").await?;
-/// let result = agent.continue_run("Tell me more").await?;
+/// let input = PromptInput::new("Tell me more")
+///     .with_attachment(Attachment::selection("selected context"));
+/// let result = agent.continue_run(input).await?;
 /// let result = agent.continue_without_input().await?;
 /// agent.reset().await;
 /// ```
@@ -152,8 +156,8 @@ struct QueuedTurnState {
 }
 
 pub(super) struct RuntimeEventPublishRequest {
-    pub event: AgentRuntimeEvent,
-    pub ack_tx: Option<oneshot::Sender<Result<RuntimeCursor, AgentRuntimeError>>>,
+    pub events: Vec<AgentRuntimeEvent>,
+    pub ack_tx: Option<oneshot::Sender<Result<Vec<RuntimeCursor>, AgentRuntimeError>>>,
     pub error_slot: Option<Arc<StdMutex<Option<AgentRuntimeError>>>>,
 }
 

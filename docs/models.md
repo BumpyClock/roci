@@ -1,47 +1,62 @@
 # Models
 
-`roci-core` exposes a string-based `LanguageModel` API:
+`roci-core` uses provider-neutral model identifiers:
 
 - `LanguageModel::Known { provider_key, model_id }`
 - `LanguageModel::Custom { provider, model_id }`
 
-Provider-specific typed enums live in `roci-providers`.
+Model resolution happens in the provider layer; runtime and host app code do not own
+provider-specific enum logic directly.
 
-## OpenAI (`OpenAiModel`)
+## Model catalog (V1)
 
-- gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-4, gpt-3.5-turbo
-- gpt-4o-realtime-preview
-- gpt-4.1, gpt-4.1-mini, gpt-4.1-nano
-- o1, o1-mini, o1-pro, o3, o3-mini, o4-mini
-- gpt-5, gpt-5.1, gpt-5.2, gpt-5-pro, gpt-5-mini, gpt-5-nano
-- gpt-5-thinking, gpt-5-thinking-mini, gpt-5-thinking-nano
-- gpt-5-chat-latest
+`roci_core::models` now includes catalog types:
+
+- `ModelInfo`
+- `ModelPolicy`
+- `ModelCatalogSource`
+- `ModelListOptions`
+- `ModelCatalog`
+
+The catalog drives:
+- `roci-agent models list`
+- provider/model discovery for host apps
+- filtering by provider and model-policy
+
+V1 constraints:
+- No pricing data in catalog entries.
+- No hidden defaults; every entry describes what is known at runtime.
+
+Catalog strategy:
+- Built-in providers expose static catalogs from their internal provider model
+  capabilities and enums (for known models and capability contracts).
+- GitHub Copilot runs opportunistic dynamic discovery when auth is valid.
+- Copilot list remains resilient: if discovery is unreachable or unauthorized, it
+  falls back to static catalog entries so explicit listings still work.
+
+Provider model enums (`OpenAiModel`, `AnthropicModel`, `GoogleModel`, etc.) live in
+`roci-providers` and feed static catalogs.
+
+## CLI usage
+
+`roci-agent` added model list command:
+
+```text
+roci-agent models list [--provider PROVIDER] [--json]
+```
+
+Examples:
+
+- `roci-agent models list --json`
+- `roci-agent models list --provider openai --json`
+- `roci-agent models list --provider copilot --json`
 
 Notes:
-- GPT-5 family uses the Responses API. `GenerationSettings.max_tokens` maps to `max_output_tokens`.
-- GPT-4.1 family uses the Chat Completions API.
-- GPT-5 family does not accept `temperature` or `top_p`.
-- GPT-5.2 accepts `temperature` or `top_p` only when `reasoning_effort = none`.
-- GPT-5 models support `GenerationSettings.text_verbosity` with `low`, `medium`, or `high`.
-- GPT-5 defaults to `text_verbosity = high` and `reasoning_effort = medium` when unset.
-- Reasoning models (o3/o4) default to `truncation = auto` when unset.
+- No `/model` interactive command exists.
+- `--provider` filters listing before host-side dedupe.
+- `--json` prints machine-readable entries for `ModelInfo` + policy flags.
 
-## Google (`GoogleModel`)
+## API references
 
-- gemini-3-flash, gemini-3-flash-preview, gemini-3-pro-preview
-- gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite, gemini-2.0-flash
-- gemini-1.5-pro, gemini-1.5-flash
-
-Notes:
-- `gemini-3-flash` currently uses the `gemini-3-flash-preview` API id.
-
-## OpenAI compatible
-
-- Configure provider key `openai-compatible` with a custom `model_id`.
-- Uses the OpenAI-compatible Chat Completions API.
-
-## Other providers
-
-See:
-- `crates/roci-core/src/models/mod.rs` for the public `LanguageModel` API
-- `crates/roci-providers/src/models/` for provider-specific model enums
+- `crates/roci-core/src/models/mod.rs` (`LanguageModel`, model catalog types)
+- `crates/roci-providers/src/models/` (provider-specific static model lists/capabilities)

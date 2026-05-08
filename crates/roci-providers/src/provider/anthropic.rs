@@ -759,6 +759,7 @@ mod tests {
                 ],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
         ];
         let request = ProviderRequest {
@@ -808,6 +809,7 @@ mod tests {
                 ],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
         ];
         let request = ProviderRequest {
@@ -972,5 +974,89 @@ mod tests {
         let body = provider.build_request_body(&request, false);
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn provider_attachment_payload_anthropic_maps_text_and_image_parts() {
+        let provider =
+            AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
+        let messages = vec![ModelMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::Text {
+                    text: "Inspect attachment".to_string(),
+                },
+                ContentPart::Image(ImageContent {
+                    data: "aW1hZ2U=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            name: None,
+            timestamp: None,
+            metadata: None,
+        }];
+        let request = ProviderRequest {
+            messages,
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("user content should be array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Inspect attachment");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "aW1hZ2U=");
+        assert!(content[1].get("file").is_none());
+        assert!(content[1].get("file_id").is_none());
+        assert!(content[1].get("input_file").is_none());
+        assert!(content[1].get("document").is_none());
+    }
+
+    #[test]
+    fn provider_attachment_payload_anthropic_preserves_unsupported_media_marker_text() {
+        let provider =
+            AnthropicProvider::new(AnthropicModel::ClaudeSonnet4, "test-key".to_string(), None);
+        let marker =
+            "User attached unsupported media: private.txt (text/plain, 42 bytes). Content omitted.";
+        let request = ProviderRequest {
+            messages: vec![ModelMessage {
+                role: Role::User,
+                content: vec![ContentPart::Text {
+                    text: marker.to_string(),
+                }],
+                name: None,
+                timestamp: None,
+                metadata: None,
+            }],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request, false);
+        let content = body["messages"][0]["content"]
+            .as_str()
+            .expect("single text content should be string");
+        assert_eq!(content, marker);
+        assert!(!content.contains("/tmp/"));
     }
 }

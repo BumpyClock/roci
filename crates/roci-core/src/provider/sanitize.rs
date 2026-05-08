@@ -158,6 +158,7 @@ mod tests {
             })],
             name: None,
             timestamp: None,
+            metadata: None,
         }
     }
 

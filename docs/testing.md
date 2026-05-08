@@ -39,6 +39,59 @@ Minimum evidence:
 
 Preferred local provider smoke test:
 
+Model catalog smoke (required for model listing changes):
+
+```bash
+tmux new-session -d -s roci-model-catalog \
+  'cd /path/to/roci && \
+   set -o pipefail; \
+   cargo build -q -p roci-cli; \
+   code=$?; printf "\n[roci cli build exit=%s]\n" "$code"; \
+   if [ "$code" -ne 0 ]; then \
+     echo "[roci cli build failed]"; \
+     exit "$code"; \
+   fi; \
+   cargo run -q -p roci-cli -- models list --provider openai --json; \
+   code=$?; printf "\n[models list --provider openai exit=%s]\n" "$code"; \
+   exec zsh'
+echo "attach: tmux attach -t roci-model-catalog"
+```
+
+Runtime model switching smoke (required for runtime switching changes):
+
+```bash
+tmux new-session -d -s roci-model-switch \
+  'cd /path/to/roci && \
+   set -o pipefail; \
+   cargo build -q -p roci-cli; \
+   code=$?; printf "\n[roci cli build exit=%s]\n" "$code"; \
+   if [ "$code" -ne 0 ]; then \
+     echo "[roci cli build failed]"; \
+     exit "$code"; \
+   fi; \
+   cargo run -q -p roci-cli -- models switch-smoke --from openai:gpt-4o --to openai:gpt-4.1 --json; \
+   code=$?; printf "\n[models switch-smoke exit=%s]\n" "$code"; \
+   exec zsh'
+echo "attach: tmux attach -t roci-model-switch"
+```
+
+Copilot catalog smoke (authenticated, with static fallback):
+
+```bash
+tmux new-session -d -s roci-model-catalog-copilot \
+  'cd /path/to/roci && \
+   set -o pipefail; \
+   cargo run -q -p roci-cli -- models list --provider github-copilot --json; \
+   code=$?; printf "\n[github-copilot models list exit=%s]\n" "$code"; \
+   if [ "$code" -ne 0 ]; then \
+     echo "[copilot dynamic unavailable] falling back to all-provider/static catalog smoke"; \
+     cargo run -q -p roci-cli -- models list --json; \
+     code=$?; printf "\n[models list --json exit=%s]\n" "$code"; \
+   fi; \
+   exec zsh'
+echo "attach: tmux attach -t roci-model-catalog-copilot"
+```
+
 ```bash
 tmux new-session -d -s roci-live-provider \
   'cd /path/to/roci && \
@@ -47,9 +100,59 @@ tmux new-session -d -s roci-live-provider \
    chat --no-skills --model "lmstudio:<model-id>" \
    --temperature 0 --max-tokens 32 \
    "Reply exactly: roci-local-smoke-ok"; \
-   status=$?; printf "\n[roci smoke exit=%s]\n" "$status"; exec zsh'
+   roci_status=$?; printf "\n[roci smoke exit=%s]\n" "$roci_status"; exec zsh'
 echo "attach: tmux attach -t roci-live-provider"
 ```
+
+Attachment changes need end-to-end CLI check (not only unit tests):
+
+```bash
+printf 'roci-text-attach-marker-6201' > /tmp/roci-attach-notes.txt
+tmux new-session -d -s roci-live-attach \
+  'cd /path/to/roci && \
+   LMSTUDIO_BASE_URL=http://127.0.0.1:1234 \
+   cargo run -q -p roci-cli --features roci/lmstudio -- \
+   chat --attach /tmp/roci-attach-notes.txt \
+   --session-root /tmp/roci-attach-smoke \
+   --model "lmstudio:<model-id>" \
+   "Repeat exactly the roci marker from the attachment."; \
+   roci_status=$?; printf "\n[roci-agent chat --attach exit=%s]\n" "$roci_status"; exec zsh'
+echo "attach: tmux attach -t roci-live-attach"
+```
+
+Unsupported media should reach the model as a bounded text marker:
+
+```bash
+printf '\000\237\222\226' > /tmp/roci-unsupported-media.pdf
+tmux new-session -d -s roci-live-attach-unsupported \
+  'cd /path/to/roci && \
+   LMSTUDIO_BASE_URL=http://127.0.0.1:1234 \
+   cargo run -q -p roci-cli --features roci/lmstudio -- \
+   chat --no-skills --model "lmstudio:<model-id>" \
+   --session-root /tmp/roci-attach-smoke --session-id unsupported-media \
+   --attach /tmp/roci-unsupported-media.pdf \
+   "Repeat exactly any unsupported attachment notice you see."; \
+   roci_status=$?; printf "\n[roci-agent chat --attach exit=%s]\n" "$roci_status"; exec zsh'
+echo "attach: tmux attach -t roci-live-attach-unsupported"
+rg -n '/tmp/roci-unsupported-media.pdf|/tmp/roci-attach-smoke' /tmp/roci-attach-smoke/unsupported-media
+```
+
+The final `rg` should exit `1`; marker text may include only the attachment
+basename, MIME type, and size.
+
+Session verification must inspect persisted snapshots/files and assert sanitized
+attachment metadata has no raw host paths:
+
+```bash
+SESSION_ROOT=/tmp/roci-session-smoke-attach
+SESSION_ID=runtime-attach-smoke
+cargo run -q -p roci-cli -- session export "$SESSION_ID" --root "$SESSION_ROOT" --output "$SESSION_ROOT/snapshot.json"
+rg -n 'file_path|raw_data|<attached-source-path>' "$SESSION_ROOT/$SESSION_ID"
+```
+
+Acceptance: metadata entries can include attachment names, MIME/type, and sizes,
+but not host file paths. Provider-facing payloads may include rendered text
+attachments or base64 image parts because they preserve the model input.
 
 Use `curl http://127.0.0.1:1234/api/v0/models` to confirm at least one local model is `loaded`. If local models are unavailable or not loaded, say so and use the configured remote provider most relevant to the change.
 
@@ -87,7 +190,7 @@ tmux new-session -d -s roci-session-resume \
    --temperature 0 --max-tokens 32 \
    --session-root "$ROOT" --session-id live-resume \
    "Reply exactly: roci session live ok"; \
-   status=$?; printf "\n[roci session smoke exit=%s]\n" "$status"; \
+   roci_status=$?; printf "\n[roci session smoke exit=%s]\n" "$roci_status"; \
    ls -la "$ROOT/live-resume"; exec zsh'
 echo "attach: tmux attach -t roci-session-resume"
 ```

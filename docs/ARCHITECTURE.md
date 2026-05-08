@@ -90,6 +90,10 @@ Re-exports `roci_core::*` so import paths like `roci::prelude::*`,
 
 ### `roci-core` -- Provider-agnostic SDK Kernel
 
+Provider creation and model discovery are split:
+- `ProviderFactory` owns concrete provider construction (`create`) and model source discovery (`list_models`).
+- `ProviderRegistry` aggregates catalog responses from all registered factories, then applies host-side filtering and dedupe.
+
 Pure library crate. No provider implementations, no `clap`, no terminal I/O.
 
 Durable sessions are opt-in and host-rooted. Roci does not write session data
@@ -104,7 +108,7 @@ use logical paths under `files/`.
 | `provider::format` | `tool_result_to_string()` |
 | `provider::schema` | `normalize_schema_for_provider()` |
 | `provider::sanitize` | `sanitize_messages_for_provider()` |
-| `models` | `LanguageModel` (string-based), `ProviderKey`, `ModelSelector`, `ModelCapabilities` |
+| `models` | `LanguageModel` (string-based), `ProviderKey`, `ModelSelector`, `ModelCapabilities`, `ModelInfo`, `ModelPolicy`, `ModelCatalogSource`, `ModelListOptions`, `ModelCatalog` |
 | `auth` | `AuthService` orchestrator, `AuthBackend` trait, `Token`, `FileTokenStore`, `DeviceCodeSession` |
 | `config` | `RociConfig` |
 | `error` | `RociError` with typed variants, categories, retryability |
@@ -133,6 +137,7 @@ use logical paths under `files/`.
 - Compaction is supported in two modes:
   - automatic pre-provider compaction in the run loop when reserved context budget would be exceeded
   - explicit/manual compaction via `AgentRuntime::compact()`
+- `current_model()` and `switch_model()` are constrained to idle runtime states.
 - Branch summaries are explicit-only via `AgentRuntime::summarize_branch_entries(...)` (not auto-triggered).
 - Summary model selection follows settings fallback:
   - conversation compaction: `compaction.model` else current run model
@@ -189,6 +194,12 @@ behind a feature flag.
 
 Provider-specific model enums (`OpenAiModel`, `AnthropicModel`, etc.) live in
 `roci-providers` and are used internally. They do not appear in the core API.
+`roci-providers` is the source of static catalog metadata for built-in providers.
+
+Catalog behavior now follows:
+- Static catalog entries are produced from provider enum/capability definitions.
+- GitHub Copilot attempts dynamic `/models` discovery first when auth is present.
+- Copilot dynamic failures (missing/expired auth or endpoint errors) fall back to static catalog entries.
 
 ### `roci-cli` -- CLI Binary
 

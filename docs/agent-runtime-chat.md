@@ -47,6 +47,18 @@ runtime state.
   - Idle-only default update for later turns.
 - `set_approval_policy(policy: ApprovalPolicy) -> Result<(), RociError>` (async)
   - Idle-only default update for later turns.
+- `prompt(input: impl Into<PromptInput>) -> Result<RunResult, RociError>` (async)
+  - Resolves attachments, downgrades safe unsupported media to marker text,
+    and preflights resource limits before mutating runtime state.
+  - Stores sanitized attachment metadata on user `ModelMessage` payloads before
+    queueing and executing provider turns.
+- `continue_run(input: impl Into<PromptInput>) -> Result<RunResult, RociError>` (async)
+  - Same attachment input handling and preflight as `prompt`.
+  - Does not prepend a system prompt to the continued user message.
+- `steer(input: impl Into<PromptInput>) -> Result<(), RociError>` (async)
+  - Compiles and queues a compiled user message for next steering drain.
+- `follow_up(input: impl Into<PromptInput>) -> Result<(), RociError>` (async)
+  - Compiles and queues a compiled user message for post-completion follow-up.
 - `cancel_turn(turn_id: TurnId) -> Result<TurnSnapshot, AgentRuntimeError>` (async)
   - Cancels queued/running turns.
   - Returns `AlreadyTerminal` for completed/failed/canceled turns.
@@ -100,6 +112,26 @@ Payloads:
 - `turn_canceled`
 
 No `SnapshotUpdated` (or raw `AgentEvent`) payload is part of this public contract.
+
+Attachment metadata is stored on user `ModelMessage` snapshots and sanitized for
+persistence:
+
+- source kind: `file`, `blob`, `selection`
+- content kind: `text`, `image`
+- display name
+- MIME type
+- byte size
+
+Attachment metadata does not persist raw local file paths or attachment bytes.
+Provider-facing message payloads may still contain model input content, such as
+rendered text attachments, unsupported-media markers, or base64 image parts,
+because chat snapshots and the provider ledger preserve the `ModelMessage` sent
+to the model.
+
+Safe unsupported media is rendered as model-visible text:
+`User attached unsupported media: <name> (<mime>, <size> bytes). Content omitted.`
+The marker uses sanitized display names and MIME metadata; raw host paths are
+not persisted.
 
 Approval, reasoning, plan, diff, and resource payloads carry runtime-owned
 snapshots:

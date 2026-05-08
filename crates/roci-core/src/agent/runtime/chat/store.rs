@@ -14,6 +14,14 @@ pub trait AgentRuntimeEventStore: Send + Sync {
     /// Append one semantic runtime event.
     async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError>;
 
+    /// Append a semantic runtime event batch.
+    ///
+    /// Stores should commit either every event in the batch or none of them.
+    async fn append_batch(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError>;
+
     /// Return retained events for `cursor.thread_id` with `seq > cursor.seq`.
     async fn events_after(
         &self,
@@ -62,14 +70,7 @@ impl AgentRuntimeEventStore for InMemoryAgentRuntimeEventStore {
     async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
         let mut inner = self.lock_inner()?;
         let thread = inner.threads.entry(event.thread_id).or_default();
-        if event.seq <= thread.latest_seq {
-            return Err(AgentRuntimeError::ProjectionFailed {
-                message: format!(
-                    "runtime event seq must increase for thread {}: received {}, latest {}",
-                    event.thread_id, event.seq, thread.latest_seq
-                ),
-            });
-        }
+        validate_event_seq(event.thread_id, event.seq, thread.latest_seq)?;
 
         let cursor = event.cursor();
         thread.latest_seq = event.seq;
@@ -81,6 +82,47 @@ impl AgentRuntimeEventStore for InMemoryAgentRuntimeEventStore {
         }
 
         Ok(cursor)
+    }
+
+    async fn append_batch(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
+        let mut inner = self.lock_inner()?;
+        let mut latest_by_thread = events
+            .iter()
+            .map(|event| {
+                (
+                    event.thread_id,
+                    inner
+                        .threads
+                        .get(&event.thread_id)
+                        .map_or(0, |thread| thread.latest_seq),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for event in &events {
+            let latest_seq = latest_by_thread
+                .get(&event.thread_id)
+                .copied()
+                .unwrap_or_default();
+            validate_event_seq(event.thread_id, event.seq, latest_seq)?;
+            latest_by_thread.insert(event.thread_id, event.seq);
+        }
+
+        let cursors = events.iter().map(AgentRuntimeEvent::cursor).collect();
+        for event in events {
+            let thread = inner.threads.entry(event.thread_id).or_default();
+            thread.latest_seq = event.seq;
+            thread.events.push_back(event);
+            if let Some(replay_capacity) = self.replay_capacity {
+                while thread.events.len() > replay_capacity.get() {
+                    thread.events.pop_front();
+                }
+            }
+        }
+        Ok(cursors)
     }
 
     async fn events_after(
@@ -133,6 +175,22 @@ impl InMemoryAgentRuntimeEventStore {
                 message: "runtime event store lock poisoned".to_string(),
             })
     }
+}
+
+fn validate_event_seq(
+    thread_id: ThreadId,
+    seq: u64,
+    latest_seq: u64,
+) -> Result<(), AgentRuntimeError> {
+    if seq <= latest_seq {
+        return Err(AgentRuntimeError::ProjectionFailed {
+            message: format!(
+                "runtime event seq must increase for thread {thread_id}: received {seq}, latest {latest_seq}"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -275,6 +333,28 @@ mod tests {
         let err = store.append(test_event(thread_id, 2)).await.unwrap_err();
 
         assert!(matches!(err, AgentRuntimeError::ProjectionFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn append_batch_rejects_without_partial_mutation() {
+        let store = InMemoryAgentRuntimeEventStore::new();
+        let thread_id = ThreadId::new();
+
+        store.append(test_event(thread_id, 1)).await.unwrap();
+        let err = store
+            .append_batch(vec![test_event(thread_id, 2), test_event(thread_id, 2)])
+            .await
+            .unwrap_err();
+        let events = store
+            .events_after(RuntimeCursor::new(thread_id, 0))
+            .await
+            .unwrap();
+
+        assert!(matches!(err, AgentRuntimeError::ProjectionFailed { .. }));
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[tokio::test]

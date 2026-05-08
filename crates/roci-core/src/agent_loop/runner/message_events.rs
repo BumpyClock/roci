@@ -23,6 +23,7 @@ fn build_assistant_message(iteration_text: &str, tool_calls: &[AgentToolCall]) -
         content,
         name: None,
         timestamp: Some(chrono::Utc::now()),
+        metadata: None,
     }
 }
 

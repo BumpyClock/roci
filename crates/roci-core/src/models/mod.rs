@@ -1,6 +1,7 @@
 //! Model definitions and selection.
 
 pub mod capabilities;
+pub mod catalog;
 pub mod provider_key;
 pub mod selector;
 
@@ -8,6 +9,7 @@ pub use capabilities::{
     FileInputCapabilities, ImageInputCapabilities, ModelCapabilities, ModelInputCapabilities,
     TextInputCapabilities,
 };
+pub use catalog::{ModelCatalog, ModelCatalogSource, ModelInfo, ModelListOptions, ModelPolicy};
 pub use provider_key::ProviderKey;
 pub use selector::ModelSelector;
 

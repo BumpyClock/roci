@@ -3,20 +3,28 @@ use super::{
     ImportedThread, QueuedTurn, ThreadId, TurnId, TurnSnapshot, TurnStatus,
 };
 use crate::agent_loop::RunResult;
+use crate::attachments::{compile_prompt_input, PromptInput};
 use crate::error::RociError;
+use crate::models::LanguageModel;
 use crate::types::{ModelMessage, Role, Usage};
 
 impl AgentRuntime {
     async fn queue_chat_turn(&self, messages: Vec<ModelMessage>) -> Result<TurnId, RociError> {
-        let projection = self
-            .chat_projector
-            .lock()
-            .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
-            .queue_turn(messages);
-        let turn_id = projection.turn_id;
-        self.publish_runtime_events(projection.events)
-            .await
-            .map_err(Self::map_chat_projection_error)?;
+        let (turn_id, events, previous_projector) = {
+            let mut projector = self
+                .chat_projector
+                .lock()
+                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
+            let previous_projector = projector.clone();
+            let projection = projector.queue_turn(messages);
+            (projection.turn_id, projection.events, previous_projector)
+        };
+        if let Err(err) = self.publish_runtime_events(events).await {
+            if let Ok(mut projector) = self.chat_projector.lock() {
+                *projector = previous_projector;
+            }
+            return Err(Self::map_chat_projection_error(err));
+        }
         Ok(turn_id)
     }
 
@@ -210,8 +218,17 @@ impl AgentRuntime {
     /// # Errors
     ///
     /// Returns [`RociError::InvalidState`] if the agent is not idle.
-    pub async fn prompt(&self, text: impl Into<String>) -> Result<RunResult, RociError> {
-        self.prompt_user_message(ModelMessage::user(text)).await
+    pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunResult, RociError> {
+        self.transition_to_running()?;
+        let model = self.model.lock().await.clone();
+        let user_message = match self.compile_user_prompt_with_model(input, &model) {
+            Ok(message) => message,
+            Err(err) => {
+                self.restore_idle_after_preflight_error().await;
+                return Err(err);
+            }
+        };
+        self.prompt_user_message(user_message).await
     }
 
     /// Start a new conversation with a user message.
@@ -229,17 +246,34 @@ impl AgentRuntime {
                 "prompt message must have user role".into(),
             ));
         }
+        self.transition_to_running()?;
         self.prompt_user_message(user_message).await
+    }
+
+    fn compile_user_prompt_with_model(
+        &self,
+        input: impl Into<PromptInput>,
+        model: &LanguageModel,
+    ) -> Result<ModelMessage, RociError> {
+        let input = input.into();
+        if input.attachments.is_empty() {
+            return Ok(ModelMessage::user(input.text));
+        }
+        let provider = self.registry.create_provider(
+            model.provider_name(),
+            model.model_id(),
+            &self.roci_config,
+        )?;
+        Ok(compile_prompt_input(&input, provider.capabilities())?.message)
     }
 
     async fn prompt_user_message(
         &self,
         user_message: ModelMessage,
     ) -> Result<RunResult, RociError> {
-        self.transition_to_running()?;
-
         let system_prompt = self.system_prompt.lock().await.clone();
         let mut msgs = self.messages.lock().await;
+        let previous_messages = msgs.clone();
         let mut turn_messages = Vec::new();
         if let Some(ref sys) = system_prompt {
             if msgs.is_empty() {
@@ -256,6 +290,7 @@ impl AgentRuntime {
         let turn_id = match self.queue_chat_turn(turn_messages).await {
             Ok(turn_id) => turn_id,
             Err(err) => {
+                *self.messages.lock().await = previous_messages;
                 self.restore_idle_after_preflight_error().await;
                 return Err(err);
             }
@@ -272,12 +307,28 @@ impl AgentRuntime {
     /// # Errors
     ///
     /// Returns [`RociError::InvalidState`] if the agent is not idle.
-    pub async fn continue_run(&self, text: impl Into<String>) -> Result<RunResult, RociError> {
+    pub async fn continue_run(
+        &self,
+        input: impl Into<PromptInput>,
+    ) -> Result<RunResult, RociError> {
         self.transition_to_running()?;
+        let model = self.model.lock().await.clone();
+        let user_message = match self.compile_user_prompt_with_model(input, &model) {
+            Ok(message) => message,
+            Err(err) => {
+                self.restore_idle_after_preflight_error().await;
+                return Err(err);
+            }
+        };
+        self.continue_with_user_message(user_message).await
+    }
 
-        let text = text.into();
+    async fn continue_with_user_message(
+        &self,
+        user_message: ModelMessage,
+    ) -> Result<RunResult, RociError> {
         let mut msgs = self.messages.lock().await;
-        let user_message = ModelMessage::user(text);
+        let previous_messages = msgs.clone();
         msgs.push(user_message.clone());
         let snapshot = msgs.clone();
         drop(msgs);
@@ -285,6 +336,7 @@ impl AgentRuntime {
         let turn_id = match self.queue_chat_turn(vec![user_message]).await {
             Ok(turn_id) => turn_id,
             Err(err) => {
+                *self.messages.lock().await = previous_messages;
                 self.restore_idle_after_preflight_error().await;
                 return Err(err);
             }
@@ -342,22 +394,22 @@ impl AgentRuntime {
     /// The message is injected between tool batches on the next iteration.
     /// Does nothing if the agent is idle (the message is still queued and
     /// will be picked up on the next run).
-    pub async fn steer(&self, text: impl Into<String>) {
-        self.steering_queue
-            .lock()
-            .await
-            .push(ModelMessage::user(text));
+    pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), RociError> {
+        let model = self.model.lock().await.clone();
+        let user_message = self.compile_user_prompt_with_model(input, &model)?;
+        self.steering_queue.lock().await.push(user_message);
+        Ok(())
     }
 
     /// Queue a follow-up message to continue after natural completion.
     ///
     /// Follow-up messages are checked when the inner loop ends (no more
     /// tool calls). If present, they extend the conversation.
-    pub async fn follow_up(&self, text: impl Into<String>) {
-        self.follow_up_queue
-            .lock()
-            .await
-            .push(ModelMessage::user(text));
+    pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), RociError> {
+        let model = self.model.lock().await.clone();
+        let user_message = self.compile_user_prompt_with_model(input, &model)?;
+        self.follow_up_queue.lock().await.push(user_message);
+        Ok(())
     }
 
     /// Abort the current run.

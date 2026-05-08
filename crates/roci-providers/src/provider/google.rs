@@ -561,6 +561,7 @@ mod tests {
             content: vec![ContentPart::ToolCall(tool_call)],
             name: None,
             timestamp: None,
+            metadata: None,
         }];
         let request = ProviderRequest {
             messages,
@@ -598,6 +599,7 @@ mod tests {
                 content: vec![ContentPart::ToolCall(tool_call)],
                 name: None,
                 timestamp: None,
+                metadata: None,
             },
             ModelMessage::tool_result("call_1", serde_json::json!({"temp": 18}), false),
         ];
@@ -813,5 +815,86 @@ mod tests {
         let settings = body["safetySettings"].as_array().unwrap();
         assert_eq!(settings.len(), 4);
         assert_eq!(settings[0]["threshold"], "BLOCK_MEDIUM_AND_ABOVE");
+    }
+
+    #[test]
+    fn provider_attachment_payload_google_maps_text_and_image_parts() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage {
+                role: Role::User,
+                content: vec![
+                    ContentPart::Text {
+                        text: "Inspect attachment".to_string(),
+                    },
+                    ContentPart::Image(ImageContent {
+                        data: "aW1hZ2U=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ],
+                name: None,
+                timestamp: None,
+                metadata: None,
+            }],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request);
+        let parts = body["contents"][0]["parts"]
+            .as_array()
+            .expect("user parts should be array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "Inspect attachment");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "aW1hZ2U=");
+        assert!(parts[1].get("file").is_none());
+        assert!(parts[1].get("file_id").is_none());
+        assert!(parts[1].get("input_file").is_none());
+        assert!(parts[1].get("document").is_none());
+    }
+
+    #[test]
+    fn provider_attachment_payload_google_preserves_unsupported_media_marker_text() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let marker =
+            "User attached unsupported media: private.txt (text/plain, 42 bytes). Content omitted.";
+        let request = ProviderRequest {
+            messages: vec![ModelMessage {
+                role: Role::User,
+                content: vec![ContentPart::Text {
+                    text: marker.to_string(),
+                }],
+                name: None,
+                timestamp: None,
+                metadata: None,
+            }],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request);
+        let part = body["contents"][0]["parts"][0]
+            .as_object()
+            .expect("single part should be object");
+        let text = part["text"].as_str().expect("marker should be text");
+        assert_eq!(text, marker);
+        assert!(!text.contains("/tmp/"));
     }
 }

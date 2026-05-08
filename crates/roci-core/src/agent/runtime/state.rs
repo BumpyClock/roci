@@ -244,34 +244,28 @@ impl AgentRuntime {
         events: Vec<AgentRuntimeEvent>,
     ) -> Result<(), AgentRuntimeError> {
         self.ensure_runtime_event_publisher().await;
-        let mut ack_receivers = Vec::with_capacity(events.len());
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         {
             let _send_guard = self.runtime_event_send_lock.lock().map_err(|_| {
                 AgentRuntimeError::ProjectionFailed {
                     message: "runtime event send lock poisoned".to_string(),
                 }
             })?;
-            for event in events {
-                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                self.runtime_event_publish_tx
-                    .send(RuntimeEventPublishRequest {
-                        event,
-                        ack_tx: Some(ack_tx),
-                        error_slot: None,
-                    })
-                    .map_err(|_| AgentRuntimeError::ProjectionFailed {
-                        message: "runtime event publisher closed".to_string(),
-                    })?;
-                ack_receivers.push(ack_rx);
-            }
-        }
-        for ack_rx in ack_receivers {
-            ack_rx
-                .await
+            self.runtime_event_publish_tx
+                .send(RuntimeEventPublishRequest {
+                    events,
+                    ack_tx: Some(ack_tx),
+                    error_slot: None,
+                })
                 .map_err(|_| AgentRuntimeError::ProjectionFailed {
-                    message: "runtime event publisher dropped acknowledgement".to_string(),
-                })??;
+                    message: "runtime event publisher closed".to_string(),
+                })?;
         }
+        ack_rx
+            .await
+            .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                message: "runtime event publisher dropped acknowledgement".to_string(),
+            })??;
         Ok(())
     }
 
@@ -296,7 +290,7 @@ impl AgentRuntime {
             })?;
             self.runtime_event_publish_tx
                 .send(RuntimeEventPublishRequest {
-                    event,
+                    events: vec![event],
                     ack_tx: Some(ack_tx),
                     error_slot: None,
                 })
@@ -309,6 +303,11 @@ impl AgentRuntime {
             .map_err(|_| AgentRuntimeError::ProjectionFailed {
                 message: "runtime event publisher dropped acknowledgement".to_string(),
             })?
+            .map(|mut cursors| {
+                cursors
+                    .pop()
+                    .expect("single event publish returns one cursor")
+            })
     }
 
     async fn ensure_runtime_event_publisher(&self) {
@@ -319,10 +318,13 @@ impl AgentRuntime {
         let event_tx = self.runtime_event_tx.clone();
         tokio::spawn(async move {
             while let Some(request) = publish_rx.recv().await {
-                let result = event_store.append(request.event.clone()).await;
+                let events = request.events;
+                let result = event_store.append_batch(events.clone()).await;
                 match &result {
                     Ok(_) => {
-                        let _ = event_tx.send(request.event);
+                        for event in events {
+                            let _ = event_tx.send(event);
+                        }
                     }
                     Err(err) => {
                         if let Some(error_slot) = &request.error_slot {
@@ -354,7 +356,7 @@ impl AgentRuntime {
             })?;
         publish_tx
             .send(RuntimeEventPublishRequest {
-                event,
+                events: vec![event],
                 ack_tx: None,
                 error_slot: Some(error_slot),
             })

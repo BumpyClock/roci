@@ -3,6 +3,8 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::*;
+use crate::models::{ImageInputCapabilities, ModelCapabilities, ModelInputCapabilities};
+use crate::types::ContentPart;
 
 fn tight_options() -> AttachmentResolveOptions {
     AttachmentResolveOptions {
@@ -88,39 +90,129 @@ fn image_blob_preserves_data() {
 }
 
 #[test]
-fn opaque_blob_fails_preflight() {
-    let blob = BlobAttachment::new([0, 159, 146, 150]).with_name("opaque");
+fn unsupported_media_opaque_blob_resolves_to_marker() {
+    let blob = BlobAttachment::new([0, 159, 146, 150]).with_name("opaque.bin");
 
-    let err = DefaultAttachmentResolver
+    let resolved = DefaultAttachmentResolver
         .resolve_attachments(
             &[Attachment::Blob(blob)],
             &AttachmentResolveOptions::default(),
         )
-        .expect_err("opaque blob should fail");
+        .expect("opaque blob should resolve as marker text");
 
-    assert!(matches!(
-        err,
-        AttachmentResolveError::UnsupportedBinary { name } if name == "opaque"
-    ));
+    let text = resolved[0].as_text().expect("marker should be text");
+    assert_eq!(
+        text,
+        "User attached unsupported media: opaque.bin (application/octet-stream, 4 bytes). Content omitted."
+    );
+    assert_eq!(
+        resolved[0].metadata().mime_type.as_deref(),
+        Some("application/octet-stream")
+    );
 }
 
 #[test]
-fn non_text_non_image_mime_fails_even_when_utf8() {
+fn unsupported_media_non_text_non_image_mime_resolves_to_marker() {
     let blob = BlobAttachment::new("pdf-ish")
         .with_name("doc.pdf")
         .with_mime_type("application/pdf");
 
+    let resolved = DefaultAttachmentResolver
+        .resolve_attachments(
+            &[Attachment::Blob(blob)],
+            &AttachmentResolveOptions::default(),
+        )
+        .expect("unsupported MIME should resolve as marker text");
+
+    let text = resolved[0].as_text().expect("marker should be text");
+    assert_eq!(
+        text,
+        "User attached unsupported media: doc.pdf (application/pdf, 7 bytes). Content omitted."
+    );
+    assert_eq!(
+        resolved[0].metadata().mime_type.as_deref(),
+        Some("application/pdf")
+    );
+}
+
+#[test]
+fn unsupported_media_marker_bounds_display_name() {
+    let long_name = format!("{}{}", "/tmp/private/", "x".repeat(512));
+    let blob = BlobAttachment::new([0, 159, 146, 150])
+        .with_name(long_name)
+        .with_mime_type("application/pdf");
+
+    let resolved = DefaultAttachmentResolver
+        .resolve_attachments(
+            &[Attachment::Blob(blob)],
+            &AttachmentResolveOptions::default(),
+        )
+        .expect("unsupported media should resolve as bounded marker text");
+
+    let text = resolved[0].as_text().expect("marker should be text");
+    assert!(text.contains("User attached unsupported media: "));
+    assert!(text.contains("application/pdf"));
+    assert!(!text.contains("/tmp/private"));
+    assert!(text.len() < 256);
+}
+
+#[test]
+fn unsupported_media_path_like_mime_errors() {
+    let blob = BlobAttachment::new([0, 159, 146, 150])
+        .with_name("opaque")
+        .with_mime_type("/tmp/private");
+
     let err = DefaultAttachmentResolver
         .resolve_attachments(
             &[Attachment::Blob(blob)],
             &AttachmentResolveOptions::default(),
         )
-        .expect_err("non-text MIME should fail");
+        .expect_err("malformed MIME should not produce marker");
 
     assert!(matches!(
         err,
         AttachmentResolveError::UnsupportedMime { name, mime_type }
-            if name == "doc.pdf" && mime_type == "application/pdf"
+            if name == "opaque" && mime_type == "/tmp/private"
+    ));
+}
+
+#[test]
+fn unsupported_media_overlong_mime_errors() {
+    let mime_type = format!("application/{}", "x".repeat(256));
+    let blob = BlobAttachment::new([0, 159, 146, 150])
+        .with_name("opaque")
+        .with_mime_type(mime_type.clone());
+
+    let err = DefaultAttachmentResolver
+        .resolve_attachments(
+            &[Attachment::Blob(blob)],
+            &AttachmentResolveOptions::default(),
+        )
+        .expect_err("overlong MIME should not produce marker");
+
+    assert!(matches!(
+        err,
+        AttachmentResolveError::UnsupportedMime { name, mime_type: actual }
+            if name == "opaque" && actual == mime_type
+    ));
+}
+
+#[test]
+fn declared_text_mime_with_invalid_utf8_still_errors() {
+    let blob = BlobAttachment::new([0xff])
+        .with_name("bad.txt")
+        .with_mime_type("text/plain");
+
+    let err = DefaultAttachmentResolver
+        .resolve_attachments(
+            &[Attachment::Blob(blob)],
+            &AttachmentResolveOptions::default(),
+        )
+        .expect_err("declared text must be valid UTF-8");
+
+    assert!(matches!(
+        err,
+        AttachmentResolveError::InvalidUtf8 { name } if name == "bad.txt"
     ));
 }
 
@@ -178,4 +270,177 @@ fn total_size_limit_fails() {
         err,
         AttachmentResolveError::TotalLimitExceeded { size: 12, max: 10 }
     ));
+}
+
+#[test]
+fn compile_prompt_input_renders_text_and_sanitizes_metadata() {
+    let input = PromptInput::new("Inspect").with_attachment(Attachment::Selection(
+        SelectionAttachment::new("selected text").with_name("Selection A"),
+    ));
+    let caps = ModelCapabilities::default();
+
+    let compiled = compile_prompt_input(&input, &caps).expect("input should compile");
+
+    assert_eq!(compiled.message.role, crate::types::Role::User);
+    assert!(compiled.message.text().contains("Inspect"));
+    assert!(compiled.message.text().contains("selected text"));
+    let metadata = compiled
+        .message
+        .metadata
+        .as_ref()
+        .expect("metadata should exist");
+    assert_eq!(metadata.attachments.len(), 1);
+    assert_eq!(
+        metadata.attachments[0].source_kind,
+        AttachmentSourceKind::Selection
+    );
+    assert_eq!(
+        metadata.attachments[0].content_kind,
+        AttachmentContentKind::Text
+    );
+    assert_eq!(metadata.attachments[0].name.as_deref(), Some("Selection A"));
+}
+
+#[test]
+fn compile_prompt_input_encodes_images_when_model_supports_vision() {
+    let input = PromptInput::new("Describe").with_attachment(Attachment::Blob(
+        BlobAttachment::new([137, 80, 78, 71]).with_mime_type("image/png"),
+    ));
+    let caps = ModelCapabilities {
+        supports_vision: true,
+        input: ModelInputCapabilities::from_vision_support(true),
+        ..ModelCapabilities::default()
+    };
+
+    let compiled = compile_prompt_input(&input, &caps).expect("image should compile");
+
+    assert!(matches!(
+        &compiled.message.content[1],
+        ContentPart::Image(image) if image.mime_type == "image/png" && !image.data.is_empty()
+    ));
+    let metadata = compiled.message.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata.attachments[0].source_kind,
+        AttachmentSourceKind::Blob
+    );
+    assert_eq!(
+        metadata.attachments[0].content_kind,
+        AttachmentContentKind::Image
+    );
+}
+
+#[test]
+fn unsupported_media_file_marker_uses_file_name_not_raw_path() {
+    let dir = tempdir().expect("tempdir should be created");
+    let path = dir.path().join("private.pdf");
+    fs::write(&path, [0, 159, 146, 150]).expect("fixture should be written");
+    let input = PromptInput::new("Inspect").with_attachment(Attachment::file(&path));
+
+    let compiled =
+        compile_prompt_input(&input, &ModelCapabilities::default()).expect("marker should compile");
+
+    let text = compiled.message.text();
+    assert!(text.contains("User attached unsupported media: private.pdf"));
+    assert!(text.contains("application/pdf"));
+    assert!(!text.contains(dir.path().to_string_lossy().as_ref()));
+
+    let json = serde_json::to_string(&compiled.message.metadata).expect("metadata serializes");
+    assert!(json.contains("private.pdf"));
+    assert!(!json.contains(dir.path().to_string_lossy().as_ref()));
+}
+
+#[test]
+fn unsupported_media_image_converts_to_marker_for_non_vision_model() {
+    let input = PromptInput::new("Describe").with_attachment(Attachment::Blob(
+        BlobAttachment::new([137, 80, 78, 71])
+            .with_name("pixel.png")
+            .with_mime_type("image/png"),
+    ));
+
+    let compiled =
+        compile_prompt_input(&input, &ModelCapabilities::default()).expect("marker should compile");
+
+    assert_eq!(compiled.message.content.len(), 1);
+    let text = compiled.message.text();
+    assert!(text.contains("User attached unsupported media: pixel.png"));
+    assert!(text.contains("image/png"));
+    assert!(text.contains("Content omitted."));
+    let metadata = compiled.message.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata.attachments[0].content_kind,
+        AttachmentContentKind::Text
+    );
+}
+
+#[test]
+fn unsupported_media_image_mime_converts_to_marker_for_vision_model() {
+    let input = PromptInput::new("Describe").with_attachment(Attachment::Blob(
+        BlobAttachment::new([71, 73, 70, 56])
+            .with_name("motion.gif")
+            .with_mime_type("image/gif"),
+    ));
+    let caps = ModelCapabilities {
+        supports_vision: true,
+        input: ModelInputCapabilities {
+            image: Some(ImageInputCapabilities {
+                supported_mime_types: vec!["image/png".to_string()],
+                ..ImageInputCapabilities::default()
+            }),
+            ..ModelInputCapabilities::default()
+        },
+        ..ModelCapabilities::default()
+    };
+
+    let compiled = compile_prompt_input(&input, &caps).expect("marker should compile");
+
+    let text = compiled.message.text();
+    assert!(text.contains("User attached unsupported media: motion.gif"));
+    assert!(text.contains("image/gif"));
+    let metadata = compiled.message.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata.attachments[0].content_kind,
+        AttachmentContentKind::Text
+    );
+}
+
+#[test]
+fn unsupported_media_oversized_image_still_errors() {
+    let input = PromptInput::new("Describe").with_attachment(Attachment::Blob(
+        BlobAttachment::new([71, 73, 70, 56])
+            .with_name("large.gif")
+            .with_mime_type("image/gif"),
+    ));
+    let caps = ModelCapabilities {
+        supports_vision: true,
+        input: ModelInputCapabilities {
+            image: Some(ImageInputCapabilities {
+                max_images: 8,
+                max_image_bytes: Some(2),
+                max_total_image_bytes: Some(10),
+                supported_mime_types: vec!["image/png".to_string()],
+                image_token_estimate: 85,
+            }),
+            ..ModelInputCapabilities::default()
+        },
+        ..ModelCapabilities::default()
+    };
+
+    let err = compile_prompt_input(&input, &caps).expect_err("oversized image should fail");
+
+    assert!(err.to_string().contains("too large"));
+}
+
+#[test]
+fn compile_prompt_input_file_metadata_omits_raw_path() {
+    let dir = tempdir().expect("tempdir should be created");
+    let path = dir.path().join("secret-notes.txt");
+    fs::write(&path, "private path should stay local").expect("fixture should be written");
+    let input = PromptInput::new("Inspect").with_attachment(Attachment::file(&path));
+
+    let compiled =
+        compile_prompt_input(&input, &ModelCapabilities::default()).expect("file should compile");
+
+    let json = serde_json::to_string(&compiled.message.metadata).expect("metadata serializes");
+    assert!(json.contains("secret-notes.txt"));
+    assert!(!json.contains(dir.path().to_string_lossy().as_ref()));
 }

@@ -32,13 +32,29 @@ impl AgentRuntime {
     ///
     /// Returns [`RociError::InvalidState`] if the runtime is not idle.
     pub async fn set_model(&self, model: LanguageModel) -> Result<(), RociError> {
+        self.switch_model(model).await?;
+        Ok(())
+    }
+
+    /// Return the configured model used for subsequent runs.
+    pub async fn current_model(&self) -> LanguageModel {
+        self.model.lock().await.clone()
+    }
+
+    /// Replace the configured model used for subsequent runs, returning the previous model.
+    ///
+    /// This does not validate the model against a provider or make any network calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the runtime is not idle.
+    pub async fn switch_model(&self, model: LanguageModel) -> Result<LanguageModel, RociError> {
         let _state_guard = self.lock_state_for_idle_mutation()?;
         let mut runtime_model = self
             .model
             .try_lock()
             .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?;
-        *runtime_model = model;
-        Ok(())
+        Ok(std::mem::replace(&mut *runtime_model, model))
     }
 
     /// Replace generation settings used by subsequent turns.

@@ -1,11 +1,12 @@
 //! Convenience re-exports for common use.
 
 pub use crate::attachments::{
-    preflight_resolved_attachments, render_prompt_input_text, render_resolved_text, Attachment,
+    compile_prompt_input, preflight_resolved_attachments, render_prompt_input_text,
+    render_resolved_text, Attachment, AttachmentContentKind, AttachmentDisplayMetadata,
     AttachmentMetadata, AttachmentPreflightError, AttachmentPreflightReport,
-    AttachmentResolveOptions, AttachmentResolver, AttachmentSource, AttachmentTextRenderer,
-    BlobAttachment, DefaultAttachmentResolver, FileAttachment, PromptInput, ResolvedAttachment,
-    SelectionAttachment,
+    AttachmentResolveOptions, AttachmentResolver, AttachmentSource, AttachmentSourceKind,
+    AttachmentTextRenderer, BlobAttachment, CompiledPromptInput, DefaultAttachmentResolver,
+    FileAttachment, PromptInput, ResolvedAttachment, SelectionAttachment,
 };
 pub use crate::config::RociConfig;
 pub use crate::error::{Result, RociError};
@@ -33,6 +34,6 @@ pub use crate::session::{
 };
 pub use crate::tools::{AgentTool, AgentToolParameters, Tool, ToolArguments};
 pub use crate::types::{
-    ContentPart, FinishReason, GenerateTextResult, GenerationSettings, ModelMessage, Role,
-    StreamEventType, StreamTextResult, TextStreamDelta, Usage,
+    ContentPart, FinishReason, GenerateTextResult, GenerationSettings, ModelMessage,
+    ModelMessageMetadata, Role, StreamEventType, StreamTextResult, TextStreamDelta, Usage,
 };

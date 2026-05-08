@@ -28,16 +28,22 @@ async fn wait_for_idle_returns_immediately_when_idle() {
 
 #[tokio::test]
 async fn steer_queues_message() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
-    agent.steer("change direction").await;
+    let agent = runtime_with_streaming_model("stub", "state-lifecycle");
+    agent
+        .steer("change direction")
+        .await
+        .expect("steer should queue");
     let queue = agent.steering_queue.lock().await;
     assert_eq!(queue.len(), 1);
 }
 
 #[tokio::test]
 async fn follow_up_queues_message() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
-    agent.follow_up("next step").await;
+    let agent = runtime_with_streaming_model("stub", "state-lifecycle");
+    agent
+        .follow_up("next step")
+        .await
+        .expect("follow-up should queue");
     let queue = agent.follow_up_queue.lock().await;
     assert_eq!(queue.len(), 1);
 }
@@ -50,11 +56,14 @@ async fn abort_returns_false_when_idle() {
 
 #[tokio::test]
 async fn reset_clears_all_state() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+    let agent = runtime_with_streaming_model("stub", "state-lifecycle");
 
     // Seed some queue data.
-    agent.steer("msg1").await;
-    agent.follow_up("msg2").await;
+    agent.steer("msg1").await.expect("steer should queue");
+    agent
+        .follow_up("msg2")
+        .await
+        .expect("follow-up should queue");
 
     agent.reset().await;
 
@@ -98,6 +107,35 @@ async fn set_model_replaces_runtime_model_when_idle() {
 
     agent.set_model(model.clone()).await.unwrap();
     assert_eq!(*agent.model.lock().await, model);
+}
+
+#[tokio::test]
+async fn current_model_returns_runtime_model() {
+    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+
+    assert_eq!(agent.current_model().await, test_agent_config().model);
+}
+
+#[tokio::test]
+async fn switch_model_returns_previous_model_and_updates_current() {
+    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+    let previous = test_agent_config().model;
+    let next: LanguageModel = "anthropic:claude-3-5-sonnet-20241022".parse().unwrap();
+
+    let returned = agent.switch_model(next.clone()).await.unwrap();
+
+    assert_eq!(returned, previous);
+    assert_eq!(agent.current_model().await, next);
+}
+
+#[tokio::test]
+async fn switch_model_rejects_when_running() {
+    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+    *agent.state.lock().await = AgentState::Running;
+
+    let model: LanguageModel = "openai:gpt-4o-mini".parse().unwrap();
+    let err = agent.switch_model(model).await.unwrap_err();
+    assert!(matches!(err, RociError::InvalidState(_)));
 }
 
 #[tokio::test]
@@ -272,13 +310,22 @@ async fn reset_is_idempotent() {
 
 #[tokio::test]
 async fn reset_clears_queued_steering_and_follow_up_messages() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+    let agent = runtime_with_streaming_model("stub", "state-lifecycle");
 
-    agent.steer("steer-1").await;
-    agent.steer("steer-2").await;
-    agent.follow_up("follow-1").await;
-    agent.follow_up("follow-2").await;
-    agent.follow_up("follow-3").await;
+    agent.steer("steer-1").await.expect("steer should queue");
+    agent.steer("steer-2").await.expect("steer should queue");
+    agent
+        .follow_up("follow-1")
+        .await
+        .expect("follow-up should queue");
+    agent
+        .follow_up("follow-2")
+        .await
+        .expect("follow-up should queue");
+    agent
+        .follow_up("follow-3")
+        .await
+        .expect("follow-up should queue");
 
     assert_eq!(agent.steering_queue.lock().await.len(), 2);
     assert_eq!(agent.follow_up_queue.lock().await.len(), 3);

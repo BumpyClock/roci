@@ -139,8 +139,19 @@ pub trait ProviderFactory: Send + Sync {
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError>;
 
+    /// List provider-backed models, optionally filtered by policy.
+    fn list_models(
+        &self,
+        config: &RociConfig,
+        provider_key: &str,
+        options: &ModelListOptions,
+    ) -> crate::provider::BoxModelCatalogFuture;
+
 }
 ```
+
+`list_models` is object-safe and uses a boxed future type so registries can
+merge async providers in a provider-neutral way.
 
 **ProviderRegistry**:
 
@@ -165,11 +176,18 @@ impl ProviderRegistry {
         config: &RociConfig,
     ) -> Result<Box<dyn ModelProvider>, RociError>;
 
+    pub async fn list_models(
+        &self,
+        config: &RociConfig,
+        options: &ModelListOptions,
+    ) -> Result<ModelCatalog, RociError>;
+
     pub fn has_provider(&self, provider_key: &str) -> bool;
 }
 ```
 
-The existing `create_provider()` free function and the closure-based factory in `agent_loop/runner.rs` are replaced by `ProviderRegistry::create_provider()`.
+Registry-level listing merges all registered catalogs, then applies provider and
+policy filters, dedupe, and ordering before host/CLI consumption.
 
 ### 6. AuthBackend Trait
 
