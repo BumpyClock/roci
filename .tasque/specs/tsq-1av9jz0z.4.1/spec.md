@@ -12,6 +12,13 @@ Define the reusable filesystem access model for path normalization and allow/den
 - Default policy remains permissive until a host configures restrictions.
 - This type is a pure policy evaluator only; concrete OS sandboxing remains out of scope.
 
+## Path and symlink semantics
+Path resolution modes: `Lexical`, `CanonicalizeExisting`, `CanonicalizeBestEffort`.
+
+Symlink policy variants: `DenySymlinks`, `FollowIfTargetAllowed`, `AllowLexical`.
+
+Decision precedence: invalid/unsupported normalization -> deny when restrictions exist; denied paths/globs; operation-specific allow root; permissive default when no restrictions are configured. Denied rules always win.
+
 ## Non-goals
 - No file I/O in the evaluator except path metadata needed for normalization when available.
 - No platform sandbox implementation.
