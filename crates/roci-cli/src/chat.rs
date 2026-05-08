@@ -1,14 +1,22 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use roci::agent::{AgentConfig, AgentRuntime, HumanInteractionCoordinator, QueueDrainMode};
 use roci::agent_loop::{ApprovalPolicy, PreToolUseHookResult, RunStatus};
+use roci::attachments::{
+    preflight_resolved_attachments, render_prompt_input_text, Attachment, AttachmentResolveOptions,
+    AttachmentResolver, DefaultAttachmentResolver, PromptInput, ResolvedAttachment,
+};
 use roci::config::RociConfig;
 use roci::mcp::{merge_mcp_instructions, MCPInstructionMergePolicy};
+use roci::models::ModelCapabilities;
 use roci::resource::SkillResourceOptions;
 use roci::session::{CreateSessionOptions, LocalSessionStore, SessionConfig, SessionId};
 use roci::skills::merge_system_prompt_with_skills;
 use roci::tools::ToolVisibilityPolicy;
+use roci::types::{ContentPart, ImageContent, ModelMessage, Role};
 
 use crate::cli::{ChatApprovalArg, ChatArgs};
 
@@ -38,6 +46,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         approval,
         session_root,
         session_id,
+        attachments,
         mcp_stdio,
         mcp_sse,
         prompt,
@@ -74,6 +83,17 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     print_resource_diagnostics(&resources);
 
     let prompt = expand_chat_prompt(&prompt, &resources);
+    let attachment_message = if attachments.is_empty() {
+        None
+    } else {
+        let provider =
+            registry.create_provider(model.provider_name(), model.model_id(), &config)?;
+        Some(build_attachment_prompt_message(
+            prompt.clone(),
+            &attachments,
+            provider.capabilities(),
+        )?)
+    };
     let resource_system_prompt = build_resource_system_prompt(system, &resources);
     let skill_system_prompt =
         merge_system_prompt_with_skills(resource_system_prompt, &resources.skills.skills);
@@ -177,7 +197,11 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     let subscription = agent.subscribe(None).await;
     renderer.subscribe(subscription, agent.clone());
 
-    let result = agent.prompt(prompt).await;
+    let result = if let Some(message) = attachment_message {
+        agent.prompt_message(message).await
+    } else {
+        agent.prompt(prompt).await
+    };
     renderer.finish().await;
     let result = result?;
     println!();
@@ -189,6 +213,63 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+fn build_attachment_prompt_message(
+    prompt: String,
+    attachment_paths: &[PathBuf],
+    capabilities: &ModelCapabilities,
+) -> Result<ModelMessage, Box<dyn std::error::Error>> {
+    let attachments = attachment_paths
+        .iter()
+        .cloned()
+        .map(Attachment::file)
+        .collect::<Vec<_>>();
+    let input = PromptInput::new(prompt).with_attachments(attachments);
+    let resolver = DefaultAttachmentResolver;
+    let resolved = resolver.resolve_prompt_input(&input, &AttachmentResolveOptions::default())?;
+    preflight_resolved_attachments(&resolved, capabilities)?;
+    Ok(prompt_message_from_resolved(input, &resolved))
+}
+
+fn prompt_message_from_resolved(
+    input: PromptInput,
+    resolved: &[ResolvedAttachment],
+) -> ModelMessage {
+    let mut content = vec![ContentPart::Text {
+        text: render_prompt_input_text(&input, resolved),
+    }];
+
+    for attachment in resolved {
+        let ResolvedAttachment::Image { data, metadata } = attachment else {
+            continue;
+        };
+        let mime_type = metadata
+            .mime_type
+            .as_deref()
+            .map(normalize_mime_type)
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        content.push(ContentPart::Image(ImageContent {
+            data: BASE64_STANDARD.encode(data),
+            mime_type,
+        }));
+    }
+
+    ModelMessage {
+        role: Role::User,
+        content,
+        name: None,
+        timestamp: Some(chrono::Utc::now()),
+    }
+}
+
+fn normalize_mime_type(mime_type: &str) -> String {
+    mime_type
+        .split(';')
+        .next()
+        .unwrap_or(mime_type)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn demo_pre_tool_use_hook(tool_name: &str, tool_call_id: &str) {
@@ -221,6 +302,18 @@ fn tool_visibility_policy_from_args<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
+    use roci::attachments::{
+        preflight_resolved_attachments, render_prompt_input_text, Attachment, AttachmentMetadata,
+        AttachmentPreflightError, AttachmentResolveOptions, AttachmentResolver, AttachmentSource,
+        DefaultAttachmentResolver, PromptInput, ResolvedAttachment,
+    };
+    use roci::models::{ModelCapabilities, ModelInputCapabilities};
+    use roci::types::ContentPart;
+
+    use super::prompt_message_from_resolved;
+
     #[test]
     fn copilot_provider_available_in_default_registry() {
         let registry = roci::default_registry();
@@ -228,5 +321,118 @@ mod tests {
             registry.has_provider("github-copilot"),
             "expected github-copilot provider to be registered in default roci-cli builds"
         );
+    }
+
+    #[test]
+    fn resolve_file_attachments_and_preflight_by_model_caps() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+
+        let text_path = workspace.path().join("notes.txt");
+        let image_path = workspace.path().join("diagram.png");
+        fs::write(&text_path, "first line\nsecond line").expect("text fixture");
+        fs::write(&image_path, [137, 80, 78, 71, 13, 10, 26, 10]).expect("image fixture");
+
+        let attachments = vec![Attachment::file(text_path), Attachment::file(image_path)];
+        let resolved = DefaultAttachmentResolver
+            .resolve_attachments(&attachments, &AttachmentResolveOptions::default())
+            .expect("attachments should resolve");
+
+        assert_eq!(resolved.len(), 2);
+
+        assert!(matches!(
+            preflight_resolved_attachments(&resolved, &ModelCapabilities::default()),
+            Err(AttachmentPreflightError::ImageUnsupported)
+        ));
+
+        let image_caps = ModelCapabilities {
+            supports_vision: true,
+            input: ModelInputCapabilities::from_vision_support(true),
+            ..ModelCapabilities::default()
+        };
+        let report = preflight_resolved_attachments(&resolved, &image_caps)
+            .expect("vision model should accept image attachment");
+
+        assert_eq!(report.total_attachments, 2);
+        assert_eq!(report.text_attachments, 1);
+        assert_eq!(report.image_attachments, 1);
+    }
+
+    #[test]
+    fn render_prompt_text_adds_only_text_attachments() {
+        let mut input = PromptInput::new("Describe this");
+
+        let text_meta = AttachmentMetadata {
+            source: AttachmentSource::File {
+                path: PathBuf::from("notes.txt"),
+            },
+            name: Some("notes.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            size_bytes: 12,
+        };
+        let image_meta = AttachmentMetadata {
+            source: AttachmentSource::Blob,
+            name: Some("diagram.png".to_string()),
+            mime_type: Some("image/png".to_string()),
+            size_bytes: 4,
+        };
+
+        let resolved = vec![
+            ResolvedAttachment::Text {
+                text: "line one\nline two".to_string(),
+                metadata: text_meta,
+            },
+            ResolvedAttachment::Image {
+                data: vec![1, 2, 3, 4],
+                metadata: image_meta,
+            },
+        ];
+        input.text = input.text.trim_end().to_string();
+
+        let rendered = render_prompt_input_text(&input, &resolved);
+
+        assert_eq!(
+            rendered,
+            [
+                "Describe this",
+                "",
+                "--- Attachment: notes.txt (text/plain) ---",
+                "line one",
+                "line two",
+                "--- End attachment ---",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn build_image_content_part_uses_base64_when_images_supported() {
+        let input = PromptInput::new("Analyze image");
+        let attachment = ResolvedAttachment::Image {
+            data: vec![1, 2, 3, 4],
+            metadata: AttachmentMetadata {
+                source: AttachmentSource::Blob,
+                name: Some("frame.bin".to_string()),
+                mime_type: Some("image/png".to_string()),
+                size_bytes: 4,
+            },
+        };
+
+        let image_caps = ModelCapabilities {
+            supports_vision: true,
+            input: ModelInputCapabilities::from_vision_support(true),
+            ..ModelCapabilities::default()
+        };
+        let report = preflight_resolved_attachments(std::slice::from_ref(&attachment), &image_caps)
+            .expect("vision model should accept image attachment");
+        assert_eq!(report.image_attachments, 1);
+
+        let message = prompt_message_from_resolved(input, std::slice::from_ref(&attachment));
+        let model_part = match &message.content[1] {
+            ContentPart::Image(content) => content.clone(),
+            _ => panic!("expected image content part"),
+        };
+
+        assert_eq!(model_part.data, "AQIDBA==");
+        assert_eq!(model_part.mime_type, "image/png");
     }
 }

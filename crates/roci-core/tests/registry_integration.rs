@@ -15,7 +15,7 @@ use roci_core::auth::{
 };
 use roci_core::config::RociConfig;
 use roci_core::error::RociError;
-use roci_core::models::capabilities::ModelCapabilities;
+use roci_core::models::capabilities::{ModelCapabilities, ModelInputCapabilities};
 use roci_core::provider::{
     ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
 };
@@ -54,6 +54,7 @@ impl ProviderFactory for MockFactory {
                 supports_system_messages: true,
                 context_length: 4096,
                 max_output_tokens: None,
+                input: ModelInputCapabilities::default(),
             },
         }))
     }

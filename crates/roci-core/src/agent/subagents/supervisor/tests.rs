@@ -652,6 +652,7 @@ impl ProviderFactory for BlockingStreamFactory {
             model_id: model_id.to_string(),
             capabilities: crate::models::capabilities::ModelCapabilities {
                 supports_streaming: true,
+                input: crate::models::capabilities::ModelInputCapabilities::default(),
                 ..Default::default()
             },
         }))

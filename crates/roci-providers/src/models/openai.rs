@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
-use roci_core::models::ModelCapabilities;
+use roci_core::models::{ModelCapabilities, ModelInputCapabilities};
 use roci_core::types::ReasoningEffort;
 
 /// OpenAI models.
@@ -212,7 +212,7 @@ impl OpenAiModel {
             | Self::Gpt5ThinkingNano
             | Self::Gpt5ChatLatest => (400_000, true, true, true, true),
             Self::Gpt4oRealtimePreview => (128_000, true, true, false, true),
-            Self::Custom(_) => (128_000, true, true, false, true),
+            Self::Custom(_) => (128_000, false, true, false, true),
         };
         ModelCapabilities {
             supports_vision: vision,
@@ -240,6 +240,39 @@ impl OpenAiModel {
                 | Self::Gpt5ChatLatest => 128_000,
                 _ => 16_384,
             }),
+            input: ModelInputCapabilities::from_vision_support(vision),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpt4o_has_vision_input_capabilities() {
+        let caps = OpenAiModel::Gpt4o.capabilities();
+
+        assert!(caps.supports_vision);
+        assert!(caps.input.image.is_some());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
+    }
+
+    #[test]
+    fn gpt4_text_model_has_no_image_input_capabilities() {
+        let caps = OpenAiModel::Gpt4.capabilities();
+
+        assert!(!caps.supports_vision);
+        assert!(caps.input.image.is_none());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
+    }
+
+    #[test]
+    fn custom_model_has_safe_text_only_input_capabilities() {
+        let caps = OpenAiModel::Custom("unknown-compatible-model".to_string()).capabilities();
+
+        assert!(!caps.supports_vision);
+        assert!(caps.input.image.is_none());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
     }
 }

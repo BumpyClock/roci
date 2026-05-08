@@ -15,16 +15,19 @@ use crate::models::openai::OpenAiModel;
 
 pub struct OllamaProvider {
     inner: OpenAiProvider,
+    capabilities: ModelCapabilities,
 }
 
 impl OllamaProvider {
     pub fn new(model: OllamaModel, base_url: String) -> Self {
+        let capabilities = model.capabilities();
         let openai_model = OpenAiModel::Custom(model.as_str().to_string());
         Self {
             inner: OpenAiProvider::new_without_auth(
                 openai_model,
                 Some(format!("{}/v1", base_url.trim_end_matches('/'))),
             ),
+            capabilities,
         }
     }
 }
@@ -38,7 +41,7 @@ impl ModelProvider for OllamaProvider {
         self.inner.model_id()
     }
     fn capabilities(&self) -> &ModelCapabilities {
-        self.inner.capabilities()
+        &self.capabilities
     }
     async fn generate_text(
         &self,
@@ -51,5 +54,21 @@ impl ModelProvider for OllamaProvider {
         request: &ProviderRequest,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         self.inner.stream_text(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ollama_provider_uses_ollama_model_capabilities() {
+        let provider =
+            OllamaProvider::new(OllamaModel::Llama33, "http://127.0.0.1:11434".to_string());
+        let caps = provider.capabilities();
+
+        assert!(!caps.supports_vision);
+        assert!(caps.input.image.is_none());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
     }
 }

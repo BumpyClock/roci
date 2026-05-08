@@ -66,3 +66,22 @@ impl ModelProvider for OpenAiCompatibleProvider {
         self.inner.stream_text(request).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAiCompatibleProvider;
+    use roci_core::provider::ModelProvider;
+
+    #[test]
+    fn unknown_compatible_model_uses_safe_text_only_capabilities() {
+        let provider = OpenAiCompatibleProvider::new(
+            "unknown-compatible-model".to_string(),
+            "test-key".to_string(),
+            "http://localhost:1234".to_string(),
+        );
+        let caps = provider.capabilities();
+
+        assert!(!caps.supports_vision);
+        assert!(caps.input.image.is_none());
+    }
+}

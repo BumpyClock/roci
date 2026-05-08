@@ -15,10 +15,12 @@ use crate::models::openai::OpenAiModel;
 
 pub struct GroqProvider {
     inner: OpenAiProvider,
+    capabilities: ModelCapabilities,
 }
 
 impl GroqProvider {
     pub fn new(model: GroqModel, api_key: String) -> Self {
+        let capabilities = model.capabilities();
         let openai_model = OpenAiModel::Custom(model.as_str().to_string());
         Self {
             inner: OpenAiProvider::new(
@@ -27,6 +29,7 @@ impl GroqProvider {
                 Some("https://api.groq.com/openai/v1".to_string()),
                 None,
             ),
+            capabilities,
         }
     }
 }
@@ -40,7 +43,7 @@ impl ModelProvider for GroqProvider {
         self.inner.model_id()
     }
     fn capabilities(&self) -> &ModelCapabilities {
-        self.inner.capabilities()
+        &self.capabilities
     }
     async fn generate_text(
         &self,
@@ -53,5 +56,19 @@ impl ModelProvider for GroqProvider {
         request: &ProviderRequest,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         self.inner.stream_text(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llama_3_3_70b_provider_is_text_only() {
+        let provider = GroqProvider::new(GroqModel::Llama3370bVersatile, String::new());
+        let caps = provider.capabilities();
+
+        assert!(caps.input.image.is_none());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
     }
 }

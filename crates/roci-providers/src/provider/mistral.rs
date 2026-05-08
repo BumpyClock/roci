@@ -15,10 +15,12 @@ use crate::models::openai::OpenAiModel;
 
 pub struct MistralProvider {
     inner: OpenAiProvider,
+    capabilities: ModelCapabilities,
 }
 
 impl MistralProvider {
     pub fn new(model: MistralModel, api_key: String) -> Self {
+        let capabilities = model.capabilities();
         let openai_model = OpenAiModel::Custom(model.as_str().to_string());
         Self {
             inner: OpenAiProvider::new(
@@ -27,6 +29,7 @@ impl MistralProvider {
                 Some("https://api.mistral.ai/v1".to_string()),
                 None,
             ),
+            capabilities,
         }
     }
 }
@@ -40,7 +43,7 @@ impl ModelProvider for MistralProvider {
         self.inner.model_id()
     }
     fn capabilities(&self) -> &ModelCapabilities {
-        self.inner.capabilities()
+        &self.capabilities
     }
     async fn generate_text(
         &self,
@@ -53,5 +56,50 @@ impl ModelProvider for MistralProvider {
         request: &ProviderRequest,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         self.inner.stream_text(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mistral_large_provider_supports_image_input() {
+        let provider = MistralProvider::new(MistralModel::MistralLarge, String::new());
+        let caps = provider.capabilities();
+
+        assert!(caps.supports_vision);
+        assert!(caps.input.image.is_some());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
+    }
+
+    #[test]
+    fn mistral_medium_provider_supports_image_input() {
+        let provider = MistralProvider::new(MistralModel::MistralMedium, String::new());
+        let caps = provider.capabilities();
+
+        assert!(caps.supports_vision);
+        assert!(caps.input.image.is_some());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
+    }
+
+    #[test]
+    fn mistral_small_provider_supports_image_input() {
+        let provider = MistralProvider::new(MistralModel::MistralSmall, String::new());
+        let caps = provider.capabilities();
+
+        assert!(caps.supports_vision);
+        assert!(caps.input.image.is_some());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
+    }
+
+    #[test]
+    fn codestral_provider_is_text_only() {
+        let provider = MistralProvider::new(MistralModel::Codestral, String::new());
+        let caps = provider.capabilities();
+
+        assert!(!caps.supports_vision);
+        assert!(caps.input.image.is_none());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
     }
 }

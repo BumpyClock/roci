@@ -23,7 +23,7 @@ use crate::agent::subagents::SubagentPromptPolicy;
 use crate::agent_loop::AgentEvent;
 use crate::config::RociConfig;
 use crate::error::RociError;
-use crate::models::{LanguageModel, ModelCapabilities};
+use crate::models::{LanguageModel, ModelCapabilities, ModelInputCapabilities};
 use crate::provider::{
     ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
 };
@@ -150,6 +150,7 @@ impl ProviderFactory for RecordingProviderFactory {
             response_text: self.response_text.clone(),
             capabilities: ModelCapabilities {
                 supports_streaming: false,
+                input: ModelInputCapabilities::default(),
                 ..ModelCapabilities::default()
             },
         }))
@@ -273,6 +274,7 @@ impl ProviderFactory for BlockingAskUserFactory {
             model_id: model_id.to_string(),
             capabilities: ModelCapabilities {
                 supports_streaming: false,
+                input: ModelInputCapabilities::default(),
                 ..ModelCapabilities::default()
             },
         }))

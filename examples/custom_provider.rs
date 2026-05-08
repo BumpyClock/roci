@@ -7,7 +7,7 @@
 //!
 //! Run: `cargo run --example custom_provider`
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -16,7 +16,7 @@ use futures::StreamExt;
 // Use the meta-crate re-exports (same types as roci_core).
 use roci::config::RociConfig;
 use roci::error::RociError;
-use roci::models::capabilities::ModelCapabilities;
+use roci::models::capabilities::{ModelCapabilities, ModelInputCapabilities};
 use roci::provider::{
     ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
 };
@@ -42,8 +42,8 @@ impl ModelProvider for EchoProvider {
     }
 
     fn capabilities(&self) -> &ModelCapabilities {
-        // Static capabilities — echo supports nothing fancy.
-        static CAPS: ModelCapabilities = ModelCapabilities {
+        static CAPS: OnceLock<ModelCapabilities> = OnceLock::new();
+        CAPS.get_or_init(|| ModelCapabilities {
             supports_vision: false,
             supports_tools: false,
             supports_streaming: true,
@@ -53,8 +53,8 @@ impl ModelProvider for EchoProvider {
             supports_system_messages: true,
             context_length: 4096,
             max_output_tokens: None,
-        };
-        &CAPS
+            input: ModelInputCapabilities::default(),
+        })
     }
 
     async fn generate_text(

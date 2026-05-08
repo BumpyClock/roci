@@ -1,14 +1,18 @@
 //! Convenience re-exports for common use.
 
 pub use crate::attachments::{
-    render_prompt_input_text, render_resolved_text, Attachment, AttachmentMetadata,
+    preflight_resolved_attachments, render_prompt_input_text, render_resolved_text, Attachment,
+    AttachmentMetadata, AttachmentPreflightError, AttachmentPreflightReport,
     AttachmentResolveOptions, AttachmentResolver, AttachmentSource, AttachmentTextRenderer,
     BlobAttachment, DefaultAttachmentResolver, FileAttachment, PromptInput, ResolvedAttachment,
     SelectionAttachment,
 };
 pub use crate::config::RociConfig;
 pub use crate::error::{Result, RociError};
-pub use crate::models::LanguageModel;
+pub use crate::models::{
+    FileInputCapabilities, ImageInputCapabilities, LanguageModel, ModelCapabilities,
+    ModelInputCapabilities, TextInputCapabilities,
+};
 pub use crate::provider::{ModelProvider, ProviderFactory, ProviderRegistry};
 pub use crate::resource::{
     BranchSummarySettings, CompactionSettings, ContextFileResource, ContextPromptLoader,

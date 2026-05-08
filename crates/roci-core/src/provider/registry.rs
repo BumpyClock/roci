@@ -74,7 +74,7 @@ mod tests {
     use super::*;
     use crate::config::RociConfig;
     use crate::error::RociError;
-    use crate::models::capabilities::ModelCapabilities;
+    use crate::models::capabilities::{ModelCapabilities, ModelInputCapabilities};
     use crate::provider::{ModelProvider, ProviderRequest, ProviderResponse};
     use crate::types::{TextStreamDelta, Usage};
     use async_trait::async_trait;
@@ -104,6 +104,7 @@ mod tests {
                     supports_system_messages: true,
                     context_length: 4096,
                     max_output_tokens: None,
+                    input: ModelInputCapabilities::default(),
                 },
             }))
         }
@@ -202,6 +203,7 @@ mod tests {
                     supports_system_messages: true,
                     context_length: 4096,
                     max_output_tokens: None,
+                    input: ModelInputCapabilities::default(),
                 },
             }))
         }
@@ -267,6 +269,7 @@ mod tests {
                     supports_system_messages: true,
                     context_length: 4096,
                     max_output_tokens: None,
+                    input: ModelInputCapabilities::default(),
                 },
             }))
         }
@@ -328,6 +331,7 @@ mod tests {
                     supports_system_messages: false,
                     context_length: 1024,
                     max_output_tokens: None,
+                    input: ModelInputCapabilities::default(),
                 },
             }))
         }

@@ -6,8 +6,8 @@ use crate::agent_loop::{ApprovalPolicy, RunStatus};
 use crate::models::ModelCapabilities;
 use crate::provider::{ModelProvider, ProviderFactory, ProviderRequest, ProviderResponse};
 use crate::types::{
-    FinishReason, GenerationSettings, ModelMessage, ResponseFormat, Role, StreamEventType,
-    TextStreamDelta, Usage,
+    ContentPart, FinishReason, GenerationSettings, ImageContent, ModelMessage, ResponseFormat,
+    Role, StreamEventType, TextStreamDelta, Usage,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -143,6 +143,51 @@ async fn prompt_projects_completed_turn_and_host_ready_messages() {
         .map(|message| message.payload.text())
         .collect::<Vec<_>>();
     assert_eq!(payload_text, ["hello".to_string(), "hello".to_string()]);
+}
+
+#[tokio::test]
+async fn prompt_message_preserves_image_parts_in_provider_request() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(FullMessageRecordingFactory {
+        provider_key: "stub",
+        requests: requests.clone(),
+    }));
+    let mut config = test_agent_config();
+    config.model = "stub:multipart".parse().expect("stub model should parse");
+    let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
+    let image_message = ModelMessage {
+        role: Role::User,
+        content: vec![
+            ContentPart::Text {
+                text: "describe image".to_string(),
+            },
+            ContentPart::Image(ImageContent {
+                data: "AQIDBA==".to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+        ],
+        name: None,
+        timestamp: None,
+    };
+
+    let result = agent
+        .prompt_message(image_message)
+        .await
+        .expect("multipart prompt should run");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let recorded = requests.lock().expect("requests lock");
+    assert_eq!(recorded.len(), 1);
+    let user_message = recorded[0]
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("provider request should include user message");
+    assert!(matches!(
+        &user_message.content[1],
+        ContentPart::Image(image)
+            if image.data == "AQIDBA==" && image.mime_type == "image/png"
+    ));
 }
 
 #[tokio::test]
@@ -887,6 +932,94 @@ struct RecordingProvider {
     settings: Arc<Mutex<Vec<GenerationSettings>>>,
     requests: Arc<Mutex<Vec<Vec<String>>>>,
     response: String,
+}
+
+struct FullMessageRecordingFactory {
+    provider_key: &'static str,
+    requests: Arc<Mutex<Vec<Vec<ModelMessage>>>>,
+}
+
+impl ProviderFactory for FullMessageRecordingFactory {
+    fn provider_keys(&self) -> &[&str] {
+        std::slice::from_ref(&self.provider_key)
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(FullMessageRecordingProvider {
+            provider_key: provider_key.to_string(),
+            model_id: model_id.to_string(),
+            requests: self.requests.clone(),
+        }))
+    }
+}
+
+struct FullMessageRecordingProvider {
+    provider_key: String,
+    model_id: String,
+    requests: Arc<Mutex<Vec<Vec<ModelMessage>>>>,
+}
+
+#[async_trait]
+impl ModelProvider for FullMessageRecordingProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        static CAPABILITIES: std::sync::OnceLock<ModelCapabilities> = std::sync::OnceLock::new();
+        CAPABILITIES.get_or_init(ModelCapabilities::default)
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "stream-only full message recording provider".to_string(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .push(request.messages.clone());
+        let events: Vec<Result<TextStreamDelta, RociError>> = vec![
+            Ok(TextStreamDelta {
+                text: "ok".to_string(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: Some(FinishReason::Stop),
+                usage: Some(Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+        ];
+        Ok(Box::pin(stream::iter(events)))
+    }
 }
 
 #[async_trait]

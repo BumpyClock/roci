@@ -20,13 +20,14 @@
 //! delegate to [`HeuristicTokenCounter`] internally.
 
 use crate::types::{ContentPart, ModelMessage, Role};
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Metadata types
 // ---------------------------------------------------------------------------
 
 /// How accurate a token count is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CountAccuracy {
     /// Exact count from a model-specific tokenizer or provider usage report.
     Exact,
@@ -35,7 +36,7 @@ pub enum CountAccuracy {
 }
 
 /// Where a token count originated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TokenCountSource {
     /// Cheap character-ratio heuristic.
     Heuristic,
@@ -66,7 +67,7 @@ impl TokenCountSource {
 /// from different sources are combined, accuracy degrades to [`CountAccuracy::Estimated`]
 /// if any component is estimated, and source falls back to the least reliable
 /// contributor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCount {
     pub tokens: usize,
     pub accuracy: CountAccuracy,
@@ -521,6 +522,18 @@ mod tests {
         assert_eq!(tc.tokens, 42);
         assert_eq!(tc.accuracy, CountAccuracy::Estimated);
         assert_eq!(tc.source, TokenCountSource::Heuristic);
+    }
+
+    #[test]
+    fn token_count_round_trips_through_json() {
+        let count = TokenCount::heuristic(42);
+
+        let json = serde_json::to_string(&count).expect("serialize token count");
+        let decoded: TokenCount = serde_json::from_str(&json).expect("deserialize token count");
+
+        assert_eq!(decoded, count);
+        assert_eq!(decoded.accuracy, CountAccuracy::Estimated);
+        assert_eq!(decoded.source, TokenCountSource::Heuristic);
     }
 
     #[test]

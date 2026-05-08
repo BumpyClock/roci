@@ -4,7 +4,10 @@ pub mod capabilities;
 pub mod provider_key;
 pub mod selector;
 
-pub use capabilities::ModelCapabilities;
+pub use capabilities::{
+    FileInputCapabilities, ImageInputCapabilities, ModelCapabilities, ModelInputCapabilities,
+    TextInputCapabilities,
+};
 pub use provider_key::ProviderKey;
 pub use selector::ModelSelector;
 

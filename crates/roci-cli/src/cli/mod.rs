@@ -205,6 +205,10 @@ pub struct ChatArgs {
     #[arg(long, value_name = "ID", requires = "session_root")]
     pub session_id: Option<String>,
 
+    /// File attachment to include with the prompt. Repeatable.
+    #[arg(long = "attach", value_name = "PATH")]
+    pub attachments: Vec<PathBuf>,
+
     /// MCP stdio server spec (repeatable). Format: `key=value` pairs separated by commas.
     /// Keys: `id`, `label`, `command`, `arg` (repeat for multiple args).
     /// Example: `--mcp-stdio 'id=local,label=Local Files,command=npx,arg=-y,arg=@modelcontextprotocol/server-filesystem,arg=.'`
@@ -823,6 +827,35 @@ mod tests {
             }
             other => panic!("expected Chat, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_chat_with_repeatable_attachments() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--attach",
+            "notes.md",
+            "--attach",
+            "diagram.png",
+            "prompt text",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(
+                    args.attachments,
+                    vec![PathBuf::from("notes.md"), PathBuf::from("diagram.png")]
+                );
+                assert_eq!(args.prompt.as_deref(), Some("prompt text"));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_attachment_requires_a_path_value() {
+        assert!(Cli::try_parse_from(["roci-agent", "chat", "--attach"]).is_err());
     }
 
     #[test]

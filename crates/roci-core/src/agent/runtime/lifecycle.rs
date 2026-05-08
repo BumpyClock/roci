@@ -211,9 +211,33 @@ impl AgentRuntime {
     ///
     /// Returns [`RociError::InvalidState`] if the agent is not idle.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<RunResult, RociError> {
+        self.prompt_user_message(ModelMessage::user(text)).await
+    }
+
+    /// Start a new conversation with a user message.
+    ///
+    /// This accepts multipart messages, including image content, for hosts that
+    /// resolve and preflight attachments before calling the runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::InvalidState`] if the agent is not idle or the
+    /// provided message is not a user message.
+    pub async fn prompt_message(&self, user_message: ModelMessage) -> Result<RunResult, RociError> {
+        if user_message.role != Role::User {
+            return Err(RociError::InvalidState(
+                "prompt message must have user role".into(),
+            ));
+        }
+        self.prompt_user_message(user_message).await
+    }
+
+    async fn prompt_user_message(
+        &self,
+        user_message: ModelMessage,
+    ) -> Result<RunResult, RociError> {
         self.transition_to_running()?;
 
-        let text = text.into();
         let system_prompt = self.system_prompt.lock().await.clone();
         let mut msgs = self.messages.lock().await;
         let mut turn_messages = Vec::new();
@@ -224,7 +248,6 @@ impl AgentRuntime {
                 turn_messages.push(system_message);
             }
         }
-        let user_message = ModelMessage::user(text);
         msgs.push(user_message.clone());
         turn_messages.push(user_message);
         let snapshot = msgs.clone();

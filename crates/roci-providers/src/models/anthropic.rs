@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
-use roci_core::models::ModelCapabilities;
+use roci_core::models::{ModelCapabilities, ModelInputCapabilities};
 
 /// Anthropic models.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Display, EnumString)]
@@ -71,6 +71,21 @@ impl AnthropicModel {
             supports_system_messages: true,
             context_length: ctx,
             max_output_tokens: Some(max_output),
+            input: ModelInputCapabilities::from_vision_support(true),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_models_have_vision_input_capabilities() {
+        let caps = AnthropicModel::ClaudeSonnet4.capabilities();
+
+        assert!(caps.supports_vision);
+        assert!(caps.input.image.is_some());
+        assert_eq!(caps.supports_vision, caps.input.image.is_some());
     }
 }

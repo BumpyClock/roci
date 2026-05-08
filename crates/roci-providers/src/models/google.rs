@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
-use roci_core::models::ModelCapabilities;
+use roci_core::models::{ModelCapabilities, ModelInputCapabilities};
 
 /// Google Gemini models.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Display, EnumString)]
@@ -67,6 +67,7 @@ impl GoogleModel {
             supports_system_messages: true,
             context_length: ctx,
             max_output_tokens: Some(8_192),
+            input: ModelInputCapabilities::from_vision_support(true),
         }
     }
 }

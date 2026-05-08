@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
-use roci_core::models::ModelCapabilities;
+use roci_core::models::{ModelCapabilities, ModelInputCapabilities};
 
 /// LMStudio models (local, OpenAI-compatible API).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Display, EnumString)]
@@ -31,6 +31,7 @@ impl LmStudioModel {
             supports_system_messages: true,
             context_length: 32_768,
             max_output_tokens: None,
+            input: ModelInputCapabilities::default(),
         }
     }
 }
