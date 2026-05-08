@@ -116,6 +116,7 @@ async fn register_default_providers_all_catalog_keeps_local_ollama_without_crede
     let config = RociConfig::new().with_token_store(None);
     let mut registry = ProviderRegistry::new();
     roci_providers::register_default_providers(&mut registry);
+    assert_eq!(registry.requires_credentials("ollama"), Some(false));
 
     let catalog = registry
         .list_models(&config, &ModelListOptions::default())

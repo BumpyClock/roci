@@ -100,7 +100,14 @@ pub fn anthropic_catalog(provider_key: &str) -> ModelCatalog {
 
     ModelCatalog::from_models(models.into_iter().map(|model| {
         let id = model.as_str().to_string();
-        model_info(provider_key, &id, model.capabilities(), true, false, false)
+        model_info(
+            provider_key,
+            &id,
+            model.capabilities(),
+            true,
+            false,
+            id == "claude-sonnet-4-5",
+        )
     }))
 }
 

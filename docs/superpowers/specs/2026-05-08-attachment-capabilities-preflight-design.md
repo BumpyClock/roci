@@ -153,7 +153,7 @@ Host app:
 2. Resolver converts attachments into `ResolvedAttachment`.
 3. Runtime calls shared preflight with provider `ModelCapabilities`.
 4. Runtime degrades safe unsupported media and unsupported image inputs into bounded marker text.
-5. Runtime renders text attachments and passes supported image attachments to provider mapping.
+5. Text attachments are rendered into the model prompt; supported image attachments are forwarded to provider mapping.
 
 CLI chat:
 

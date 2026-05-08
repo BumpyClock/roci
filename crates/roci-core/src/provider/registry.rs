@@ -82,6 +82,8 @@ impl ProviderRegistry {
                 .get(provider_key)
                 .expect("provider key came from registry");
 
+            // Skip known unavailable remotes before calling `list_models`; explicit
+            // provider requests still surface the provider's MissingCredential error.
             if !options.include_unavailable
                 && factory.requires_credentials(provider_key)
                 && !has_credentials(config, provider_key)

@@ -306,7 +306,7 @@ impl AgentRuntime {
             .map(|mut cursors| {
                 cursors
                     .pop()
-                    .expect("single event publish returns one cursor")
+                    .expect("batch ack for single-event publish must return exactly one cursor")
             })
     }
 

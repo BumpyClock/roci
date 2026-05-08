@@ -271,6 +271,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_copilot_models_maps_auth_errors_to_authentication() {
+        for status in [401, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("auth failed"))
+                .mount(&server)
+                .await;
+
+            let err = list_copilot_models("bad-token", &server.uri(), "github-copilot")
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, RociError::Authentication(_)));
+        }
+    }
+
+    #[tokio::test]
     async fn list_copilot_models_maps_5xx_to_api_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

@@ -1729,7 +1729,7 @@ catalogs for host apps and CLI tools.
 
 Add a model catalog smoke section:
 
-```markdown
+````markdown
 ## Model Catalog Smoke
 
 Provider-facing model catalog work must be proven through `roci-agent`, not only
@@ -1747,7 +1747,7 @@ Copilot dynamic smoke, when authenticated:
 ```bash
 cargo run -q -p roci-cli --features roci/github-copilot -- models list --provider github-copilot --json
 ```
-```
+````
 
 - [ ] **Step 4: Run docs grep sanity**
 

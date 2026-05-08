@@ -685,7 +685,7 @@ fn build_prompt_input_preserves_attachment_paths() {
 }
 ```
 
-Runtime-owned preflight is covered by core/runtime tests. CLI live verification in Task 5 is required evidence that `--attach` uses current runtime path end to end.
+Runtime-owned preflight is covered by core/runtime tests. CLI live verification in Task 5 is required evidence that `--attach` uses current runtime path end-to-end.
 
 - [ ] **Step 2: Add helper**
 

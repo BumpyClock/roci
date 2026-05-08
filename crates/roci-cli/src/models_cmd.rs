@@ -143,7 +143,12 @@ pub(crate) async fn run_switch_chat_smoke(
         .rev()
         .find(|message| message.role == Role::Assistant)
         .map(|message| message.text())
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            format!(
+                "switched model prompt returned no assistant message; status={:?} error={:?}",
+                result.status, result.error
+            )
+        })?;
 
     if result.status != RunStatus::Completed {
         return Err(format!(
