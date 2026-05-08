@@ -1,12 +1,12 @@
 ## Overview
-Add first-class host-facing attachments for prompt inputs and CLI chat. V1 supports text and images only: text files/selections render into model-visible text, images use existing `ContentPart::Image`, unsupported opaque blobs fail preflight.
+Add first-class host-facing attachments for prompt inputs and CLI chat. V1 supports text and images only: text files/selections render into model-visible text, images use existing `ContentPart::Image` when the model/provider supports them, and safe unsupported media degrades into bounded model-visible marker text.
 
 ## Constraints / Non-goals
 - Active development: breaking API changes allowed; no compatibility shims.
 - No native provider file upload / `ContentPart::File` in V1.
 - Only text and image attachments for now.
 - MIME detection uses `mime_guess` plus UTF-8 fallback; no deep content sniffing.
-- Attachment text is model-visible; hosts must avoid attaching secrets.
+- Attachment text and unsupported-media markers are model-visible; hosts must avoid attaching secrets.
 - Sessioned attachments do not make host cwd into session workspace.
 
 ## Interfaces (CLI/API)
@@ -19,20 +19,21 @@ Add first-class host-facing attachments for prompt inputs and CLI chat. V1 suppo
 
 ## Data model / schema changes
 - Text attachments become bounded rendered `ContentPart::Text` with metadata.
-- Image attachments become existing `ContentPart::Image` with MIME/data and metadata.
-- Unsupported blobs/native files return preflight errors before provider call.
-- Token estimation accounts for rendered text and conservative image placeholders.
+- Image attachments become existing `ContentPart::Image` with MIME/data and metadata when supported.
+- Safe unsupported media and images unsupported by the selected model/MIME become bounded `ContentPart::Text` markers: `User attached unsupported media: <name> (<mime>, <size> bytes). Content omitted.`
+- Malformed marker metadata, unreadable paths, count limits, and byte/resource limits return errors before provider calls.
+- Token estimation accounts for rendered text, unsupported-media markers, and conservative image placeholders.
 - Provider payload mappings rely on existing image serialization for OpenAI Chat/Responses, Anthropic, and Google.
-- In a durable session, `--attach <host_path>` is ephemeral prompt input with source metadata. Explicit import/copy into session `files/` is separate session/workspace API behavior.
+- In a durable session, `--attach <host_path>` is ephemeral prompt input with sanitized source metadata. Explicit import/copy into session `files/` is separate session/workspace API behavior.
 
 ## Acceptance criteria
-- Resolver tests cover file/blob/selection, size/count limits, MIME, UTF-8 fallback, unsupported opaque blobs.
+- Resolver tests cover file/blob/selection, size/count limits, MIME, UTF-8 fallback, unsupported media markers, and malformed marker metadata.
 - Serde/token/preflight tests pass.
 - Runtime queue tests prove PromptInput flows through prompt/continue/steer/follow-up and chat metadata.
-- Provider JSON assertions prove image/text payload shape.
+- Provider JSON assertions prove image/text payload shape and unsupported-media marker text.
 - CLI parse and chat wiring tests pass.
 - Sessioned CLI test proves `--attach` never turns host cwd into session workspace implicitly.
-- Docs and live tmux text+vision smoke complete or clearly report missing vision-capable provider/auth.
+- Docs and live tmux text+unsupported-media/vision smoke complete or clearly report missing vision-capable provider/auth.
 
 ## Test plan
 - `cargo test -p roci-core attachments`
@@ -42,4 +43,4 @@ Add first-class host-facing attachments for prompt inputs and CLI chat. V1 suppo
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --features full -- -D warnings`
 - `cargo test`
-- Live tmux text attachment smoke and vision attachment smoke per `docs/testing.md`.
+- Live tmux attachment smoke per `docs/testing.md`, including unsupported-media marker and session raw-path check.
