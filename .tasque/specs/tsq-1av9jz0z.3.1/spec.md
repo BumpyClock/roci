@@ -12,6 +12,9 @@ Define the reusable secret redaction API for text and JSON payloads used by appr
 - Model-visible tool results are not redacted by default; hosts may explicitly opt into model-context redaction later.
 - Pi and Codex prior art have weaker generalized redaction coverage, so Roci owns this contract instead of copying a host-specific approach.
 
+## Match semantics
+Text ranges are UTF-8 byte offsets into original input. JSON paths use RFC 6901 JSON Pointer. V1 scans/redacts string values only; object keys are preserved. Overlaps resolve by start ascending, end descending, then kind priority: `PrivateKey`, `AuthHeader`, `BearerToken`, `ApiKey`, `EnvSecret`, `GenericSecret`. Keep first non-overlapping match.
+
 ## Non-goals
 - No secret storage/key management.
 - No telemetry pipeline implementation.
