@@ -6,6 +6,30 @@ Lock the multi-server MCP identity and namespacing contract before implementatio
 - Define how resources carry server provenance.
 - Define the long-term exposed naming contract for multi-server MCP tools.
 
+## Constraints / Non-goals
+- Do not route by parsing exposed tool names.
+- Do not use display labels as stable server identity.
+- Do not make suffixing the default collision behavior.
+- Do not change native Roci tool names unless a host explicitly opts into native namespacing.
+
+## Interfaces (CLI/API)
+```rust
+pub enum McpToolCollisionPolicy {
+    DenyOnCollision,
+    SuffixOnCollision { hash_len: usize },
+}
+
+pub struct McpToolIdentity {
+    pub server_id: String,
+    pub tool_name: String,
+}
+
+pub struct ExposedMcpToolName {
+    pub exposed_name: String,
+    pub identity: McpToolIdentity,
+}
+```
+
 ## Decision
 - Canonical exposed MCP tool name is `mcp__<server_id>__<tool_name>`.
 - This is the intended long-term contract, not a transitional compatibility shim.
@@ -24,6 +48,12 @@ V1 exposed-name serialization is exactly `mcp__{server_id}__{tool_name}`. Routin
 
 Collision detection compares final exposed names after serialization. `DenyOnCollision` returns a configuration error before exposing tools. `SuffixOnCollision { hash_len }` appends `__h{hash}`, where `hash` is lower-hex SHA-256 of `server_id + "\0" + tool_name`, truncated to `hash_len`.
 
+## Data model / schema changes
+- Add explicit stable server identity fields wherever aggregate tools, resources, instructions, auth, and transport state cross boundaries.
+- Preserve raw `McpToolIdentity` beside model-visible exposed names.
+- Store collision policy as aggregate configuration, defaulting to `DenyOnCollision`.
+- Resource descriptors carry `{ server_id, uri }` provenance without encoding the server id into the URI.
+
 ## Acceptance criteria
 1. Server identity fields are consistent across transports, auth, tools, instructions, and resources.
 2. Namespacing decisions are documented clearly enough that follow-on tasks do not need to revisit them.
@@ -33,3 +63,10 @@ Collision detection compares final exposed names after serialization. `DenyOnCol
 
 ## Validation
 - Design-only task: verify downstream task specs reference the same naming and identity model.
+
+## Test plan
+- Fixture tests for `mcp__<server_id>__<tool_name>` serialization.
+- Collision tests for `DenyOnCollision`.
+- Collision tests for `SuffixOnCollision { hash_len: 12 }` using lower-hex SHA-256 suffixing.
+- Native/MCP separation tests proving native tool names remain plain.
+- Resource provenance tests proving structured `{ server_id, uri }` routing.
