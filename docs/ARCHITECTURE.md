@@ -126,7 +126,7 @@ use logical paths under `files/`.
 - See [Agent runtime chat semantics](agent-runtime-chat.md) for projected snapshots/events, cursor replay, and cancellation contracts.
 - Runtime module layout:
   - `crates/roci-core/src/agent/runtime.rs` is the runtime module root/wiring layer.
-  - `crates/roci-core/src/agent/runtime/{types,config,state,lifecycle,mutations,run_loop,events,summary}.rs` contains runtime internals by concern.
+  - `crates/roci-core/src/agent/runtime/{chat,types,config,state,lifecycle,mutations,run_loop,events,summary}.rs` contains runtime internals by concern.
   - `crates/roci-core/src/agent/runtime_tests/` contains `agent::runtime::tests::*` (support + domain test modules).
 - `agent_loop::runner` executes provider turns, streaming, tool execution, approvals, retries, and event emission.
 - `agent::Agent` is the simple conversation API. When tools are attached it delegates to `agent_loop::LoopRunner`, so approvals and tool hooks follow the same path as `AgentRuntime`.
@@ -396,6 +396,14 @@ Pass-through: `roci` features forward to `roci-providers` and `roci-core`.
 `roci-core` has **no** provider feature flags -- it is always provider-agnostic.
 
 Default features (via `roci`): `openai`, `anthropic`, `google`.
+
+## Durable Sessions
+
+- `session::LocalSessionStore` owns session filesystem lifecycle. Host apps
+  choose the session root and call async store APIs before constructing or
+  resuming an `AgentRuntime`.
+- `AgentRuntime::{new,try_new}` consume prepared session configuration only.
+  They do not write session metadata or create session directories.
 
 ## Import Paths
 

@@ -108,6 +108,12 @@ impl AgentRuntime {
             .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
             .await
             .map_err(Self::map_chat_projection_error)?;
+        if let Some(ledger) = &self.provider_ledger {
+            ledger
+                .append_compacted(snapshot.thread_id, messages.clone())
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
+            *self.persisted_provider_message_count.lock().await = messages.len();
+        }
         *existing_messages = messages;
         drop(existing_messages);
         drop(state_guard);

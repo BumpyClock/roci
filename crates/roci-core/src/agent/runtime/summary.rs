@@ -58,7 +58,20 @@ impl AgentRuntime {
         .await?;
 
         if let Some(compacted_messages) = compacted {
-            *self.messages.lock().await = compacted_messages;
+            let state_guard = self.lock_state_for_idle_mutation()?;
+            let mut messages = self.messages.try_lock().map_err(|_| {
+                RociError::InvalidState("Agent is busy (messages lock contended)".into())
+            })?;
+            if let Some(ledger) = &self.provider_ledger {
+                let thread_id = self.default_thread_id();
+                ledger
+                    .append_compacted(thread_id, compacted_messages.clone())
+                    .map_err(|err| RociError::InvalidState(err.to_string()))?;
+                *self.persisted_provider_message_count.lock().await = compacted_messages.len();
+            }
+            *messages = compacted_messages;
+            drop(messages);
+            drop(state_guard);
             self.broadcast_snapshot().await;
         }
 

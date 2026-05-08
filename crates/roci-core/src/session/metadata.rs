@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::{SessionError, SessionId, SessionResult};
 
 /// Metadata recorded for a durable session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionMetadata {
     /// Stable durable session ID.
     pub id: SessionId,
@@ -17,10 +17,42 @@ pub struct SessionMetadata {
     pub created_at: DateTime<Utc>,
     /// Last metadata update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// Last user/runtime activity timestamp.
+    pub last_activity_at: DateTime<Utc>,
     /// Host cwd used when the session was created or imported.
     pub host_cwd: Option<PathBuf>,
     /// Optional source path imported into the session workspace.
     pub import_source: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct SessionMetadataWire {
+    id: SessionId,
+    title: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    last_activity_at: Option<DateTime<Utc>>,
+    host_cwd: Option<PathBuf>,
+    import_source: Option<PathBuf>,
+}
+
+impl<'de> Deserialize<'de> for SessionMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = SessionMetadataWire::deserialize(deserializer)?;
+        Ok(Self {
+            id: wire.id,
+            title: wire.title,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+            last_activity_at: wire.last_activity_at.unwrap_or(wire.updated_at),
+            host_cwd: wire.host_cwd,
+            import_source: wire.import_source,
+        })
+    }
 }
 
 impl SessionMetadata {
@@ -33,6 +65,7 @@ impl SessionMetadata {
             title: None,
             created_at: now,
             updated_at: now,
+            last_activity_at: now,
             host_cwd,
             import_source,
         }
@@ -68,5 +101,30 @@ impl SessionMetadata {
             fs::create_dir_all(parent).map_err(|source| SessionError::io(parent, source))?;
         }
         fs::write(path, json).map_err(|source| SessionError::io(path, source))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_metadata_defaults_last_activity_to_updated_at() {
+        let updated_at = "2026-05-08T03:00:00Z";
+        let json = format!(
+            r#"{{
+              "id":"session-old",
+              "title":null,
+              "created_at":"2026-05-08T02:00:00Z",
+              "updated_at":"{updated_at}",
+              "host_cwd":null,
+              "import_source":null
+            }}"#
+        );
+
+        let metadata: SessionMetadata =
+            serde_json::from_str(&json).expect("old metadata should deserialize");
+
+        assert_eq!(metadata.last_activity_at, metadata.updated_at);
     }
 }

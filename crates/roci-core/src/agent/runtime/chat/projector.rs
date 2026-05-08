@@ -819,6 +819,97 @@ impl ThreadState {
         Ok(self.event(None, payload))
     }
 
+    fn apply_replayed_event(&mut self, event: AgentRuntimeEvent) -> Result<(), AgentRuntimeError> {
+        if event.thread_id != self.thread_id() {
+            return Err(AgentRuntimeError::ProjectionFailed {
+                message: format!(
+                    "runtime event thread mismatch: event {}, projector {}",
+                    event.thread_id,
+                    self.thread_id()
+                ),
+            });
+        }
+        if event.seq <= self.snapshot.last_seq {
+            return Err(AgentRuntimeError::ProjectionFailed {
+                message: format!(
+                    "runtime event seq must increase for thread {}: received {}, latest {}",
+                    event.thread_id, event.seq, self.snapshot.last_seq
+                ),
+            });
+        }
+
+        self.apply_replayed_payload(&event.payload)?;
+        self.snapshot.last_seq = event.seq;
+        self.refresh_replay_counters();
+        if self.replay_capacity > 0 {
+            self.events.push_back(event);
+            while self.events.len() > self.replay_capacity {
+                self.events.pop_front();
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_replayed_payload(
+        &mut self,
+        payload: &AgentRuntimeEventPayload,
+    ) -> Result<(), AgentRuntimeError> {
+        match payload {
+            AgentRuntimeEventPayload::TurnQueued { turn }
+            | AgentRuntimeEventPayload::TurnStarted { turn }
+            | AgentRuntimeEventPayload::TurnCompleted { turn }
+            | AgentRuntimeEventPayload::TurnFailed { turn, .. }
+            | AgentRuntimeEventPayload::TurnCanceled { turn } => {
+                self.upsert_turn(turn.clone());
+                self.snapshot.active_turn_id = self.current_active_turn_id();
+            }
+            AgentRuntimeEventPayload::MessageStarted { message }
+            | AgentRuntimeEventPayload::MessageUpdated { message }
+            | AgentRuntimeEventPayload::MessageCompleted { message } => {
+                self.upsert_message(message.clone());
+                self.attach_message_to_turn(message.turn_id, message.message_id);
+            }
+            AgentRuntimeEventPayload::ToolStarted { tool }
+            | AgentRuntimeEventPayload::ToolUpdated { tool }
+            | AgentRuntimeEventPayload::ToolCompleted { tool } => {
+                self.upsert_tool(tool.clone());
+                self.apply_tool_activity(tool);
+            }
+            AgentRuntimeEventPayload::ApprovalRequired { approval }
+            | AgentRuntimeEventPayload::ApprovalResolved { approval }
+            | AgentRuntimeEventPayload::ApprovalCanceled { approval } => {
+                self.upsert_approval(approval.clone());
+            }
+            AgentRuntimeEventPayload::HumanInteractionRequested { interaction }
+            | AgentRuntimeEventPayload::HumanInteractionResolved { interaction }
+            | AgentRuntimeEventPayload::HumanInteractionCanceled { interaction } => {
+                self.upsert_human_interaction(interaction.clone());
+            }
+            AgentRuntimeEventPayload::ReasoningUpdated { reasoning, .. } => {
+                self.upsert_reasoning(reasoning.clone());
+            }
+            AgentRuntimeEventPayload::PlanUpdated { plan } => {
+                self.upsert_plan(plan.clone());
+            }
+            AgentRuntimeEventPayload::DiffUpdated { diff } => {
+                self.upsert_diff(diff.clone());
+            }
+            AgentRuntimeEventPayload::PlanWritten { .. }
+            | AgentRuntimeEventPayload::WorkspaceUpdated { .. }
+            | AgentRuntimeEventPayload::ArtifactCreated { .. }
+            | AgentRuntimeEventPayload::TempFileWritten { .. }
+            | AgentRuntimeEventPayload::CheckpointCreated { .. }
+            | AgentRuntimeEventPayload::SessionFileWritten { .. }
+            | AgentRuntimeEventPayload::SessionFileDeleted { .. } => {
+                validate_session_resource_payload(payload)?;
+                self.apply_session_resource(payload)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn apply_session_resource(
         &mut self,
         payload: &AgentRuntimeEventPayload,
@@ -925,6 +1016,165 @@ impl ThreadState {
         );
         self.next_message_ordinal += 1;
         message_id
+    }
+
+    fn upsert_turn(&mut self, turn: TurnSnapshot) {
+        self.snapshot.revision = self.snapshot.revision.max(turn.turn_id.revision());
+        if let Some(existing) = self
+            .snapshot
+            .turns
+            .iter_mut()
+            .find(|candidate| candidate.turn_id == turn.turn_id)
+        {
+            *existing = turn;
+        } else {
+            self.snapshot.turns.push(turn);
+        }
+    }
+
+    fn upsert_message(&mut self, message: MessageSnapshot) {
+        self.snapshot.revision = self.snapshot.revision.max(message.message_id.revision());
+        if let Some(existing) = self
+            .snapshot
+            .messages
+            .iter_mut()
+            .find(|candidate| candidate.message_id == message.message_id)
+        {
+            *existing = message;
+        } else {
+            self.snapshot.messages.push(message);
+        }
+    }
+
+    fn upsert_tool(&mut self, tool: ToolExecutionSnapshot) {
+        self.snapshot.revision = self.snapshot.revision.max(tool.turn_id.revision());
+        if let Some(existing) = self.snapshot.tools.iter_mut().find(|candidate| {
+            candidate.turn_id == tool.turn_id && candidate.tool_call_id == tool.tool_call_id
+        }) {
+            *existing = tool;
+        } else {
+            self.snapshot.tools.push(tool);
+        }
+    }
+
+    fn upsert_approval(&mut self, approval: ApprovalSnapshot) {
+        self.snapshot.revision = self.snapshot.revision.max(approval.turn_id.revision());
+        if let Some(existing) = self.snapshot.approvals.iter_mut().find(|candidate| {
+            candidate.turn_id == approval.turn_id && candidate.request.id == approval.request.id
+        }) {
+            *existing = approval;
+        } else {
+            self.snapshot.approvals.push(approval);
+        }
+    }
+
+    fn upsert_human_interaction(&mut self, interaction: HumanInteractionSnapshot) {
+        self.snapshot.revision = self.snapshot.revision.max(interaction.turn_id.revision());
+        if let Some(existing) = self
+            .snapshot
+            .human_interactions
+            .iter_mut()
+            .find(|candidate| {
+                candidate.turn_id == interaction.turn_id
+                    && candidate.request.request_id == interaction.request.request_id
+            })
+        {
+            *existing = interaction;
+        } else {
+            self.snapshot.human_interactions.push(interaction);
+        }
+    }
+
+    fn upsert_reasoning(&mut self, reasoning: ReasoningSnapshot) {
+        self.snapshot.revision = self.snapshot.revision.max(reasoning.turn_id.revision());
+        if let Some(existing) = self.snapshot.reasoning.iter_mut().find(|candidate| {
+            candidate.turn_id == reasoning.turn_id && candidate.message_id == reasoning.message_id
+        }) {
+            *existing = reasoning;
+        } else {
+            self.snapshot.reasoning.push(reasoning);
+        }
+    }
+
+    fn upsert_plan(&mut self, plan: PlanSnapshot) {
+        self.snapshot.revision = self.snapshot.revision.max(plan.turn_id.revision());
+        if let Some(existing) = self
+            .snapshot
+            .plans
+            .iter_mut()
+            .find(|candidate| candidate.turn_id == plan.turn_id)
+        {
+            *existing = plan;
+        } else {
+            self.snapshot.plans.push(plan);
+        }
+    }
+
+    fn upsert_diff(&mut self, diff: DiffSnapshot) {
+        self.snapshot.revision = self.snapshot.revision.max(diff.turn_id.revision());
+        if let Some(existing) = self
+            .snapshot
+            .diffs
+            .iter_mut()
+            .find(|candidate| candidate.turn_id == diff.turn_id)
+        {
+            *existing = diff;
+        } else {
+            self.snapshot.diffs.push(diff);
+        }
+    }
+
+    fn attach_message_to_turn(&mut self, turn_id: TurnId, message_id: MessageId) {
+        if let Some(turn) = self.turn_mut(turn_id) {
+            if !turn.message_ids.contains(&message_id) {
+                turn.message_ids.push(message_id);
+            }
+        }
+    }
+
+    fn apply_tool_activity(&mut self, tool: &ToolExecutionSnapshot) {
+        if let Some(turn) = self.turn_mut(tool.turn_id) {
+            match tool.status {
+                ToolStatus::Running => {
+                    if !turn.active_tool_call_ids.contains(&tool.tool_call_id) {
+                        turn.active_tool_call_ids.push(tool.tool_call_id.clone());
+                    }
+                }
+                ToolStatus::Completed => {
+                    turn.active_tool_call_ids
+                        .retain(|id| id != &tool.tool_call_id);
+                }
+            }
+        }
+    }
+
+    fn current_active_turn_id(&self) -> Option<TurnId> {
+        self.snapshot
+            .turns
+            .iter()
+            .find(|turn| matches!(turn.status, TurnStatus::Queued | TurnStatus::Running))
+            .map(|turn| turn.turn_id)
+    }
+
+    fn refresh_replay_counters(&mut self) {
+        self.next_turn_ordinal = self
+            .snapshot
+            .turns
+            .iter()
+            .filter(|turn| turn.turn_id.thread_id() == self.thread_id())
+            .map(|turn| turn.turn_id.ordinal())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.next_message_ordinal = self
+            .snapshot
+            .messages
+            .iter()
+            .filter(|message| message.message_id.thread_id() == self.thread_id())
+            .map(|message| message.message_id.ordinal())
+            .max()
+            .unwrap_or(0)
+            + 1;
     }
 
     fn ensure_turn_can_project(&self, turn_id: TurnId) -> Result<(), AgentRuntimeError> {
@@ -1130,6 +1380,7 @@ impl ThreadState {
 #[derive(Debug, Clone)]
 pub struct ChatProjector {
     default_thread_id: ThreadId,
+    replay_capacity: usize,
     threads: HashMap<ThreadId, ThreadState>,
 }
 
@@ -1147,13 +1398,43 @@ impl ChatProjector {
         threads.insert(thread_id, ThreadState::new(thread_id, replay_capacity));
         Self {
             default_thread_id: thread_id,
+            replay_capacity,
             threads,
         }
+    }
+
+    pub fn from_events(
+        config: ChatRuntimeConfig,
+        events: impl IntoIterator<Item = AgentRuntimeEvent>,
+    ) -> Result<Self, AgentRuntimeError> {
+        let mut projector = Self::new(config);
+        for event in events {
+            projector.apply_replayed_event(event)?;
+        }
+        Ok(projector)
+    }
+
+    pub fn apply_replayed_event(
+        &mut self,
+        event: AgentRuntimeEvent,
+    ) -> Result<(), AgentRuntimeError> {
+        self.threads
+            .entry(event.thread_id)
+            .or_insert_with(|| ThreadState::new(event.thread_id, self.replay_capacity));
+        self.thread_mut(event.thread_id)?
+            .apply_replayed_event(event)
     }
 
     #[must_use]
     pub fn default_thread_id(&self) -> ThreadId {
         self.default_thread_id
+    }
+
+    #[must_use]
+    pub fn thread_ids(&self) -> Vec<ThreadId> {
+        let mut ids = self.threads.keys().copied().collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.to_string());
+        ids
     }
 
     #[must_use]
@@ -1424,6 +1705,64 @@ impl ChatProjector {
     ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
         self.thread_mut(thread_id)?
             .record_session_resource_for_thread(payload)
+    }
+
+    pub fn normalize_for_resume(&mut self) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        let mut events = Vec::new();
+        for thread_id in self.thread_ids() {
+            events.extend(self.normalize_thread_for_resume(thread_id)?);
+        }
+        Ok(events)
+    }
+
+    fn normalize_thread_for_resume(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        let snapshot = self.read_thread(thread_id)?;
+        let mut events = Vec::new();
+
+        let running_tools = snapshot
+            .tools
+            .iter()
+            .filter(|tool| tool.status == ToolStatus::Running)
+            .map(|tool| (tool.turn_id, tool.tool_call_id.clone()))
+            .collect::<Vec<_>>();
+        for (turn_id, tool_call_id) in running_tools {
+            events.push(self.complete_tool(
+                turn_id,
+                &tool_call_id,
+                AgentToolResult {
+                    tool_call_id: tool_call_id.clone(),
+                    result: serde_json::json!({
+                        "error": "session resumed before tool completed"
+                    }),
+                    is_error: true,
+                },
+            )?);
+        }
+
+        let streaming_messages = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.status == MessageStatus::Streaming)
+            .map(|message| (message.message_id, message.payload.clone()))
+            .collect::<Vec<_>>();
+        for (message_id, payload) in streaming_messages {
+            events.push(self.complete_message(message_id, payload)?);
+        }
+
+        for turn in snapshot
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.status, TurnStatus::Queued | TurnStatus::Running))
+        {
+            events.extend(self.cancel_pending_approvals(turn.turn_id)?);
+            events.extend(self.cancel_pending_human_interactions(turn.turn_id)?);
+            events.push(self.cancel_turn(turn.turn_id)?);
+        }
+
+        Ok(events)
     }
 
     fn thread(&self, thread_id: ThreadId) -> Result<&ThreadState, AgentRuntimeError> {

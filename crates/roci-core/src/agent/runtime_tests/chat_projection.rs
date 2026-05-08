@@ -1,7 +1,7 @@
 use super::chat::{
-    AgentRuntimeError, AgentRuntimeEventPayload, ApprovalStatus, ChatProjector,
-    HumanInteractionStatus, MessageStatus, RuntimeCursor, SessionResourceSnapshot, ToolStatus,
-    TurnStatus,
+    AgentRuntimeError, AgentRuntimeEventPayload, AgentRuntimeEventStore, ApprovalStatus,
+    ChatProjector, ChatRuntimeConfig, HumanInteractionStatus, JsonlAgentRuntimeEventStore,
+    MessageStatus, RuntimeCursor, SessionResourceSnapshot, ThreadId, ToolStatus, TurnStatus,
 };
 use crate::agent_loop::{ApprovalDecision, ApprovalKind, ApprovalRequest, ToolUpdatePayload};
 use crate::human_interaction::{
@@ -24,6 +24,32 @@ fn resource(
         len,
         updated_at: Utc::now(),
         metadata: serde_json::json!({ "origin": "projection-test" }),
+    }
+}
+
+fn approval_request(id: &str) -> ApprovalRequest {
+    ApprovalRequest {
+        id: id.to_string(),
+        kind: ApprovalKind::CommandExecution,
+        reason: Some("run shell".to_string()),
+        payload: serde_json::json!({ "tool_name": "shell" }),
+        suggested_policy_change: None,
+    }
+}
+
+fn ask_user_request() -> HumanInteractionRequest {
+    HumanInteractionRequest {
+        request_id: uuid::Uuid::new_v4(),
+        source: HumanInteractionSource::Host,
+        payload: HumanInteractionPayload::AskUser(AskUserRequest {
+            prompt: AskUserPrompt::Confirm {
+                id: "continue".to_string(),
+                question: "Continue?".to_string(),
+                default: None,
+            },
+        }),
+        timeout_ms: None,
+        created_at: Utc::now(),
     }
 }
 
@@ -802,4 +828,320 @@ fn terminal_methods_reject_already_terminal_turns() {
             status: TurnStatus::Canceled,
         }
     );
+}
+
+#[test]
+fn projector_replays_runtime_events_into_snapshot() {
+    let mut projector = ChatProjector::new(ChatRuntimeConfig::default());
+    let thread_id = projector.default_thread_id();
+    let queued = projector.queue_turn(vec![ModelMessage::user("hello replay")]);
+    let started = projector.start_turn(queued.turn_id).unwrap();
+    let message = projector
+        .start_message(queued.turn_id, ModelMessage::assistant(""))
+        .unwrap();
+    let updated = projector
+        .update_message(message.message_id, ModelMessage::assistant("stream"))
+        .unwrap();
+    let completed_message = projector
+        .complete_message(message.message_id, ModelMessage::assistant("done"))
+        .unwrap();
+    let tool_started = projector
+        .start_tool(
+            queued.turn_id,
+            "call-replay",
+            "search",
+            serde_json::json!({ "query": "roci" }),
+        )
+        .unwrap();
+    let tool_updated = projector
+        .update_tool(
+            queued.turn_id,
+            "call-replay",
+            ToolUpdatePayload {
+                content: vec![ContentPart::Text {
+                    text: "partial".to_string(),
+                }],
+                details: serde_json::json!({ "seen": 1 }),
+            },
+        )
+        .unwrap();
+    let tool_completed = projector
+        .complete_tool(
+            queued.turn_id,
+            "call-replay",
+            AgentToolResult {
+                tool_call_id: "call-replay".to_string(),
+                result: serde_json::json!({ "ok": true }),
+                is_error: false,
+            },
+        )
+        .unwrap();
+    let approval_required = projector
+        .require_approval(queued.turn_id, approval_request("approval-replay"))
+        .unwrap();
+    let approval_resolved = projector
+        .resolve_approval(queued.turn_id, "approval-replay", ApprovalDecision::Accept)
+        .unwrap();
+    let interaction_request = ask_user_request();
+    let interaction_requested = projector
+        .request_human_interaction(queued.turn_id, interaction_request.clone())
+        .unwrap();
+    let interaction_resolved = projector
+        .resolve_human_interaction(
+            queued.turn_id,
+            HumanInteractionResponse {
+                request_id: interaction_request.request_id,
+                payload: HumanInteractionResponsePayload::Declined,
+                resolved_at: Utc::now(),
+            },
+        )
+        .unwrap();
+    let reasoning = projector
+        .update_reasoning(queued.turn_id, Some(message.message_id), "think")
+        .unwrap();
+    let plan = projector.update_plan(queued.turn_id, "plan").unwrap();
+    let diff = projector.update_diff(queued.turn_id, "diff").unwrap();
+    let artifact = projector
+        .record_session_resource(
+            queued.turn_id,
+            AgentRuntimeEventPayload::ArtifactCreated {
+                resource: resource(
+                    SessionResourceNamespace::Artifacts,
+                    Some("replay/out.md"),
+                    12,
+                ),
+            },
+        )
+        .unwrap();
+    let completed = projector.complete_turn(queued.turn_id).unwrap();
+    let mut events = queued.events;
+    events.extend([
+        started,
+        message.event,
+        updated,
+        completed_message,
+        tool_started,
+        tool_updated,
+        tool_completed,
+        approval_required,
+        approval_resolved,
+        interaction_requested,
+        interaction_resolved,
+        reasoning,
+        plan,
+        diff,
+        artifact,
+        completed,
+    ]);
+
+    let replayed = ChatProjector::from_events(
+        ChatRuntimeConfig {
+            default_thread_id: Some(thread_id),
+            ..ChatRuntimeConfig::default()
+        },
+        events.clone(),
+    )
+    .unwrap();
+    let thread = replayed.read_thread(thread_id).unwrap();
+
+    assert_eq!(thread.last_seq, events.last().unwrap().seq);
+    assert_eq!(thread.turns[0].status, TurnStatus::Completed);
+    assert_eq!(thread.messages[0].payload.text(), "hello replay");
+    assert_eq!(thread.messages[1].payload.text(), "done");
+    assert_eq!(thread.tools[0].status, ToolStatus::Completed);
+    assert_eq!(thread.approvals[0].status, ApprovalStatus::Resolved);
+    assert_eq!(
+        thread.human_interactions[0].status,
+        HumanInteractionStatus::Resolved
+    );
+    assert_eq!(thread.reasoning[0].text, "think");
+    assert_eq!(thread.plans[0].plan, "plan");
+    assert_eq!(thread.diffs[0].diff, "diff");
+    assert_eq!(thread.resources.artifacts.len(), 1);
+    assert!(thread.active_turn_id.is_none());
+    assert_eq!(
+        replayed
+            .events_after(RuntimeCursor::new(thread_id, 0))
+            .unwrap(),
+        events
+    );
+}
+
+#[test]
+fn projector_replays_non_default_thread_events() {
+    let non_default = ThreadId::new();
+    let mut source = ChatProjector::new(ChatRuntimeConfig {
+        default_thread_id: Some(non_default),
+        ..ChatRuntimeConfig::default()
+    });
+    let queued = source.queue_turn(vec![ModelMessage::user("other thread")]);
+
+    let replayed = ChatProjector::from_events(ChatRuntimeConfig::default(), queued.events).unwrap();
+
+    assert_eq!(
+        replayed.read_thread(non_default).unwrap().messages[0]
+            .payload
+            .text(),
+        "other thread"
+    );
+    assert_eq!(replayed.thread_ids(), {
+        let mut ids = vec![replayed.default_thread_id(), non_default];
+        ids.sort_by_key(|id| id.to_string());
+        ids
+    });
+}
+
+#[tokio::test]
+async fn all_events_orders_by_thread_seq_not_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonlAgentRuntimeEventStore::open(dir.path().join("events.jsonl")).unwrap();
+    let mut projector = ChatProjector::new(ChatRuntimeConfig::default());
+    let queued = projector.queue_turn(vec![ModelMessage::user("timestamp order")]);
+    let mut first = queued.events[0].clone();
+    let mut second = queued.events[1].clone();
+    first.timestamp = Utc::now();
+    second.timestamp = first.timestamp - chrono::Duration::seconds(60);
+    store.append(first).await.unwrap();
+    store.append(second).await.unwrap();
+
+    let events = store.all_events().await;
+
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn normalize_for_resume_cancels_queued_and_running_turns() {
+    let mut projector = ChatProjector::default();
+    let running = projector.queue_turn(Vec::new());
+    projector.start_turn(running.turn_id).unwrap();
+    let queued = projector.queue_turn(Vec::new());
+
+    let events = projector.normalize_for_resume().unwrap();
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.payload, AgentRuntimeEventPayload::TurnCanceled { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        thread
+            .turns
+            .iter()
+            .find(|turn| turn.turn_id == running.turn_id)
+            .unwrap()
+            .status,
+        TurnStatus::Canceled
+    );
+    assert_eq!(
+        thread
+            .turns
+            .iter()
+            .find(|turn| turn.turn_id == queued.turn_id)
+            .unwrap()
+            .status,
+        TurnStatus::Canceled
+    );
+    assert!(thread.active_turn_id.is_none());
+}
+
+#[test]
+fn normalize_for_resume_cancels_pending_approval_and_human_interaction() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).unwrap();
+    projector
+        .require_approval(queued.turn_id, approval_request("approval-normalize"))
+        .unwrap();
+    projector
+        .request_human_interaction(queued.turn_id, ask_user_request())
+        .unwrap();
+
+    let events = projector.normalize_for_resume().unwrap();
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    assert!(events.iter().any(|event| matches!(
+        event.payload,
+        AgentRuntimeEventPayload::ApprovalCanceled { .. }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event.payload,
+        AgentRuntimeEventPayload::HumanInteractionCanceled { .. }
+    )));
+    assert_eq!(thread.approvals[0].status, ApprovalStatus::Canceled);
+    assert_eq!(
+        thread.human_interactions[0].status,
+        HumanInteractionStatus::Canceled
+    );
+}
+
+#[test]
+fn normalize_for_resume_finishes_active_tool_with_error_result() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).unwrap();
+    projector
+        .start_tool(
+            queued.turn_id,
+            "call-normalize",
+            "search",
+            serde_json::json!({ "query": "roci" }),
+        )
+        .unwrap();
+
+    let events = projector.normalize_for_resume().unwrap();
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    let completed = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            AgentRuntimeEventPayload::ToolCompleted { tool } => Some(tool),
+            _ => None,
+        })
+        .expect("tool completion emitted");
+    assert_eq!(completed.status, ToolStatus::Completed);
+    assert_eq!(completed.final_result.as_ref().unwrap().is_error, true);
+    assert_eq!(thread.tools[0].status, ToolStatus::Completed);
+    assert!(thread.turns[0].active_tool_call_ids.is_empty());
+}
+
+#[test]
+fn normalize_for_resume_completes_streaming_message_with_current_payload() {
+    let mut projector = ChatProjector::default();
+    let queued = projector.queue_turn(Vec::new());
+    projector.start_turn(queued.turn_id).unwrap();
+    let message = projector
+        .start_message(queued.turn_id, ModelMessage::assistant(""))
+        .unwrap();
+    projector
+        .update_message(message.message_id, ModelMessage::assistant("partial"))
+        .unwrap();
+
+    let events = projector.normalize_for_resume().unwrap();
+    let thread = projector
+        .read_thread(projector.default_thread_id())
+        .expect("default thread exists");
+
+    let completed = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            AgentRuntimeEventPayload::MessageCompleted { message } => Some(message),
+            _ => None,
+        })
+        .expect("message completion emitted");
+    assert_eq!(completed.payload.text(), "partial");
+    assert_eq!(completed.status, MessageStatus::Completed);
+    assert_eq!(thread.messages[0].status, MessageStatus::Completed);
+    assert_eq!(thread.messages[0].payload.text(), "partial");
 }

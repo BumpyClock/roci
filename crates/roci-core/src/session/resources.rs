@@ -67,6 +67,20 @@ impl LocalSessionResources {
         Ok(Self { conventions })
     }
 
+    /// Open existing local session resources using explicit path conventions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when required directories are missing.
+    pub fn open_existing_with_conventions(conventions: PathConventions) -> SessionResult<Self> {
+        ensure_dir(conventions.root())?;
+        ensure_dir(conventions.files_dir())?;
+        ensure_dir(conventions.artifacts_dir())?;
+        ensure_dir(conventions.temp_dir())?;
+        ensure_dir(conventions.checkpoints_dir())?;
+        Ok(Self { conventions })
+    }
+
     /// Return path conventions used by this resource store.
     #[must_use]
     pub fn conventions(&self) -> &PathConventions {
@@ -477,6 +491,18 @@ impl LocalSessionResources {
 fn create_dir(path: impl AsRef<Path>) -> SessionResult<()> {
     let path = path.as_ref();
     fs::create_dir_all(path).map_err(|source| SessionError::io(path, source))
+}
+
+fn ensure_dir(path: impl AsRef<Path>) -> SessionResult<()> {
+    let path = path.as_ref();
+    let metadata = fs::metadata(path).map_err(|source| SessionError::io(path, source))?;
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(SessionError::NotDirectory {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 fn create_namespace_dir(path: impl AsRef<Path>) -> SessionResult<()> {

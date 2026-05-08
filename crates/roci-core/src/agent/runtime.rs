@@ -1,6 +1,6 @@
 //! High-level Agent runtime wrapping the agent loop.
 //!
-//! Provides the pi-mono aligned API surface:
+//! Provides the public high-level Agent runtime API surface:
 //! - [`Agent::prompt`] — start a new conversation
 //! - [`Agent::continue_run`] — continue with additional context
 //! - [`Agent::continue_without_input`] — continue without appending a new user message
@@ -63,7 +63,9 @@ use crate::provider::ProviderRegistry;
 use crate::provider::ProviderRequest;
 #[cfg(test)]
 use crate::resource::{BranchSummarySettings, CompactionSettings};
-use crate::session::{LocalSessionFs, LocalSessionResources, SessionMetadata};
+use crate::session::{
+    LocalProviderLedger, LocalSessionFs, LocalSessionResources, SessionLease, SessionResumeState,
+};
 use crate::tools::dynamic::DynamicToolProvider;
 use crate::tools::tool::Tool;
 use crate::tools::SandboxProvider;
@@ -124,6 +126,9 @@ pub struct AgentRuntime {
     session_config: Option<crate::session::SessionConfig>,
     session_fs: Option<Arc<LocalSessionFs>>,
     session_resources: Option<Arc<LocalSessionResources>>,
+    provider_ledger: Option<Arc<LocalProviderLedger>>,
+    persisted_provider_message_count: Arc<Mutex<usize>>,
+    session_lease: Option<Arc<SessionLease>>,
     sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     /// Persistent session usage ledger. Accumulates across runs, cleared on reset.
     session_usage: Arc<Mutex<Usage>>,
@@ -187,28 +192,14 @@ impl AgentRuntime {
         let dynamic_tool_providers = Arc::new(Mutex::new(config.dynamic_tool_providers.clone()));
         let replay_capacity = normalized_replay_capacity(config.chat.replay_capacity);
         let session_conventions = config.session.as_ref().map(|session| session.conventions());
-        let session_resources = session_conventions
-            .clone()
-            .map(LocalSessionResources::with_conventions)
-            .transpose()
-            .map_err(|err| RociError::InvalidState(err.to_string()))?
-            .map(Arc::new);
-        let session_fs = session_conventions
-            .clone()
-            .map(LocalSessionFs::with_conventions)
-            .transpose()
-            .map_err(|err| RociError::InvalidState(err.to_string()))?
-            .map(Arc::new);
-        if let (Some(session), Some(conventions)) = (&config.session, &session_conventions) {
-            SessionMetadata::new(session.id.clone(), std::env::current_dir().ok(), None)
-                .write_to_path(conventions.metadata_file())
-                .map_err(|err| RociError::InvalidState(err.to_string()))?;
-        }
+        let session_resources = None;
+        let session_fs = None;
         let runtime_event_store: Arc<dyn AgentRuntimeEventStore> = match session_conventions {
-            Some(conventions) => Arc::new(
-                JsonlAgentRuntimeEventStore::open(conventions.events_file())
-                    .map_err(Self::map_chat_projection_error)?,
-            ),
+            Some(_) => config.chat.event_store.clone().ok_or_else(|| {
+                RociError::InvalidState(
+                    "session runtime event store must be prepared by LocalSessionStore".to_string(),
+                )
+            })?,
             None => config.chat.event_store.clone().unwrap_or_else(|| {
                 Arc::new(InMemoryAgentRuntimeEventStore::with_replay_capacity(
                     replay_capacity,
@@ -274,6 +265,9 @@ impl AgentRuntime {
             session_config,
             session_fs,
             session_resources,
+            provider_ledger: None,
+            persisted_provider_message_count: Arc::new(Mutex::new(0)),
+            session_lease: None,
             sandbox_provider,
             session_usage: Arc::new(Mutex::new(Usage::default())),
             #[cfg(feature = "agent")]
@@ -281,6 +275,89 @@ impl AgentRuntime {
             #[cfg(feature = "agent")]
             tool_permission_session_approvals,
         })
+    }
+
+    /// Resume an agent runtime from prepared local session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when config mismatches the prepared session state or
+    /// runtime construction fails.
+    pub async fn resume_session(
+        registry: Arc<ProviderRegistry>,
+        roci_config: RociConfig,
+        mut config: AgentConfig,
+        state: SessionResumeState,
+    ) -> Result<Self, RociError> {
+        if state.session_config.id != state.metadata.id {
+            return Err(RociError::InvalidState(
+                "resume state session id does not match metadata id".to_string(),
+            ));
+        }
+        if let Some(existing) = &config.session {
+            if existing != &state.session_config {
+                return Err(RociError::InvalidState(
+                    "resume session config does not match resume state".to_string(),
+                ));
+            }
+        }
+        if let Some(thread_id) = config.chat.default_thread_id {
+            if thread_id != state.default_thread_id {
+                return Err(RociError::InvalidState(
+                    "resume default thread id does not match resume state".to_string(),
+                ));
+            }
+        }
+
+        config.session = Some(state.session_config.clone());
+        config.chat.default_thread_id = Some(state.default_thread_id);
+        config.chat.event_store = Some(Arc::new(
+            JsonlAgentRuntimeEventStore::open(state.session_config.conventions().events_file())
+                .map_err(Self::map_chat_projection_error)?,
+        ));
+        let mut agent = Self::try_new(registry, roci_config, config)?;
+        agent.session_fs = Some(Arc::new(
+            LocalSessionFs::open_existing_with_conventions(state.session_config.conventions())
+                .map_err(|err| RociError::InvalidState(err.to_string()))?,
+        ));
+        agent.session_resources = Some(Arc::new(
+            LocalSessionResources::open_existing_with_conventions(
+                state.session_config.conventions(),
+            )
+            .map_err(|err| RociError::InvalidState(err.to_string()))?,
+        ));
+        let persisted_count = state.model_messages.len();
+        agent
+            .import_runtime_snapshot(state.runtime, state.model_messages)
+            .await?;
+        agent.provider_ledger = Some(Arc::new(
+            LocalProviderLedger::open(state.session_config.conventions().provider_ledger_file())
+                .map_err(|err| RociError::InvalidState(err.to_string()))?,
+        ));
+        *agent.persisted_provider_message_count.lock().await = persisted_count;
+        agent.session_lease = Some(state.lease);
+        Ok(agent)
+    }
+
+    async fn import_runtime_snapshot(
+        &self,
+        snapshot: RuntimeSnapshot,
+        model_messages: Vec<ModelMessage>,
+    ) -> Result<(), RociError> {
+        {
+            let mut projector = self
+                .chat_projector
+                .lock()
+                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
+            for thread in snapshot.threads {
+                projector
+                    .import_thread(thread)
+                    .map_err(Self::map_chat_projection_error)?;
+            }
+        }
+        *self.messages.lock().await = model_messages;
+        self.broadcast_snapshot().await;
+        Ok(())
     }
 
     /// Submit a user input response.

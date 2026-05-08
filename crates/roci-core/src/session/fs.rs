@@ -151,6 +151,31 @@ impl LocalSessionFs {
         })
     }
 
+    /// Open an existing local session filesystem using explicit conventions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session root or `files/` directory is missing.
+    pub fn open_existing_with_conventions(conventions: PathConventions) -> SessionResult<Self> {
+        if !conventions.root().is_dir() {
+            return Err(SessionError::NotDirectory {
+                path: conventions.root().to_path_buf(),
+            });
+        }
+        if !conventions.files_dir().is_dir() {
+            return Err(SessionError::NotDirectory {
+                path: conventions.files_dir(),
+            });
+        }
+        let canonical_files_root = fs::canonicalize(conventions.files_dir())
+            .map_err(|source| SessionError::io(conventions.files_dir(), source))?;
+
+        Ok(Self {
+            conventions,
+            canonical_files_root,
+        })
+    }
+
     /// Return path conventions used by this filesystem.
     #[must_use]
     pub fn conventions(&self) -> &PathConventions {

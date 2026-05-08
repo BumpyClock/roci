@@ -187,6 +187,24 @@ impl PathConventions {
         self.root.join("events.jsonl")
     }
 
+    /// Runtime snapshot cache path.
+    #[must_use]
+    pub fn runtime_snapshot_file(&self) -> PathBuf {
+        self.root.join("runtime.snapshot.json")
+    }
+
+    /// Provider message ledger path.
+    #[must_use]
+    pub fn provider_ledger_file(&self) -> PathBuf {
+        self.root.join("model_messages.jsonl")
+    }
+
+    /// Provider message ledger snapshot cache path.
+    #[must_use]
+    pub fn provider_ledger_snapshot_file(&self) -> PathBuf {
+        self.root.join("model_messages.snapshot.json")
+    }
+
     /// Session plan document path.
     #[must_use]
     pub fn plan_file(&self) -> PathBuf {
@@ -287,5 +305,26 @@ mod tests {
         assert!(serde_json::from_str::<LogicalPath>(r#""../outside.txt""#).is_err());
         assert!(serde_json::from_str::<LogicalPath>(r#""/tmp/out.txt""#).is_err());
         assert!(serde_json::from_str::<LogicalPath>(r#""nested\\out.txt""#).is_err());
+    }
+
+    #[test]
+    fn path_conventions_include_resume_cache_and_provider_ledger_paths() {
+        let id = SessionId::parse("session-layout").unwrap();
+        let conventions = PathConventions::for_session("/tmp/roci-sessions", &id);
+
+        assert_eq!(
+            conventions.runtime_snapshot_file(),
+            std::path::PathBuf::from("/tmp/roci-sessions/session-layout/runtime.snapshot.json")
+        );
+        assert_eq!(
+            conventions.provider_ledger_file(),
+            std::path::PathBuf::from("/tmp/roci-sessions/session-layout/model_messages.jsonl")
+        );
+        assert_eq!(
+            conventions.provider_ledger_snapshot_file(),
+            std::path::PathBuf::from(
+                "/tmp/roci-sessions/session-layout/model_messages.snapshot.json"
+            )
+        );
     }
 }

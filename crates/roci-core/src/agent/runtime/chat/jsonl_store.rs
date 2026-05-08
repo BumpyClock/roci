@@ -103,6 +103,18 @@ impl JsonlAgentRuntimeEventStore {
 
         Ok(())
     }
+
+    /// Return all retained replay events sorted by thread id and per-thread seq.
+    pub async fn all_events(&self) -> Vec<AgentRuntimeEvent> {
+        let inner = self.inner.lock().await;
+        let mut events = inner
+            .threads
+            .values()
+            .flat_map(|thread| thread.events.iter().cloned())
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| (event.thread_id.to_string(), event.seq));
+        events
+    }
 }
 
 #[async_trait]

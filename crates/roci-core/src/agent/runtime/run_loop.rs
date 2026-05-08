@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::types::drain_queue;
-use super::{AgentRuntime, AgentRuntimeError, CollaborationMode, TurnId, TurnStatus};
+use super::{AgentRuntime, AgentRuntimeError, CollaborationMode, ThreadId, TurnId, TurnStatus};
 use crate::agent_loop::runner::{
     AutoCompactionConfig, BeforeAgentStartHookPayload, BeforeAgentStartHookResult,
     CompactionHandler, FollowUpMessagesFn, RunHooks, SteeringMessagesFn,
@@ -437,7 +437,18 @@ impl AgentRuntime {
                             .project_structured_plan(turn_id, &result.messages)
                             .await
                         {
-                            Ok(()) => self.complete_chat_turn(turn_id).await,
+                            Ok(()) => {
+                                match self
+                                    .persist_provider_ledger_messages(
+                                        turn_id.thread_id(),
+                                        &result.messages,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => self.complete_chat_turn(turn_id).await,
+                                    Err(err) => Err(err),
+                                }
+                            }
                             Err(err) => {
                                 let message = err.to_string();
                                 plan_contract_error = Some(message.clone());
@@ -445,7 +456,13 @@ impl AgentRuntime {
                             }
                         }
                     } else {
-                        self.complete_chat_turn(turn_id).await
+                        match self
+                            .persist_provider_ledger_messages(turn_id.thread_id(), &result.messages)
+                            .await
+                        {
+                            Ok(()) => self.complete_chat_turn(turn_id).await,
+                            Err(err) => Err(err),
+                        }
                     }
                 }
                 RunStatus::Failed => {
@@ -558,6 +575,38 @@ impl AgentRuntime {
             .await
             .map(|_| ())
             .map_err(Self::map_chat_projection_error)
+    }
+
+    async fn persist_provider_ledger_messages(
+        &self,
+        thread_id: ThreadId,
+        messages: &[ModelMessage],
+    ) -> Result<(), RociError> {
+        let Some(ledger) = &self.provider_ledger else {
+            return Ok(());
+        };
+        let mut persisted = self.persisted_provider_message_count.lock().await;
+        let needs_compaction = *persisted > messages.len()
+            || self
+                .messages
+                .lock()
+                .await
+                .get(..*persisted)
+                .is_some_and(|current| current != messages.get(..*persisted).unwrap_or(&[]));
+        if needs_compaction {
+            ledger
+                .append_compacted(thread_id, messages.to_vec())
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
+            *persisted = messages.len();
+            return Ok(());
+        }
+        for message in &messages[*persisted..] {
+            ledger
+                .append_message(thread_id, message.clone())
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
+        }
+        *persisted = messages.len();
+        Ok(())
     }
 }
 

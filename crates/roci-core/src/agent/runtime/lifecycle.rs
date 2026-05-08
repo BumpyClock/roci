@@ -48,6 +48,12 @@ impl AgentRuntime {
             .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
             .await
             .map_err(Self::map_chat_projection_error)?;
+        if let Some(ledger) = &self.provider_ledger {
+            ledger
+                .append_compacted(snapshot.thread_id, imported.model_messages.clone())
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
+            *self.persisted_provider_message_count.lock().await = imported.model_messages.len();
+        }
         *existing_messages = imported.model_messages;
         drop(existing_messages);
         drop(state_guard);
@@ -474,6 +480,12 @@ impl AgentRuntime {
             .await
         {
             *self.last_error.lock().await = Some(err.to_string());
+        }
+        if let Some(ledger) = &self.provider_ledger {
+            if let Err(err) = ledger.append_ledger_invalidated(snapshot.thread_id) {
+                *self.last_error.lock().await = Some(err.to_string());
+            }
+            *self.persisted_provider_message_count.lock().await = 0;
         }
 
         let mut state = self.state.lock().await;

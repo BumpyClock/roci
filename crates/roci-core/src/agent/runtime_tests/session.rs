@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
@@ -8,7 +8,10 @@ use tokio::time::{timeout, Duration};
 use super::chat::{AgentRuntimeEvent, AgentRuntimeEventPayload, TurnStatus};
 use super::support::*;
 use super::*;
-use crate::session::{LogicalPath, SessionConfig, SessionId};
+use crate::session::{
+    CreateSessionOptions, ImportPolicy, LocalProviderLedger, LocalSessionResources,
+    LocalSessionStore, LogicalPath, SessionConfig, SessionId,
+};
 
 static CWD_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -38,12 +41,21 @@ fn logical_path(value: &str) -> LogicalPath {
     LogicalPath::parse(value).expect("logical path should parse")
 }
 
-fn runtime_with_session(root: &std::path::Path, id: &str) -> AgentRuntime {
+async fn runtime_with_session(root: &std::path::Path, id: &str) -> AgentRuntime {
     let registry = registry_with_streaming_provider("stub", 1, 1);
     let mut config = test_agent_config();
     config.model = "stub:session".parse().expect("stub model should parse");
-    config.session = Some(SessionConfig::new(session_id(id), root));
-    AgentRuntime::try_new(registry, test_config(), config).expect("runtime should construct")
+    let store = LocalSessionStore::new(root);
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(session_id(id)),
+            ..CreateSessionOptions::default()
+        })
+        .await
+        .expect("session should create");
+    AgentRuntime::resume_session(registry, test_config(), config, state)
+        .await
+        .expect("runtime should resume")
 }
 
 async fn recv_event(sub: &mut RuntimeSubscription) -> AgentRuntimeEvent {
@@ -67,6 +79,305 @@ async fn assert_turn_status(agent: &AgentRuntime, turn_id: TurnId, status: TurnS
     assert_eq!(turn.status, status);
 }
 
+#[tokio::test]
+async fn local_session_store_create_writes_metadata_once_and_open_preserves_it() {
+    let sessions = tempdir().expect("session tempdir should be created");
+    let store = LocalSessionStore::new(sessions.path());
+    let id = session_id("session-store");
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            title: Some("Store test".to_string()),
+            host_cwd: Some(PathBuf::from("/tmp/project")),
+            import_source: None,
+            default_thread_id: None,
+        })
+        .await
+        .expect("session creates");
+    let created_at = state.metadata.created_at;
+    drop(state);
+
+    let reopened = store.open(id.clone()).await.expect("session opens");
+
+    assert_eq!(reopened.metadata.id, id);
+    assert_eq!(reopened.metadata.title.as_deref(), Some("Store test"));
+    assert_eq!(reopened.metadata.created_at, created_at);
+    assert_eq!(
+        reopened.metadata.host_cwd,
+        Some(PathBuf::from("/tmp/project"))
+    );
+    assert!(
+        SessionConfig::new(reopened.metadata.id.clone(), sessions.path())
+            .conventions()
+            .provider_ledger_file()
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn local_session_store_rejects_second_open_while_resume_state_alive() {
+    let sessions = tempdir().expect("session tempdir should be created");
+    let store = LocalSessionStore::new(sessions.path());
+    let id = session_id("session-lease");
+    let _state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..CreateSessionOptions::default()
+        })
+        .await
+        .unwrap();
+
+    let err = store.open(id).await.unwrap_err();
+
+    assert!(err.to_string().contains("already open"));
+}
+
+#[tokio::test]
+async fn resume_session_seeds_runtime_snapshot_and_provider_ledger() {
+    let sessions = tempdir().expect("session tempdir should be created");
+    let store = LocalSessionStore::new(sessions.path());
+    let id = session_id("session-resume");
+    let created = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..CreateSessionOptions::default()
+        })
+        .await
+        .unwrap();
+    let thread_id = created.default_thread_id;
+    let provider_ledger_file = created.session_config.conventions().provider_ledger_file();
+    drop(created);
+    let ledger = LocalProviderLedger::open(provider_ledger_file).unwrap();
+    let persisted = ModelMessage::user("persisted");
+    ledger
+        .append_message(thread_id, persisted.clone())
+        .expect("ledger appends");
+    drop(ledger);
+    let state = store.open(id).await.unwrap();
+    let registry = registry_with_streaming_provider("stub", 1, 1);
+    let mut config = test_agent_config();
+    config.model = "stub:session".parse().unwrap();
+
+    let agent = AgentRuntime::resume_session(registry, test_config(), config, state)
+        .await
+        .expect("session resumes");
+
+    assert_eq!(agent.messages().await, vec![persisted]);
+}
+
+#[tokio::test]
+async fn completed_turn_appends_provider_ledger_messages() {
+    let sessions = tempdir().expect("session tempdir should be created");
+    let store = LocalSessionStore::new(sessions.path());
+    let id = session_id("session-ledger-turn");
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..CreateSessionOptions::default()
+        })
+        .await
+        .unwrap();
+    let registry = registry_with_streaming_provider("stub", 1, 1);
+    let mut config = test_agent_config();
+    config.model = "stub:session".parse().unwrap();
+    let agent = AgentRuntime::resume_session(registry, test_config(), config, state)
+        .await
+        .unwrap();
+
+    let turn_id = agent
+        .enqueue_turn(EnqueueTurnRequest {
+            messages: vec![ModelMessage::user("persist me")],
+            generation_settings: None,
+            approval_policy: None,
+            collaboration_mode: None,
+        })
+        .await
+        .unwrap();
+    assert_turn_status(&agent, turn_id, TurnStatus::Completed).await;
+    drop(agent);
+
+    let reopened = store.open(id).await.unwrap();
+    assert_eq!(reopened.model_messages.len(), 2);
+    assert_eq!(reopened.model_messages[0].role, Role::User);
+    assert_eq!(reopened.model_messages[0].text(), "persist me");
+    assert_eq!(reopened.model_messages[1].role, Role::Assistant);
+    assert_eq!(reopened.model_messages[1].text(), "hello");
+}
+
+#[tokio::test]
+async fn replace_messages_writes_compacted_provider_ledger() {
+    let sessions = tempdir().unwrap();
+    let store = LocalSessionStore::new(sessions.path());
+    let id = session_id("session-ledger-replace");
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let agent =
+        AgentRuntime::resume_session(test_registry(), test_config(), test_agent_config(), state)
+            .await
+            .unwrap();
+
+    let replacement = ModelMessage::user("replacement");
+    agent
+        .replace_messages(vec![replacement.clone()])
+        .await
+        .unwrap();
+    drop(agent);
+
+    let reopened = store.open(id).await.unwrap();
+    assert_eq!(reopened.model_messages, vec![replacement]);
+}
+
+#[tokio::test]
+async fn replace_messages_after_resume_compacts_provider_ledger_without_suffix_panic() {
+    let sessions = tempdir().unwrap();
+    let store = LocalSessionStore::new(sessions.path());
+    let id = session_id("session-ledger-resume-replace");
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let thread_id = state.default_thread_id;
+    let ledger_path = state.session_config.conventions().provider_ledger_file();
+    drop(state);
+    let ledger = LocalProviderLedger::open(ledger_path).unwrap();
+    ledger
+        .append_message(thread_id, ModelMessage::user("old 1"))
+        .unwrap();
+    ledger
+        .append_message(thread_id, ModelMessage::assistant("old 2"))
+        .unwrap();
+    drop(ledger);
+
+    let state = store.open(id.clone()).await.unwrap();
+    let agent =
+        AgentRuntime::resume_session(test_registry(), test_config(), test_agent_config(), state)
+            .await
+            .unwrap();
+    let replacement = ModelMessage::user("short replacement");
+    agent
+        .replace_messages(vec![replacement.clone()])
+        .await
+        .unwrap();
+    drop(agent);
+
+    let reopened = store.open(id).await.unwrap();
+
+    assert_eq!(reopened.model_messages, vec![replacement]);
+}
+
+#[tokio::test]
+async fn compact_writes_compacted_provider_ledger_for_resume() {
+    let sessions = tempdir().unwrap();
+    let store = LocalSessionStore::new(sessions.path());
+    let id = session_id("session-ledger-compact");
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let registry = registry_with_summary_provider(
+        "stub",
+        "durable compact summary",
+        Arc::new(StdMutex::new(Vec::new())),
+    );
+    let mut config = test_agent_config();
+    config.model = "stub:run-model".parse().unwrap();
+    config.compaction.keep_recent_tokens = 1;
+    let agent = AgentRuntime::resume_session(registry, test_config(), config, state)
+        .await
+        .unwrap();
+    agent
+        .replace_messages(vec![
+            ModelMessage::user("old user"),
+            ModelMessage::assistant("old answer"),
+            ModelMessage::user("latest request"),
+        ])
+        .await
+        .unwrap();
+
+    agent.compact().await.unwrap();
+    let compacted = agent.messages().await;
+    assert!(compacted
+        .iter()
+        .any(|message| message.text().contains("durable compact summary")));
+    drop(agent);
+
+    let reopened = store.open(id).await.unwrap();
+    assert_eq!(reopened.model_messages, compacted);
+}
+
+#[tokio::test]
+async fn export_snapshot_contains_manifest_and_no_resource_bytes() {
+    let sessions = tempdir().unwrap();
+    let store = LocalSessionStore::new(sessions.path());
+    let id = session_id("session-export");
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let resources =
+        LocalSessionResources::with_conventions(state.session_config.conventions()).unwrap();
+    resources
+        .write_artifact(logical_path("artifact.txt"), b"payload bytes")
+        .unwrap();
+    drop(state);
+
+    let snapshot = store.export_snapshot(id).await.unwrap();
+    let json = serde_json::to_string(&snapshot).unwrap();
+
+    assert!(json.contains("artifact.txt"));
+    assert!(!json.contains("payload bytes"));
+}
+
+#[tokio::test]
+async fn import_snapshot_new_id_preserves_unavailable_resource_manifest() {
+    let sessions = tempdir().unwrap();
+    let source_store = LocalSessionStore::new(sessions.path().join("source"));
+    let target_store = LocalSessionStore::new(sessions.path().join("target"));
+    let source_id = session_id("source-session");
+    let source = source_store
+        .create(CreateSessionOptions {
+            id: Some(source_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    LocalSessionResources::with_conventions(source.session_config.conventions())
+        .unwrap()
+        .write_artifact(logical_path("artifact.txt"), b"payload")
+        .unwrap();
+    drop(source);
+    let snapshot = source_store.export_snapshot(source_id).await.unwrap();
+    let target_id = session_id("target-session");
+
+    let imported = target_store
+        .import_snapshot(snapshot, ImportPolicy::NewId(Some(target_id.clone())))
+        .await
+        .unwrap();
+
+    assert_eq!(imported.metadata.id, target_id);
+    assert_eq!(imported.resources.artifacts.len(), 1);
+    assert!(!imported.resources.artifacts[0].available);
+    assert!(imported
+        .runtime
+        .threads
+        .iter()
+        .all(|thread| thread.resources.artifacts.is_empty()));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn session_config_uses_jsonl_store_without_project_cwd_storage() {
     let project = tempdir().expect("project tempdir should be created");
@@ -78,8 +389,18 @@ async fn session_config_uses_jsonl_store_without_project_cwd_storage() {
         let registry = registry_with_streaming_provider("stub", 1, 1);
         let mut config = test_agent_config();
         config.model = "stub:session".parse().expect("stub model should parse");
-        config.session = Some(SessionConfig::new(session_id.clone(), sessions.path()));
-        AgentRuntime::try_new(registry, test_config(), config).expect("runtime should construct")
+        let store = LocalSessionStore::new(sessions.path());
+        let state = store
+            .create(CreateSessionOptions {
+                id: Some(session_id.clone()),
+                host_cwd: std::env::current_dir().ok(),
+                ..CreateSessionOptions::default()
+            })
+            .await
+            .expect("session should create");
+        AgentRuntime::resume_session(registry, test_config(), config, state)
+            .await
+            .expect("runtime should resume")
     };
 
     let turn_id = agent
@@ -109,9 +430,17 @@ async fn plan_updates_are_mirrored_to_plan_md() {
     config.model = "plan-json:stub-model"
         .parse()
         .expect("stub model should parse");
-    config.session = Some(SessionConfig::new(session_id.clone(), sessions.path()));
-    let agent =
-        AgentRuntime::try_new(registry, test_config(), config).expect("runtime should construct");
+    let store = LocalSessionStore::new(sessions.path());
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(session_id.clone()),
+            ..CreateSessionOptions::default()
+        })
+        .await
+        .expect("session should create");
+    let agent = AgentRuntime::resume_session(registry, test_config(), config, state)
+        .await
+        .expect("runtime should resume");
 
     let turn_id = agent
         .enqueue_turn(EnqueueTurnRequest {
@@ -133,22 +462,26 @@ async fn plan_updates_are_mirrored_to_plan_md() {
     assert!(plan.contains("make a plan"));
 }
 
-#[test]
-fn session_constructor_surfaces_corrupt_events_jsonl() {
+#[tokio::test]
+async fn session_store_open_surfaces_corrupt_events_jsonl() {
     let sessions = tempdir().expect("session tempdir should be created");
     let session_id = session_id("session-corrupt");
-    let conventions = SessionConfig::new(session_id.clone(), sessions.path()).conventions();
-    fs::create_dir_all(conventions.root()).expect("session dir should be created");
+    let store = LocalSessionStore::new(sessions.path());
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(session_id.clone()),
+            ..CreateSessionOptions::default()
+        })
+        .await
+        .expect("session should create");
+    let conventions = state.session_config.conventions();
+    drop(state);
     fs::write(conventions.events_file(), "not-json\n").expect("events jsonl should be written");
-    let registry = registry_with_streaming_provider("stub", 1, 1);
-    let mut config = test_agent_config();
-    config.model = "stub:session".parse().expect("stub model should parse");
-    config.session = Some(SessionConfig::new(session_id, sessions.path()));
 
-    let err = match AgentRuntime::try_new(registry, test_config(), config) {
-        Ok(_) => panic!("corrupt events.jsonl should fail constructor"),
-        Err(err) => err,
-    };
+    let err = store
+        .open(session_id)
+        .await
+        .expect_err("corrupt events.jsonl should fail open");
     let message = err.to_string();
     assert!(message.contains("events.jsonl"));
     assert!(message.contains("line 1"));
@@ -158,7 +491,7 @@ fn session_constructor_surfaces_corrupt_events_jsonl() {
 async fn runtime_resource_methods_write_files_events_and_snapshot() {
     let sessions = tempdir().expect("session tempdir should be created");
     let session_id = session_id("session-resources");
-    let agent = runtime_with_session(sessions.path(), session_id.as_str());
+    let agent = runtime_with_session(sessions.path(), session_id.as_str()).await;
     let conventions = SessionConfig::new(session_id.clone(), sessions.path()).conventions();
 
     let mut sub = agent.subscribe(None).await;

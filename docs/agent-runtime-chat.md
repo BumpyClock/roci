@@ -239,6 +239,17 @@ Malformed nonblank committed lines fail replay with a visible error. Hosts that
 need salvage behavior should use a separate tolerant history/repair layer, not
 runtime event replay.
 
+### Durable session resume
+
+`LocalSessionStore` owns local session create/open/import/export. Runtime
+constructors do not create session files. Resume flows load
+`SessionResumeState` from the store, then call `AgentRuntime::resume_session`.
+
+`events.jsonl` is the canonical semantic runtime event log.
+`runtime.snapshot.json` is cache only.
+`model_messages.jsonl` is the canonical provider context ledger.
+`model_messages.snapshot.json` is cache only.
+
 ## Reconnect flow
 
 1. Full sync:
