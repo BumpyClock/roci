@@ -109,7 +109,7 @@ Profile fields must have explicit projection scope:
 - `tools`: main and subagent projection.
 - `excluded_tools`: main and subagent projection.
 - `skills`: main and subagent projection.
-- `mcp_servers`: subagent projection; MCP is explicit opt-in for child runtimes.
+- `mcp_servers`: main and subagent projection; MCP is explicit opt-in wherever a profile is projected. Child runtimes never inherit parent/default MCP servers implicitly.
 - `default_agent_excluded_tools`: parent/default agent only.
 - `default`: default delegate target when `delegate_subagent` omits `profile`.
 
@@ -158,7 +158,7 @@ The child receives all exposed tools/resources from those servers. Per-tool/reso
 MCP validation/projection phases:
 
 - Profile parse validates `mcp_servers` entries are non-empty, unique server ids.
-- Subagent projection resolves each entry against configured MCP aggregate
+- Main and subagent projections resolve each entry against configured MCP aggregate
   servers and fails on unknown ids.
 - Projection/routing uses structured identity from the MCP contract:
   `McpToolIdentity::Mcp { server_id, tool_name }` for tools and structured
