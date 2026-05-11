@@ -1,5 +1,9 @@
 # Subagent Routing Profile Isolation Design
 
+## Overview
+
+Add a public `agent profile` contract for subagent routing and isolation. For `tsq-r0c1agt6.2`, implement only the profile data model, validation, projection boundaries, and pure tool/MCP isolation contract that downstream controller, runtime, CLI, and verification tasks consume.
+
 ## Context
 
 Roci already has subagent execution pieces, MCP identity/namespacing, model candidates, retry/health, and security primitives. The next P0 feature is `tsq-r0c1agt6`, which adds a user-facing subagent routing and custom-agent selection surface.
@@ -87,6 +91,12 @@ V1 uses TOML only with an optional inline multiline `prompt` field. There is no 
 
 `roci chat --profile scout` applies a profile for the current invocation/session only. Profile selection does not persist across future sessions in v1.
 
+## Interfaces (CLI/API)
+
+The public configuration interface for this design is the `[subagents.<id>]` TOML table. Runtime/API consumers should not apply this public artifact directly. They should consume validated `AgentProfile` values and explicit `MainAgentProjection` / `SubagentProjection` outputs.
+
+Downstream CLI and tool APIs are expected to expose profile selection and subagent management, but `.2` only defines the profile/projection contract those APIs depend on.
+
 ## Internal Boundaries
 
 The public profile artifact should not be applied directly everywhere. Runtime code should use projections:
@@ -97,6 +107,16 @@ The public profile artifact should not be applied directly everywhere. Runtime c
 - `SubagentRoutingController`: session-scoped registry and lifecycle owner for profiles and running subagents.
 
 This keeps a future Codex-style split possible. If Roci later introduces public "roles", existing `agent profile` files can remain valid while roles become overlays or specialized projections.
+
+## Data model / schema changes
+
+The schema change for `.2` is the canonical `[subagents.<id>]` TOML shape and related Rust data structures. Existing internal profile support may remain as compatibility code, but new public tests and docs target the canonical shape.
+
+Projection types should make scope visible in the type system:
+
+- `AgentProfile`: validated public config artifact.
+- `MainAgentProjection`: main/default runtime prompt, model, tool exclusions, skills, and explicit MCP server ids.
+- `SubagentProjection`: child runtime prompt, model, native tool projection, skills, and explicit MCP server ids.
 
 ## Field Scope
 
@@ -344,6 +364,22 @@ For downstream tasks:
 - Runtime tests prove `SubagentNeedsInput` routes through the parent/send path.
 - CLI tests cover profile load, profile selection, disabled subagents, listing, and event rendering.
 - Live tmux verification proves `roci-cli` can load a profile, delegate to a child, show semantic events, and return a compact result to the parent.
+
+## Test plan
+
+For `.2`, run focused core tests first:
+
+- `cargo test -p roci-core --features agent subagent_profile`
+- `cargo test -p roci-core --features agent subagent_projection`
+- `cargo test -p roci-core --features agent subagent_isolation`
+
+Then run package gates:
+
+- `cargo fmt --all --check`
+- `cargo check -p roci-core --features agent,mcp`
+- `cargo clippy -p roci-core --features agent,mcp --all-targets -- -D warnings`
+
+Downstream `.3-.6` tasks own live tmux CLI verification for controller/runtime/CLI behavior.
 
 ## Self-Review Notes
 
