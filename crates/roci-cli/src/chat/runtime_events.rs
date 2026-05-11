@@ -682,6 +682,92 @@ impl ChatRenderer {
             | AgentRuntimeEventPayload::CheckpointCreated { .. }
             | AgentRuntimeEventPayload::SessionFileWritten { .. }
             | AgentRuntimeEventPayload::SessionFileDeleted { .. } => {}
+            AgentRuntimeEventPayload::SubagentStarted { subagent } => {
+                let _ = writeln!(
+                    stderr,
+                    "\n[subagent] started {} id={}{}{}",
+                    subagent.profile_id,
+                    short_id(&subagent.subagent_id.to_string()),
+                    format_label(subagent.label.as_deref()),
+                    format_model(subagent.model.as_ref())
+                );
+            }
+            AgentRuntimeEventPayload::SubagentProgress { subagent, message } => {
+                if let Some(message) = message {
+                    let _ = writeln!(
+                        stderr,
+                        "[subagent] {}: {}",
+                        subagent.profile_id,
+                        truncate_preview(&message, 160)
+                    );
+                }
+            }
+            AgentRuntimeEventPayload::SubagentToolCallStarted { subagent, tool } => {
+                let _ = writeln!(
+                    stderr,
+                    "[subagent] {} tool {} ({})",
+                    subagent.profile_id, tool.tool_name, tool.tool_call_id
+                );
+            }
+            AgentRuntimeEventPayload::SubagentToolCallCompleted { subagent, tool } => {
+                let preview = tool
+                    .result
+                    .as_ref()
+                    .map(|result| truncate_preview(&result.result.to_string(), 160))
+                    .unwrap_or_else(|| "done".to_string());
+                let _ = writeln!(
+                    stderr,
+                    "[subagent] {} tool {} done: {}",
+                    subagent.profile_id, tool.tool_name, preview
+                );
+            }
+            AgentRuntimeEventPayload::SubagentMessage { subagent, message } => {
+                if !message.text.is_empty() {
+                    let _ = writeln!(
+                        stderr,
+                        "[subagent] {} message: {}",
+                        subagent.profile_id,
+                        truncate_preview(&message.text, 200)
+                    );
+                }
+            }
+            AgentRuntimeEventPayload::SubagentNeedsInput {
+                subagent, question, ..
+            } => {
+                let _ = writeln!(
+                    stderr,
+                    "[subagent] {} needs input: {}",
+                    subagent.profile_id,
+                    truncate_preview(&question, 200)
+                );
+            }
+            AgentRuntimeEventPayload::SubagentCompleted { subagent, result } => {
+                let _ = writeln!(
+                    stderr,
+                    "[subagent] {} completed id={} status={:?}: {}",
+                    subagent.profile_id,
+                    short_id(&subagent.subagent_id.to_string()),
+                    result.status,
+                    truncate_preview(&result.summary, 200)
+                );
+            }
+            AgentRuntimeEventPayload::SubagentFailed { subagent, error } => {
+                let _ = writeln!(
+                    stderr,
+                    "[subagent] {} failed id={}: {}",
+                    subagent.profile_id,
+                    short_id(&subagent.subagent_id.to_string()),
+                    truncate_preview(&error, 200)
+                );
+            }
+            AgentRuntimeEventPayload::SubagentCancelled { subagent } => {
+                let _ = writeln!(
+                    stderr,
+                    "[subagent] {} cancelled id={}",
+                    subagent.profile_id,
+                    short_id(&subagent.subagent_id.to_string())
+                );
+            }
             AgentRuntimeEventPayload::TurnCompleted { .. }
             | AgentRuntimeEventPayload::TurnFailed { .. }
             | AgentRuntimeEventPayload::TurnCanceled { .. } => return true,
@@ -772,13 +858,34 @@ impl ChatRenderer {
     }
 }
 
+fn format_label(label: Option<&str>) -> String {
+    label
+        .map(|label| format!(" label={}", truncate_preview(label, 48)))
+        .unwrap_or_default()
+}
+
+fn format_model(model: Option<&roci::models::LanguageModel>) -> String {
+    model
+        .map(|model| format!(" model={model}"))
+        .unwrap_or_default()
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
 
     use super::*;
-    use roci::agent::{MessageStatus, ThreadId, ToolStatus, TurnId, TurnSnapshot, TurnStatus};
+    use roci::agent::subagents::{DelegateSubagentResult, SubagentId, SubagentStatus};
+    use roci::agent::{
+        MessageStatus, SubagentMessageSnapshot, SubagentRuntimeSnapshot, SubagentToolCallSnapshot,
+        ThreadId, ToolStatus, TurnId, TurnSnapshot, TurnStatus,
+    };
     use roci::agent_loop::{ApprovalKind, ToolUpdatePayload};
+    use roci::models::LanguageModel;
     use roci::tools::{
         AskUserPrompt, UserInputRequest, UserInputRequestId, UserInputResponse, UserInputResult,
     };
@@ -841,6 +948,25 @@ mod tests {
             queued_at: Utc::now(),
             started_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
+        }
+    }
+
+    fn subagent_snapshot() -> SubagentRuntimeSnapshot {
+        SubagentRuntimeSnapshot {
+            subagent_id: SubagentId::parse_str("aaaaaaaa-0000-0000-0000-000000000000").unwrap(),
+            profile_id: "dev".to_string(),
+            label: Some("worker".to_string()),
+            status: SubagentStatus::Running,
+            model: Some(LanguageModel::Known {
+                provider_key: "test".to_string(),
+                model_id: "model".to_string(),
+            }),
+            parent_turn_id: None,
+            parent_tool_call_id: Some("parent-call".to_string()),
+            child_thread_id: Some(ThreadId::new()),
+            source_subagent_id: None,
+            target_subagent_id: None,
+            sequence: 1,
         }
     }
 
@@ -968,6 +1094,116 @@ mod tests {
             String::from_utf8(stderr).unwrap(),
             "\n⚡ search (call_1)\n  … search: step 1\n  ✅ {\"ok\":true}\n"
         );
+    }
+
+    #[test]
+    fn chat_renderer_renders_subagent_lifecycle_to_stderr() {
+        let mut renderer = ChatRenderer::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let subagent = subagent_snapshot();
+
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentStarted {
+                subagent: subagent.clone(),
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentMessage {
+                subagent: subagent.clone(),
+                message: SubagentMessageSnapshot {
+                    role: Role::Assistant,
+                    text: "child summary".to_string(),
+                    status: MessageStatus::Completed,
+                },
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentToolCallStarted {
+                subagent: subagent.clone(),
+                tool: SubagentToolCallSnapshot {
+                    tool_call_id: "child-call".to_string(),
+                    tool_name: "inspect".to_string(),
+                    args: serde_json::json!({ "path": "src/lib.rs" }),
+                    result: None,
+                    status: ToolStatus::Running,
+                },
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentToolCallCompleted {
+                subagent: subagent.clone(),
+                tool: SubagentToolCallSnapshot {
+                    tool_call_id: "child-call".to_string(),
+                    tool_name: "inspect".to_string(),
+                    args: serde_json::json!({ "path": "src/lib.rs" }),
+                    result: Some(AgentToolResult {
+                        tool_call_id: "child-call".to_string(),
+                        result: serde_json::json!({ "ok": true }),
+                        is_error: false,
+                    }),
+                    status: ToolStatus::Completed,
+                },
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentNeedsInput {
+                subagent: subagent.clone(),
+                question: "confirm deploy?".to_string(),
+                context: Some("request-1".to_string()),
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentCompleted {
+                subagent: subagent.clone(),
+                result: DelegateSubagentResult {
+                    subagent_id: subagent.subagent_id,
+                    profile_id: subagent.profile_id.clone(),
+                    status: SubagentStatus::Completed,
+                    summary: "task done".to_string(),
+                    artifacts: Vec::new(),
+                    child_thread_id: subagent.child_thread_id,
+                    usage: None,
+                    error: None,
+                },
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentFailed {
+                subagent: subagent.clone(),
+                error: "boom".to_string(),
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentCancelled { subagent },
+            &mut stdout,
+            &mut stderr,
+        ));
+
+        assert!(String::from_utf8(stdout).unwrap().is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("[subagent] started dev id=aaaaaaaa label=worker model=test:model"));
+        assert!(stderr.contains("[subagent] dev message: child summary"));
+        assert!(stderr.contains("[subagent] dev tool inspect (child-call)"));
+        assert!(stderr.contains("[subagent] dev tool inspect done: {\"ok\":true}"));
+        assert!(stderr.contains("[subagent] dev needs input: confirm deploy?"));
+        assert!(stderr.contains("[subagent] dev completed id=aaaaaaaa status=Completed: task done"));
+        assert!(stderr.contains("[subagent] dev failed id=aaaaaaaa: boom"));
+        assert!(stderr.contains("[subagent] dev cancelled id=aaaaaaaa"));
     }
 
     #[tokio::test]

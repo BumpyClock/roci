@@ -34,6 +34,8 @@ pub use crate::human_interaction::HumanInteractionCoordinator;
 
 pub use self::chat::*;
 pub use self::config::AgentConfig;
+#[cfg(feature = "agent")]
+pub use self::config::AgentSubagentConfig;
 #[cfg(test)]
 use self::types::drain_queue;
 pub use self::types::{
@@ -127,6 +129,8 @@ pub struct AgentRuntime {
     runtime_event_publish_tx: mpsc::UnboundedSender<RuntimeEventPublishRequest>,
     runtime_event_publish_rx:
         Arc<Mutex<Option<mpsc::UnboundedReceiver<RuntimeEventPublishRequest>>>>,
+    #[cfg(feature = "agent")]
+    subagent_controller: Option<Arc<crate::agent::subagents::SubagentRoutingController>>,
     session_config: Option<crate::session::SessionConfig>,
     session_fs: Option<Arc<LocalSessionFs>>,
     session_resources: Option<Arc<LocalSessionResources>>,
@@ -217,6 +221,7 @@ impl AgentRuntime {
         let (runtime_event_tx, _) = broadcast::channel(replay_capacity.get());
         let (runtime_event_publish_tx, runtime_event_publish_rx) =
             mpsc::unbounded_channel::<RuntimeEventPublishRequest>();
+        let runtime_event_send_lock = Arc::new(StdMutex::new(()));
         let chat_projector = Arc::new(StdMutex::new(ChatProjector::new(config.chat.clone())));
         let (state_tx, state_rx) = watch::channel(AgentState::Idle);
         let initial_snapshot = AgentSnapshot {
@@ -235,6 +240,32 @@ impl AgentRuntime {
         #[cfg(feature = "agent")]
         let tool_permission_session_approvals =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
+        #[cfg(feature = "agent")]
+        let subagent_controller = config.subagents.as_ref().and_then(|subagents| {
+            if !subagents.enabled {
+                return None;
+            }
+            let mut base_config = config.clone();
+            base_config.subagents = None;
+            Some(Arc::new(
+                crate::agent::subagents::SubagentRoutingController::new(
+                    registry.clone(),
+                    roci_config.clone(),
+                    base_config,
+                    subagents.supervisor.clone(),
+                    subagents.profiles.clone(),
+                ),
+            ))
+        });
+        #[cfg(feature = "agent")]
+        if let Some(controller) = &subagent_controller {
+            spawn_subagent_runtime_event_bridge(
+                controller.clone(),
+                chat_projector.clone(),
+                runtime_event_publish_tx.clone(),
+                runtime_event_send_lock.clone(),
+            );
+        }
         Ok(Self {
             config,
             runner,
@@ -265,9 +296,11 @@ impl AgentRuntime {
             chat_projector,
             runtime_event_tx,
             runtime_event_store,
-            runtime_event_send_lock: Arc::new(StdMutex::new(())),
+            runtime_event_send_lock,
             runtime_event_publish_tx,
             runtime_event_publish_rx: Arc::new(Mutex::new(Some(runtime_event_publish_rx))),
+            #[cfg(feature = "agent")]
+            subagent_controller,
             session_config,
             session_fs,
             session_resources,
@@ -397,6 +430,467 @@ fn normalized_replay_capacity(replay_capacity: usize) -> NonZeroUsize {
     NonZeroUsize::new(replay_capacity)
         .or_else(|| NonZeroUsize::new(ChatRuntimeConfig::default().replay_capacity))
         .expect("default chat replay capacity is non-zero")
+}
+
+#[cfg(feature = "agent")]
+fn spawn_subagent_runtime_event_bridge(
+    controller: Arc<crate::agent::subagents::SubagentRoutingController>,
+    chat_projector: Arc<StdMutex<ChatProjector>>,
+    runtime_event_publish_tx: mpsc::UnboundedSender<RuntimeEventPublishRequest>,
+    runtime_event_send_lock: Arc<StdMutex<()>>,
+) {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::time::{Duration, Instant};
+
+    use crate::agent::runtime::chat::{
+        AgentRuntimeError, AgentRuntimeEventPayload, MessageStatus, SubagentMessageSnapshot,
+        SubagentRuntimeSnapshot, SubagentToolCallSnapshot, ThreadId, ToolStatus,
+    };
+    use crate::agent::subagents::{SubagentEvent, SubagentId, SubagentRoutingMetadata};
+    use crate::agent_loop::AgentEvent;
+    use crate::human_interaction::HumanInteractionPayload;
+    use crate::tools::AskUserPrompt;
+
+    const PENDING_EVENT_CAP: usize = 64;
+    const PENDING_EVENT_TTL: Duration = Duration::from_secs(300);
+
+    struct PendingSubagentEvents {
+        first_seen: Instant,
+        events: VecDeque<SubagentEvent>,
+    }
+
+    let mut events = controller.subscribe();
+    let controller = Arc::downgrade(&controller);
+    tokio::spawn(async move {
+        let mut sequences: HashMap<SubagentId, u64> = HashMap::new();
+        let mut started: HashSet<SubagentId> = HashSet::new();
+        let mut pending: HashMap<SubagentId, PendingSubagentEvents> = HashMap::new();
+        let projection_error = Arc::new(StdMutex::new(None));
+
+        'events: loop {
+            log_projection_error(&projection_error, None, None, None);
+            purge_stale_pending(&mut pending);
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let subagent_id = subagent_event_id(&event);
+            if !matches!(event, SubagentEvent::Spawned { .. }) && !started.contains(&subagent_id) {
+                if matches!(
+                    event,
+                    SubagentEvent::Failed { .. } | SubagentEvent::Aborted { .. }
+                ) {
+                    pending.remove(&subagent_id);
+                    continue;
+                }
+                let entry = pending
+                    .entry(subagent_id)
+                    .or_insert_with(|| PendingSubagentEvents {
+                        first_seen: Instant::now(),
+                        events: VecDeque::new(),
+                    });
+                if entry.events.len() == PENDING_EVENT_CAP {
+                    entry.events.pop_front();
+                }
+                entry.events.push_back(event);
+                continue;
+            }
+
+            let mut events_to_project = vec![event];
+            if matches!(events_to_project[0], SubagentEvent::Spawned { .. }) {
+                started.insert(subagent_id);
+                if let Some(buffered) = pending.remove(&subagent_id) {
+                    events_to_project.extend(buffered.events);
+                }
+            }
+
+            for event in events_to_project {
+                let Some(controller) = controller.upgrade() else {
+                    break 'events;
+                };
+                let subagent_id = subagent_event_id(&event);
+                let sequence = sequences
+                    .entry(subagent_id)
+                    .and_modify(|value| *value += 1)
+                    .or_insert(1);
+                let metadata = controller.metadata(subagent_id).await;
+                let (thread_id, active_turn_id) = match chat_projector.lock() {
+                    Ok(projector) => {
+                        let thread_id = projector.default_thread_id();
+                        let active_turn_id = projector
+                            .read_thread(thread_id)
+                            .ok()
+                            .and_then(|thread| thread.active_turn_id);
+                        (thread_id, active_turn_id)
+                    }
+                    Err(_) => continue,
+                };
+                let Some(payload) =
+                    subagent_runtime_payload(event, metadata, active_turn_id, *sequence)
+                else {
+                    continue;
+                };
+                let projected = match chat_projector.lock() {
+                    Ok(mut projector) => {
+                        if let Some(turn_id) = active_turn_id {
+                            projector
+                                .record_subagent_event(turn_id, payload.clone())
+                                .or_else(|_| {
+                                    projector.record_subagent_event_for_thread(thread_id, payload)
+                                })
+                        } else {
+                            projector.record_subagent_event_for_thread(thread_id, payload)
+                        }
+                    }
+                    Err(_) => continue,
+                };
+                let projected = match projected {
+                    Ok(projected) => projected,
+                    Err(err) => {
+                        log_chat_projection_error(subagent_id, *sequence, Some(thread_id), &err);
+                        continue;
+                    }
+                };
+                if let Err(err) = AgentRuntime::queue_runtime_event_to(
+                    &runtime_event_publish_tx,
+                    &runtime_event_send_lock,
+                    projected,
+                    projection_error.clone(),
+                ) {
+                    log_chat_projection_error(subagent_id, *sequence, Some(thread_id), &err);
+                    continue;
+                }
+                log_projection_error(
+                    &projection_error,
+                    Some(subagent_id),
+                    Some(*sequence),
+                    Some(thread_id),
+                );
+            }
+        }
+    });
+
+    fn purge_stale_pending(pending: &mut HashMap<SubagentId, PendingSubagentEvents>) {
+        let now = Instant::now();
+        pending.retain(|_, entry| now.duration_since(entry.first_seen) <= PENDING_EVENT_TTL);
+    }
+
+    fn log_projection_error(
+        slot: &Arc<StdMutex<Option<AgentRuntimeError>>>,
+        subagent_id: Option<SubagentId>,
+        sequence: Option<u64>,
+        thread_id: Option<ThreadId>,
+    ) {
+        let Some(err) = slot.lock().ok().and_then(|mut error| error.take()) else {
+            return;
+        };
+        log_chat_projection_error_context(subagent_id, sequence, thread_id, &err);
+    }
+
+    fn log_chat_projection_error(
+        subagent_id: SubagentId,
+        sequence: u64,
+        thread_id: Option<ThreadId>,
+        err: &AgentRuntimeError,
+    ) {
+        log_chat_projection_error_context(Some(subagent_id), Some(sequence), thread_id, err);
+    }
+
+    fn log_chat_projection_error_context(
+        subagent_id: Option<SubagentId>,
+        sequence: Option<u64>,
+        thread_id: Option<ThreadId>,
+        err: &AgentRuntimeError,
+    ) {
+        eprintln!(
+            "roci subagent projection failed subagent_id={} sequence={} thread_id={} error={err}",
+            subagent_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            sequence
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            thread_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        );
+    }
+
+    fn subagent_event_id(event: &SubagentEvent) -> SubagentId {
+        match event {
+            SubagentEvent::Spawned { subagent_id, .. }
+            | SubagentEvent::StatusChanged { subagent_id, .. }
+            | SubagentEvent::AgentEvent { subagent_id, .. }
+            | SubagentEvent::Completed { subagent_id, .. }
+            | SubagentEvent::Failed { subagent_id, .. }
+            | SubagentEvent::Aborted { subagent_id } => *subagent_id,
+        }
+    }
+
+    fn subagent_runtime_payload(
+        event: SubagentEvent,
+        metadata: Option<SubagentRoutingMetadata>,
+        parent_turn_id: Option<TurnId>,
+        sequence: u64,
+    ) -> Option<AgentRuntimeEventPayload> {
+        match event {
+            SubagentEvent::Spawned {
+                subagent_id,
+                label,
+                profile,
+                model,
+            } => Some(AgentRuntimeEventPayload::SubagentStarted {
+                subagent: subagent_snapshot(
+                    subagent_id,
+                    metadata,
+                    profile,
+                    label,
+                    model,
+                    crate::agent::subagents::SubagentStatus::Running,
+                    parent_turn_id,
+                    sequence,
+                ),
+            }),
+            SubagentEvent::StatusChanged {
+                subagent_id,
+                status,
+            } => Some(AgentRuntimeEventPayload::SubagentProgress {
+                subagent: subagent_snapshot_from_metadata(
+                    subagent_id,
+                    metadata,
+                    status,
+                    parent_turn_id,
+                    sequence,
+                ),
+                message: Some(format!("status: {status:?}")),
+            }),
+            SubagentEvent::AgentEvent {
+                subagent_id,
+                label,
+                event,
+            } => child_agent_payload(
+                subagent_id,
+                label,
+                *event,
+                metadata,
+                parent_turn_id,
+                sequence,
+            ),
+            SubagentEvent::Completed {
+                subagent_id,
+                result,
+            } => {
+                let profile_id = metadata
+                    .as_ref()
+                    .map(|metadata| metadata.profile_id.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let child_thread_id = metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.child_thread_id);
+                Some(AgentRuntimeEventPayload::SubagentCompleted {
+                    subagent: subagent_snapshot_from_metadata(
+                        subagent_id,
+                        metadata,
+                        result.status,
+                        parent_turn_id,
+                        sequence,
+                    ),
+                    result: crate::agent::subagents::routing::compact_result_for_runtime(
+                        &profile_id,
+                        &result,
+                        child_thread_id,
+                    ),
+                })
+            }
+            SubagentEvent::Failed { subagent_id, error } => {
+                Some(AgentRuntimeEventPayload::SubagentFailed {
+                    subagent: subagent_snapshot_from_metadata(
+                        subagent_id,
+                        metadata,
+                        crate::agent::subagents::SubagentStatus::Failed,
+                        parent_turn_id,
+                        sequence,
+                    ),
+                    error,
+                })
+            }
+            SubagentEvent::Aborted { subagent_id } => {
+                Some(AgentRuntimeEventPayload::SubagentCancelled {
+                    subagent: subagent_snapshot_from_metadata(
+                        subagent_id,
+                        metadata,
+                        crate::agent::subagents::SubagentStatus::Aborted,
+                        parent_turn_id,
+                        sequence,
+                    ),
+                })
+            }
+        }
+    }
+
+    fn child_agent_payload(
+        subagent_id: SubagentId,
+        label: Option<String>,
+        event: AgentEvent,
+        metadata: Option<SubagentRoutingMetadata>,
+        parent_turn_id: Option<TurnId>,
+        sequence: u64,
+    ) -> Option<AgentRuntimeEventPayload> {
+        let fallback_profile = metadata
+            .as_ref()
+            .map(|metadata| metadata.profile_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let fallback_model = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.model.clone());
+        let status = crate::agent::subagents::SubagentStatus::Running;
+        let subagent = subagent_snapshot(
+            subagent_id,
+            metadata,
+            fallback_profile,
+            label,
+            fallback_model,
+            status,
+            parent_turn_id,
+            sequence,
+        );
+        match event {
+            AgentEvent::MessageUpdate { message, .. } => {
+                Some(AgentRuntimeEventPayload::SubagentProgress {
+                    subagent,
+                    message: Some(message.text()),
+                })
+            }
+            AgentEvent::MessageEnd { message } => Some(AgentRuntimeEventPayload::SubagentMessage {
+                subagent,
+                message: SubagentMessageSnapshot {
+                    role: message.role,
+                    text: message.text(),
+                    status: MessageStatus::Completed,
+                },
+            }),
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => Some(AgentRuntimeEventPayload::SubagentToolCallStarted {
+                subagent,
+                tool: SubagentToolCallSnapshot {
+                    tool_call_id,
+                    tool_name,
+                    args,
+                    result: None,
+                    status: ToolStatus::Running,
+                },
+            }),
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error: _,
+            } => Some(AgentRuntimeEventPayload::SubagentToolCallCompleted {
+                subagent,
+                tool: SubagentToolCallSnapshot {
+                    tool_call_id,
+                    tool_name,
+                    args: serde_json::Value::Null,
+                    result: Some(result),
+                    status: ToolStatus::Completed,
+                },
+            }),
+            AgentEvent::HumanInteractionRequested { request } => {
+                let (question, context) = match &request.payload {
+                    HumanInteractionPayload::AskUser(payload) => ask_user_question(&payload.prompt),
+                    _ => ("Child sub-agent requested input".to_string(), None),
+                };
+                Some(AgentRuntimeEventPayload::SubagentNeedsInput {
+                    subagent,
+                    question,
+                    context,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn subagent_snapshot_from_metadata(
+        subagent_id: SubagentId,
+        metadata: Option<SubagentRoutingMetadata>,
+        status: crate::agent::subagents::SubagentStatus,
+        parent_turn_id: Option<TurnId>,
+        sequence: u64,
+    ) -> SubagentRuntimeSnapshot {
+        let profile = metadata
+            .as_ref()
+            .map(|metadata| metadata.profile_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let label = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.label.clone());
+        let model = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.model.clone());
+        subagent_snapshot(
+            subagent_id,
+            metadata,
+            profile,
+            label,
+            model,
+            status,
+            parent_turn_id,
+            sequence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn subagent_snapshot(
+        subagent_id: SubagentId,
+        metadata: Option<SubagentRoutingMetadata>,
+        profile_id: String,
+        label: Option<String>,
+        model: Option<LanguageModel>,
+        status: crate::agent::subagents::SubagentStatus,
+        parent_turn_id: Option<TurnId>,
+        sequence: u64,
+    ) -> SubagentRuntimeSnapshot {
+        SubagentRuntimeSnapshot {
+            subagent_id,
+            profile_id,
+            label,
+            status,
+            model,
+            parent_turn_id,
+            parent_tool_call_id: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.parent_tool_call_id.clone()),
+            child_thread_id: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.child_thread_id),
+            source_subagent_id: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.source_subagent_id),
+            target_subagent_id: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.target_subagent_id),
+            sequence,
+        }
+    }
+
+    fn ask_user_question(prompt: &AskUserPrompt) -> (String, Option<String>) {
+        match prompt {
+            AskUserPrompt::Question { question, .. }
+            | AskUserPrompt::Confirm { question, .. }
+            | AskUserPrompt::Choice { question, .. }
+            | AskUserPrompt::MultiChoice { question, .. } => (question.clone(), None),
+            AskUserPrompt::Form { title, .. } => (
+                title
+                    .clone()
+                    .unwrap_or_else(|| "Child sub-agent requested input".to_string()),
+                Some(prompt.id().to_string()),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]

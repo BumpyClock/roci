@@ -159,6 +159,7 @@ async fn submit_user_input_unknown_request_returns_error() {
         pre_tool_use: None,
         post_tool_use: None,
         user_input_timeout_ms: None,
+        subagents: None,
         human_interaction_coordinator: None,
         context_budget: None,
         chat: Default::default(),

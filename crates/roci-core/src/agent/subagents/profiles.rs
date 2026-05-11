@@ -1,6 +1,6 @@
 //! Sub-agent profile registry: lookup, inheritance, and model resolution.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::agent::runtime::AgentConfig;
@@ -11,8 +11,8 @@ use crate::provider::ProviderRegistry;
 
 use super::config::{TomlProfile, TomlProfileFile};
 use super::types::{
-    ModelCandidate, SubagentKind, SubagentOverrides, SubagentProfile, SubagentProfileSummary,
-    ToolPolicy,
+    MainAgentProjection, McpServerProjection, ModelCandidate, NativeToolProjection, SubagentKind,
+    SubagentOverrides, SubagentProfile, SubagentProfileSummary, SubagentProjection, ToolPolicy,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,16 +45,24 @@ impl SubagentProfileRegistry {
     /// Create a registry pre-loaded with the three built-in profiles.
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
-        reg.register(SubagentProfile::builtin_developer());
-        reg.register(SubagentProfile::builtin_planner());
-        reg.register(SubagentProfile::builtin_explorer());
+        reg.register(SubagentProfile::builtin_developer())
+            .expect("built-in developer profile must be valid");
+        reg.register(SubagentProfile::builtin_planner())
+            .expect("built-in planner profile must be valid");
+        reg.register(SubagentProfile::builtin_explorer())
+            .expect("built-in explorer profile must be valid");
         reg
     }
 
     /// Register a profile by name. Overwrites any existing profile with the
     /// same name.
-    pub fn register(&mut self, profile: SubagentProfile) {
+    pub fn register(&mut self, profile: SubagentProfile) -> Result<(), RociError> {
+        validate_profile(&profile)?;
+        let mut projected_profiles = self.profiles.clone();
+        projected_profiles.insert(profile.name.clone(), profile.clone());
+        validate_default_profile_count(&projected_profiles)?;
         self.profiles.insert(profile.name.clone(), profile);
+        Ok(())
     }
 
     /// Return registered profile names in deterministic order.
@@ -62,6 +70,14 @@ impl SubagentProfileRegistry {
         let mut names: Vec<_> = self.profiles.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Return the configured default profile name, if one exists.
+    pub fn default_profile_ref(&self) -> Option<String> {
+        self.profiles
+            .values()
+            .find(|profile| profile.default)
+            .map(|profile| profile.name.clone())
     }
 
     /// Return resolved summaries for all registered profiles in name order.
@@ -82,8 +98,21 @@ impl SubagentProfileRegistry {
     pub fn load_toml(&mut self, toml_str: &str) -> Result<(), RociError> {
         let file = TomlProfileFile::parse(toml_str)
             .map_err(|e| RociError::Configuration(format!("invalid profile TOML: {e}")))?;
-        for tp in file.into_profiles() {
-            self.register(toml_profile_to_subagent_profile(tp));
+        let profiles = file
+            .into_profiles()
+            .into_iter()
+            .map(toml_profile_to_subagent_profile)
+            .collect::<Vec<_>>();
+        for profile in &profiles {
+            validate_profile(profile)?;
+        }
+        let mut projected_profiles = self.profiles.clone();
+        for profile in &profiles {
+            projected_profiles.insert(profile.name.clone(), profile.clone());
+        }
+        validate_default_profile_count(&projected_profiles)?;
+        for profile in profiles {
+            self.profiles.insert(profile.name.clone(), profile);
         }
         Ok(())
     }
@@ -133,7 +162,9 @@ impl SubagentProfileRegistry {
     pub fn resolve(&self, profile_ref: &str) -> Result<SubagentProfile, RociError> {
         let mut chain = Vec::new();
         self.collect_chain(profile_ref, &mut chain)?;
-        Ok(merge_chain(&chain))
+        let profile = merge_chain(&chain);
+        validate_profile(&profile)?;
+        Ok(profile)
     }
 
     /// Resolve a profile and then layer per-spawn overrides on top.
@@ -144,6 +175,7 @@ impl SubagentProfileRegistry {
     ) -> Result<SubagentProfile, RociError> {
         let mut profile = self.resolve(profile_ref)?;
         apply_overrides(&mut profile, overrides);
+        validate_profile(&profile)?;
         Ok(profile)
     }
 
@@ -255,6 +287,64 @@ impl SubagentProfileRegistry {
     }
 }
 
+/// Project a profile onto main/default agent runtime-visible capabilities.
+pub fn project_main_agent_profile(
+    profile: &SubagentProfile,
+    base_native_tools: &[&str],
+    available_mcp_servers: &[&str],
+) -> Result<MainAgentProjection, RociError> {
+    let excluded_tools = combine_excluded_tools(
+        &profile.excluded_tools,
+        &profile.default_agent_excluded_tools,
+    );
+    let native_tools = project_native_tools(
+        &profile.name,
+        &profile.tools,
+        &excluded_tools,
+        base_native_tools,
+    )?;
+    let mcp_servers =
+        project_mcp_servers(&profile.name, &profile.mcp_servers, available_mcp_servers)?;
+
+    Ok(MainAgentProjection {
+        profile: profile.name.clone(),
+        display_name: profile.display_name.clone(),
+        infer: profile.infer.clone(),
+        system_prompt: profile.system_prompt.clone(),
+        models: profile.models.clone(),
+        native_tools,
+        skills: profile.skills.clone(),
+        mcp_servers,
+    })
+}
+
+/// Project a profile onto child subagent runtime-visible capabilities.
+pub fn project_subagent_profile(
+    profile: &SubagentProfile,
+    base_native_tools: &[&str],
+    available_mcp_servers: &[&str],
+) -> Result<SubagentProjection, RociError> {
+    let native_tools = project_native_tools(
+        &profile.name,
+        &profile.tools,
+        &profile.excluded_tools,
+        base_native_tools,
+    )?;
+    let mcp_servers =
+        project_mcp_servers(&profile.name, &profile.mcp_servers, available_mcp_servers)?;
+
+    Ok(SubagentProjection {
+        profile: profile.name.clone(),
+        display_name: profile.display_name.clone(),
+        infer: profile.infer.clone(),
+        system_prompt: profile.system_prompt.clone(),
+        models: profile.models.clone(),
+        native_tools,
+        skills: profile.skills.clone(),
+        mcp_servers,
+    })
+}
+
 fn is_viable_model_candidate(
     candidate: &ModelCandidate,
     registry: &ProviderRegistry,
@@ -288,6 +378,213 @@ fn has_auth_provider_headers(headers: &reqwest::header::HeaderMap) -> bool {
         || headers.contains_key("x-api-key")
 }
 
+fn validate_profile(profile: &SubagentProfile) -> Result<(), RociError> {
+    if profile.name.trim().is_empty() {
+        return Err(RociError::Configuration(
+            "subagent profile id must not be empty".into(),
+        ));
+    }
+
+    let mut seen_mcp = BTreeSet::new();
+    for server_id in &profile.mcp_servers {
+        if server_id.trim().is_empty() {
+            return Err(RociError::Configuration(format!(
+                "profile '{}' has empty mcp_servers entry",
+                profile.name
+            )));
+        }
+        if !seen_mcp.insert(server_id.clone()) {
+            return Err(RociError::Configuration(format!(
+                "profile '{}' repeats mcp server '{}'",
+                profile.name, server_id
+            )));
+        }
+    }
+
+    validate_model_candidates(profile)?;
+    validate_tool_conflicts(profile)?;
+    Ok(())
+}
+
+fn validate_model_candidates(profile: &SubagentProfile) -> Result<(), RociError> {
+    for candidate in &profile.models {
+        if candidate.provider.trim().is_empty() || candidate.model.trim().is_empty() {
+            return Err(RociError::Configuration(format!(
+                "profile '{}' model must use provider:model syntax",
+                profile.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_default_profile_count(
+    profiles: &HashMap<String, SubagentProfile>,
+) -> Result<(), RociError> {
+    let defaults = profiles.values().filter(|profile| profile.default).count();
+    if defaults > 1 {
+        return Err(RociError::Configuration(
+            "only one subagent profile may set default = true in the registry".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_conflicts(profile: &SubagentProfile) -> Result<(), RociError> {
+    validate_tool_policy_conflicts(profile, "excluded_tools", &profile.excluded_tools)?;
+    validate_tool_policy_conflicts(
+        profile,
+        "default_agent_excluded_tools",
+        &profile.default_agent_excluded_tools,
+    )
+}
+
+fn validate_tool_policy_conflicts(
+    profile: &SubagentProfile,
+    deny_field: &str,
+    denied_tools: &[String],
+) -> Result<(), RociError> {
+    let denied = denied_tools.iter().collect::<BTreeSet<_>>();
+
+    match &profile.tools {
+        ToolPolicy::Replace { tools } => {
+            for tool in tools {
+                if denied.contains(tool) {
+                    return Err(RociError::Configuration(format!(
+                        "profile '{}' lists tool '{}' in both tools and {}",
+                        profile.name, tool, deny_field
+                    )));
+                }
+            }
+        }
+        ToolPolicy::InheritWithOverrides { add, remove } => {
+            for tool in add {
+                if remove.contains(tool) {
+                    return Err(RociError::Configuration(format!(
+                        "profile '{}' has conflicting tool add/remove rule for '{}'",
+                        profile.name, tool
+                    )));
+                }
+                if denied.contains(tool) {
+                    return Err(RociError::Configuration(format!(
+                        "profile '{}' lists tool '{}' in both tools.add and {}",
+                        profile.name, tool, deny_field
+                    )));
+                }
+            }
+        }
+        ToolPolicy::Inherit => {}
+    }
+    Ok(())
+}
+
+fn combine_excluded_tools(primary: &[String], additional: &[String]) -> Vec<String> {
+    let mut combined = primary.to_vec();
+    append_unique(&mut combined, additional);
+    combined
+}
+
+fn project_native_tools(
+    profile_name: &str,
+    policy: &ToolPolicy,
+    excluded_tools: &[String],
+    base_native_tools: &[&str],
+) -> Result<NativeToolProjection, RociError> {
+    let base = base_native_tools.iter().copied().collect::<BTreeSet<_>>();
+    validate_requested_native_tools(profile_name, "excluded_tools", excluded_tools, &base)?;
+
+    let excluded = excluded_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+
+    let projected = match policy {
+        ToolPolicy::Inherit => base_native_tools
+            .iter()
+            .copied()
+            .filter(|tool| !excluded.contains(tool))
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        ToolPolicy::Replace { tools } => {
+            validate_requested_native_tools(profile_name, "tools", tools, &base)?;
+            let allowed = tools.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            base_native_tools
+                .iter()
+                .copied()
+                .filter(|tool| allowed.contains(tool) && !excluded.contains(tool))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        }
+        ToolPolicy::InheritWithOverrides { add, remove } => {
+            validate_requested_native_tools(profile_name, "tools.add", add, &base)?;
+            validate_requested_native_tools(profile_name, "tools.remove", remove, &base)?;
+            let remove = remove.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            let add = add.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            let mut projected = base_native_tools
+                .iter()
+                .copied()
+                .filter(|tool| !remove.contains(tool) && !excluded.contains(tool))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            for tool in add {
+                if base.contains(tool)
+                    && !remove.contains(tool)
+                    && !excluded.contains(tool)
+                    && !projected.iter().any(|existing| existing == tool)
+                {
+                    projected.push(tool.to_string());
+                }
+            }
+            projected
+        }
+    };
+
+    Ok(NativeToolProjection {
+        model_visible: projected.clone(),
+        dispatch: projected,
+    })
+}
+
+fn validate_requested_native_tools(
+    profile_name: &str,
+    field_name: &str,
+    requested_tools: &[String],
+    base_native_tools: &BTreeSet<&str>,
+) -> Result<(), RociError> {
+    for tool in requested_tools {
+        if !base_native_tools.contains(tool.as_str()) {
+            return Err(RociError::Configuration(format!(
+                "profile '{}' references unknown native tool '{}' in {}",
+                profile_name, tool, field_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn project_mcp_servers(
+    profile_name: &str,
+    server_ids: &[String],
+    available_mcp_servers: &[&str],
+) -> Result<McpServerProjection, RociError> {
+    let available = available_mcp_servers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for server_id in server_ids {
+        if !available.contains(server_id.as_str()) {
+            return Err(RociError::Configuration(format!(
+                "profile '{}' references unknown mcp server '{}'",
+                profile_name, server_id
+            )));
+        }
+    }
+
+    Ok(McpServerProjection {
+        server_ids: server_ids.to_vec(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Inheritance merge
 // ---------------------------------------------------------------------------
@@ -296,10 +593,12 @@ fn has_auth_provider_headers(headers: &reqwest::header::HeaderMap) -> bool {
 ///
 /// Rules:
 /// - Child scalar fields replace parent scalar fields when present.
-/// - `skills`, `mcp_servers`, and `default_agent_excluded_tools` are inherited
-///   additively from root to child with duplicates removed at first occurrence.
+/// - `skills`, `mcp_servers`, `default_agent_excluded_tools`, and
+///   `excluded_tools` are inherited additively from root to child with
+///   duplicates removed at first occurrence.
 /// - `models` replaces wholesale (not merged).
 /// - `tools` uses the child's policy directly (ToolPolicy handles semantics).
+/// - `default` uses the requested child's value so parent defaults do not leak.
 /// - `metadata` is merged with child keys winning.
 /// - Empty child lists mean "no additions"; TOML cannot express "clear parent
 ///   list" for these fields because the public schema uses `Vec<String>`.
@@ -335,6 +634,7 @@ fn merge_chain(chain: &[SubagentProfile]) -> SubagentProfile {
             &mut result.default_agent_excluded_tools,
             &child.default_agent_excluded_tools,
         );
+        append_unique(&mut result.excluded_tools, &child.excluded_tools);
         if !child.models.is_empty() {
             result.models.clone_from(&child.models);
         }
@@ -349,6 +649,7 @@ fn merge_chain(chain: &[SubagentProfile]) -> SubagentProfile {
                 result.metadata.insert(k.clone(), v.clone());
             }
         }
+        result.default = child.default;
         result.version = child.version;
     }
     result
@@ -402,11 +703,13 @@ fn toml_profile_to_subagent_profile(tp: TomlProfile) -> SubagentProfile {
         skills: tp.skills,
         mcp_servers: tp.mcp_servers,
         default_agent_excluded_tools: tp.default_agent_excluded_tools,
+        excluded_tools: tp.excluded_tools,
         models: tp.models,
         inherits: tp.inherits,
         default_timeout_ms: tp.default_timeout_ms,
         metadata: tp.metadata,
         version: tp.version.unwrap_or(1),
+        default: tp.default,
     }
 }
 
@@ -492,6 +795,380 @@ description = "Beta agent"
             reg.profiles.get("beta").unwrap().description.as_deref(),
             Some("Beta agent")
         );
+    }
+
+    #[test]
+    fn canonical_profile_rejects_tool_conflict() {
+        let mut reg = SubagentProfileRegistry::new();
+        let err = reg
+            .load_toml(
+                r#"
+[subagents.scout]
+tools = ["grep", "read_file"]
+excluded_tools = ["grep"]
+"#,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("tool"));
+        assert!(err.to_string().contains("grep"));
+    }
+
+    #[test]
+    fn canonical_profile_rejects_default_agent_tool_conflict() {
+        let mut reg = SubagentProfileRegistry::new();
+        let err = reg
+            .load_toml(
+                r#"
+[subagents.scout]
+tools = ["grep", "read_file"]
+default_agent_excluded_tools = ["grep"]
+"#,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("default_agent_excluded_tools"));
+        assert!(err.to_string().contains("grep"));
+    }
+
+    #[test]
+    fn canonical_profile_rejects_default_agent_tool_add_conflict() {
+        let mut reg = SubagentProfileRegistry::new();
+        let err = reg
+            .load_toml(
+                r#"
+name = "scout"
+default_agent_excluded_tools = ["grep"]
+
+[tools]
+mode = "inherit_with_overrides"
+add = ["grep"]
+"#,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("default_agent_excluded_tools"));
+        assert!(err.to_string().contains("grep"));
+    }
+
+    #[test]
+    fn canonical_profile_rejects_empty_mcp_server_id() {
+        let mut reg = SubagentProfileRegistry::new();
+        let err = reg
+            .load_toml(
+                r#"
+[subagents.scout]
+mcp_servers = [""]
+"#,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("mcp_servers"));
+    }
+
+    #[test]
+    fn canonical_profile_rejects_multiple_defaults() {
+        let mut reg = SubagentProfileRegistry::new();
+        let err = reg
+            .load_toml(
+                r#"
+[subagents.alpha]
+default = true
+
+[subagents.beta]
+default = true
+"#,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("default"));
+    }
+
+    #[test]
+    fn canonical_profile_rejects_multiple_defaults_across_loads() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.load_toml(
+            r#"
+[subagents.alpha]
+default = true
+"#,
+        )
+        .unwrap();
+
+        let err = reg
+            .load_toml(
+                r#"
+[subagents.beta]
+default = true
+"#,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("default"));
+    }
+
+    #[test]
+    fn canonical_profile_allows_overwriting_default_profile() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.load_toml(
+            r#"
+[subagents.alpha]
+default = true
+"#,
+        )
+        .unwrap();
+
+        reg.load_toml(
+            r#"
+[subagents.alpha]
+default = true
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn canonical_profile_allows_default_transfer_within_batch() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.load_toml(
+            r#"
+[subagents.alpha]
+default = true
+"#,
+        )
+        .unwrap();
+
+        reg.load_toml(
+            r#"
+[subagents.beta]
+default = true
+
+[subagents.alpha]
+default = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!reg.profiles.get("alpha").unwrap().default);
+        assert!(reg.profiles.get("beta").unwrap().default);
+    }
+
+    #[test]
+    fn canonical_profile_rejects_model_without_provider() {
+        let mut reg = SubagentProfileRegistry::new();
+        let err = reg
+            .load_toml(
+                r#"
+[subagents.scout]
+model = "gpt-4o"
+"#,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("provider:model"));
+    }
+
+    #[test]
+    fn register_rejects_multiple_defaults() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.register(SubagentProfile {
+            name: "alpha".into(),
+            default: true,
+            ..SubagentProfile::default()
+        })
+        .unwrap();
+
+        let err = reg
+            .register(SubagentProfile {
+                name: "beta".into(),
+                default: true,
+                ..SubagentProfile::default()
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("default"));
+        assert!(!reg.profiles.contains_key("beta"));
+    }
+
+    #[test]
+    fn subagent_projection_inherits_native_tools_without_mcp_inheritance() {
+        let projection = subagent_projection_with_native_inheritance_and_explicit_mcp();
+
+        assert_eq!(
+            projection.native_tools.model_visible,
+            vec!["read_file", "grep", "shell"]
+        );
+        assert_eq!(
+            projection.native_tools.dispatch,
+            projection.native_tools.model_visible
+        );
+        assert_eq!(projection.mcp_servers.server_ids, vec!["github"]);
+    }
+
+    #[test]
+    fn subagent_isolation_inherits_native_tools_without_implicit_mcp() {
+        let projection = subagent_projection_with_native_inheritance_and_explicit_mcp();
+
+        assert_eq!(
+            projection.native_tools.model_visible,
+            vec!["read_file", "grep", "shell"]
+        );
+        assert_eq!(projection.mcp_servers.server_ids, vec!["github"]);
+    }
+
+    fn subagent_projection_with_native_inheritance_and_explicit_mcp() -> SubagentProjection {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            mcp_servers: vec!["github".into()],
+            ..SubagentProfile::default()
+        };
+        project_subagent_profile(
+            &profile,
+            &["read_file", "grep", "shell"],
+            &["github", "docs"],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn subagent_projection_allowlist_cannot_grant_parent_hidden_tools() {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            tools: ToolPolicy::Replace {
+                tools: vec!["grep".into(), "shell".into()],
+            },
+            ..SubagentProfile::default()
+        };
+        let err = project_subagent_profile(&profile, &["grep"], &[]).unwrap_err();
+
+        assert!(err.to_string().contains("shell"));
+        assert!(err.to_string().contains("unknown native tool"));
+    }
+
+    #[test]
+    fn subagent_projection_rejects_unknown_excluded_native_tool() {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            excluded_tools: vec!["shell".into()],
+            ..SubagentProfile::default()
+        };
+        let err = project_subagent_profile(&profile, &["grep"], &[]).unwrap_err();
+
+        assert!(err.to_string().contains("excluded_tools"));
+        assert!(err.to_string().contains("shell"));
+    }
+
+    #[test]
+    fn subagent_projection_rejects_unknown_added_native_tool() {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            tools: ToolPolicy::InheritWithOverrides {
+                add: vec!["shell".into()],
+                remove: Vec::new(),
+            },
+            ..SubagentProfile::default()
+        };
+        let err = project_subagent_profile(&profile, &["grep"], &[]).unwrap_err();
+
+        assert!(err.to_string().contains("tools.add"));
+        assert!(err.to_string().contains("shell"));
+    }
+
+    #[test]
+    fn subagent_projection_rejects_unknown_removed_native_tool() {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            tools: ToolPolicy::InheritWithOverrides {
+                add: Vec::new(),
+                remove: vec!["shell".into()],
+            },
+            ..SubagentProfile::default()
+        };
+        let err = project_subagent_profile(&profile, &["grep"], &[]).unwrap_err();
+
+        assert!(err.to_string().contains("tools.remove"));
+        assert!(err.to_string().contains("shell"));
+    }
+
+    #[test]
+    fn subagent_projection_excludes_tools_from_visible_and_dispatch_sets() {
+        let projection = subagent_projection_with_hidden_tool_removal();
+
+        assert_eq!(projection.native_tools.model_visible, vec!["read_file"]);
+        assert_eq!(projection.native_tools.dispatch, vec!["read_file"]);
+    }
+
+    #[test]
+    fn subagent_isolation_removes_hidden_tools_from_visible_and_dispatch_sets() {
+        let projection = subagent_projection_with_hidden_tool_removal();
+
+        assert_eq!(projection.native_tools.model_visible, vec!["read_file"]);
+        assert_eq!(projection.native_tools.dispatch, vec!["read_file"]);
+    }
+
+    fn subagent_projection_with_hidden_tool_removal() -> SubagentProjection {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            excluded_tools: vec!["shell".into()],
+            ..SubagentProfile::default()
+        };
+        project_subagent_profile(&profile, &["read_file", "shell"], &[]).unwrap()
+    }
+
+    #[test]
+    fn main_projection_applies_default_agent_exclusions_but_child_does_not() {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            default_agent_excluded_tools: vec!["apply_patch".into()],
+            ..SubagentProfile::default()
+        };
+
+        let main =
+            project_main_agent_profile(&profile, &["read_file", "apply_patch"], &[]).unwrap();
+        let child = project_subagent_profile(&profile, &["read_file", "apply_patch"], &[]).unwrap();
+
+        assert_eq!(main.native_tools.model_visible, vec!["read_file"]);
+        assert_eq!(
+            child.native_tools.model_visible,
+            vec!["read_file", "apply_patch"]
+        );
+    }
+
+    #[test]
+    fn main_projection_applies_excluded_tools() {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            excluded_tools: vec!["shell".into()],
+            ..SubagentProfile::default()
+        };
+
+        let main = project_main_agent_profile(&profile, &["read_file", "shell"], &[]).unwrap();
+
+        assert_eq!(main.native_tools.model_visible, vec!["read_file"]);
+        assert_eq!(main.native_tools.dispatch, vec!["read_file"]);
+    }
+
+    #[test]
+    fn mcp_projection_rejects_unknown_server_id() {
+        let err = unknown_mcp_server_projection_error();
+
+        assert!(err.to_string().contains("github"));
+    }
+
+    #[test]
+    fn subagent_isolation_rejects_unknown_mcp_server_id() {
+        let err = unknown_mcp_server_projection_error();
+
+        assert!(err.to_string().contains("github"));
+    }
+
+    fn unknown_mcp_server_projection_error() -> RociError {
+        let profile = SubagentProfile {
+            name: "scout".into(),
+            mcp_servers: vec!["github".into()],
+            ..SubagentProfile::default()
+        };
+        project_subagent_profile(&profile, &["read_file"], &["docs"]).unwrap_err()
     }
 
     // -- Builtin lookup -----------------------------------------------------
@@ -610,18 +1287,118 @@ model = "claude-opus-4"
     }
 
     #[test]
+    fn resolve_inherits_excluded_tools_additively() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.load_toml(
+            r#"
+name = "parent"
+excluded_tools = ["read_file"]
+"#,
+        )
+        .unwrap();
+        reg.load_toml(
+            r#"
+name = "child"
+inherits = "parent"
+excluded_tools = ["shell"]
+"#,
+        )
+        .unwrap();
+
+        let resolved = reg.resolve("child").unwrap();
+
+        assert_eq!(resolved.excluded_tools, vec!["read_file", "shell"]);
+    }
+
+    #[test]
+    fn resolve_rejects_inherited_tool_conflict() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.load_toml(
+            r#"
+name = "parent"
+excluded_tools = ["grep"]
+"#,
+        )
+        .unwrap();
+        reg.load_toml(
+            r#"
+name = "child"
+inherits = "parent"
+
+[tools]
+mode = "replace"
+tools = ["grep"]
+"#,
+        )
+        .unwrap();
+
+        let err = reg.resolve("child").unwrap_err();
+
+        assert!(err.to_string().contains("grep"));
+        assert!(err.to_string().contains("excluded_tools"));
+    }
+
+    #[test]
+    fn resolve_preserves_child_default_true() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.load_toml(
+            r#"
+name = "parent"
+"#,
+        )
+        .unwrap();
+        reg.load_toml(
+            r#"
+name = "child"
+inherits = "parent"
+default = true
+"#,
+        )
+        .unwrap();
+
+        let resolved = reg.resolve("child").unwrap();
+
+        assert!(resolved.default);
+    }
+
+    #[test]
+    fn resolve_does_not_leak_parent_default_to_child() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.load_toml(
+            r#"
+name = "parent"
+default = true
+"#,
+        )
+        .unwrap();
+        reg.load_toml(
+            r#"
+name = "child"
+inherits = "parent"
+"#,
+        )
+        .unwrap();
+
+        let resolved = reg.resolve("child").unwrap();
+
+        assert!(!resolved.default);
+    }
+
+    #[test]
     fn circular_inheritance_detected() {
         let mut reg = SubagentProfileRegistry::new();
         reg.register(SubagentProfile {
             name: "a".into(),
             inherits: Some("b".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         reg.register(SubagentProfile {
             name: "b".into(),
             inherits: Some("a".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let err = reg.resolve("a").unwrap_err();
         assert!(err.to_string().contains("circular"));
     }
@@ -644,7 +1421,8 @@ model = "claude-opus-4"
                 reasoning_effort: None,
             }],
             ..Default::default()
-        });
+        })
+        .unwrap();
         reg.register(SubagentProfile {
             name: "a-child".into(),
             inherits: Some("z-parent".into()),
@@ -653,7 +1431,8 @@ model = "claude-opus-4"
             mcp_servers: vec!["github".into(), "filesystem".into()],
             default_agent_excluded_tools: vec!["reset_hard".into()],
             ..Default::default()
-        });
+        })
+        .unwrap();
 
         assert_eq!(
             reg.list_profile_refs(),
@@ -1112,5 +1891,28 @@ system_prompt = "Custom prompt"
             .resolve_effective("builtin:developer", &SubagentOverrides::default())
             .unwrap();
         assert_eq!(base, effective);
+    }
+
+    #[test]
+    fn resolve_effective_rejects_override_created_tool_conflict() {
+        let mut reg = SubagentProfileRegistry::new();
+        reg.load_toml(
+            r#"
+name = "scout"
+excluded_tools = ["grep"]
+"#,
+        )
+        .unwrap();
+        let overrides = SubagentOverrides {
+            tools: Some(ToolPolicy::Replace {
+                tools: vec!["grep".into()],
+            }),
+            ..SubagentOverrides::default()
+        };
+
+        let err = reg.resolve_effective("scout", &overrides).unwrap_err();
+
+        assert!(err.to_string().contains("grep"));
+        assert!(err.to_string().contains("excluded_tools"));
     }
 }

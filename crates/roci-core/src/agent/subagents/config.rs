@@ -1,6 +1,6 @@
 //! TOML configuration shapes for sub-agent profile files.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +36,8 @@ pub struct TomlProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_agent_excluded_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolPolicy>,
@@ -45,6 +47,8 @@ pub struct TomlProfile {
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
+    #[serde(default)]
+    pub default: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +62,43 @@ pub struct TomlProfileFileMulti {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical subagents TOML shape
+// ---------------------------------------------------------------------------
+
+/// Canonical public profile shape under `[subagents.<id>]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TomlSubagentProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_agent_excluded_tools: Vec<String>,
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// Wrapper for canonical `[subagents.<id>]` TOML files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TomlSubagentsFile {
+    pub subagents: BTreeMap<String, TomlSubagentProfile>,
+}
+
+// ---------------------------------------------------------------------------
 // Top-level file: single or multi
 // ---------------------------------------------------------------------------
 
@@ -66,8 +107,10 @@ pub struct TomlProfileFileMulti {
 /// A file may be either:
 /// - A single profile (all fields at top level, including `name`)
 /// - Multiple profiles under `[[profiles]]`
+/// - Canonical public profiles under `[subagents.<id>]`
 #[derive(Debug, Clone)]
 pub enum TomlProfileFile {
+    Subagents(Vec<TomlProfile>),
     Single(Box<TomlProfile>),
     Multi(Vec<TomlProfile>),
 }
@@ -75,9 +118,20 @@ pub enum TomlProfileFile {
 impl TomlProfileFile {
     /// Parse a TOML string into a profile file.
     ///
-    /// Tries multi-profile (`[[profiles]]`) first, then falls back to
-    /// single-profile (top-level fields).
+    /// Tries canonical subagent profiles first, then multi-profile
+    /// (`[[profiles]]`), then single-profile (top-level fields).
     pub fn parse(toml_str: &str) -> Result<Self, toml::de::Error> {
+        let table = toml::from_str::<toml::Table>(toml_str)?;
+        if table.contains_key("subagents") {
+            let canonical = toml::from_str::<TomlSubagentsFile>(toml_str)?;
+            let profiles = canonical
+                .subagents
+                .into_iter()
+                .map(|(name, profile)| canonical_to_legacy_toml_profile(name, profile))
+                .collect();
+            return Ok(Self::Subagents(profiles));
+        }
+
         // Try multi-profile first
         if let Ok(multi) = toml::from_str::<TomlProfileFileMulti>(toml_str) {
             if !multi.profiles.is_empty() {
@@ -92,15 +146,174 @@ impl TomlProfileFile {
     /// Return all profiles contained in this file.
     pub fn into_profiles(self) -> Vec<TomlProfile> {
         match self {
+            Self::Subagents(ps) => ps,
             Self::Single(p) => vec![*p],
             Self::Multi(ps) => ps,
         }
     }
 }
 
+fn canonical_to_legacy_toml_profile(name: String, profile: TomlSubagentProfile) -> TomlProfile {
+    let models = profile
+        .model
+        .map(|model| {
+            let (provider, model) = model.split_once(':').unwrap_or(("", model.as_str()));
+            ModelCandidate {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                reasoning_effort: None,
+            }
+        })
+        .into_iter()
+        .collect();
+
+    TomlProfile {
+        name,
+        display_name: profile.display_name,
+        description: None,
+        kind: None,
+        infer: profile.infer,
+        system_prompt: profile.prompt,
+        inherits: None,
+        skills: profile.skills,
+        mcp_servers: profile.mcp_servers,
+        default_agent_excluded_tools: profile.default_agent_excluded_tools,
+        excluded_tools: profile.excluded_tools,
+        models,
+        tools: profile.tools.map(|tools| ToolPolicy::Replace { tools }),
+        default_timeout_ms: None,
+        metadata: HashMap::new(),
+        version: None,
+        default: profile.default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_canonical_subagents_table() {
+        let toml_str = r#"
+[subagents.scout]
+display_name = "Scout"
+infer = "Use for repo search"
+model = "openai:gpt-4o"
+tools = ["grep", "read_file"]
+excluded_tools = ["shell"]
+default_agent_excluded_tools = ["apply_patch"]
+skills = ["rust-skills"]
+mcp_servers = ["github"]
+default = true
+prompt = """
+You are Scout.
+Do not edit files.
+"""
+"#;
+
+        let file = TomlProfileFile::parse(toml_str).unwrap();
+        let profiles = file.into_profiles();
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "scout");
+        assert_eq!(profiles[0].display_name.as_deref(), Some("Scout"));
+        assert_eq!(profiles[0].infer.as_deref(), Some("Use for repo search"));
+        assert_eq!(
+            profiles[0].system_prompt.as_deref(),
+            Some("You are Scout.\nDo not edit files.\n")
+        );
+        assert_eq!(profiles[0].models.len(), 1);
+        assert_eq!(profiles[0].models[0].provider, "openai");
+        assert_eq!(profiles[0].models[0].model, "gpt-4o");
+        assert_eq!(
+            profiles[0].tools,
+            Some(ToolPolicy::Replace {
+                tools: vec!["grep".into(), "read_file".into()],
+            })
+        );
+        assert_eq!(profiles[0].excluded_tools, vec!["shell"]);
+        assert_eq!(
+            profiles[0].default_agent_excluded_tools,
+            vec!["apply_patch"]
+        );
+        assert_eq!(profiles[0].skills, vec!["rust-skills"]);
+        assert_eq!(profiles[0].mcp_servers, vec!["github"]);
+        assert!(profiles[0].default);
+    }
+
+    #[test]
+    fn parse_canonical_multiple_subagents_deterministically() {
+        let toml_str = r#"
+[subagents.zeta]
+display_name = "Zeta"
+
+[subagents.alpha]
+display_name = "Alpha"
+"#;
+
+        let file = TomlProfileFile::parse(toml_str).unwrap();
+        let profiles = file.into_profiles();
+
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "alpha");
+        assert_eq!(profiles[1].name, "zeta");
+    }
+
+    #[test]
+    fn parse_malformed_canonical_subagents_returns_canonical_error() {
+        let toml_str = r#"
+[subagents.scout]
+tools = "grep"
+"#;
+
+        let err = TomlProfileFile::parse(toml_str).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("tools"));
+        assert!(!message.contains("missing field `name`"));
+    }
+
+    #[test]
+    fn parse_canonical_rejects_unknown_field() {
+        let toml_str = r#"
+[subagents.scout]
+prompt_file = "scout.md"
+"#;
+
+        let err = TomlProfileFile::parse(toml_str).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("prompt_file"));
+    }
+
+    #[test]
+    fn parse_canonical_rejects_legacy_description_field() {
+        let toml_str = r#"
+[subagents.scout]
+description = "Legacy field"
+"#;
+
+        let err = TomlProfileFile::parse(toml_str).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("description"));
+    }
+
+    #[test]
+    fn parse_canonical_rejects_mixed_legacy_profiles() {
+        let toml_str = r#"
+[subagents.scout]
+display_name = "Scout"
+
+[[profiles]]
+name = "legacy"
+"#;
+
+        let err = TomlProfileFile::parse(toml_str).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("profiles"));
+    }
 
     #[test]
     fn parse_single_profile_toml() {

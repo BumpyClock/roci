@@ -21,7 +21,8 @@ pub use domain::{
 };
 pub use error::AgentRuntimeError;
 pub use event::{
-    AgentRuntimeEvent, AgentRuntimeEventPayload, RuntimeCursor, AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
+    AgentRuntimeEvent, AgentRuntimeEventPayload, RuntimeCursor, SubagentMessageSnapshot,
+    SubagentRuntimeSnapshot, SubagentToolCallSnapshot, AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
 };
 pub use jsonl_store::JsonlAgentRuntimeEventStore;
 pub use projector::{ChatProjector, MessageProjection, ModelMessages, TurnProjection};

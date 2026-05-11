@@ -313,7 +313,7 @@ impl AgentRuntime {
             })
     }
 
-    async fn ensure_runtime_event_publisher(&self) {
+    pub(super) async fn ensure_runtime_event_publisher(&self) {
         let Some(mut publish_rx) = self.runtime_event_publish_rx.lock().await.take() else {
             return;
         };

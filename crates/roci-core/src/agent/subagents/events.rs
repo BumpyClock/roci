@@ -18,6 +18,10 @@ pub fn build_child_event_sink(
     event_tx: broadcast::Sender<SubagentEvent>,
 ) -> AgentEventSink {
     Arc::new(move |event: AgentEvent| {
+        if matches!(&event, AgentEvent::MessageUpdate { message, .. } if message.text().is_empty())
+        {
+            return;
+        }
         let _ = event_tx.send(SubagentEvent::AgentEvent {
             subagent_id,
             label: label.clone(),
@@ -74,5 +78,27 @@ mod tests {
             }
             _ => panic!("expected SubagentEvent::AgentEvent"),
         }
+    }
+
+    #[test]
+    fn build_child_event_sink_drops_empty_message_updates() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = build_child_event_sink(Uuid::new_v4(), None, tx);
+
+        sink(AgentEvent::MessageUpdate {
+            message: crate::types::ModelMessage::assistant(""),
+            assistant_message_event: crate::types::TextStreamDelta {
+                text: String::new(),
+                event_type: crate::types::StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            },
+        });
+
+        assert!(rx.try_recv().is_err());
     }
 }

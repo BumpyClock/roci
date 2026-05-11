@@ -88,6 +88,8 @@ fn make_base_config() -> AgentConfig {
         human_interaction_coordinator: None,
         context_budget: None,
         chat: Default::default(),
+        #[cfg(feature = "agent")]
+        subagents: None,
     }
 }
 
@@ -238,16 +240,18 @@ fn make_recording_supervisor(
     roci_config.set_api_key("test", "test-key".into());
 
     let mut profile_registry = SubagentProfileRegistry::with_builtins();
-    profile_registry.register(SubagentProfile {
-        name: "test:dev".into(),
-        system_prompt: Some("You are a test sub-agent.".into()),
-        models: vec![ModelCandidate {
-            provider: "test".into(),
-            model: "test-model".into(),
-            reasoning_effort: None,
-        }],
-        ..Default::default()
-    });
+    profile_registry
+        .register(SubagentProfile {
+            name: "test:dev".into(),
+            system_prompt: Some("You are a test sub-agent.".into()),
+            models: vec![ModelCandidate {
+                provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
 
     let supervisor = SubagentSupervisor::new(
         Arc::new(registry),
@@ -400,16 +404,18 @@ fn make_blocking_ask_user_supervisor() -> SubagentSupervisor {
     base_config.tools = vec![ask_user_tool];
 
     let mut profile_registry = SubagentProfileRegistry::with_builtins();
-    profile_registry.register(SubagentProfile {
-        name: "test:dev".into(),
-        system_prompt: Some("You are a test sub-agent.".into()),
-        models: vec![ModelCandidate {
-            provider: "test".into(),
-            model: "test-model".into(),
-            reasoning_effort: None,
-        }],
-        ..Default::default()
-    });
+    profile_registry
+        .register(SubagentProfile {
+            name: "test:dev".into(),
+            system_prompt: Some("You are a test sub-agent.".into()),
+            models: vec![ModelCandidate {
+                provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
 
     SubagentSupervisor::new(
         Arc::new(registry),

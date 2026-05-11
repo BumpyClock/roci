@@ -19,6 +19,11 @@ use crate::tools::tool::Tool;
 use crate::types::{
     GenerationSettings, ModelMessage, OpenAiResponsesOptions, ResponseFormat, Role,
 };
+#[cfg(feature = "agent")]
+use crate::{
+    agent::subagents::{project_main_agent_profile, SubagentProfile},
+    tools::catalog::ToolVisibilityPolicy,
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct TurnRunOptions {
@@ -108,8 +113,74 @@ impl AgentRuntime {
     pub(super) async fn resolve_tools_for_run(&self) -> Result<Vec<Arc<dyn Tool>>, RociError> {
         let static_tools = self.tools.lock().await.clone();
         let providers = self.dynamic_tool_providers.lock().await.clone();
-        let catalog = Self::merge_static_and_dynamic_tools(static_tools, providers).await?;
-        Ok(catalog.resolve(&self.config.tool_visibility_policy))
+        let mut catalog = Self::merge_static_and_dynamic_tools(static_tools, providers).await?;
+        #[cfg(feature = "agent")]
+        self.inject_subagent_tools(&mut catalog);
+        let policy = self.effective_tool_visibility_policy(&catalog)?;
+        Ok(catalog.resolve(&policy))
+    }
+
+    #[cfg(feature = "agent")]
+    fn inject_subagent_tools(&self, catalog: &mut ToolCatalog) {
+        let Some(controller) = &self.subagent_controller else {
+            return;
+        };
+        for tool in crate::agent::subagents::SubagentRoutingTools::new(controller.clone()).tools() {
+            catalog.insert_first_wins(tool, ToolOrigin::Custom);
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    fn effective_tool_visibility_policy(
+        &self,
+        catalog: &ToolCatalog,
+    ) -> Result<ToolVisibilityPolicy, RociError> {
+        let base_policy = &self.config.tool_visibility_policy;
+        let Some(profile) = self.main_subagent_profile()? else {
+            return Ok(base_policy.clone());
+        };
+        let base_names = catalog
+            .resolve_descriptors(base_policy)
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        let base_name_refs = base_names.iter().map(String::as_str).collect::<Vec<_>>();
+        let available_mcp_servers = profile
+            .mcp_servers
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let projection =
+            project_main_agent_profile(&profile, &base_name_refs, &available_mcp_servers)?;
+        Ok(ToolVisibilityPolicy::allow_only(
+            projection.native_tools.dispatch,
+        ))
+    }
+
+    #[cfg(not(feature = "agent"))]
+    fn effective_tool_visibility_policy(
+        &self,
+        _catalog: &ToolCatalog,
+    ) -> Result<crate::tools::catalog::ToolVisibilityPolicy, RociError> {
+        Ok(self.config.tool_visibility_policy.clone())
+    }
+
+    #[cfg(feature = "agent")]
+    fn main_subagent_profile(&self) -> Result<Option<SubagentProfile>, RociError> {
+        let Some(subagents) = &self.config.subagents else {
+            return Ok(None);
+        };
+        if !subagents.enabled {
+            return Ok(None);
+        }
+        let Some(profile_ref) = subagents
+            .main_profile
+            .clone()
+            .or_else(|| subagents.profiles.default_profile_ref())
+        else {
+            return Ok(None);
+        };
+        subagents.profiles.resolve(&profile_ref).map(Some)
     }
 
     async fn merge_static_and_dynamic_tools(

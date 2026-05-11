@@ -48,16 +48,18 @@ fn test_profile_registry() -> SubagentProfileRegistry {
     use crate::agent::subagents::types::SubagentProfile;
 
     let mut registry = SubagentProfileRegistry::with_builtins();
-    registry.register(SubagentProfile {
-        name: "test:dev".into(),
-        system_prompt: Some("You are a test sub-agent.".into()),
-        models: vec![ModelCandidate {
-            provider: "test".into(),
-            model: "test-model".into(),
-            reasoning_effort: None,
-        }],
-        ..Default::default()
-    });
+    registry
+        .register(SubagentProfile {
+            name: "test:dev".into(),
+            system_prompt: Some("You are a test sub-agent.".into()),
+            models: vec![ModelCandidate {
+                provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
     registry
 }
 
@@ -140,6 +142,8 @@ fn make_base_config() -> AgentConfig {
         human_interaction_coordinator: None,
         context_budget: None,
         chat: Default::default(),
+        #[cfg(feature = "agent")]
+        subagents: None,
     }
 }
 
@@ -224,6 +228,10 @@ fn make_supervisor_with_mock_config(
     provider_registry.register(Arc::new(CredentialFlagFactory {
         keys: &["test"],
         requires_credentials: true,
+    }));
+    provider_registry.register(Arc::new(CredentialFlagFactory {
+        keys: &["local"],
+        requires_credentials: false,
     }));
     make_supervisor_with_mock_config_and_registry(
         base_config,
@@ -355,26 +363,28 @@ async fn spawn_applies_tool_policy_and_reasoning_effort() {
     };
 
     let mut profile_registry = test_profile_registry();
-    profile_registry.register(SubagentProfile {
-        name: "test:scoped".into(),
-        system_prompt: Some("Scoped sub-agent".into()),
-        tools: ToolPolicy::Replace {
-            tools: vec!["read".into(), "shell".into()],
-        },
-        models: vec![
-            ModelCandidate {
-                provider: "test".into(),
-                model: "test-model".into(),
-                reasoning_effort: Some("high".into()),
+    profile_registry
+        .register(SubagentProfile {
+            name: "test:scoped".into(),
+            system_prompt: Some("Scoped sub-agent".into()),
+            tools: ToolPolicy::Replace {
+                tools: vec!["read".into(), "shell".into()],
             },
-            ModelCandidate {
-                provider: "local".into(),
-                model: "fallback-model".into(),
-                reasoning_effort: None,
-            },
-        ],
-        ..Default::default()
-    });
+            models: vec![
+                ModelCandidate {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning_effort: Some("high".into()),
+                },
+                ModelCandidate {
+                    provider: "local".into(),
+                    model: "fallback-model".into(),
+                    reasoning_effort: None,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
     let (supervisor, _, captured_config) =
         make_supervisor_with_mock_config(base_config, profile_registry);
 
@@ -426,23 +436,25 @@ async fn spawn_filters_unauth_remote_primary_to_local_fallback() {
     }));
 
     let mut profile_registry = SubagentProfileRegistry::new();
-    profile_registry.register(SubagentProfile {
-        name: "test:fallback".into(),
-        system_prompt: Some("Fallback sub-agent".into()),
-        models: vec![
-            ModelCandidate {
-                provider: "remote".into(),
-                model: "remote-model".into(),
-                reasoning_effort: Some("high".into()),
-            },
-            ModelCandidate {
-                provider: "local".into(),
-                model: "local-model".into(),
-                reasoning_effort: Some("medium".into()),
-            },
-        ],
-        ..Default::default()
-    });
+    profile_registry
+        .register(SubagentProfile {
+            name: "test:fallback".into(),
+            system_prompt: Some("Fallback sub-agent".into()),
+            models: vec![
+                ModelCandidate {
+                    provider: "remote".into(),
+                    model: "remote-model".into(),
+                    reasoning_effort: Some("high".into()),
+                },
+                ModelCandidate {
+                    provider: "local".into(),
+                    model: "local-model".into(),
+                    reasoning_effort: Some("medium".into()),
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
 
     let (supervisor, _, captured_config) = make_supervisor_with_mock_config_and_registry(
         make_base_config(),
@@ -484,19 +496,21 @@ async fn spawn_rejects_unknown_tool_policy_entry() {
     let mut base_config = make_base_config();
     base_config.tools = vec![dummy_tool("read")];
     let mut profile_registry = test_profile_registry();
-    profile_registry.register(SubagentProfile {
-        name: "test:missing-tool".into(),
-        system_prompt: Some("Scoped sub-agent".into()),
-        tools: ToolPolicy::Replace {
-            tools: vec!["missing".into()],
-        },
-        models: vec![ModelCandidate {
-            provider: "test".into(),
-            model: "test-model".into(),
-            reasoning_effort: None,
-        }],
-        ..Default::default()
-    });
+    profile_registry
+        .register(SubagentProfile {
+            name: "test:missing-tool".into(),
+            system_prompt: Some("Scoped sub-agent".into()),
+            tools: ToolPolicy::Replace {
+                tools: vec!["missing".into()],
+            },
+            models: vec![ModelCandidate {
+                provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
     let (supervisor, _, _) = make_supervisor_with_mock_config(base_config, profile_registry);
 
     let result = supervisor
@@ -697,17 +711,19 @@ async fn profile_timeout_aborts_child_run() {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(BlockingStreamFactory));
     let mut profile_registry = SubagentProfileRegistry::new();
-    profile_registry.register(SubagentProfile {
-        name: "test:timeout".into(),
-        system_prompt: Some("Timeout sub-agent".into()),
-        default_timeout_ms: Some(20),
-        models: vec![ModelCandidate {
-            provider: "test".into(),
-            model: "test-model".into(),
-            reasoning_effort: None,
-        }],
-        ..Default::default()
-    });
+    profile_registry
+        .register(SubagentProfile {
+            name: "test:timeout".into(),
+            system_prompt: Some("Timeout sub-agent".into()),
+            default_timeout_ms: Some(20),
+            models: vec![ModelCandidate {
+                provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
 
     let supervisor = SubagentSupervisor::new(
         Arc::new(registry),

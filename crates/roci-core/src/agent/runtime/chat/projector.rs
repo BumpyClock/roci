@@ -819,6 +819,24 @@ impl ThreadState {
         Ok(self.event(None, payload))
     }
 
+    fn record_subagent_event(
+        &mut self,
+        turn_id: TurnId,
+        payload: AgentRuntimeEventPayload,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        validate_subagent_payload(&payload)?;
+        Ok(self.event(Some(turn_id), payload))
+    }
+
+    fn record_subagent_event_for_thread(
+        &mut self,
+        payload: AgentRuntimeEventPayload,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        validate_subagent_payload(&payload)?;
+        Ok(self.event(None, payload))
+    }
+
     fn record_retry(
         &mut self,
         turn_id: TurnId,
@@ -905,6 +923,15 @@ impl ThreadState {
                 self.upsert_diff(diff.clone());
             }
             AgentRuntimeEventPayload::Retry { .. } => {}
+            AgentRuntimeEventPayload::SubagentStarted { .. }
+            | AgentRuntimeEventPayload::SubagentProgress { .. }
+            | AgentRuntimeEventPayload::SubagentToolCallStarted { .. }
+            | AgentRuntimeEventPayload::SubagentToolCallCompleted { .. }
+            | AgentRuntimeEventPayload::SubagentMessage { .. }
+            | AgentRuntimeEventPayload::SubagentNeedsInput { .. }
+            | AgentRuntimeEventPayload::SubagentCompleted { .. }
+            | AgentRuntimeEventPayload::SubagentFailed { .. }
+            | AgentRuntimeEventPayload::SubagentCancelled { .. } => {}
             AgentRuntimeEventPayload::PlanWritten { .. }
             | AgentRuntimeEventPayload::WorkspaceUpdated { .. }
             | AgentRuntimeEventPayload::ArtifactCreated { .. }
@@ -1708,6 +1735,24 @@ impl ChatProjector {
             .record_session_resource(turn_id, payload)
     }
 
+    pub fn record_subagent_event(
+        &mut self,
+        turn_id: TurnId,
+        payload: AgentRuntimeEventPayload,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .record_subagent_event(turn_id, payload)
+    }
+
+    pub fn record_subagent_event_for_thread(
+        &mut self,
+        thread_id: ThreadId,
+        payload: AgentRuntimeEventPayload,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(thread_id)?
+            .record_subagent_event_for_thread(payload)
+    }
+
     pub fn record_retry(
         &mut self,
         turn_id: TurnId,
@@ -1882,6 +1927,16 @@ fn validate_session_resource_payload(
     }
 }
 
+fn validate_subagent_payload(payload: &AgentRuntimeEventPayload) -> Result<(), AgentRuntimeError> {
+    if payload.is_subagent_event() {
+        return Ok(());
+    }
+
+    Err(AgentRuntimeError::ProjectionFailed {
+        message: "payload is not a subagent runtime event".to_string(),
+    })
+}
+
 fn validate_resource(
     event_name: &str,
     resource: &SessionResourceSnapshot,
@@ -1910,4 +1965,78 @@ fn validate_resource(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::event::SubagentRuntimeSnapshot;
+    use super::*;
+    use crate::agent::subagents::{SubagentId, SubagentStatus};
+    use crate::models::LanguageModel;
+
+    fn test_model() -> LanguageModel {
+        LanguageModel::Known {
+            provider_key: "test".to_string(),
+            model_id: "semantic-projector".to_string(),
+        }
+    }
+
+    fn test_subagent(turn_id: TurnId) -> SubagentRuntimeSnapshot {
+        SubagentRuntimeSnapshot {
+            subagent_id: SubagentId::nil(),
+            profile_id: "coder".to_string(),
+            label: Some("impl".to_string()),
+            status: SubagentStatus::Running,
+            model: Some(test_model()),
+            parent_turn_id: Some(turn_id),
+            parent_tool_call_id: None,
+            child_thread_id: None,
+            source_subagent_id: None,
+            target_subagent_id: None,
+            sequence: 1,
+        }
+    }
+
+    #[test]
+    fn subagent_runtime_wiring_record_subagent_event_records_event() {
+        let mut projector = ChatProjector::default();
+        let queued = projector.queue_turn(Vec::new());
+        let payload = AgentRuntimeEventPayload::SubagentStarted {
+            subagent: test_subagent(queued.turn_id),
+        };
+
+        let event = projector
+            .record_subagent_event(queued.turn_id, payload.clone())
+            .expect("subagent event records");
+        let thread = projector
+            .read_thread(projector.default_thread_id())
+            .expect("thread exists");
+
+        assert_eq!(event.turn_id, Some(queued.turn_id));
+        assert_eq!(event.seq, 2);
+        assert_eq!(event.payload, payload);
+        assert_eq!(thread.last_seq, 2);
+    }
+
+    #[test]
+    fn subagent_runtime_wiring_record_subagent_event_rejects_non_subagent_payload() {
+        let mut projector = ChatProjector::default();
+        let queued = projector.queue_turn(Vec::new());
+        let turn = projector
+            .turn_snapshot(queued.turn_id)
+            .expect("queued turn projected");
+
+        let err = projector
+            .record_subagent_event(
+                queued.turn_id,
+                AgentRuntimeEventPayload::TurnQueued { turn },
+            )
+            .expect_err("non-subagent payload rejected");
+        let thread = projector
+            .read_thread(projector.default_thread_id())
+            .expect("thread exists");
+
+        assert!(matches!(err, AgentRuntimeError::ProjectionFailed { .. }));
+        assert_eq!(thread.last_seq, 1);
+    }
 }

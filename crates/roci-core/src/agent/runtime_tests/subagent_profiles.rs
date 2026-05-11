@@ -148,12 +148,14 @@ fn circular_inheritance_detected() {
         name: "a".into(),
         inherits: Some("b".into()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     reg.register(SubagentProfile {
         name: "b".into(),
         inherits: Some("a".into()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     let err = reg.resolve("a").unwrap_err();
     assert!(err.to_string().contains("circular"));
 }
@@ -165,17 +167,20 @@ fn three_way_circular_inheritance_detected() {
         name: "x".into(),
         inherits: Some("y".into()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     reg.register(SubagentProfile {
         name: "y".into(),
         inherits: Some("z".into()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     reg.register(SubagentProfile {
         name: "z".into(),
         inherits: Some("x".into()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     let err = reg.resolve("x").unwrap_err();
     assert!(err.to_string().contains("circular"));
 }

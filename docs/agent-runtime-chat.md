@@ -107,6 +107,15 @@ Payloads:
 - `checkpoint_created`
 - `session_file_written`
 - `session_file_deleted`
+- `subagent_started`
+- `subagent_progress`
+- `subagent_tool_call_started`
+- `subagent_tool_call_completed`
+- `subagent_message`
+- `subagent_needs_input`
+- `subagent_completed`
+- `subagent_failed`
+- `subagent_cancelled`
 - `turn_completed`
 - `turn_failed`
 - `turn_canceled`
@@ -153,6 +162,13 @@ snapshots:
 Resource payloads update `ThreadSnapshot.resources`: latest plan/workspace,
 created artifacts, temp files, checkpoints, and session files. Deleted session
 files are removed from the projected file list.
+
+Subagent payloads are parent-visible semantic events. They intentionally expose
+`SubagentRuntimeSnapshot`, `SubagentMessageSnapshot`, and
+`SubagentToolCallSnapshot` instead of raw child `AgentEvent` or parent-thread
+message/tool ids. Hosts can render child lifecycle, progress, tool activity,
+needs-input prompts, and terminal outcomes without merging child history into the
+main thread context.
 
 Plan/diff updates are semantic runtime inputs. When the loop or host integration
 emits `AgentEvent::PlanUpdated` / `AgentEvent::DiffUpdated`, chat projection owns

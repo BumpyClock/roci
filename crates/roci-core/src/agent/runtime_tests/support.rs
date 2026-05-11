@@ -148,6 +148,8 @@ pub(super) fn test_agent_config() -> AgentConfig {
         context_budget: None,
         chat: Default::default(),
         #[cfg(feature = "agent")]
+        subagents: None,
+        #[cfg(feature = "agent")]
         human_interaction_coordinator: None,
     }
 }

@@ -202,6 +202,7 @@ impl SubagentSupervisor {
             .launcher
             .launch(id, initial_messages, child_config)
             .await?;
+        let handle_runtime = launched.runtime.clone();
 
         // 7. Shared status
         let status = Arc::new(Mutex::new(SubagentStatus::Pending));
@@ -269,6 +270,7 @@ impl SubagentSupervisor {
             spec.label,
             spec.profile,
             Some(model),
+            handle_runtime,
             status,
             snapshot_rx,
             cancel_token,

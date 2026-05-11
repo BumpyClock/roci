@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::agent::runtime::chat::ThreadId;
 use crate::agent_loop::AgentEvent;
 use crate::models::LanguageModel;
 use crate::types::ModelMessage;
@@ -66,6 +67,59 @@ pub enum ToolPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// Profile projections
+// ---------------------------------------------------------------------------
+
+/// Native tool visibility projected for model schema and dispatch paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeToolProjection {
+    pub model_visible: Vec<String>,
+    pub dispatch: Vec<String>,
+}
+
+/// MCP server identity projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerProjection {
+    pub server_ids: Vec<String>,
+}
+
+/// Profile projection for the main/default agent runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MainAgentProjection {
+    pub profile: SubagentProfileRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelCandidate>,
+    pub native_tools: NativeToolProjection,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    pub mcp_servers: McpServerProjection,
+}
+
+/// Profile projection for child subagent runtime construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentProjection {
+    pub profile: SubagentProfileRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelCandidate>,
+    pub native_tools: NativeToolProjection,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    pub mcp_servers: McpServerProjection,
+}
+
+// ---------------------------------------------------------------------------
 // Profile
 // ---------------------------------------------------------------------------
 
@@ -92,6 +146,8 @@ pub struct SubagentProfile {
     pub mcp_servers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_agent_excluded_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_tools: Vec<String>,
     #[serde(default)]
     pub models: Vec<ModelCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +158,8 @@ pub struct SubagentProfile {
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(default = "default_version")]
     pub version: u32,
+    #[serde(default)]
+    pub default: bool,
 }
 
 fn default_version() -> u32 {
@@ -121,11 +179,13 @@ impl Default for SubagentProfile {
             skills: Vec::new(),
             mcp_servers: Vec::new(),
             default_agent_excluded_tools: Vec::new(),
+            excluded_tools: Vec::new(),
             models: Vec::new(),
             inherits: None,
             default_timeout_ms: None,
             metadata: HashMap::new(),
             version: 1,
+            default: false,
         }
     }
 }
@@ -211,9 +271,13 @@ pub struct SubagentProfileSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_agent_excluded_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub default: bool,
     pub version: u32,
 }
 
@@ -228,8 +292,10 @@ impl From<&SubagentProfile> for SubagentProfileSummary {
             skills: profile.skills.clone(),
             mcp_servers: profile.mcp_servers.clone(),
             default_agent_excluded_tools: profile.default_agent_excluded_tools.clone(),
+            excluded_tools: profile.excluded_tools.clone(),
             models: profile.models.clone(),
             default_timeout_ms: profile.default_timeout_ms,
+            default: profile.default,
             version: profile.version,
         }
     }
@@ -362,6 +428,107 @@ pub enum SubagentStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Routing DTOs
+// ---------------------------------------------------------------------------
+
+/// Request payload for delegating a task to a sub-agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DelegateSubagentRequest {
+    pub profile: Option<SubagentProfileRef>,
+    pub task: String,
+    pub label: Option<String>,
+    #[serde(default)]
+    pub run_in_background: bool,
+}
+
+/// Compact artifact emitted by a completed sub-agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubagentArtifact {
+    pub kind: String,
+    pub title: String,
+    pub content: String,
+}
+
+/// Compact controller-facing result for a delegated sub-agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DelegateSubagentResult {
+    pub subagent_id: SubagentId,
+    pub profile_id: SubagentProfileRef,
+    pub status: SubagentStatus,
+    pub summary: String,
+    pub artifacts: Vec<SubagentArtifact>,
+    pub child_thread_id: Option<ThreadId>,
+    pub usage: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+/// Caller identity for sub-agent management operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentCaller {
+    pub is_main_agent: bool,
+    pub depth: u32,
+    pub source_subagent_id: Option<SubagentId>,
+}
+
+impl SubagentCaller {
+    /// Build a caller identity for the main/default agent.
+    pub fn main_agent() -> Self {
+        Self {
+            is_main_agent: true,
+            depth: 0,
+            source_subagent_id: None,
+        }
+    }
+
+    /// Build a caller identity for a child sub-agent.
+    pub fn child(source: SubagentId, depth: u32) -> Self {
+        Self {
+            is_main_agent: false,
+            depth,
+            source_subagent_id: Some(source),
+        }
+    }
+}
+
+/// Compact summary of a child known to the routing controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentKnownChild {
+    pub subagent_id: SubagentId,
+    pub profile_id: SubagentProfileRef,
+    pub label: Option<String>,
+    pub status: SubagentStatus,
+    pub model: Option<LanguageModel>,
+}
+
+/// Result for a sub-agent cancel request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentCancelResult {
+    pub subagent_id: SubagentId,
+    pub status: SubagentStatus,
+    pub canceled: bool,
+}
+
+/// Result for a parent-to-child message send request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendSubagentMessageResult {
+    pub subagent_id: SubagentId,
+    pub accepted: bool,
+}
+
+/// Parent-visible routing metadata for one known child sub-agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRoutingMetadata {
+    pub subagent_id: SubagentId,
+    pub profile_id: SubagentProfileRef,
+    pub label: Option<String>,
+    pub model: Option<LanguageModel>,
+    pub parent_tool_call_id: Option<String>,
+    pub child_thread_id: Option<ThreadId>,
+    pub source_subagent_id: Option<SubagentId>,
+    pub target_subagent_id: Option<SubagentId>,
+}
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -461,7 +628,9 @@ mod tests {
         assert!(profile.skills.is_empty());
         assert!(profile.mcp_servers.is_empty());
         assert!(profile.default_agent_excluded_tools.is_empty());
+        assert!(profile.excluded_tools.is_empty());
         assert!(profile.models.is_empty());
+        assert!(!profile.default);
     }
 
     #[test]
@@ -600,6 +769,8 @@ mod tests {
             skills: vec!["rust-skills".into()],
             mcp_servers: vec!["github".into()],
             default_agent_excluded_tools: vec!["dangerous-delete".into()],
+            excluded_tools: vec!["shell".into()],
+            default: true,
             ..SubagentProfile::builtin_developer()
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -613,6 +784,8 @@ mod tests {
             skills: vec!["rust-skills".into()],
             mcp_servers: vec!["github".into()],
             default_agent_excluded_tools: vec!["dangerous-delete".into()],
+            excluded_tools: vec!["shell".into()],
+            default: true,
             ..SubagentProfile::builtin_developer()
         };
         let summary = SubagentProfileSummary::from(&profile);
@@ -624,6 +797,8 @@ mod tests {
             summary.default_agent_excluded_tools,
             vec!["dangerous-delete"]
         );
+        assert_eq!(summary.excluded_tools, vec!["shell"]);
+        assert!(summary.default);
     }
 
     #[test]
@@ -677,5 +852,83 @@ mod tests {
         assert!(profile.skills.is_empty());
         assert!(profile.mcp_servers.is_empty());
         assert!(profile.default_agent_excluded_tools.is_empty());
+        assert!(profile.excluded_tools.is_empty());
+        assert!(!profile.default);
+    }
+
+    #[test]
+    fn delegate_subagent_request_subagent_routing_dto_defaults_foreground_from_minimal_json() {
+        let request: DelegateSubagentRequest =
+            serde_json::from_str(r#"{ "task": "Find runtime wiring" }"#).unwrap();
+
+        assert_eq!(request.task, "Find runtime wiring");
+        assert!(request.profile.is_none());
+        assert!(request.label.is_none());
+        assert!(!request.run_in_background);
+    }
+
+    #[test]
+    fn delegate_subagent_result_subagent_routing_dto_serde_roundtrip() {
+        let child_thread_id = ThreadId::new();
+        let result = DelegateSubagentResult {
+            subagent_id: SubagentId::nil(),
+            profile_id: "builtin:developer".into(),
+            status: SubagentStatus::Completed,
+            summary: "runtime wiring found".into(),
+            artifacts: vec![SubagentArtifact {
+                kind: "text".into(),
+                title: "notes".into(),
+                content: "child result".into(),
+            }],
+            child_thread_id: Some(child_thread_id),
+            usage: Some(serde_json::json!({ "input_tokens": 12 })),
+            error: None,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: DelegateSubagentResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, result);
+    }
+
+    #[test]
+    fn subagent_caller_subagent_routing_dto_serde_roundtrip() {
+        let callers = [
+            SubagentCaller::main_agent(),
+            SubagentCaller::child(SubagentId::nil(), 1),
+        ];
+
+        for caller in callers {
+            let json = serde_json::to_string(&caller).unwrap();
+            let deserialized: SubagentCaller = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, caller);
+        }
+    }
+
+    #[test]
+    fn subagent_cancel_result_subagent_routing_dto_serde_roundtrip() {
+        let result = SubagentCancelResult {
+            subagent_id: SubagentId::nil(),
+            status: SubagentStatus::Aborted,
+            canceled: true,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: SubagentCancelResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, result);
+    }
+
+    #[test]
+    fn send_subagent_message_result_subagent_routing_dto_serde_roundtrip() {
+        let result = SendSubagentMessageResult {
+            subagent_id: SubagentId::nil(),
+            accepted: true,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: SendSubagentMessageResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, result);
     }
 }

@@ -21,6 +21,28 @@ use crate::types::GenerationSettings;
 use super::chat::ChatRuntimeConfig;
 use super::types::{GetApiKeyFn, QueueDrainMode, SessionBeforeCompactHook, SessionBeforeTreeHook};
 
+/// Sub-agent runtime configuration for the parent/default agent.
+#[cfg(feature = "agent")]
+#[derive(Clone)]
+pub struct AgentSubagentConfig {
+    pub profiles: crate::agent::subagents::SubagentProfileRegistry,
+    pub supervisor: crate::agent::subagents::SubagentSupervisorConfig,
+    pub enabled: bool,
+    pub main_profile: Option<crate::agent::subagents::SubagentProfileRef>,
+}
+
+#[cfg(all(test, feature = "agent"))]
+impl Default for AgentSubagentConfig {
+    fn default() -> Self {
+        Self {
+            profiles: crate::agent::subagents::SubagentProfileRegistry::default(),
+            supervisor: crate::agent::subagents::SubagentSupervisorConfig::default(),
+            enabled: true,
+            main_profile: None,
+        }
+    }
+}
+
 /// Configuration for creating an [`super::AgentRuntime`].
 ///
 /// # API key resolution
@@ -120,6 +142,9 @@ pub struct AgentConfig {
     pub context_budget: Option<ContextBudget>,
     /// Chat runtime contract and event configuration.
     pub chat: ChatRuntimeConfig,
+    /// Optional sub-agent runtime configuration.
+    #[cfg(feature = "agent")]
+    pub subagents: Option<AgentSubagentConfig>,
     /// Optional shared coordinator for human interaction requests.
     ///
     /// When provided, the runtime uses this coordinator instead of creating
@@ -172,6 +197,8 @@ impl Default for AgentConfig {
             context_budget: None,
             chat: ChatRuntimeConfig::default(),
             #[cfg(feature = "agent")]
+            subagents: None,
+            #[cfg(feature = "agent")]
             human_interaction_coordinator: None,
         }
     }
@@ -197,6 +224,12 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "agent")]
+    fn subagent_runtime_wiring_default_agent_config_has_no_subagents() {
+        assert!(AgentConfig::default().subagents.is_none());
+    }
 
     #[test]
     fn default_retry_mode_derives_from_backoff() {

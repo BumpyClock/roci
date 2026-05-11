@@ -17,6 +17,7 @@ use crate::cli::{ChatApprovalArg, ChatArgs, ChatRetryModeArg};
 mod mcp;
 mod resource_prompt;
 mod runtime_events;
+mod subagents;
 mod user_input;
 
 use mcp::build_mcp_runtime_wiring;
@@ -24,6 +25,7 @@ use resource_prompt::{
     build_resource_system_prompt, expand_chat_prompt, print_resource_diagnostics,
 };
 use runtime_events::RuntimeEventRenderer;
+use subagents::{load_cli_subagent_profiles, print_agent_profiles};
 
 pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ChatArgs {
@@ -36,6 +38,9 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         skill_path,
         skill_root,
         no_skills,
+        agent,
+        no_subagents,
+        list_agents,
         no_tools,
         tools: allowed_tools,
         exclude_tools,
@@ -50,13 +55,15 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         prompt,
     } = args;
 
-    let prompt = match prompt {
-        Some(p) => p,
-        None => {
-            eprintln!("Usage: roci-agent chat \"your prompt here\"");
-            std::process::exit(1);
-        }
-    };
+    let cwd = std::env::current_dir()?;
+    let subagent_profiles = load_cli_subagent_profiles(&cwd, agent)?;
+    if list_agents {
+        let mut stdout = std::io::stdout();
+        print_agent_profiles(&subagent_profiles.registry, &mut stdout)?;
+        return Ok(());
+    }
+    let config = RociConfig::from_env();
+    let registry = Arc::new(roci::default_registry());
 
     let model: roci::models::LanguageModel = model_arg.parse().map_err(|_| {
         format!(
@@ -74,16 +81,21 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         })?;
         candidates.push(parsed);
     }
+    let prompt = match prompt {
+        Some(p) => p,
+        None => {
+            eprintln!("No prompt provided.");
+            eprintln!("Usage: roci-agent chat \"your prompt here\"");
+            eprintln!("Or pipe stdin: echo \"your prompt here\" | roci-agent chat");
+            std::process::exit(1);
+        }
+    };
     let retry_mode = match retry_mode {
         ChatRetryModeArg::Bounded => Some(RetryMode::Bounded {
             max_attempts: max_retry_attempts,
         }),
         ChatRetryModeArg::Persistent => Some(RetryMode::Persistent),
     };
-
-    let config = RociConfig::from_env();
-    let registry = Arc::new(roci::default_registry());
-    let cwd = std::env::current_dir()?;
 
     let skill_options = SkillResourceOptions {
         enabled: !no_skills,
@@ -179,6 +191,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         user_input_timeout_ms: None,
         context_budget: None,
         chat: Default::default(),
+        subagents: subagent_profiles.into_config(!no_subagents),
         human_interaction_coordinator: Some(coordinator.clone()),
     };
     let agent = if let Some(session_config) = agent_config.session.clone() {

@@ -89,7 +89,7 @@ impl SubagentLauncher for InProcessLauncher {
 /// - hooks/callbacks: reset (`transform_context`, `convert_to_llm`,
 ///   `before_agent_start`, session hooks, tool hooks, provider payload callback).
 /// - approval policy/handler: inherit from parent.
-/// - session fields: reset `session_id`.
+/// - session fields: reset. Child persistence needs child-specific session resources.
 /// - provider fields: inherit transport, retry, API key, headers, metadata, key fn.
 /// - tools: replace with profile-selected child tools.
 /// - user input coordinator: replace with supervisor coordinator.
@@ -128,7 +128,7 @@ pub(super) fn build_child_config(
         convert_to_llm: None,
         before_agent_start: None,
         session_id: None,
-        session: parent.session.clone(),
+        session: None,
         sandbox_provider: parent.sandbox_provider.clone(),
         steering_mode: parent.steering_mode,
         follow_up_mode: parent.follow_up_mode,
@@ -150,6 +150,8 @@ pub(super) fn build_child_config(
         user_input_timeout_ms: parent.user_input_timeout_ms,
         context_budget: parent.context_budget.clone(),
         chat: Default::default(),
+        #[cfg(feature = "agent")]
+        subagents: None,
     })
 }
 
@@ -236,6 +238,31 @@ mod tests {
     }
 
     #[test]
+    fn subagent_runtime_wiring_build_child_config_clears_subagents() {
+        let model = LanguageModel::Known {
+            provider_key: "test".into(),
+            model_id: "test-model".into(),
+        };
+        let parent = AgentConfig {
+            subagents: Some(Default::default()),
+            ..AgentConfig::default()
+        };
+
+        let cfg = build_child_config(
+            &parent,
+            vec![model],
+            Vec::new(),
+            None,
+            None,
+            #[cfg(feature = "agent")]
+            Arc::new(HumanInteractionCoordinator::new()),
+        )
+        .unwrap();
+
+        assert!(cfg.subagents.is_none());
+    }
+
+    #[test]
     fn build_child_config_applies_explicit_inheritance_matrix() {
         let mut provider_headers = reqwest::header::HeaderMap::new();
         provider_headers.insert("x-parent", "1".parse().unwrap());
@@ -253,6 +280,10 @@ mod tests {
             })),
             approval_policy: ApprovalPolicy::Never,
             session_id: Some("parent-session".into()),
+            session: Some(crate::session::SessionConfig::new(
+                crate::session::SessionId::parse("parent-durable-session").unwrap(),
+                std::env::temp_dir(),
+            )),
             transport: Some("proxy".into()),
             max_retry_delay_ms: Some(123),
             retry_mode: Some(RetryMode::Persistent),
@@ -286,6 +317,7 @@ mod tests {
         assert!(cfg.event_sink.is_none(), "event_sink is replacement-only");
         assert_eq!(cfg.approval_policy, ApprovalPolicy::Never);
         assert_eq!(cfg.session_id, None, "session_id resets");
+        assert_eq!(cfg.session, None, "durable session config resets");
         assert_eq!(cfg.transport.as_deref(), Some("proxy"));
         assert_eq!(cfg.max_retry_delay_ms, Some(123));
         assert_eq!(cfg.retry_mode, Some(RetryMode::Persistent));

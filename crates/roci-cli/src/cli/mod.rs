@@ -203,6 +203,18 @@ pub struct ChatArgs {
     #[arg(long)]
     pub no_skills: bool,
 
+    /// Select main/default agent profile by id.
+    #[arg(long = "agent", value_name = "PROFILE")]
+    pub agent: Option<String>,
+
+    /// Disable subagent routing tools.
+    #[arg(long)]
+    pub no_subagents: bool,
+
+    /// List loaded agent profiles and exit.
+    #[arg(long)]
+    pub list_agents: bool,
+
     /// Disable all model-visible tools
     #[arg(long)]
     pub no_tools: bool,
@@ -555,6 +567,9 @@ mod tests {
                 assert!(args.skill_path.is_empty());
                 assert!(args.skill_root.is_empty());
                 assert!(!args.no_skills);
+                assert!(args.agent.is_none());
+                assert!(!args.no_subagents);
+                assert!(!args.list_agents);
                 assert!(!args.no_tools);
                 assert!(args.tools.is_empty());
                 assert!(args.exclude_tools.is_empty());
@@ -811,6 +826,9 @@ mod tests {
                 assert!(args.skill_path.is_empty());
                 assert!(args.skill_root.is_empty());
                 assert!(!args.no_skills);
+                assert!(args.agent.is_none());
+                assert!(!args.no_subagents);
+                assert!(!args.list_agents);
                 assert!(!args.no_tools);
                 assert!(args.tools.is_empty());
                 assert!(args.exclude_tools.is_empty());
@@ -839,6 +857,28 @@ mod tests {
                 assert!(args.mcp_stdio.is_empty());
                 assert!(args.mcp_streamable_http.is_empty());
                 assert!(args.mcp_websocket.is_empty());
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_with_subagent_options() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--agent",
+            "developer",
+            "--no-subagents",
+            "--list-agents",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.agent.as_deref(), Some("developer"));
+                assert!(args.no_subagents);
+                assert!(args.list_agents);
+                assert!(args.prompt.is_none());
             }
             other => panic!("expected Chat, got {other:?}"),
         }

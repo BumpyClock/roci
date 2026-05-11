@@ -196,6 +196,54 @@ tmux new-session -d -s roci-session-resume \
 echo "attach: tmux attach -t roci-session-resume"
 ```
 
+## Subagent live verification
+
+Subagent CLI/runtime changes must prove the real `roci-agent` binary can:
+
+- load a profile from `.roci/subagents/*.toml`
+- expose `delegate_subagent` to the parent model
+- run a child provider call
+- render semantic subagent events
+- return the child summary to the parent turn
+
+Framed OpenAI-compatible endpoint:
+
+```bash
+# Replace /path/to/roci/Cargo.toml with the local checkout path.
+tmux new-session -d -s roci-subagent-live '
+  set -o pipefail
+  # Temporary cwd prevents session/test artifacts from polluting the repo.
+  WORKDIR=$(mktemp -d /tmp/roci-subagent-live-cwd.XXXXXX)
+  mkdir -p "$WORKDIR/.roci/subagents"
+  cat > "$WORKDIR/.roci/subagents/smoke.toml" <<EOF
+[[profiles]]
+name = "smoke"
+display_name = "Smoke Worker"
+default = true
+[[profiles.models]]
+provider = "openai"
+# Local framed test infra model. Use an equivalent configured smoke model if unavailable.
+model = "gemma-4-e4b"
+EOF
+  cd "$WORKDIR"
+  # framed:4001 is local OpenAI-compatible test infra from AGENTS.md.
+  OPENAI_API_KEY=sk-local-dummy \
+  OPENAI_BASE_URL=http://framed:4001/v1 \
+  cargo run -q --manifest-path /path/to/roci/Cargo.toml -p roci-cli -- \
+    chat --no-skills --agent smoke --model openai:gemma-4-e4b \
+    --temperature 0 --max-tokens 220 \
+    "Use delegate_subagent with profile smoke to ask child to reply exactly roci-subagent-live-ok. Then return the child summary." \
+    2>&1 | tee /tmp/roci-subagent-live.log
+  roci_status=$?
+  printf "\n[roci subagent live exit=%s]\n" "$roci_status" | tee -a /tmp/roci-subagent-live.log
+  exec zsh
+'
+echo "attach: tmux attach -t roci-subagent-live"
+```
+
+Acceptance: log contains `[subagent] started`, `[subagent] ... completed`,
+`roci-subagent-live-ok`, and `[roci subagent live exit=0]`.
+
 ## Environment
 
 Use `.env` for local secrets and `.env.example` as the template.

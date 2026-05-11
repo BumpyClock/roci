@@ -6,6 +6,7 @@ Roci's resource loader composes three core concerns:
 - context files (`AGENTS.md` / `CLAUDE.md`)
 - prompt templates (`prompts/*.md`)
 - skills (`SKILL.md`)
+- subagent profiles (`subagents/*.toml`, loaded by `roci-agent chat`)
 
 It also loads skill definitions from configured skill roots and injects them into `ResourceBundle`.
 
@@ -55,3 +56,16 @@ Resource loading returns diagnostics for unreadable files and collisions.
 `roci-agent` surfaces these diagnostics to stderr.
 
 `SkillResourceOptions` controls skill wiring for `ResourceLoader`, including explicit skill paths, extra roots, and disabling.
+
+## Subagent profiles
+
+`roci-agent chat` loads subagent profiles separately from skills:
+
+- built-in profiles first
+- `~/.roci/agent/subagents/*.toml`
+- `~/.agents/subagents/*.toml`
+- `.roci/subagents/*.toml`
+- `.agents/subagents/*.toml`
+
+Later roots override earlier profile ids. Use `roci-agent chat --list-agents`
+to inspect the resolved catalog without starting a provider call.

@@ -63,6 +63,17 @@ fn payload_name(payload: &AgentRuntimeEventPayload) -> &'static str {
         AgentRuntimeEventPayload::CheckpointCreated { .. } => "checkpoint_created",
         AgentRuntimeEventPayload::SessionFileWritten { .. } => "session_file_written",
         AgentRuntimeEventPayload::SessionFileDeleted { .. } => "session_file_deleted",
+        AgentRuntimeEventPayload::SubagentStarted { .. } => "subagent_started",
+        AgentRuntimeEventPayload::SubagentProgress { .. } => "subagent_progress",
+        AgentRuntimeEventPayload::SubagentToolCallStarted { .. } => "subagent_tool_call_started",
+        AgentRuntimeEventPayload::SubagentToolCallCompleted { .. } => {
+            "subagent_tool_call_completed"
+        }
+        AgentRuntimeEventPayload::SubagentMessage { .. } => "subagent_message",
+        AgentRuntimeEventPayload::SubagentNeedsInput { .. } => "subagent_needs_input",
+        AgentRuntimeEventPayload::SubagentCompleted { .. } => "subagent_completed",
+        AgentRuntimeEventPayload::SubagentFailed { .. } => "subagent_failed",
+        AgentRuntimeEventPayload::SubagentCancelled { .. } => "subagent_cancelled",
         AgentRuntimeEventPayload::TurnCompleted { .. } => "turn_completed",
         AgentRuntimeEventPayload::TurnFailed { .. } => "turn_failed",
         AgentRuntimeEventPayload::TurnCanceled { .. } => "turn_canceled",
