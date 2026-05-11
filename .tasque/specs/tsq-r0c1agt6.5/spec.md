@@ -1,6 +1,6 @@
 # roci-cli Subagent Profile Loading Design
 
-## Task
+## Overview
 
 `tsq-r0c1agt6.5` - Add roci-cli subagent profile loading and selection rendering.
 
@@ -32,7 +32,7 @@ Start with `SubagentProfileRegistry::with_builtins()`, then load TOML profile fi
 
 This mirrors existing resource/skill global-vs-project ergonomics while keeping profile files out of arbitrary project cwd.
 
-## CLI Behavior
+## Interfaces (CLI/API)
 
 - Default chat enables subagent routing tools when profiles load successfully.
 - `--no-subagents` leaves `AgentConfig.subagents = None`; no routing tools appear.
@@ -44,6 +44,21 @@ This mirrors existing resource/skill global-vs-project ergonomics while keeping 
   - model candidates
   - description/infer preview
 - `--list-agents --no-subagents` is valid and prints the catalog without wiring tools.
+
+API surface:
+
+- `roci::agent::AgentSubagentConfig` is re-exported so CLI can construct runtime subagent config without depending on private modules.
+- CLI helper returns a `SubagentProfileRegistry` plus optional selected main profile reference.
+
+## Data model / schema changes
+
+- No persisted session schema changes.
+- No provider payload schema changes.
+- CLI args add three fields to `ChatArgs`:
+  - `agent: Option<String>`
+  - `no_subagents: bool`
+  - `list_agents: bool`
+- `AgentConfig.subagents` receives `AgentSubagentConfig` when subagents are enabled.
 
 ## Runtime Rendering
 
@@ -59,6 +74,22 @@ Minimum events:
 - `SubagentCompleted` / `Failed` / `Cancelled`: terminal status.
 
 Renderer output goes to stderr so assistant stdout remains model response text.
+
+## Test plan
+
+- `roci-agent chat --list-agents` lists built-ins without requiring a prompt/provider call.
+- `roci-agent chat --agent <profile>` parses and validates the profile.
+- `roci-agent chat --no-subagents` parses and does not wire subagent config.
+- Chat config sets `AgentSubagentConfig` when subagents are enabled.
+- Subagent runtime events produce visible CLI lifecycle lines.
+- Automated tests cover CLI parsing, profile root loading/override, subagent config wiring, list output, and event rendering.
+
+Commands:
+
+- `cargo test -p roci-cli`
+- `cargo test -p roci-core --features agent subagent_runtime_wiring -- --nocapture`
+- `cargo clippy -p roci-cli --all-targets -- -D warnings`
+- `cargo clippy -p roci-core --features agent,mcp --all-targets -- -D warnings`
 
 ## Acceptance Criteria
 
