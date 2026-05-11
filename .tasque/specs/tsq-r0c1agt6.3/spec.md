@@ -6,6 +6,15 @@ Implement `tsq-r0c1agt6.3`: a core `SubagentRoutingController` plus model-callab
 
 This spec narrows the approved full feature design in `docs/superpowers/specs/2026-05-11-subagent-routing-profile-isolation-design.md` to `.3`.
 
+## Constraints / Non-goals
+
+- Do not inject tools into `AgentRuntime` in this slice; `.4` owns runtime visibility and event projection.
+- Do not add CLI flags or rendering in this slice; `.5` owns `roci-cli`.
+- Do not run live CLI verification in this slice; `.6` owns full tmux/live verification after runtime and CLI wiring exist.
+- Do not expose raw child `AgentEvent` as the public runtime event contract.
+- Do not enable recursive subagent delegation by default.
+- Do not write child session data to project cwd.
+
 ## Interfaces
 
 Create a new `agent::subagents::routing` module exported through `agent::subagents`.
