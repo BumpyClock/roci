@@ -35,6 +35,7 @@ Controller methods accept a `SubagentCaller`:
 - Main/default agent callers are allowed to use management tools.
 - Child callers are rejected in v1 with clear config/permission errors.
 - `depth` is tracked now so later recursive/depth-limited delegation can evolve without changing public method shape.
+- Every management method uses the same `authorize_main_agent` check in v1.
 
 Tool names:
 
@@ -61,6 +62,10 @@ Add DTOs to `agent::subagents::types`:
 `DelegateSubagentResult.summary` is derived from the last assistant text in child messages. If the child fails, summary is empty and `error` carries the failure. `artifacts` remains empty in v1 unless a later task adds richer extraction.
 
 `child_thread_id`, `usage`, and richer artifacts are nullable/seam fields in `.3`; runtime/session persistence work remains downstream.
+
+`DelegateSubagentRequest.run_in_background` defaults to `false` during JSON deserialization so model calls may send only `{ "task": "..." }`.
+
+The routing controller and supervisor must share one authoritative profile registry. The controller may retain its own registry clone for default lookup/listing, but the public constructor must build the supervisor from the same clone or expose a supervisor registry snapshot so default/list/spawn cannot diverge.
 
 ## Behavior
 
@@ -98,6 +103,8 @@ Send:
 - Message routes through child runtime steering queue.
 - Unknown or terminal child returns clear error.
 
+Main-agent-only enforcement applies to all management operations in this slice: delegate, list profiles, list subagents, wait, cancel, and send.
+
 Tool execution:
 
 - Tool handlers deserialize JSON args via `ToolArguments::deserialize`.
@@ -109,6 +116,7 @@ Tool execution:
 Focused tests:
 
 - Profile listing and default resolution are deterministic.
+- Minimal delegate tool args `{ "task": "..." }` deserialize and run foreground by default.
 - Delegate without profile uses default profile.
 - Delegate without default fails clearly.
 - Unknown profile fails clearly.
@@ -116,7 +124,8 @@ Focused tests:
 - Background delegate returns running handle and appears in `list_subagents`.
 - `wait_subagent` returns and caches compact completion.
 - `cancel_subagent` cancels active child and reports status.
-- `send_subagent_message` rejects child callers and unknown/terminal children.
+- All management methods reject child callers.
+- `send_subagent_message` rejects unknown/terminal children.
 - Tool wrappers execute through `Tool::execute` and return JSON DTOs.
 
 Commands:
