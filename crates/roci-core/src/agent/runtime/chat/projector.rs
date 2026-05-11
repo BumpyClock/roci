@@ -819,6 +819,15 @@ impl ThreadState {
         Ok(self.event(None, payload))
     }
 
+    fn record_retry(
+        &mut self,
+        turn_id: TurnId,
+        event: crate::agent_loop::RetryEvent,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.ensure_turn_can_project(turn_id)?;
+        Ok(self.event(Some(turn_id), AgentRuntimeEventPayload::Retry { event }))
+    }
+
     fn apply_replayed_event(&mut self, event: AgentRuntimeEvent) -> Result<(), AgentRuntimeError> {
         if event.thread_id != self.thread_id() {
             return Err(AgentRuntimeError::ProjectionFailed {
@@ -895,6 +904,7 @@ impl ThreadState {
             AgentRuntimeEventPayload::DiffUpdated { diff } => {
                 self.upsert_diff(diff.clone());
             }
+            AgentRuntimeEventPayload::Retry { .. } => {}
             AgentRuntimeEventPayload::PlanWritten { .. }
             | AgentRuntimeEventPayload::WorkspaceUpdated { .. }
             | AgentRuntimeEventPayload::ArtifactCreated { .. }
@@ -1696,6 +1706,15 @@ impl ChatProjector {
     ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
         self.thread_mut(turn_id.thread_id())?
             .record_session_resource(turn_id, payload)
+    }
+
+    pub fn record_retry(
+        &mut self,
+        turn_id: TurnId,
+        event: crate::agent_loop::RetryEvent,
+    ) -> Result<AgentRuntimeEvent, AgentRuntimeError> {
+        self.thread_mut(turn_id.thread_id())?
+            .record_retry(turn_id, event)
     }
 
     pub fn record_session_resource_for_thread(

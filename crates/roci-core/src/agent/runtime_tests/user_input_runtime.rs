@@ -172,7 +172,7 @@ async fn prompt_emits_user_input_event_and_submit_user_input_unblocks_tool() {
 
     let agent_slot: Arc<Mutex<Option<Arc<AgentRuntime>>>> = Arc::new(Mutex::new(None));
     let mut config = test_agent_config();
-    config.model = "stub:ask-user-runtime".parse().expect("stub model parses");
+    config.candidates = vec!["stub:ask-user-runtime".parse().expect("stub model parses")];
     config.tools = vec![ask_user_tool];
     config.event_sink = Some({
         let event_requests = event_requests.clone();
@@ -270,7 +270,7 @@ async fn abort_while_waiting_for_user_input_unblocks_run() {
     let request_seen_tx = Arc::new(Mutex::new(Some(request_seen_tx)));
 
     let mut config = test_agent_config();
-    config.model = "stub:ask-user-runtime".parse().expect("stub model parses");
+    config.candidates = vec!["stub:ask-user-runtime".parse().expect("stub model parses")];
     config.tools = vec![ask_user_tool];
     config.event_sink = Some({
         let request_seen_tx = Arc::clone(&request_seen_tx);

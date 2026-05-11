@@ -15,7 +15,7 @@ use crate::agent_loop::{
 };
 use crate::config::RociConfig;
 use crate::error::RociError;
-use crate::models::LanguageModel;
+use crate::models::{LanguageModel, ModelCandidates};
 use crate::provider::ProviderRegistry;
 use crate::tools::tool::Tool;
 use crate::types::*;
@@ -24,7 +24,7 @@ use super::conversation::Conversation;
 
 /// An AI agent that maintains conversation state and can use tools.
 pub struct Agent {
-    model: LanguageModel,
+    candidates: ModelCandidates,
     config: RociConfig,
     registry: Arc<ProviderRegistry>,
     system_prompt: Option<String>,
@@ -39,7 +39,7 @@ impl Agent {
     /// Create a new agent with an explicit provider registry.
     pub fn new(model: LanguageModel, registry: Arc<ProviderRegistry>) -> Self {
         Self {
-            model,
+            candidates: ModelCandidates::from_model(model),
             config: RociConfig::from_env(),
             registry,
             system_prompt: None,
@@ -122,8 +122,8 @@ impl Agent {
         }
 
         let provider = self.registry.create_provider(
-            self.model.provider_name(),
-            self.model.model_id(),
+            self.active_model().provider_name(),
+            self.active_model().model_id(),
             &self.config,
         )?;
 
@@ -172,8 +172,8 @@ impl Agent {
         }
 
         let provider = self.registry.create_provider(
-            self.model.provider_name(),
-            self.model.model_id(),
+            self.active_model().provider_name(),
+            self.active_model().model_id(),
             &self.config,
         )?;
         let provider = Arc::from(provider);
@@ -213,9 +213,10 @@ impl Agent {
         event_sink: Option<RunEventSink>,
     ) -> Result<crate::agent_loop::RunHandle, RociError> {
         let runner = LoopRunner::with_registry(self.config.clone(), self.registry.clone());
-        let mut request = RunRequest::new(self.model.clone(), messages)
-            .with_tools(self.tools.clone())
-            .with_approval_policy(self.approval_policy);
+        let mut request =
+            RunRequest::with_candidates(self.candidates.as_slice().to_vec(), messages)?
+                .with_tools(self.tools.clone())
+                .with_approval_policy(self.approval_policy);
         if let Some(handler) = &self.approval_handler {
             request = request.with_approval_handler(handler.clone());
         }
@@ -224,6 +225,10 @@ impl Agent {
             request = request.with_event_sink(sink);
         }
         runner.start(request).await
+    }
+
+    fn active_model(&self) -> &LanguageModel {
+        self.candidates.primary()
     }
 }
 
@@ -347,7 +352,8 @@ fn run_event_to_stream_item(
         RunEventPayload::ToolResult { .. }
         | RunEventPayload::PlanUpdated { .. }
         | RunEventPayload::DiffUpdated { .. }
-        | RunEventPayload::ApprovalRequired { .. } => None,
+        | RunEventPayload::ApprovalRequired { .. }
+        | RunEventPayload::Retry { .. } => None,
     }
 }
 

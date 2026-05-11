@@ -21,6 +21,12 @@ pub(super) struct ResolvedSubagentModel {
     pub reasoning_effort: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResolvedSubagentCandidates {
+    pub candidates: Vec<LanguageModel>,
+    pub reasoning_effort: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -158,6 +164,7 @@ impl SubagentProfileRegistry {
             .model)
     }
 
+    #[cfg(test)]
     pub(super) fn resolve_model_candidate(
         &self,
         profile: &SubagentProfile,
@@ -166,6 +173,35 @@ impl SubagentProfileRegistry {
         base_config: &AgentConfig,
     ) -> Result<ResolvedSubagentModel, RociError> {
         self.resolve_model_candidate_with_auth(profile, registry, config, Some(base_config))
+    }
+
+    pub(super) fn resolve_model_candidates_with_auth(
+        &self,
+        profile: &SubagentProfile,
+        registry: &ProviderRegistry,
+        config: &RociConfig,
+        base_config: &AgentConfig,
+    ) -> Result<ResolvedSubagentCandidates, RociError> {
+        let candidates = profile
+            .models
+            .iter()
+            .filter(|candidate| {
+                is_viable_model_candidate(candidate, registry, config, Some(base_config))
+            })
+            .collect::<Vec<_>>();
+        let first = candidates
+            .first()
+            .ok_or_else(|| RociError::Configuration("no viable model candidate".into()))?;
+        Ok(ResolvedSubagentCandidates {
+            candidates: candidates
+                .iter()
+                .map(|candidate| LanguageModel::Known {
+                    provider_key: candidate.provider.clone(),
+                    model_id: candidate.model.clone(),
+                })
+                .collect(),
+            reasoning_effort: first.reasoning_effort.clone(),
+        })
     }
 
     fn resolve_model_candidate_without_base_config(
@@ -840,7 +876,7 @@ model = "claude-opus-4"
         provider_reg.register(std::sync::Arc::new(CredentialFactory));
         let config = RociConfig::default();
         let base_config = AgentConfig {
-            get_api_key: Some(std::sync::Arc::new(|| {
+            get_api_key: Some(std::sync::Arc::new(|_model| {
                 Box::pin(async { Ok("request-key".into()) })
             })),
             ..AgentConfig::default()

@@ -7,9 +7,9 @@ use crate::types::Usage;
 fn runtime_with_budget(context_budget: Option<ContextBudget>) -> AgentRuntime {
     let registry = registry_with_streaming_provider("stub", 40, 5);
     let mut config = test_agent_config();
-    config.model = "stub:budget-runtime"
+    config.candidates = vec!["stub:budget-runtime"
         .parse()
-        .expect("stub model should parse");
+        .expect("stub model should parse")];
     config.context_budget = context_budget;
     AgentRuntime::new(registry, test_config(), config)
 }

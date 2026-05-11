@@ -44,7 +44,7 @@ fn logical_path(value: &str) -> LogicalPath {
 async fn runtime_with_session(root: &std::path::Path, id: &str) -> AgentRuntime {
     let registry = registry_with_streaming_provider("stub", 1, 1);
     let mut config = test_agent_config();
-    config.model = "stub:session".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:session".parse().expect("stub model should parse")];
     let store = LocalSessionStore::new(root);
     let state = store
         .create(CreateSessionOptions {
@@ -156,7 +156,7 @@ async fn resume_session_seeds_runtime_snapshot_and_provider_ledger() {
     let state = store.open(id).await.unwrap();
     let registry = registry_with_streaming_provider("stub", 1, 1);
     let mut config = test_agent_config();
-    config.model = "stub:session".parse().unwrap();
+    config.candidates = vec!["stub:session".parse().unwrap()];
 
     let agent = AgentRuntime::resume_session(registry, test_config(), config, state)
         .await
@@ -179,7 +179,7 @@ async fn completed_turn_appends_provider_ledger_messages() {
         .unwrap();
     let registry = registry_with_streaming_provider("stub", 1, 1);
     let mut config = test_agent_config();
-    config.model = "stub:session".parse().unwrap();
+    config.candidates = vec!["stub:session".parse().unwrap()];
     let agent = AgentRuntime::resume_session(registry, test_config(), config, state)
         .await
         .unwrap();
@@ -291,7 +291,7 @@ async fn compact_writes_compacted_provider_ledger_for_resume() {
         Arc::new(StdMutex::new(Vec::new())),
     );
     let mut config = test_agent_config();
-    config.model = "stub:run-model".parse().unwrap();
+    config.candidates = vec!["stub:run-model".parse().unwrap()];
     config.compaction.keep_recent_tokens = 1;
     let agent = AgentRuntime::resume_session(registry, test_config(), config, state)
         .await
@@ -391,7 +391,7 @@ async fn session_config_uses_jsonl_store_without_project_cwd_storage() {
     let agent = {
         let registry = registry_with_streaming_provider("stub", 1, 1);
         let mut config = test_agent_config();
-        config.model = "stub:session".parse().expect("stub model should parse");
+        config.candidates = vec!["stub:session".parse().expect("stub model should parse")];
         let store = LocalSessionStore::new(sessions.path());
         let state = store
             .create(CreateSessionOptions {
@@ -430,9 +430,9 @@ async fn plan_updates_are_mirrored_to_plan_md() {
     let session_id = session_id("session-plan");
     let registry = registry_with_plan_json_provider("plan-json", "make a plan");
     let mut config = test_agent_config();
-    config.model = "plan-json:stub-model"
+    config.candidates = vec!["plan-json:stub-model"
         .parse()
-        .expect("stub model should parse");
+        .expect("stub model should parse")];
     let store = LocalSessionStore::new(sessions.path());
     let state = store
         .create(CreateSessionOptions {

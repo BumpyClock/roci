@@ -7,8 +7,10 @@ use std::collections::HashSet;
 pub enum MCPServerKind {
     /// A stdio-connected MCP server.
     Stdio,
-    /// A streamable HTTP/SSE MCP server.
-    Sse,
+    /// A streamable HTTP MCP server.
+    StreamableHttp,
+    /// A WebSocket MCP server.
+    WebSocket,
     /// Unknown or unspecified server kind.
     #[default]
     Unknown,
@@ -58,6 +60,23 @@ impl MCPInstructionSource {
     /// Return the label used for prompt rendering.
     pub fn display_label(&self) -> &str {
         self.server.display_label()
+    }
+}
+
+/// Structured identity for a resource from one MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MCPResourceIdentity {
+    pub server_id: String,
+    pub uri: String,
+}
+
+impl MCPResourceIdentity {
+    /// Create resource identity without encoding server id into URI.
+    pub fn new(server_id: impl Into<String>, uri: impl Into<String>) -> Self {
+        Self {
+            server_id: server_id.into(),
+            uri: uri.into(),
+        }
     }
 }
 
@@ -184,5 +203,23 @@ mod tests {
     fn merge_returns_none_when_empty() {
         let merged = merge_mcp_instructions(None, &[], MCPInstructionMergePolicy::AppendBlock);
         assert!(merged.is_none());
+    }
+
+    #[test]
+    fn resource_identity_routes_same_uri_by_server_id() {
+        let alpha = MCPResourceIdentity::new("alpha", "file:///shared/readme.md");
+        let beta = MCPResourceIdentity::new("beta", "file:///shared/readme.md");
+
+        assert_ne!(alpha, beta);
+        assert_eq!(alpha.uri, beta.uri);
+    }
+
+    #[test]
+    fn resource_identity_ignores_label_changes() {
+        let original = MCPResourceIdentity::new("docs", "file:///guide.md");
+        let relabeled_server = MCPServerMetadata::with_label("docs", "Docs Gateway");
+        let after_label_change = MCPResourceIdentity::new(relabeled_server.id, "file:///guide.md");
+
+        assert_eq!(original, after_label_change);
     }
 }

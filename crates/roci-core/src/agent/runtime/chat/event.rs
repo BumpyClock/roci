@@ -6,6 +6,7 @@ use super::domain::{
     ReasoningSnapshot, SessionResourceSnapshot, ThreadId, ToolExecutionSnapshot, TurnId,
     TurnSnapshot,
 };
+use crate::agent_loop::RetryEvent;
 
 pub const AGENT_RUNTIME_EVENT_SCHEMA_VERSION: u16 = 1;
 
@@ -114,6 +115,9 @@ pub enum AgentRuntimeEventPayload {
     },
     DiffUpdated {
         diff: DiffSnapshot,
+    },
+    Retry {
+        event: RetryEvent,
     },
     PlanWritten {
         resource: SessionResourceSnapshot,
@@ -232,6 +236,11 @@ impl AgentRuntimeEventPayload {
     #[must_use]
     pub const fn diff_updated_name() -> &'static str {
         "diff_updated"
+    }
+
+    #[must_use]
+    pub const fn retry_name() -> &'static str {
+        "retry"
     }
 
     #[must_use]

@@ -112,7 +112,7 @@ impl ModelProvider for SummaryProvider {
 pub(super) fn test_agent_config() -> AgentConfig {
     let model: LanguageModel = "openai:gpt-4o".parse().unwrap();
     AgentConfig {
-        model,
+        candidates: vec![model],
         system_prompt: None,
         tools: Vec::new(),
         tool_visibility_policy: Default::default(),
@@ -132,6 +132,8 @@ pub(super) fn test_agent_config() -> AgentConfig {
         transport: None,
         max_retry_delay_ms: None,
         retry_backoff: RetryBackoffPolicy::default(),
+        retry_mode: Default::default(),
+        model_health: Arc::new(crate::models::SharedModelHealthRegistry::default()),
         api_key_override: None,
         provider_headers: reqwest::header::HeaderMap::new(),
         provider_metadata: HashMap::new(),
@@ -156,9 +158,9 @@ pub(super) fn runtime_with_streaming_model(
 ) -> AgentRuntime {
     let registry = registry_with_streaming_provider(provider_key, 8, 3);
     let mut config = test_agent_config();
-    config.model = format!("{provider_key}:{model_id}")
+    config.candidates = vec![format!("{provider_key}:{model_id}")
         .parse()
-        .expect("stub model should parse");
+        .expect("stub model should parse")];
     AgentRuntime::new(registry, test_config(), config)
 }
 

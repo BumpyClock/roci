@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::AgentRuntime;
 use crate::agent_loop::ApprovalPolicy;
 use crate::error::RociError;
-use crate::models::LanguageModel;
+use crate::models::{LanguageModel, ModelCandidates};
 use crate::tools::dynamic::DynamicToolProvider;
 use crate::tools::tool::Tool;
 use crate::types::{GenerationSettings, ModelMessage};
@@ -38,7 +38,24 @@ impl AgentRuntime {
 
     /// Return the configured model used for subsequent runs.
     pub async fn current_model(&self) -> LanguageModel {
-        self.model.lock().await.clone()
+        self.active_candidate()
+            .await
+            .expect("runtime candidates are validated at construction")
+    }
+
+    /// Return the active candidate used for preflight and initial provider creation.
+    pub async fn active_candidate(&self) -> Result<LanguageModel, RociError> {
+        self.candidates
+            .lock()
+            .await
+            .first()
+            .cloned()
+            .ok_or_else(|| RociError::Configuration("model candidates cannot be empty".into()))
+    }
+
+    /// Return configured candidates used for subsequent runs.
+    pub async fn current_candidates(&self) -> Vec<LanguageModel> {
+        self.candidates.lock().await.clone()
     }
 
     /// Replace the configured model used for subsequent runs, returning the previous model.
@@ -50,11 +67,30 @@ impl AgentRuntime {
     /// Returns [`RociError::InvalidState`] if the runtime is not idle.
     pub async fn switch_model(&self, model: LanguageModel) -> Result<LanguageModel, RociError> {
         let _state_guard = self.lock_state_for_idle_mutation()?;
-        let mut runtime_model = self
-            .model
+        let mut runtime_candidates = self
+            .candidates
             .try_lock()
             .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?;
-        Ok(std::mem::replace(&mut *runtime_model, model))
+        let previous = runtime_candidates
+            .first()
+            .cloned()
+            .ok_or_else(|| RociError::Configuration("model candidates cannot be empty".into()))?;
+        *runtime_candidates = ModelCandidates::from_model(model).into_vec();
+        Ok(previous)
+    }
+
+    /// Replace configured model candidates used for subsequent runs.
+    pub async fn set_model_candidates(
+        &self,
+        candidates: Vec<LanguageModel>,
+    ) -> Result<Vec<LanguageModel>, RociError> {
+        let normalized = ModelCandidates::new(candidates)?.into_vec();
+        let _state_guard = self.lock_state_for_idle_mutation()?;
+        let mut runtime_candidates = self
+            .candidates
+            .try_lock()
+            .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?;
+        Ok(std::mem::replace(&mut *runtime_candidates, normalized))
     }
 
     /// Replace generation settings used by subsequent turns.

@@ -73,7 +73,7 @@ mod tests {
     use serde_json::json;
     use std::collections::VecDeque;
 
-    use crate::mcp::client::MCPToolCallResult;
+    use crate::mcp::client::{MCPReadResourceResult, MCPResourceSchema, MCPToolCallResult};
     use crate::mcp::transport::MCPTransport;
 
     struct NoopTransport;
@@ -130,6 +130,16 @@ mod tests {
 
         async fn instructions(&mut self) -> Result<Option<String>, RociError> {
             Ok(None)
+        }
+
+        async fn list_resources(&mut self) -> Result<Vec<MCPResourceSchema>, RociError> {
+            Ok(Vec::new())
+        }
+
+        async fn read_resource(&mut self, uri: &str) -> Result<MCPReadResourceResult, RociError> {
+            Err(RociError::InvalidArgument(format!(
+                "Unknown resource '{uri}'"
+            )))
         }
 
         async fn call_tool(

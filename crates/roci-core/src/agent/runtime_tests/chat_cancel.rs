@@ -18,7 +18,7 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(2);
 fn runtime_with_chat_provider() -> AgentRuntime {
     let registry = registry_with_streaming_provider("stub", 8, 3);
     let mut config = test_agent_config();
-    config.model = "stub:chat-cancel".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:chat-cancel".parse().expect("stub model should parse")];
     AgentRuntime::new(registry, test_config(), config)
 }
 
@@ -27,9 +27,9 @@ fn runtime_with_blocking_provider() -> Arc<AgentRuntime> {
     registry.register(Arc::new(BlockingTextFactory));
 
     let mut config = test_agent_config();
-    config.model = "stub:chat-cancel-blocking"
+    config.candidates = vec!["stub:chat-cancel-blocking"
         .parse()
-        .expect("stub model should parse");
+        .expect("stub model should parse")];
 
     Arc::new(AgentRuntime::new(Arc::new(registry), test_config(), config))
 }

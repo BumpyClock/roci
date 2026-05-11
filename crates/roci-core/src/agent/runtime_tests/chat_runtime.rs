@@ -1,16 +1,16 @@
 use super::chat::{
-    AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventStore, MessageStatus, RuntimeCursor,
-    ThreadId, TurnStatus,
+    AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, AgentRuntimeEventStore,
+    MessageStatus, RuntimeCursor, ThreadId, TurnStatus,
 };
 use super::support::*;
 use super::*;
-use crate::agent_loop::runner::BeforeAgentStartHookResult;
-use crate::agent_loop::{ApprovalPolicy, RunStatus};
+use crate::agent_loop::runner::{BeforeAgentStartHookResult, RetryBackoffPolicy};
+use crate::agent_loop::{ApprovalPolicy, RetryEventKind, RunStatus};
 use crate::attachments::{
     Attachment, AttachmentContentKind, AttachmentSourceKind, BlobAttachment, PromptInput,
     SelectionAttachment,
 };
-use crate::models::{ModelCapabilities, ModelInputCapabilities};
+use crate::models::{ImageInputCapabilities, ModelCapabilities, ModelInputCapabilities};
 use crate::provider::{ModelProvider, ProviderFactory, ProviderRequest, ProviderResponse};
 use crate::types::{
     ContentPart, FinishReason, GenerationSettings, ImageContent, ModelMessage, ResponseFormat,
@@ -29,18 +29,18 @@ type RecordedProviderRequests = Arc<Mutex<Vec<Vec<String>>>>;
 fn runtime_with_chat_provider() -> AgentRuntime {
     let registry = registry_with_streaming_provider("stub", 8, 3);
     let mut config = test_agent_config();
-    config.model = "stub:chat-runtime"
+    config.candidates = vec!["stub:chat-runtime"
         .parse()
-        .expect("stub model should parse");
+        .expect("stub model should parse")];
     AgentRuntime::new(registry, test_config(), config)
 }
 
 fn runtime_with_default_thread(thread_id: ThreadId) -> AgentRuntime {
     let registry = registry_with_streaming_provider("stub", 8, 3);
     let mut config = test_agent_config();
-    config.model = "stub:chat-runtime"
+    config.candidates = vec!["stub:chat-runtime"
         .parse()
-        .expect("stub model should parse");
+        .expect("stub model should parse")];
     config.chat.default_thread_id = Some(thread_id);
     AgentRuntime::new(registry, test_config(), config)
 }
@@ -161,7 +161,7 @@ async fn prompt_message_preserves_image_parts_in_provider_request() {
         requests: requests.clone(),
     }));
     let mut config = test_agent_config();
-    config.model = "stub:multipart".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:multipart".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
     let image_message = ModelMessage {
         role: Role::User,
@@ -278,7 +278,7 @@ async fn prompt_input_sends_image_parts_in_provider_request() {
         requests: requests.clone(),
     }));
     let mut config = test_agent_config();
-    config.model = "stub:vision".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:vision".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
     let input = PromptInput::new("describe image").with_attachment(Attachment::Blob(
         BlobAttachment::new([137, 80, 78, 71]).with_mime_type("image/png"),
@@ -298,12 +298,198 @@ async fn prompt_input_sends_image_parts_in_provider_request() {
 }
 
 #[tokio::test]
+async fn runtime_subscriber_receives_retry_and_candidate_advance_events() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CandidateFallbackFactory {
+        provider_key: "stub",
+        requests: requests.clone(),
+    }));
+    let mut config = test_agent_config();
+    config.candidates = vec![
+        "stub:vision-timeout"
+            .parse()
+            .expect("stub model should parse"),
+        "stub:text".parse().expect("stub model should parse"),
+    ];
+    config.retry_backoff = RetryBackoffPolicy {
+        max_attempts: 2,
+        initial_delay_ms: 1,
+        multiplier: 1.0,
+        jitter_ratio: 0.0,
+        max_delay_ms: 1,
+    };
+    config.retry_mode = None;
+    let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
+    let mut subscription = agent.subscribe(None).await;
+
+    let result = agent.prompt("hello").await.expect("prompt should run");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let mut retry_kinds = Vec::new();
+    for _ in 0..20 {
+        let event = timeout(Duration::from_secs(2), subscription.recv())
+            .await
+            .expect("runtime event timeout")
+            .expect("runtime event");
+        match event.payload {
+            AgentRuntimeEventPayload::Retry { event } => retry_kinds.push(event.kind),
+            AgentRuntimeEventPayload::TurnCompleted { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(retry_kinds.contains(&RetryEventKind::RetryScheduled));
+    assert!(retry_kinds.contains(&RetryEventKind::RetryResuming));
+    assert!(retry_kinds.contains(&RetryEventKind::CandidateAdvancing));
+}
+
+#[tokio::test]
+async fn runtime_retry_mode_none_derives_attempts_from_backoff() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CandidateFallbackFactory {
+        provider_key: "stub",
+        requests: requests.clone(),
+    }));
+    let mut config = test_agent_config();
+    config.candidates = vec![
+        "stub:vision-timeout"
+            .parse()
+            .expect("stub model should parse"),
+        "stub:text".parse().expect("stub model should parse"),
+    ];
+    config.retry_backoff = RetryBackoffPolicy {
+        max_attempts: 1,
+        initial_delay_ms: 1,
+        multiplier: 1.0,
+        jitter_ratio: 0.0,
+        max_delay_ms: 1,
+    };
+    config.retry_mode = None;
+    let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
+
+    let result = agent.prompt("hello").await.expect("prompt should run");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let recorded = requests.lock().expect("requests lock");
+    let timeout_attempts = recorded
+        .iter()
+        .filter(|(model_id, _)| model_id == "vision-timeout")
+        .count();
+    assert_eq!(timeout_attempts, 1);
+}
+
+#[tokio::test]
+async fn prompt_input_uses_common_denominator_capabilities_for_fallback_candidates() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CandidateFallbackFactory {
+        provider_key: "stub",
+        requests: requests.clone(),
+    }));
+    let mut config = test_agent_config();
+    config.candidates = vec![
+        "stub:vision-timeout"
+            .parse()
+            .expect("stub model should parse"),
+        "stub:text".parse().expect("stub model should parse"),
+    ];
+    config.retry_backoff = RetryBackoffPolicy {
+        max_attempts: 1,
+        initial_delay_ms: 1,
+        multiplier: 1.0,
+        jitter_ratio: 0.0,
+        max_delay_ms: 1,
+    };
+    config.retry_mode = None;
+    let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
+    let input = PromptInput::new("describe image").with_attachment(Attachment::Blob(
+        BlobAttachment::new([137, 80, 78, 71])
+            .with_name("pixel.png")
+            .with_mime_type("image/png"),
+    ));
+
+    let result = agent.prompt(input).await.expect("prompt should run");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let recorded = requests.lock().expect("requests lock");
+    let (_model_id, messages) = recorded
+        .iter()
+        .find(|(model_id, _)| model_id == "text")
+        .expect("fallback text model request");
+    let user_message = messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("user message");
+    assert_eq!(user_message.content.len(), 1);
+    assert!(!user_message
+        .content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image(_))));
+    assert!(user_message
+        .text()
+        .contains("User attached unsupported media: pixel.png"));
+}
+
+#[tokio::test]
+async fn prompt_input_intersects_candidate_image_mime_types() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CandidateFallbackFactory {
+        provider_key: "stub",
+        requests: requests.clone(),
+    }));
+    let mut config = test_agent_config();
+    config.candidates = vec![
+        "stub:vision-gif-timeout"
+            .parse()
+            .expect("stub model should parse"),
+        "stub:vision-png".parse().expect("stub model should parse"),
+    ];
+    config.retry_backoff = RetryBackoffPolicy {
+        max_attempts: 1,
+        initial_delay_ms: 1,
+        multiplier: 1.0,
+        jitter_ratio: 0.0,
+        max_delay_ms: 1,
+    };
+    config.retry_mode = None;
+    let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
+    let input = PromptInput::new("describe gif").with_attachment(Attachment::Blob(
+        BlobAttachment::new([71, 73, 70, 56])
+            .with_name("motion.gif")
+            .with_mime_type("image/gif"),
+    ));
+
+    let result = agent.prompt(input).await.expect("prompt should run");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let recorded = requests.lock().expect("requests lock");
+    let (_model_id, messages) = recorded
+        .iter()
+        .find(|(model_id, _)| model_id == "vision-png")
+        .expect("fallback png model request");
+    let user_message = messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("user message");
+    assert_eq!(user_message.content.len(), 1);
+    assert!(!user_message
+        .content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image(_))));
+    assert!(user_message
+        .text()
+        .contains("User attached unsupported media: motion.gif"));
+}
+
+#[tokio::test]
 async fn event_publish_failure_rolls_back_messages_and_chat_turn() {
     let registry = registry_with_streaming_provider("stub", 8, 3);
     let mut config = test_agent_config();
-    config.model = "stub:event-failure"
+    config.candidates = vec!["stub:event-failure"
         .parse()
-        .expect("stub model should parse");
+        .expect("stub model should parse")];
     config.chat.event_store = Some(Arc::new(FailingRuntimeEventStore::new()));
     let agent = AgentRuntime::new(registry, test_config(), config);
 
@@ -481,7 +667,7 @@ async fn queued_cancel_prevents_provider_call_and_emits_turn_canceled() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let registry = registry_with_counting_blocking_provider("stub", provider_calls.clone());
     let mut config = test_agent_config();
-    config.model = "stub:blocking".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:blocking".parse().expect("stub model should parse")];
     let agent = Arc::new(AgentRuntime::new(registry, test_config(), config));
     let mut sub = agent.subscribe(None).await;
 
@@ -519,7 +705,7 @@ async fn canceling_queued_turn_does_not_abort_running_turn() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let registry = registry_with_counting_blocking_provider("stub", provider_calls.clone());
     let mut config = test_agent_config();
-    config.model = "stub:blocking".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:blocking".parse().expect("stub model should parse")];
     let agent = Arc::new(AgentRuntime::new(registry, test_config(), config));
     let mut sub = agent.subscribe(None).await;
 
@@ -563,7 +749,7 @@ async fn idle_mutations_reject_while_turn_is_queued() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let registry = registry_with_counting_blocking_provider("stub", provider_calls.clone());
     let mut config = test_agent_config();
-    config.model = "stub:blocking".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:blocking".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
 
     let turn_id = agent
@@ -590,7 +776,7 @@ async fn reset_after_enqueue_cancels_queue_without_stranding_runtime() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let registry = registry_with_counting_blocking_provider("stub", provider_calls);
     let mut config = test_agent_config();
-    config.model = "stub:blocking".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:blocking".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
 
     agent
@@ -614,7 +800,7 @@ async fn reset_after_enqueue_cancels_queue_without_stranding_runtime() {
 async fn queued_turns_run_fifo() {
     let (registry, requests) = registry_with_request_recording_provider("stub", "ok");
     let mut config = test_agent_config();
-    config.model = "stub:fifo".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:fifo".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
 
     let first = agent
@@ -661,7 +847,7 @@ async fn pre_start_cancel_does_not_commit_canceled_prompt_to_provider_ledger() {
     let release_for_hook = release.clone();
     let hook_calls_for_hook = hook_calls.clone();
     let mut config = test_agent_config();
-    config.model = "stub:pre-start".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:pre-start".parse().expect("stub model should parse")];
     config.before_agent_start = Some(Arc::new(move |_payload| {
         let entered = entered_for_hook.clone();
         let release = release_for_hook.clone();
@@ -741,7 +927,7 @@ async fn idle_settings_mutator_and_per_turn_override_freeze_effective_settings()
     let seen_settings = Arc::new(Mutex::new(Vec::new()));
     let registry = registry_with_recording_provider("stub", seen_settings.clone(), None);
     let mut config = test_agent_config();
-    config.model = "stub:settings".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:settings".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
 
     agent
@@ -784,7 +970,7 @@ async fn plan_mode_emits_plan_updated_from_structured_response() {
         Some(r#"{"steps":["inspect","edit","verify"]}"#.to_string()),
     );
     let mut config = test_agent_config();
-    config.model = "stub:plan".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:plan".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
     let mut sub = agent.subscribe(None).await;
 
@@ -818,7 +1004,7 @@ async fn plan_mode_malformed_response_marks_turn_failed_without_plan_update() {
         Some("plain prose plan".to_string()),
     );
     let mut config = test_agent_config();
-    config.model = "stub:plan".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:plan".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
 
     let turn_id = agent
@@ -1067,6 +1253,139 @@ struct RecordingProvider {
 struct FullMessageRecordingFactory {
     provider_key: &'static str,
     requests: Arc<Mutex<Vec<Vec<ModelMessage>>>>,
+}
+
+type CandidateRequestRecord = (String, Vec<ModelMessage>);
+type CandidateRequestLog = Arc<Mutex<Vec<CandidateRequestRecord>>>;
+
+struct CandidateFallbackFactory {
+    provider_key: &'static str,
+    requests: CandidateRequestLog,
+}
+
+impl ProviderFactory for CandidateFallbackFactory {
+    fn provider_keys(&self) -> &[&str] {
+        std::slice::from_ref(&self.provider_key)
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        let capabilities = candidate_capabilities(model_id);
+        Ok(Box::new(CandidateFallbackProvider {
+            provider_key: provider_key.to_string(),
+            model_id: model_id.to_string(),
+            requests: self.requests.clone(),
+            capabilities,
+        }))
+    }
+}
+
+fn candidate_capabilities(model_id: &str) -> ModelCapabilities {
+    if model_id.starts_with("vision-gif") {
+        return ModelCapabilities {
+            supports_vision: true,
+            input: ModelInputCapabilities {
+                image: Some(ImageInputCapabilities {
+                    supported_mime_types: vec!["image/gif".to_string()],
+                    ..ImageInputCapabilities::default()
+                }),
+                ..ModelInputCapabilities::default()
+            },
+            ..ModelCapabilities::default()
+        };
+    }
+    if model_id.starts_with("vision-png") {
+        return ModelCapabilities {
+            supports_vision: true,
+            input: ModelInputCapabilities {
+                image: Some(ImageInputCapabilities {
+                    supported_mime_types: vec!["image/png".to_string()],
+                    ..ImageInputCapabilities::default()
+                }),
+                ..ModelInputCapabilities::default()
+            },
+            ..ModelCapabilities::default()
+        };
+    }
+    if model_id.starts_with("vision") {
+        return ModelCapabilities {
+            supports_vision: true,
+            input: ModelInputCapabilities::from_vision_support(true),
+            ..ModelCapabilities::default()
+        };
+    }
+    ModelCapabilities::default()
+}
+
+struct CandidateFallbackProvider {
+    provider_key: String,
+    model_id: String,
+    requests: CandidateRequestLog,
+    capabilities: ModelCapabilities,
+}
+
+#[async_trait]
+impl ModelProvider for CandidateFallbackProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "stream-only fallback test provider".to_string(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .push((self.model_id.clone(), request.messages.clone()));
+        if self.model_id.contains("timeout") {
+            return Err(RociError::Timeout(10));
+        }
+        let events: Vec<Result<TextStreamDelta, RociError>> = vec![
+            Ok(TextStreamDelta {
+                text: "ok".to_string(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: Some(FinishReason::Stop),
+                usage: Some(Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }),
+        ];
+        Ok(Box::pin(stream::iter(events)))
+    }
 }
 
 impl ProviderFactory for FullMessageRecordingFactory {

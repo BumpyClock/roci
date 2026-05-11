@@ -22,6 +22,7 @@ pub(super) enum ProviderScenario {
     RateLimitedWithoutRetryHint,
     RetryableTimeoutThenComplete,
     RetryableTimeoutExhausted,
+    StreamTimeoutThenComplete,
     ContextOverflowThenComplete,
     ContextOverflowAlways,
     UntypedOverflowError,
@@ -184,6 +185,33 @@ pub(super) fn test_runner(
     let requests = Arc::new(std::sync::Mutex::new(Vec::<ProviderRequest>::new()));
     let provider_requests = requests.clone();
     let factory: ProviderFactory = Arc::new(move |_model, _config| {
+        Ok(Box::new(StubProvider::new(
+            scenario,
+            provider_requests.clone(),
+        )))
+    });
+    (
+        LoopRunner::with_provider_factory(RociConfig::new(), factory),
+        requests,
+    )
+}
+
+pub(super) fn test_runner_by_model(
+    scenarios: Vec<(&'static str, ProviderScenario)>,
+) -> (LoopRunner, Arc<std::sync::Mutex<Vec<ProviderRequest>>>) {
+    let scenarios = std::collections::HashMap::<String, ProviderScenario>::from_iter(
+        scenarios
+            .into_iter()
+            .map(|(model_id, scenario)| (model_id.to_string(), scenario)),
+    );
+    let scenarios = Arc::new(scenarios);
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<ProviderRequest>::new()));
+    let provider_requests = requests.clone();
+    let factory: ProviderFactory = Arc::new(move |model, _config| {
+        let scenario = scenarios
+            .get(model.model_id())
+            .copied()
+            .unwrap_or(ProviderScenario::MissingOptionalFields);
         Ok(Box::new(StubProvider::new(
             scenario,
             provider_requests.clone(),

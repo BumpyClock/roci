@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::agent_loop::events::RetryMode;
 use crate::agent_loop::runner::{
     AgentEventSink, BeforeAgentStartHook, ConvertToLlmFn, PostToolUseHook, PreToolUseHook,
     RetryBackoffPolicy, TransformContextFn,
 };
 use crate::agent_loop::{ApprovalHandler, ApprovalPolicy};
 use crate::context::ContextBudget;
-use crate::models::LanguageModel;
+use crate::error::RociError;
+use crate::models::{LanguageModel, SharedModelHealthRegistry};
 use crate::provider::ProviderPayloadCallback;
 use crate::resource::CompactionSettings;
 use crate::session::SessionConfig;
@@ -32,8 +34,8 @@ use super::types::{GetApiKeyFn, QueueDrainMode, SessionBeforeCompactHook, Sessio
 /// dynamic keys (e.g., token rotation or multi-tenant key injection).
 #[derive(Clone)]
 pub struct AgentConfig {
-    /// The language model to use for generation.
-    pub model: LanguageModel,
+    /// Ordered language model candidates to use for generation.
+    pub candidates: Vec<LanguageModel>,
     /// Optional system prompt prepended to the first turn.
     pub system_prompt: Option<String>,
     /// Tools available for tool-use loops.
@@ -73,6 +75,10 @@ pub struct AgentConfig {
     pub max_retry_delay_ms: Option<u64>,
     /// Retry/backoff policy for transient provider failures.
     pub retry_backoff: RetryBackoffPolicy,
+    /// Optional retry mode override. When `None`, bounded retry attempts derive from retry_backoff.
+    pub retry_mode: Option<RetryMode>,
+    /// Shared model health registry. Each run creates a fresh session tracker.
+    pub model_health: Arc<SharedModelHealthRegistry>,
     /// Optional per-run provider API key override.
     pub api_key_override: Option<String>,
     /// Optional per-run provider header overrides.
@@ -81,16 +87,17 @@ pub struct AgentConfig {
     pub provider_metadata: HashMap<String, String>,
     /// Optional callback for inspecting provider request payloads.
     pub provider_payload_callback: Option<ProviderPayloadCallback>,
-    /// Optional async callback to resolve an API key per run.
+    /// Optional async callback to resolve an API key for each active model.
     ///
-    /// Precedence is: request override -> provider/config key -> this callback.
+    /// Precedence is: provider-scoped request override -> provider/config key -> this callback.
     ///
     /// When `None` (the default), the agent resolves keys automatically
     /// through [`crate::config::RociConfig`] which checks explicit API keys
     /// loaded from environment or `.env`, then OAuth tokens saved via
     /// `roci auth login`.
     /// No explicit key configuration is needed if any of those sources
-    /// has a valid credential for the provider.
+    /// has a valid credential for the provider. The callback receives the
+    /// active model so fallback across providers can resolve the right key.
     pub get_api_key: Option<GetApiKeyFn>,
     /// Compaction policy and summarization model selection.
     pub compaction: CompactionSettings,
@@ -126,10 +133,10 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: LanguageModel::Known {
+            candidates: vec![LanguageModel::Known {
                 provider_key: "openai".to_string(),
                 model_id: "gpt-4o".to_string(),
-            },
+            }],
             system_prompt: None,
             tools: Vec::new(),
             tool_visibility_policy: ToolVisibilityPolicy::default(),
@@ -149,6 +156,8 @@ impl Default for AgentConfig {
             transport: None,
             max_retry_delay_ms: None,
             retry_backoff: RetryBackoffPolicy::default(),
+            retry_mode: None,
+            model_health: Arc::new(SharedModelHealthRegistry::default()),
             api_key_override: None,
             provider_headers: reqwest::header::HeaderMap::new(),
             provider_metadata: HashMap::new(),
@@ -165,5 +174,68 @@ impl Default for AgentConfig {
             #[cfg(feature = "agent")]
             human_interaction_coordinator: None,
         }
+    }
+}
+
+impl AgentConfig {
+    pub(crate) fn effective_retry_mode(&self) -> Result<RetryMode, RociError> {
+        match self.retry_mode {
+            Some(RetryMode::Bounded { max_attempts: 0 }) => Err(RociError::Configuration(
+                "retry_mode bounded max_attempts must be at least 1".to_string(),
+            )),
+            Some(mode) => Ok(mode),
+            None if self.retry_backoff.max_attempts == 0 => Err(RociError::Configuration(
+                "retry_backoff max_attempts must be at least 1".to_string(),
+            )),
+            None => Ok(RetryMode::Bounded {
+                max_attempts: self.retry_backoff.max_attempts,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_retry_mode_derives_from_backoff() {
+        assert_eq!(
+            AgentConfig::default().effective_retry_mode().unwrap(),
+            RetryMode::Bounded { max_attempts: 3 }
+        );
+    }
+
+    #[test]
+    fn explicit_retry_mode_overrides_backoff_attempts() {
+        let config = AgentConfig {
+            retry_backoff: RetryBackoffPolicy {
+                max_attempts: 9,
+                ..RetryBackoffPolicy::default()
+            },
+            retry_mode: Some(RetryMode::Bounded { max_attempts: 2 }),
+            ..AgentConfig::default()
+        };
+
+        assert_eq!(
+            config.effective_retry_mode().unwrap(),
+            RetryMode::Bounded { max_attempts: 2 }
+        );
+    }
+
+    #[test]
+    fn derived_retry_mode_rejects_zero_backoff_attempts() {
+        let config = AgentConfig {
+            retry_backoff: RetryBackoffPolicy {
+                max_attempts: 0,
+                ..RetryBackoffPolicy::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        assert!(matches!(
+            config.effective_retry_mode(),
+            Err(RociError::Configuration(_))
+        ));
     }
 }

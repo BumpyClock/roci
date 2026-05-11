@@ -10,7 +10,9 @@ use roci::agent::{
     MessageId, MessageSnapshot, RuntimeCursor, RuntimeSnapshot, RuntimeSubscription,
     ToolExecutionSnapshot,
 };
-use roci::agent_loop::{AgentEvent, ApprovalDecision, ApprovalHandler, ApprovalRequest};
+use roci::agent_loop::{
+    AgentEvent, ApprovalDecision, ApprovalHandler, ApprovalRequest, RetryEventKind,
+};
 use roci::human_interaction::{
     HumanInteractionPayload, HumanInteractionRequest, HumanInteractionResponse,
     HumanInteractionResponsePayload, ToolPermissionDecision, UiElicitationField,
@@ -633,6 +635,46 @@ impl ChatRenderer {
             AgentRuntimeEventPayload::DiffUpdated { diff } => {
                 let _ = writeln!(stderr, "\n[diff]\n{}", truncate_preview(&diff.diff, 400));
             }
+            AgentRuntimeEventPayload::Retry { event } => match event.kind {
+                RetryEventKind::RetryScheduled => {
+                    let _ = writeln!(
+                        stderr,
+                        "\n[retry] {}:{} attempt={} sleep_ms={}",
+                        event.provider,
+                        event.model_id,
+                        event.attempt,
+                        event.sleep_ms.unwrap_or(0)
+                    );
+                }
+                RetryEventKind::RetryResuming => {
+                    let _ = writeln!(
+                        stderr,
+                        "[retry] {}:{} resuming attempt={}",
+                        event.provider, event.model_id, event.attempt
+                    );
+                }
+                RetryEventKind::RetryCanceled => {
+                    let _ = writeln!(
+                        stderr,
+                        "[retry] {}:{} canceled",
+                        event.provider, event.model_id
+                    );
+                }
+                RetryEventKind::CandidateAdvancing => {
+                    let _ = writeln!(
+                        stderr,
+                        "[retry] {}:{} advancing after {:?}",
+                        event.provider, event.model_id, event.failure_category
+                    );
+                }
+                RetryEventKind::RetryExhausted => {
+                    let _ = writeln!(
+                        stderr,
+                        "[retry] {}:{} exhausted after {:?}",
+                        event.provider, event.model_id, event.failure_category
+                    );
+                }
+            },
             AgentRuntimeEventPayload::PlanWritten { .. }
             | AgentRuntimeEventPayload::WorkspaceUpdated { .. }
             | AgentRuntimeEventPayload::ArtifactCreated { .. }

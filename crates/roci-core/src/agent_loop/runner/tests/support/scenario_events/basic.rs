@@ -154,6 +154,21 @@ pub(super) fn events_for_scenario(
             })])
         }
         ProviderScenario::RetryableTimeoutExhausted => Err(RociError::Timeout(10)),
+        ProviderScenario::StreamTimeoutThenComplete => {
+            if call_index == 0 {
+                return Ok(vec![Err(RociError::Timeout(10))]);
+            }
+            Ok(vec![Ok(TextStreamDelta {
+                text: "done".to_string(),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            })])
+        }
         ProviderScenario::ContextOverflowThenComplete => {
             if call_index == 0 {
                 return Err(typed_overflow_error());

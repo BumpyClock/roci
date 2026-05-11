@@ -106,20 +106,23 @@ async fn set_model_replaces_runtime_model_when_idle() {
     let model: LanguageModel = "openai:gpt-4o-mini".parse().unwrap();
 
     agent.set_model(model.clone()).await.unwrap();
-    assert_eq!(*agent.model.lock().await, model);
+    assert_eq!(agent.current_candidates().await, vec![model]);
 }
 
 #[tokio::test]
 async fn current_model_returns_runtime_model() {
     let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
 
-    assert_eq!(agent.current_model().await, test_agent_config().model);
+    assert_eq!(
+        agent.current_model().await,
+        test_agent_config().candidates[0].clone()
+    );
 }
 
 #[tokio::test]
 async fn switch_model_returns_previous_model_and_updates_current() {
     let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
-    let previous = test_agent_config().model;
+    let previous = test_agent_config().candidates[0].clone();
     let next: LanguageModel = "anthropic:claude-3-5-sonnet-20241022".parse().unwrap();
 
     let returned = agent.switch_model(next.clone()).await.unwrap();

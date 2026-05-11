@@ -17,6 +17,7 @@ pub mod models;
 pub mod prelude;
 pub mod provider;
 pub mod resource;
+pub mod security;
 pub mod session;
 pub mod skills;
 pub mod stop;

@@ -97,7 +97,7 @@ impl MCPTransport for StdioTransport {
         let message: ServerJsonRpcMessage = self
             .inner_mut()?
             .receive()
-            .await
+            .await?
             .ok_or_else(|| RociError::Stream("MCP transport closed by peer".into()))?;
         Ok(serde_json::to_value(message)?)
     }

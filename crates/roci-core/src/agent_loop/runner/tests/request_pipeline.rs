@@ -119,6 +119,52 @@ async fn provider_request_fields_are_forwarded_to_provider() {
 }
 
 #[tokio::test]
+async fn fallback_resolves_api_key_for_active_provider() {
+    let (runner, requests) = test_runner_by_model(vec![
+        ("openai-model", ProviderScenario::RateLimitedExceedsCap),
+        ("anthropic-model", ProviderScenario::MissingOptionalFields),
+    ]);
+    let mut request = RunRequest::with_candidates(
+        vec![
+            LanguageModel::Custom {
+                provider: "openai".to_string(),
+                model_id: "openai-model".to_string(),
+            },
+            LanguageModel::Custom {
+                provider: "anthropic".to_string(),
+                model_id: "anthropic-model".to_string(),
+            },
+        ],
+        vec![ModelMessage::user("hello")],
+    )
+    .expect("valid candidates");
+    request.retry_mode = RetryMode::Bounded { max_attempts: 1 };
+    request.get_api_key = Some(Arc::new(|model| {
+        Box::pin(async move {
+            Ok(match model.provider_name() {
+                "openai" => "sk-openai".to_string(),
+                "anthropic" => "sk-anthropic".to_string(),
+                other => panic!("unexpected provider {other}"),
+            })
+        })
+    }));
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let requests = requests.lock().expect("request lock");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].api_key_override.as_deref(), Some("sk-openai"));
+    assert_eq!(
+        requests[1].api_key_override.as_deref(),
+        Some("sk-anthropic")
+    );
+}
+
+#[tokio::test]
 async fn unsupported_request_transport_is_rejected_before_provider_call() {
     let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
@@ -358,9 +404,16 @@ async fn rate_limited_stream_fails_when_retry_delay_exceeds_cap() {
 }
 
 #[tokio::test]
-async fn rate_limited_without_retry_hint_fails_immediately() {
+async fn rate_limited_without_retry_hint_uses_bounded_backoff() {
     let (runner, requests) = test_runner(ProviderScenario::RateLimitedWithoutRetryHint);
-    let request = RunRequest::new(test_model(), vec![ModelMessage::user("retry")]);
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("retry")])
+        .with_retry_backoff(RetryBackoffPolicy {
+            max_attempts: 2,
+            initial_delay_ms: 1,
+            multiplier: 1.0,
+            jitter_ratio: 0.0,
+            max_delay_ms: 1,
+        });
 
     let handle = runner.start(request).await.expect("start run");
     let result = timeout(Duration::from_secs(2), handle.wait())
@@ -372,13 +425,13 @@ async fn rate_limited_without_retry_hint_fails_immediately() {
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("without retry_after hint"),
-        "expected missing retry hint failure, got: {:?}",
+            .contains("retry budget exhausted"),
+        "expected retry budget failure, got: {:?}",
         result.error
     );
 
     let requests = requests.lock().expect("request lock");
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
 }
 
 #[tokio::test]

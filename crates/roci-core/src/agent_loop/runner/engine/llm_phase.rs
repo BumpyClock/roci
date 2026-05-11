@@ -1,6 +1,6 @@
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::super::control::{process_stream_delta, AgentEventEmitter, RunEventEmitter};
@@ -12,6 +12,7 @@ use super::super::{
     TransformContextHookPayload, TransformContextHookResult,
 };
 use crate::agent::message::{convert_to_llm, AgentMessage};
+use crate::agent_loop::{FailureCategory, RetryEvent, RetryEventKind, RetryMode, RetryNextAction};
 use crate::context::{
     estimate_context_usage, estimate_message_tokens, AbortReason, CompactionProgress,
     OverflowRecoveryPolicy, RecoveryAction, RecoveryEvent, RecoveryState,
@@ -81,6 +82,7 @@ pub(super) enum LlmPhaseOutcome {
     Failed {
         reason: String,
         assistant_message: Option<ModelMessage>,
+        failure_category: FailureCategory,
     },
 }
 
@@ -100,6 +102,8 @@ pub(super) struct LlmPhaseArgs<'a> {
     pub(super) run_usage: &'a mut Usage,
     /// Optional anchor from a prior call for exact-prefix token estimation.
     pub(super) exact_anchor: &'a mut Option<ExactUsageAnchor>,
+    /// Start time for current candidate retry lane.
+    pub(super) retry_started_at: &'a Instant,
 }
 
 pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
@@ -116,6 +120,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
         iteration,
         run_usage,
         exact_anchor,
+        retry_started_at,
     } = args;
 
     while let Ok(message) = input_rx.try_recv() {
@@ -140,6 +145,7 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                 reason: "auto-compaction is enabled but no compaction hook is configured"
                     .to_string(),
                 assistant_message: None,
+                failure_category: FailureCategory::Configuration,
             };
         };
         let compaction_cancel_token = run_cancel_token.child_token();
@@ -164,12 +170,16 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                 return LlmPhaseOutcome::Failed {
                     reason: format!("compaction failed: {err}"),
                     assistant_message: None,
+                    failure_category: failure_category_for_error(&err),
                 };
             }
         }
     }
 
-    let max_attempts = request.retry_backoff.max_attempts.max(1);
+    let max_attempts = match request.retry_mode {
+        RetryMode::Bounded { max_attempts } => max_attempts,
+        RetryMode::Persistent => u32::MAX,
+    };
     let mut attempt: u32 = 1;
     let mut next_backoff_ms = request.retry_backoff.initial_delay_ms.max(1);
 
@@ -182,304 +192,101 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
     let mut in_overflow_episode = false;
     let mut staged_provider_request: Option<ProviderRequest> = None;
 
-    let (mut stream, last_provider_messages) = loop {
-        let provider_request = match staged_provider_request.take() {
-            Some(request) => request,
-            None => match build_provider_request(
-                request,
-                provider,
-                tool_defs,
-                messages,
-                abort_rx,
-                run_cancel_token,
-                &effective_settings,
-            )
-            .await
-            {
-                Ok(req) => req,
-                Err(outcome) => return outcome,
-            },
-        };
-
-        // -- Preflight budget check (5.3) --
-        // Uses exact-anchor path when available: if the prior call's
-        // provider messages are a prefix of the current request, combine
-        // exact provider counts with a heuristic tail estimate.
-        if let Some(ref budget) = request.context_budget {
-            let turn_input_tokens =
-                estimate_turn_input(&provider_request.messages, exact_anchor.as_ref());
-            let prior_input = request.prior_session_input_tokens + run_usage.input_tokens as usize;
-            let prior_output =
-                request.prior_session_output_tokens + run_usage.output_tokens as usize;
-            let context_window = provider.capabilities().context_length;
-            let snapshot =
-                budget.snapshot(context_window, turn_input_tokens, prior_input, prior_output);
-            if snapshot.is_over_budget() {
-                let reason = format_budget_rejection(&snapshot);
-                return LlmPhaseOutcome::Failed {
-                    reason,
-                    assistant_message: None,
-                };
-            }
-        }
-
-        match provider.stream_text(&provider_request).await {
-            Ok(stream) => {
-                if in_overflow_episode {
-                    emit_overflow_recovery(
-                        emitter,
-                        &RecoveryEvent::EpisodeResolved {
-                            total_attempts: recovery_state.total_attempts(),
-                        },
-                    );
-                }
-                break (stream, provider_request.messages);
-            }
-            Err(RociError::RateLimited { retry_after_ms }) => {
-                let retry_after_ms = retry_after_ms.unwrap_or(0);
-                if retry_after_ms == 0 {
-                    return LlmPhaseOutcome::Failed {
-                        reason: "rate limited without retry_after hint".to_string(),
-                        assistant_message: None,
-                    };
-                }
-                if let Some(max_retry_delay_ms) = request.max_retry_delay_ms {
-                    if max_retry_delay_ms > 0 && retry_after_ms > max_retry_delay_ms {
-                        return LlmPhaseOutcome::Failed {
-                            reason: format!(
-                                "rate limit retry delay {retry_after_ms}ms exceeds max_retry_delay_ms={max_retry_delay_ms}"
-                            ),
-                            assistant_message: None,
-                        };
-                    }
-                }
-                if attempt >= max_attempts {
-                    return LlmPhaseOutcome::Failed {
-                        reason: format!(
-                            "rate limited after {attempt} attempts; retry budget exhausted"
-                        ),
-                        assistant_message: None,
-                    };
-                }
-                emit_retry_lifecycle(emitter, attempt, max_attempts, retry_after_ms, "rate_limit");
-                if !sleep_with_cancellation(
+    'attempts: loop {
+        let (mut stream, last_provider_messages) = loop {
+            let provider_request = match staged_provider_request.take() {
+                Some(request) => request,
+                None => match build_provider_request(
+                    request,
+                    provider,
+                    tool_defs,
+                    messages,
                     abort_rx,
                     run_cancel_token,
-                    Duration::from_millis(retry_after_ms),
+                    &effective_settings,
                 )
                 .await
                 {
-                    return LlmPhaseOutcome::Canceled {
+                    Ok(req) => req,
+                    Err(outcome) => return outcome,
+                },
+            };
+
+            // -- Preflight budget check (5.3) --
+            // Uses exact-anchor path when available: if the prior call's
+            // provider messages are a prefix of the current request, combine
+            // exact provider counts with a heuristic tail estimate.
+            if let Some(ref budget) = request.context_budget {
+                let turn_input_tokens =
+                    estimate_turn_input(&provider_request.messages, exact_anchor.as_ref());
+                let prior_input =
+                    request.prior_session_input_tokens + run_usage.input_tokens as usize;
+                let prior_output =
+                    request.prior_session_output_tokens + run_usage.output_tokens as usize;
+                let context_window = provider.capabilities().context_length;
+                let snapshot =
+                    budget.snapshot(context_window, turn_input_tokens, prior_input, prior_output);
+                if snapshot.is_over_budget() {
+                    let reason = format_budget_rejection(&snapshot);
+                    return LlmPhaseOutcome::Failed {
+                        reason,
                         assistant_message: None,
+                        failure_category: FailureCategory::InvalidRequest,
                     };
                 }
-                attempt += 1;
             }
-            Err(err) => {
-                // -- Overflow recovery (separate from generic retry) --
-                if let Some(signal) = provider.classify_overflow(&err) {
-                    if !in_overflow_episode {
-                        in_overflow_episode = true;
+
+            match provider.stream_text(&provider_request).await {
+                Ok(stream) => {
+                    if in_overflow_episode {
                         emit_overflow_recovery(
                             emitter,
-                            &RecoveryEvent::EpisodeStarted {
-                                overflow_kind: signal.kind,
+                            &RecoveryEvent::EpisodeResolved {
+                                total_attempts: recovery_state.total_attempts(),
                             },
                         );
                     }
-
-                    // Process recovery decisions. When output budget reduction
-                    // is not possible (no safe smaller budget), advance the
-                    // ladder to the next action without retrying the provider.
-                    'recovery: {
-                        let mut decision = policy.next_action(&signal, &recovery_state);
-                        let attempt_index = recovery_state.total_attempts();
-
-                        if decision.action() == RecoveryAction::ReduceOutputBudget {
-                            if let Some(new_max_tokens) =
-                                safe_smaller_output_budget(request, &effective_settings)
-                            {
-                                recovery_state.record_output_reduction();
-                                emit_overflow_recovery(
-                                    emitter,
-                                    &RecoveryEvent::ActionDecided {
-                                        decision,
-                                        attempt_index,
-                                    },
-                                );
-                                effective_settings.max_tokens = Some(new_max_tokens);
-                                break 'recovery; // retry provider call
-                            }
-
-                            // Output reduction was not applicable (no safe
-                            // smaller budget). Record the attempt on the real
-                            // state so the policy advances the ladder.
-                            recovery_state.record_output_reduction();
-                            decision = policy.next_action(&signal, &recovery_state);
-                        }
-
-                        match decision.action() {
-                            RecoveryAction::CompactContext => {
-                                emit_overflow_recovery(
-                                    emitter,
-                                    &RecoveryEvent::ActionDecided {
-                                        decision,
-                                        attempt_index,
-                                    },
-                                );
-
-                                let Some(compact) = request.hooks.compaction.as_ref() else {
-                                    return LlmPhaseOutcome::Failed {
-                                        reason:
-                                            "overflow detected but no compaction hook is configured"
-                                                .to_string(),
-                                        assistant_message: None,
-                                    };
-                                };
-
-                                let tokens_before: usize = provider_request
-                                    .messages
-                                    .iter()
-                                    .map(estimate_message_tokens)
-                                    .sum();
-
-                                let compaction_cancel_token = run_cancel_token.child_token();
-                                let compaction_future =
-                                    compact(messages.clone(), compaction_cancel_token.clone());
-                                tokio::pin!(compaction_future);
-                                let compaction_result = tokio::select! {
-                                    _ = &mut *abort_rx => {
-                                        run_cancel_token.cancel();
-                                        compaction_cancel_token.cancel();
-                                        return LlmPhaseOutcome::Canceled {
-                                            assistant_message: None,
-                                        };
-                                    }
-                                    _ = run_cancel_token.cancelled() => {
-                                        compaction_cancel_token.cancel();
-                                        return LlmPhaseOutcome::Canceled {
-                                            assistant_message: None,
-                                        };
-                                    }
-                                    result = &mut compaction_future => result,
-                                };
-
-                                match compaction_result {
-                                    Ok(Some(compacted)) => {
-                                        if compacted == *messages {
-                                            return LlmPhaseOutcome::Failed {
-                                                reason:
-                                                    "overflow recovery compaction made no changes"
-                                                        .to_string(),
-                                                assistant_message: None,
-                                            };
-                                        }
-                                        let next_provider_request = match build_provider_request(
-                                            request,
-                                            provider,
-                                            tool_defs,
-                                            &compacted,
-                                            abort_rx,
-                                            run_cancel_token,
-                                            &effective_settings,
-                                        )
-                                        .await
-                                        {
-                                            Ok(req) => req,
-                                            Err(outcome) => return outcome,
-                                        };
-                                        let progress = CompactionProgress::new(
-                                            tokens_before,
-                                            next_provider_request
-                                                .messages
-                                                .iter()
-                                                .map(estimate_message_tokens)
-                                                .sum(),
-                                        );
-                                        recovery_state.record_compaction(progress);
-                                        *messages = compacted;
-                                        staged_provider_request = Some(next_provider_request);
-
-                                        if roci_debug_enabled() {
-                                            tracing::debug!(
-                                                run_id = %request.run_id,
-                                                iteration,
-                                                total_attempts = recovery_state.total_attempts(),
-                                                tokens_freed = progress.tokens_freed(),
-                                                "overflow recovery compacted context"
-                                            );
-                                        }
-                                        break 'recovery; // retry provider call
-                                    }
-                                    Ok(None) => {
-                                        return LlmPhaseOutcome::Failed {
-                                            reason: "overflow recovery compaction made no changes"
-                                                .to_string(),
-                                            assistant_message: None,
-                                        };
-                                    }
-                                    Err(compaction_err) => {
-                                        return LlmPhaseOutcome::Failed {
-                                            reason: format!(
-                                                "overflow recovery compaction failed: {compaction_err}"
-                                            ),
-                                            assistant_message: None,
-                                        };
-                                    }
-                                }
-                            }
-                            RecoveryAction::Abort => {
-                                let abort_reason = decision
-                                    .as_abort_reason()
-                                    .unwrap_or(AbortReason::NotRecoverable);
-                                emit_overflow_recovery(
-                                    emitter,
-                                    &RecoveryEvent::EpisodeExhausted {
-                                        reason: abort_reason,
-                                        total_attempts: recovery_state.total_attempts(),
-                                    },
-                                );
+                    break (stream, provider_request.messages);
+                }
+                Err(RociError::RateLimited { retry_after_ms }) => {
+                    let server_retry_after_ms = retry_after_ms.filter(|delay| *delay > 0);
+                    if let Some(retry_after_ms) = server_retry_after_ms {
+                        if let Some(max_retry_delay_ms) = request.max_retry_delay_ms {
+                            if max_retry_delay_ms > 0 && retry_after_ms > max_retry_delay_ms {
                                 return LlmPhaseOutcome::Failed {
-                                    reason: format_overflow_recovery_abort(
-                                        &err,
-                                        recovery_state.total_attempts(),
-                                        abort_reason,
-                                    ),
-                                    assistant_message: None,
-                                };
-                            }
-                            RecoveryAction::ReduceOutputBudget => {
-                                return LlmPhaseOutcome::Failed {
-                                    reason:
-                                        "overflow recovery could not derive a smaller max_tokens budget"
-                                            .to_string(),
-                                    assistant_message: None,
-                                };
+                                reason: format!(
+                                    "rate limit retry delay {retry_after_ms}ms exceeds max_retry_delay_ms={max_retry_delay_ms}"
+                                ),
+                                assistant_message: None,
+                                failure_category: FailureCategory::RateLimit,
+                            };
                             }
                         }
                     }
-                    // Labeled block broke → retry the provider call
-                } else if err.is_retryable() {
-                    // -- Generic retry (separate from overflow) --
                     if attempt >= max_attempts {
                         return LlmPhaseOutcome::Failed {
                             reason: format!(
-                                "retryable provider error after {attempt} attempts: {err}"
+                                "rate limited after {attempt} attempts; retry budget exhausted"
                             ),
                             assistant_message: None,
+                            failure_category: FailureCategory::RateLimit,
                         };
                     }
-                    let delay_ms = jittered_backoff_ms(
-                        next_backoff_ms,
-                        request.retry_backoff.jitter_ratio,
-                        request.retry_backoff.max_delay_ms.max(1),
-                    );
-                    emit_retry_lifecycle(
+                    let delay_ms = server_retry_after_ms.unwrap_or_else(|| {
+                        jittered_backoff_ms(
+                            next_backoff_ms,
+                            request.retry_backoff.jitter_ratio,
+                            request.retry_backoff.max_delay_ms.max(1),
+                        )
+                    });
+                    emit_retry_event(
+                        request,
                         emitter,
+                        RetryEventKind::RetryScheduled,
                         attempt,
-                        max_attempts,
-                        delay_ms,
-                        "retryable_error",
+                        FailureCategory::RateLimit,
+                        RetryStep::sleep(delay_ms),
+                        retry_started_at,
                     );
                     if !sleep_with_cancellation(
                         abort_rx,
@@ -488,84 +295,428 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                     )
                     .await
                     {
+                        emit_retry_event(
+                            request,
+                            emitter,
+                            RetryEventKind::RetryCanceled,
+                            attempt,
+                            FailureCategory::Canceled,
+                            RetryStep::cancel(),
+                            retry_started_at,
+                        );
                         return LlmPhaseOutcome::Canceled {
                             assistant_message: None,
                         };
                     }
+                    emit_retry_event(
+                        request,
+                        emitter,
+                        RetryEventKind::RetryResuming,
+                        attempt + 1,
+                        FailureCategory::RateLimit,
+                        RetryStep::resume_same_candidate(),
+                        retry_started_at,
+                    );
                     attempt += 1;
-                    next_backoff_ms = next_backoff_ms_for_policy(next_backoff_ms, request);
-                } else {
-                    return LlmPhaseOutcome::Failed {
-                        reason: err.to_string(),
-                        assistant_message: None,
-                    };
+                    if server_retry_after_ms.is_none() {
+                        next_backoff_ms = next_backoff_ms_for_policy(next_backoff_ms, request);
+                    }
+                }
+                Err(err) => {
+                    // -- Overflow recovery (separate from generic retry) --
+                    if let Some(signal) = provider.classify_overflow(&err) {
+                        if !in_overflow_episode {
+                            in_overflow_episode = true;
+                            emit_overflow_recovery(
+                                emitter,
+                                &RecoveryEvent::EpisodeStarted {
+                                    overflow_kind: signal.kind,
+                                },
+                            );
+                        }
+
+                        // Process recovery decisions. When output budget reduction
+                        // is not possible (no safe smaller budget), advance the
+                        // ladder to the next action without retrying the provider.
+                        'recovery: {
+                            let mut decision = policy.next_action(&signal, &recovery_state);
+                            let attempt_index = recovery_state.total_attempts();
+
+                            if decision.action() == RecoveryAction::ReduceOutputBudget {
+                                if let Some(new_max_tokens) =
+                                    safe_smaller_output_budget(request, &effective_settings)
+                                {
+                                    recovery_state.record_output_reduction();
+                                    emit_overflow_recovery(
+                                        emitter,
+                                        &RecoveryEvent::ActionDecided {
+                                            decision,
+                                            attempt_index,
+                                        },
+                                    );
+                                    effective_settings.max_tokens = Some(new_max_tokens);
+                                    break 'recovery; // retry provider call
+                                }
+
+                                // Output reduction was not applicable (no safe
+                                // smaller budget). Record the attempt on the real
+                                // state so the policy advances the ladder.
+                                recovery_state.record_output_reduction();
+                                decision = policy.next_action(&signal, &recovery_state);
+                            }
+
+                            match decision.action() {
+                                RecoveryAction::CompactContext => {
+                                    emit_overflow_recovery(
+                                        emitter,
+                                        &RecoveryEvent::ActionDecided {
+                                            decision,
+                                            attempt_index,
+                                        },
+                                    );
+
+                                    let Some(compact) = request.hooks.compaction.as_ref() else {
+                                        return LlmPhaseOutcome::Failed {
+                                        reason:
+                                            "overflow detected but no compaction hook is configured"
+                                                .to_string(),
+                                        assistant_message: None,
+                                        failure_category: FailureCategory::Overflow,
+                                    };
+                                    };
+
+                                    let tokens_before: usize = provider_request
+                                        .messages
+                                        .iter()
+                                        .map(estimate_message_tokens)
+                                        .sum();
+
+                                    let compaction_cancel_token = run_cancel_token.child_token();
+                                    let compaction_future =
+                                        compact(messages.clone(), compaction_cancel_token.clone());
+                                    tokio::pin!(compaction_future);
+                                    let compaction_result = tokio::select! {
+                                        _ = &mut *abort_rx => {
+                                            run_cancel_token.cancel();
+                                            compaction_cancel_token.cancel();
+                                            return LlmPhaseOutcome::Canceled {
+                                                assistant_message: None,
+                                            };
+                                        }
+                                        _ = run_cancel_token.cancelled() => {
+                                            compaction_cancel_token.cancel();
+                                            return LlmPhaseOutcome::Canceled {
+                                                assistant_message: None,
+                                            };
+                                        }
+                                        result = &mut compaction_future => result,
+                                    };
+
+                                    match compaction_result {
+                                        Ok(Some(compacted)) => {
+                                            if compacted == *messages {
+                                                return LlmPhaseOutcome::Failed {
+                                                reason:
+                                                    "overflow recovery compaction made no changes"
+                                                        .to_string(),
+                                                assistant_message: None,
+                                                failure_category: FailureCategory::Overflow,
+                                            };
+                                            }
+                                            let next_provider_request =
+                                                match build_provider_request(
+                                                    request,
+                                                    provider,
+                                                    tool_defs,
+                                                    &compacted,
+                                                    abort_rx,
+                                                    run_cancel_token,
+                                                    &effective_settings,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(req) => req,
+                                                    Err(outcome) => return outcome,
+                                                };
+                                            let progress = CompactionProgress::new(
+                                                tokens_before,
+                                                next_provider_request
+                                                    .messages
+                                                    .iter()
+                                                    .map(estimate_message_tokens)
+                                                    .sum(),
+                                            );
+                                            recovery_state.record_compaction(progress);
+                                            *messages = compacted;
+                                            staged_provider_request = Some(next_provider_request);
+
+                                            if roci_debug_enabled() {
+                                                tracing::debug!(
+                                                    run_id = %request.run_id,
+                                                    iteration,
+                                                    total_attempts = recovery_state.total_attempts(),
+                                                    tokens_freed = progress.tokens_freed(),
+                                                    "overflow recovery compacted context"
+                                                );
+                                            }
+                                            break 'recovery; // retry provider call
+                                        }
+                                        Ok(None) => {
+                                            return LlmPhaseOutcome::Failed {
+                                                reason:
+                                                    "overflow recovery compaction made no changes"
+                                                        .to_string(),
+                                                assistant_message: None,
+                                                failure_category: FailureCategory::Overflow,
+                                            };
+                                        }
+                                        Err(compaction_err) => {
+                                            return LlmPhaseOutcome::Failed {
+                                            reason: format!(
+                                                "overflow recovery compaction failed: {compaction_err}"
+                                            ),
+                                            assistant_message: None,
+                                            failure_category: FailureCategory::Overflow,
+                                        };
+                                        }
+                                    }
+                                }
+                                RecoveryAction::Abort => {
+                                    let abort_reason = decision
+                                        .as_abort_reason()
+                                        .unwrap_or(AbortReason::NotRecoverable);
+                                    emit_overflow_recovery(
+                                        emitter,
+                                        &RecoveryEvent::EpisodeExhausted {
+                                            reason: abort_reason,
+                                            total_attempts: recovery_state.total_attempts(),
+                                        },
+                                    );
+                                    return LlmPhaseOutcome::Failed {
+                                        reason: format_overflow_recovery_abort(
+                                            &err,
+                                            recovery_state.total_attempts(),
+                                            abort_reason,
+                                        ),
+                                        assistant_message: None,
+                                        failure_category: FailureCategory::Overflow,
+                                    };
+                                }
+                                RecoveryAction::ReduceOutputBudget => {
+                                    return LlmPhaseOutcome::Failed {
+                                    reason:
+                                        "overflow recovery could not derive a smaller max_tokens budget"
+                                            .to_string(),
+                                    assistant_message: None,
+                                    failure_category: FailureCategory::Overflow,
+                                };
+                                }
+                            }
+                        }
+                        // Labeled block broke → retry the provider call
+                    } else if err.is_retryable() {
+                        // -- Generic retry (separate from overflow) --
+                        if attempt >= max_attempts {
+                            return LlmPhaseOutcome::Failed {
+                                reason: format!(
+                                    "retryable provider error after {attempt} attempts: {err}"
+                                ),
+                                assistant_message: None,
+                                failure_category: failure_category_for_error(&err),
+                            };
+                        }
+                        let failure_category = failure_category_for_error(&err);
+                        let delay_ms = jittered_backoff_ms(
+                            next_backoff_ms,
+                            request.retry_backoff.jitter_ratio,
+                            request.retry_backoff.max_delay_ms.max(1),
+                        );
+                        emit_retry_event(
+                            request,
+                            emitter,
+                            RetryEventKind::RetryScheduled,
+                            attempt,
+                            failure_category,
+                            RetryStep::sleep(delay_ms),
+                            retry_started_at,
+                        );
+                        if !sleep_with_cancellation(
+                            abort_rx,
+                            run_cancel_token,
+                            Duration::from_millis(delay_ms),
+                        )
+                        .await
+                        {
+                            emit_retry_event(
+                                request,
+                                emitter,
+                                RetryEventKind::RetryCanceled,
+                                attempt,
+                                FailureCategory::Canceled,
+                                RetryStep::cancel(),
+                                retry_started_at,
+                            );
+                            return LlmPhaseOutcome::Canceled {
+                                assistant_message: None,
+                            };
+                        }
+                        emit_retry_event(
+                            request,
+                            emitter,
+                            RetryEventKind::RetryResuming,
+                            attempt + 1,
+                            failure_category,
+                            RetryStep::resume_same_candidate(),
+                            retry_started_at,
+                        );
+                        attempt += 1;
+                        next_backoff_ms = next_backoff_ms_for_policy(next_backoff_ms, request);
+                    } else {
+                        return LlmPhaseOutcome::Failed {
+                            reason: err.to_string(),
+                            assistant_message: None,
+                            failure_category: failure_category_for_error(&err),
+                        };
+                    }
                 }
             }
-        }
-    };
+        };
 
-    let mut iteration_text = String::new();
-    let mut tool_calls: Vec<AgentToolCall> = Vec::new();
-    let mut stream_done = false;
-    let mut message_open = false;
-    let mut call_usage: Option<Usage> = None;
-    let idle_timeout_ms = request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
-    let mut idle_sleep = (idle_timeout_ms > 0)
-        .then(|| Box::pin(time::sleep(Duration::from_millis(idle_timeout_ms))));
-    loop {
-        if let Some(ref mut sleep) = idle_sleep {
-            tokio::select! {
-                _ = &mut *abort_rx => {
-                    run_cancel_token.cancel();
-                    emit_message_end_if_open(
-                        agent_emitter,
-                        &mut message_open,
-                        &iteration_text,
-                        &tool_calls,
-                    );
-                    finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
-                    return LlmPhaseOutcome::Canceled {
-                        assistant_message: assistant_snapshot_if_present(
+        let mut iteration_text = String::new();
+        let mut tool_calls: Vec<AgentToolCall> = Vec::new();
+        let mut stream_done = false;
+        let mut message_open = false;
+        let mut call_usage: Option<Usage> = None;
+        let idle_timeout_ms = request.settings.stream_idle_timeout_ms.unwrap_or(120_000);
+        let mut idle_sleep = (idle_timeout_ms > 0)
+            .then(|| Box::pin(time::sleep(Duration::from_millis(idle_timeout_ms))));
+        loop {
+            if let Some(ref mut sleep) = idle_sleep {
+                tokio::select! {
+                    _ = &mut *abort_rx => {
+                        run_cancel_token.cancel();
+                        emit_message_end_if_open(
+                            agent_emitter,
+                            &mut message_open,
                             &iteration_text,
                             &tool_calls,
-                        ),
-                    };
-                }
-                _ = sleep.as_mut() => {
-                    emit_message_end_if_open(
-                        agent_emitter,
-                        &mut message_open,
-                        &iteration_text,
-                        &tool_calls,
-                    );
-                    finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
-                    return LlmPhaseOutcome::Failed {
-                        reason: "stream idle timeout".to_string(),
-                        assistant_message: assistant_snapshot_if_present(
+                        );
+                        finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
+                        return LlmPhaseOutcome::Canceled {
+                            assistant_message: assistant_snapshot_if_present(
+                                &iteration_text,
+                                &tool_calls,
+                            ),
+                        };
+                    }
+                    _ = sleep.as_mut() => {
+                        emit_message_end_if_open(
+                            agent_emitter,
+                            &mut message_open,
                             &iteration_text,
                             &tool_calls,
-                        ),
-                    };
-                }
-                delta = stream.next() => {
-                    let Some(delta) = delta else { break; };
-                    match delta {
-                        Ok(delta) => {
-                            sleep.as_mut().reset(
-                                time::Instant::now() + Duration::from_millis(idle_timeout_ms),
-                            );
-                            if let Some(ref u) = delta.usage {
-                                call_usage = Some(u.clone());
-                            }
-                            if let Some(reason) = process_stream_delta(
+                        );
+                        finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
+                        if should_retry_same_candidate(
+                            request,
+                            attempt,
+                            max_attempts,
+                            FailureCategory::Timeout,
+                            &iteration_text,
+                            &tool_calls,
+                        ) {
+                            let delay_ms = retry_delay_ms(next_backoff_ms, request);
+                            emit_retry_event(
+                                request,
                                 emitter,
-                                agent_emitter,
-                                delta,
-                                &mut iteration_text,
-                                &mut tool_calls,
-                                &mut stream_done,
-                                &mut message_open,
-                            ) {
+                                RetryEventKind::RetryScheduled,
+                                attempt,
+                                FailureCategory::Timeout,
+                                RetryStep::sleep(delay_ms),
+                                retry_started_at,
+                            );
+                            if !sleep_with_cancellation(
+                                abort_rx,
+                                run_cancel_token,
+                                Duration::from_millis(delay_ms),
+                            )
+                            .await
+                            {
+                                emit_retry_event(
+                                    request,
+                                    emitter,
+                                    RetryEventKind::RetryCanceled,
+                                    attempt,
+                                    FailureCategory::Canceled,
+                                    RetryStep::cancel(),
+                                    retry_started_at,
+                                );
+                                return LlmPhaseOutcome::Canceled {
+                                    assistant_message: None,
+                                };
+                            }
+                            emit_retry_event(
+                                request,
+                                emitter,
+                                RetryEventKind::RetryResuming,
+                                attempt + 1,
+                                FailureCategory::Timeout,
+                                RetryStep::resume_same_candidate(),
+                                retry_started_at,
+                            );
+                            attempt += 1;
+                            next_backoff_ms = next_backoff_ms_for_policy(next_backoff_ms, request);
+                            continue 'attempts;
+                        }
+                        return LlmPhaseOutcome::Failed {
+                            reason: "stream idle timeout".to_string(),
+                            assistant_message: assistant_snapshot_if_present(
+                                &iteration_text,
+                                &tool_calls,
+                            ),
+                            failure_category: FailureCategory::Timeout,
+                        };
+                    }
+                    delta = stream.next() => {
+                        let Some(delta) = delta else { break; };
+                        match delta {
+                            Ok(delta) => {
+                                sleep.as_mut().reset(
+                                    time::Instant::now() + Duration::from_millis(idle_timeout_ms),
+                                );
+                                if let Some(ref u) = delta.usage {
+                                    call_usage = Some(u.clone());
+                                }
+                                if let Some(reason) = process_stream_delta(
+                                    emitter,
+                                    agent_emitter,
+                                    delta,
+                                    &mut iteration_text,
+                                    &mut tool_calls,
+                                    &mut stream_done,
+                                    &mut message_open,
+                                ) {
+                                    emit_message_end_if_open(
+                                        agent_emitter,
+                                        &mut message_open,
+                                        &iteration_text,
+                                        &tool_calls,
+                                    );
+                                    finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
+                                    return LlmPhaseOutcome::Failed {
+                                        reason,
+                                        assistant_message: assistant_snapshot_if_present(
+                                            &iteration_text,
+                                            &tool_calls,
+                                        ),
+                                        failure_category: FailureCategory::InvalidRequest,
+                                    };
+                                }
+                                if stream_done {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
                                 emit_message_end_if_open(
                                     agent_emitter,
                                     &mut message_open,
@@ -573,71 +724,125 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                     &tool_calls,
                                 );
                                 finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
+                                let failure_category = failure_category_for_error(&err);
+                                if should_retry_same_candidate(
+                                    request,
+                                    attempt,
+                                    max_attempts,
+                                    failure_category,
+                                    &iteration_text,
+                                    &tool_calls,
+                                ) {
+                                    let delay_ms = retry_delay_ms(next_backoff_ms, request);
+                                    emit_retry_event(
+                                        request,
+                                        emitter,
+                                        RetryEventKind::RetryScheduled,
+                                        attempt,
+                                        failure_category,
+                                        RetryStep::sleep(delay_ms),
+                                        retry_started_at,
+                                    );
+                                    if !sleep_with_cancellation(
+                                        abort_rx,
+                                        run_cancel_token,
+                                        Duration::from_millis(delay_ms),
+                                    )
+                                    .await
+                                    {
+                                        emit_retry_event(
+                                            request,
+                                            emitter,
+                                            RetryEventKind::RetryCanceled,
+                                            attempt,
+                                            FailureCategory::Canceled,
+                                            RetryStep::cancel(),
+                                            retry_started_at,
+                                        );
+                                        return LlmPhaseOutcome::Canceled {
+                                            assistant_message: None,
+                                        };
+                                    }
+                                    emit_retry_event(
+                                        request,
+                                        emitter,
+                                        RetryEventKind::RetryResuming,
+                                        attempt + 1,
+                                        failure_category,
+                                        RetryStep::resume_same_candidate(),
+                                        retry_started_at,
+                                    );
+                                    attempt += 1;
+                                    next_backoff_ms = next_backoff_ms_for_policy(next_backoff_ms, request);
+                                    continue 'attempts;
+                                }
                                 return LlmPhaseOutcome::Failed {
-                                    reason,
+                                    reason: err.to_string(),
                                     assistant_message: assistant_snapshot_if_present(
                                         &iteration_text,
                                         &tool_calls,
                                     ),
+                                    failure_category,
                                 };
                             }
-                            if stream_done {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            emit_message_end_if_open(
-                                agent_emitter,
-                                &mut message_open,
-                                &iteration_text,
-                                &tool_calls,
-                            );
-                            finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
-                            return LlmPhaseOutcome::Failed {
-                                reason: err.to_string(),
-                                assistant_message: assistant_snapshot_if_present(
-                                    &iteration_text,
-                                    &tool_calls,
-                                ),
-                            };
                         }
                     }
                 }
-            }
-        } else {
-            tokio::select! {
-                _ = &mut *abort_rx => {
-                    run_cancel_token.cancel();
-                    emit_message_end_if_open(
-                        agent_emitter,
-                        &mut message_open,
-                        &iteration_text,
-                        &tool_calls,
-                    );
-                    finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
-                    return LlmPhaseOutcome::Canceled {
-                        assistant_message: assistant_snapshot_if_present(
+            } else {
+                tokio::select! {
+                    _ = &mut *abort_rx => {
+                        run_cancel_token.cancel();
+                        emit_message_end_if_open(
+                            agent_emitter,
+                            &mut message_open,
                             &iteration_text,
                             &tool_calls,
-                        ),
-                    };
-                }
-                delta = stream.next() => {
-                    let Some(delta) = delta else { break; };
-                    match delta {
-                        Ok(delta) => {
-                            if let Some(ref u) = delta.usage {
-                                call_usage = Some(u.clone());
+                        );
+                        finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
+                        return LlmPhaseOutcome::Canceled {
+                            assistant_message: assistant_snapshot_if_present(
+                                &iteration_text,
+                                &tool_calls,
+                            ),
+                        };
+                    }
+                    delta = stream.next() => {
+                        let Some(delta) = delta else { break; };
+                        match delta {
+                            Ok(delta) => {
+                                if let Some(ref u) = delta.usage {
+                                    call_usage = Some(u.clone());
+                                }
+                                if let Some(reason) = process_stream_delta(
+                                    emitter,
+                                    agent_emitter,
+                                    delta,
+                                    &mut iteration_text,
+                                    &mut tool_calls,
+                                    &mut stream_done,
+                                    &mut message_open,
+                                ) {
+                                    emit_message_end_if_open(
+                                        agent_emitter,
+                                        &mut message_open,
+                                        &iteration_text,
+                                        &tool_calls,
+                                    );
+                                    finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
+                                    return LlmPhaseOutcome::Failed {
+                                        reason,
+                                        assistant_message: assistant_snapshot_if_present(
+                                            &iteration_text,
+                                            &tool_calls,
+                                        ),
+                                        failure_category: FailureCategory::InvalidRequest,
+                                    };
+                                }
+                                if stream_done {
+                                    break;
+                                }
                             }
-                            if let Some(reason) = process_stream_delta(
-                                emitter,
-                                agent_emitter,
-                                delta,
-                                &mut iteration_text,
-                                &mut tool_calls,
-                                &mut stream_done,
-                                &mut message_open,
-                            ) {
+                            Err(err) => {
                                 emit_message_end_if_open(
                                     agent_emitter,
                                     &mut message_open,
@@ -645,91 +850,125 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                     &tool_calls,
                                 );
                                 finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
+                                let failure_category = failure_category_for_error(&err);
+                                if should_retry_same_candidate(
+                                    request,
+                                    attempt,
+                                    max_attempts,
+                                    failure_category,
+                                    &iteration_text,
+                                    &tool_calls,
+                                ) {
+                                    let delay_ms = retry_delay_ms(next_backoff_ms, request);
+                                    emit_retry_event(
+                                        request,
+                                        emitter,
+                                        RetryEventKind::RetryScheduled,
+                                        attempt,
+                                        failure_category,
+                                        RetryStep::sleep(delay_ms),
+                                        retry_started_at,
+                                    );
+                                    if !sleep_with_cancellation(
+                                        abort_rx,
+                                        run_cancel_token,
+                                        Duration::from_millis(delay_ms),
+                                    )
+                                    .await
+                                    {
+                                        emit_retry_event(
+                                            request,
+                                            emitter,
+                                            RetryEventKind::RetryCanceled,
+                                            attempt,
+                                            FailureCategory::Canceled,
+                                            RetryStep::cancel(),
+                                            retry_started_at,
+                                        );
+                                        return LlmPhaseOutcome::Canceled {
+                                            assistant_message: None,
+                                        };
+                                    }
+                                    emit_retry_event(
+                                        request,
+                                        emitter,
+                                        RetryEventKind::RetryResuming,
+                                        attempt + 1,
+                                        failure_category,
+                                        RetryStep::resume_same_candidate(),
+                                        retry_started_at,
+                                    );
+                                    attempt += 1;
+                                    next_backoff_ms = next_backoff_ms_for_policy(next_backoff_ms, request);
+                                    continue 'attempts;
+                                }
                                 return LlmPhaseOutcome::Failed {
-                                    reason,
+                                    reason: err.to_string(),
                                     assistant_message: assistant_snapshot_if_present(
                                         &iteration_text,
                                         &tool_calls,
                                     ),
+                                    failure_category,
                                 };
                             }
-                            if stream_done {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            emit_message_end_if_open(
-                                agent_emitter,
-                                &mut message_open,
-                                &iteration_text,
-                                &tool_calls,
-                            );
-                            finalize_call_usage(call_usage, &last_provider_messages, &iteration_text, &tool_calls, run_usage);
-                            return LlmPhaseOutcome::Failed {
-                                reason: err.to_string(),
-                                assistant_message: assistant_snapshot_if_present(
-                                    &iteration_text,
-                                    &tool_calls,
-                                ),
-                            };
                         }
                     }
                 }
             }
         }
-    }
-    emit_message_end_if_open(
-        agent_emitter,
-        &mut message_open,
-        &iteration_text,
-        &tool_calls,
-    );
-
-    // Merge call usage into the run accumulator on the happy path.
-    // Finalize before updating the anchor so `last_provider_messages` is
-    // still available for the heuristic fallback (when call_usage is None,
-    // the provider messages are used; when Some, the exact usage is used and
-    // the messages param is ignored).
-    finalize_call_usage(
-        call_usage.clone(),
-        &last_provider_messages,
-        &iteration_text,
-        &tool_calls,
-        run_usage,
-    );
-
-    // Update the exact anchor only when the provider reported a meaningful
-    // nonzero prompt count. Zero/default usage must not replace a prior
-    // anchor with a fail-open zero-token prefix.
-    if let Some(ref usage) = call_usage {
-        if usage.input_tokens > 0 {
-            *exact_anchor = Some(ExactUsageAnchor {
-                provider_messages: last_provider_messages,
-                prompt_tokens: usage.input_tokens as usize,
-            });
-        }
-    }
-
-    if roci_debug_enabled() {
-        let tool_names = tool_calls
-            .iter()
-            .map(|call| call.name.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        tracing::debug!(
-            run_id = %request.run_id,
-            iteration,
-            stream_done,
-            tool_calls = tool_calls.len(),
-            tool_names = %tool_names,
-            text_len = iteration_text.len(),
-            "roci iteration complete"
+        emit_message_end_if_open(
+            agent_emitter,
+            &mut message_open,
+            &iteration_text,
+            &tool_calls,
         );
-    }
 
-    LlmPhaseOutcome::Ready {
-        iteration_text,
-        tool_calls,
+        // Merge call usage into the run accumulator on the happy path.
+        // Finalize before updating the anchor so `last_provider_messages` is
+        // still available for the heuristic fallback (when call_usage is None,
+        // the provider messages are used; when Some, the exact usage is used and
+        // the messages param is ignored).
+        finalize_call_usage(
+            call_usage.clone(),
+            &last_provider_messages,
+            &iteration_text,
+            &tool_calls,
+            run_usage,
+        );
+
+        // Update the exact anchor only when the provider reported a meaningful
+        // nonzero prompt count. Zero/default usage must not replace a prior
+        // anchor with a fail-open zero-token prefix.
+        if let Some(ref usage) = call_usage {
+            if usage.input_tokens > 0 {
+                *exact_anchor = Some(ExactUsageAnchor {
+                    provider_messages: last_provider_messages,
+                    prompt_tokens: usage.input_tokens as usize,
+                });
+            }
+        }
+
+        if roci_debug_enabled() {
+            let tool_names = tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::debug!(
+                run_id = %request.run_id,
+                iteration,
+                stream_done,
+                tool_calls = tool_calls.len(),
+                tool_names = %tool_names,
+                text_len = iteration_text.len(),
+                "roci iteration complete"
+            );
+        }
+
+        return LlmPhaseOutcome::Ready {
+            iteration_text,
+            tool_calls,
+        };
     }
 }
 
@@ -747,7 +986,7 @@ async fn build_provider_request(
         let transform_cancel = run_cancel_token.child_token();
         let transform_payload = TransformContextHookPayload {
             run_id: request.run_id,
-            model: request.model.clone(),
+            model: request.active_model().clone(),
             messages: transformed.clone(),
             cancellation_token: transform_cancel.clone(),
         };
@@ -778,12 +1017,14 @@ async fn build_provider_request(
                     reason: reason
                         .unwrap_or_else(|| "transform_context hook canceled LLM phase".to_string()),
                     assistant_message: None,
+                    failure_category: FailureCategory::Canceled,
                 });
             }
             Err(err) => {
                 return Err(LlmPhaseOutcome::Failed {
                     reason: format!("transform_context hook failed: {err}"),
                     assistant_message: None,
+                    failure_category: failure_category_for_error(&err),
                 });
             }
         };
@@ -798,7 +1039,7 @@ async fn build_provider_request(
             .collect();
         let convert_payload = ConvertToLlmHookPayload {
             run_id: request.run_id,
-            model: request.model.clone(),
+            model: request.active_model().clone(),
             messages: agent_messages.clone(),
             cancellation_token: convert_cancel.clone(),
         };
@@ -829,12 +1070,14 @@ async fn build_provider_request(
                     reason: reason
                         .unwrap_or_else(|| "convert_to_llm hook canceled LLM phase".to_string()),
                     assistant_message: None,
+                    failure_category: FailureCategory::Canceled,
                 });
             }
             Err(err) => {
                 return Err(LlmPhaseOutcome::Failed {
                     reason: format!("convert_to_llm hook failed: {err}"),
                     assistant_message: None,
+                    failure_category: failure_category_for_error(&err),
                 });
             }
         }
@@ -849,7 +1092,7 @@ async fn build_provider_request(
         settings: effective_settings.clone(),
         tools: tool_defs.clone(),
         response_format: effective_settings.response_format.clone(),
-        api_key_override: request.api_key_override.clone(),
+        api_key_override: request.active_api_key_override().map(str::to_string),
         headers: request.provider_headers.clone(),
         metadata: request.provider_metadata.clone(),
         payload_callback: request.provider_payload_callback.clone(),
@@ -922,21 +1165,117 @@ fn format_overflow_recovery_abort(
     }
 }
 
-fn emit_retry_lifecycle(
+fn emit_retry_event(
+    request: &RunRequest,
     emitter: &RunEventEmitter,
+    kind: RetryEventKind,
     attempt: u32,
-    max_attempts: u32,
-    delay_ms: u64,
-    reason: &str,
+    failure_category: FailureCategory,
+    step: RetryStep,
+    retry_started_at: &Instant,
 ) {
+    let model = request.active_model();
     emitter.emit(
         RunEventStream::System,
-        RunEventPayload::Error {
-            message: format!(
-                "provider retry attempt={attempt}/{max_attempts} delay_ms={delay_ms} reason={reason}"
-            ),
+        RunEventPayload::Retry {
+            event: RetryEvent {
+                kind,
+                run_id: request.run_id,
+                provider: model.provider_name().to_string(),
+                model_id: model.model_id().to_string(),
+                candidate_index: request.active_candidate_index,
+                attempt,
+                retry_mode: request.retry_mode,
+                failure_category,
+                sleep_ms: step.sleep_ms,
+                elapsed_retry_ms: elapsed_retry_ms(retry_started_at),
+                candidates_remaining: request.candidates_remaining(),
+                partial_output_seen: false,
+                next_action: step.next_action,
+            },
         },
     );
+}
+
+struct RetryStep {
+    sleep_ms: Option<u64>,
+    next_action: RetryNextAction,
+}
+
+impl RetryStep {
+    fn sleep(delay_ms: u64) -> Self {
+        Self {
+            sleep_ms: Some(delay_ms),
+            next_action: RetryNextAction::Sleep,
+        }
+    }
+
+    fn cancel() -> Self {
+        Self {
+            sleep_ms: None,
+            next_action: RetryNextAction::Cancel,
+        }
+    }
+
+    fn resume_same_candidate() -> Self {
+        Self {
+            sleep_ms: None,
+            next_action: RetryNextAction::ResumeSameCandidate,
+        }
+    }
+}
+
+fn should_retry_same_candidate(
+    request: &RunRequest,
+    attempt: u32,
+    max_attempts: u32,
+    failure_category: FailureCategory,
+    iteration_text: &str,
+    tool_calls: &[AgentToolCall],
+) -> bool {
+    if attempt >= max_attempts || !is_transient_retry_category(failure_category) {
+        return false;
+    }
+    assistant_snapshot_if_present(iteration_text, tool_calls).is_none()
+        && !matches!(request.retry_mode, RetryMode::Bounded { max_attempts: 0 })
+}
+
+fn is_transient_retry_category(category: FailureCategory) -> bool {
+    matches!(
+        category,
+        FailureCategory::RateLimit
+            | FailureCategory::Network
+            | FailureCategory::Server
+            | FailureCategory::Timeout
+    )
+}
+
+fn retry_delay_ms(next_backoff_ms: u64, request: &RunRequest) -> u64 {
+    jittered_backoff_ms(
+        next_backoff_ms,
+        request.retry_backoff.jitter_ratio,
+        request.retry_backoff.max_delay_ms.max(1),
+    )
+}
+
+fn elapsed_retry_ms(retry_started_at: &Instant) -> u64 {
+    u64::try_from(retry_started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+pub(super) fn failure_category_for_error(error: &RociError) -> FailureCategory {
+    match error.category() {
+        crate::error::ErrorCategory::Authentication => FailureCategory::Auth,
+        crate::error::ErrorCategory::RateLimit => FailureCategory::RateLimit,
+        crate::error::ErrorCategory::Network => FailureCategory::Network,
+        crate::error::ErrorCategory::Timeout => FailureCategory::Timeout,
+        crate::error::ErrorCategory::Server => FailureCategory::Server,
+        crate::error::ErrorCategory::Configuration => FailureCategory::Configuration,
+        crate::error::ErrorCategory::ToolExecution => FailureCategory::Tool,
+        crate::error::ErrorCategory::Api => FailureCategory::InvalidRequest,
+        crate::error::ErrorCategory::Serialization | crate::error::ErrorCategory::Unknown => {
+            FailureCategory::Unknown
+        }
+    }
 }
 
 async fn sleep_with_cancellation(

@@ -44,7 +44,7 @@ async fn main() {
         .expect("valid model identifier");
 
     let base_config = AgentConfig {
-        model,
+        candidates: vec![model],
         system_prompt: Some("You are a helpful assistant.".into()),
         tools: Vec::new(),
         tool_visibility_policy: Default::default(),
@@ -62,6 +62,8 @@ async fn main() {
         transport: None,
         max_retry_delay_ms: None,
         retry_backoff: RetryBackoffPolicy::default(),
+        retry_mode: Default::default(),
+        model_health: Default::default(),
         api_key_override: None,
         provider_headers: Default::default(),
         provider_metadata: std::collections::HashMap::new(),

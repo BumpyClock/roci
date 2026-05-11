@@ -52,9 +52,9 @@ use child_registry::ChildEntry;
 /// - Event forwarding from children to parent
 /// - Abort, wait, and shutdown orchestration
 pub struct SubagentSupervisor {
+    config: SubagentSupervisorConfig,
     registry: Arc<ProviderRegistry>,
     roci_config: RociConfig,
-    config: SubagentSupervisorConfig,
     profile_registry: SubagentProfileRegistry,
     prompt_policy: SubagentPromptPolicy,
     base_config: AgentConfig,
@@ -93,9 +93,9 @@ impl SubagentSupervisor {
         let semaphore = Arc::new(Semaphore::new(supervisor_config.max_concurrent));
 
         Self {
+            config: supervisor_config,
             registry,
             roci_config,
-            config: supervisor_config,
             profile_registry,
             prompt_policy: SubagentPromptPolicy::default(),
             base_config,
@@ -156,13 +156,17 @@ impl SubagentSupervisor {
         let profile = self
             .profile_registry
             .resolve_effective(&spec.profile, &spec.overrides)?;
-        let resolved_model = self.profile_registry.resolve_model_candidate(
+        let resolved_model = self.profile_registry.resolve_model_candidates_with_auth(
             &profile,
             &self.registry,
             &self.roci_config,
             &self.base_config,
         )?;
-        let model = resolved_model.model;
+        let model = resolved_model
+            .candidates
+            .first()
+            .cloned()
+            .ok_or_else(|| RociError::Configuration("no model candidates".into()))?;
 
         // 3. Build initial messages (system prompt + context + task/continuation).
         //    The composed prompt policy is the first (system) message.
@@ -184,7 +188,7 @@ impl SubagentSupervisor {
         let child_tools = select_child_tools(&self.base_config.tools, &profile.tools)?;
         let child_config = build_child_config(
             &self.base_config,
-            model.clone(),
+            resolved_model.candidates.clone(),
             child_tools,
             resolved_model.reasoning_effort.as_deref(),
             Some(child_event_sink),

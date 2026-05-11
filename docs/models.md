@@ -37,6 +37,30 @@ Catalog strategy:
 Provider model enums (`OpenAiModel`, `AnthropicModel`, `GoogleModel`, etc.) live in
 `roci-providers` and feed static catalogs.
 
+## Runtime candidates
+
+Agent runtime model selection is expressed as ordered
+`Vec<LanguageModel>` candidates:
+
+- `AgentConfig.candidates`
+- `RunRequest::with_candidates(...)`
+- subagent `profile.models`
+
+Candidate order is stable. `candidates[0]` is tried first, duplicates are
+deduped by `(provider, model_id)` with first occurrence winning, and an empty
+candidate list fails configuration before provider creation.
+
+`RunRequest::new(model, messages)`, `AgentRuntime::set_model(...)`, and
+`AgentRuntime::current_model()` remain single-model migration helpers that map
+to the primary candidate.
+
+Retries happen on the active candidate first. Bounded retry may advance to the
+next candidate after retry exhaustion for transient failures before any partial
+assistant output or tool delta. Persistent retry never advances candidates.
+
+Model health observes real run outcomes only. It does not probe providers,
+persist to disk, or reorder candidates.
+
 ## CLI usage
 
 `roci-agent` added model list command:

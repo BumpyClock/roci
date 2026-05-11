@@ -8,7 +8,7 @@ async fn compact_replaces_history_with_summary_and_preserves_system_prompt() {
     let created_models = Arc::new(Mutex::new(Vec::new()));
     let registry = registry_with_summary_provider("stub", "summarized context", created_models);
     let mut config = test_agent_config();
-    config.model = "stub:run-model".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:run-model".parse().expect("stub model should parse")];
     config.compaction.keep_recent_tokens = 1;
     let agent = AgentRuntime::new(registry, test_config(), config);
 
@@ -47,7 +47,7 @@ async fn compact_uses_configured_compaction_model_when_present() {
     let created_models = Arc::new(Mutex::new(Vec::new()));
     let registry = registry_with_summary_provider("summary", "summary", created_models.clone());
     let mut config = test_agent_config();
-    config.model = "run:model".parse().expect("run model should parse");
+    config.candidates = vec!["run:model".parse().expect("run model should parse")];
     config.compaction.model = Some("summary:compact-model".to_string());
     config.compaction.keep_recent_tokens = 1;
     let agent = AgentRuntime::new(registry, test_config(), config);
@@ -73,7 +73,7 @@ async fn summarize_branch_entries_uses_branch_summary_model_override_when_presen
     let registry =
         registry_with_summary_provider("summary", "branch summary", created_models.clone());
     let mut config = test_agent_config();
-    config.model = "run:run-model".parse().expect("run model should parse");
+    config.candidates = vec!["run:run-model".parse().expect("run model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
 
     let settings = BranchSummarySettings {
@@ -101,7 +101,7 @@ async fn summarize_branch_entries_returns_branch_summary_message_with_cumulative
     let created_models = Arc::new(Mutex::new(Vec::new()));
     let registry = registry_with_summary_provider("stub", "new progress", created_models);
     let mut config = test_agent_config();
-    config.model = "stub:run-model".parse().expect("run model should parse");
+    config.candidates = vec!["stub:run-model".parse().expect("run model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
 
     let prior_summary = PiMonoSummary {

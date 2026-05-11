@@ -96,7 +96,7 @@ impl SubagentLauncher for InProcessLauncher {
 /// - compaction: inherit. Chat config: reset to avoid sharing parent event store.
 pub(super) fn build_child_config(
     parent: &AgentConfig,
-    model: LanguageModel,
+    candidates: Vec<LanguageModel>,
     tools: Vec<Arc<dyn Tool>>,
     reasoning_effort: Option<&str>,
     event_sink: Option<AgentEventSink>,
@@ -113,7 +113,7 @@ pub(super) fn build_child_config(
     }
 
     Ok(AgentConfig {
-        model,
+        candidates,
         system_prompt: None,
         tools,
         tool_visibility_policy: parent.tool_visibility_policy.clone(),
@@ -135,6 +135,8 @@ pub(super) fn build_child_config(
         transport: parent.transport.clone(),
         max_retry_delay_ms: parent.max_retry_delay_ms,
         retry_backoff: parent.retry_backoff,
+        retry_mode: parent.retry_mode,
+        model_health: parent.model_health.clone(),
         api_key_override: parent.api_key_override.clone(),
         provider_headers: parent.provider_headers.clone(),
         provider_metadata: parent.provider_metadata.clone(),
@@ -201,6 +203,7 @@ mod tests {
         BeforeAgentStartHookResult, PreToolUseHookResult, TransformContextHookResult,
     };
     use crate::agent_loop::ApprovalPolicy;
+    use crate::agent_loop::RetryMode;
     use crate::tools::{AgentTool, AgentToolParameters};
     use crate::types::GenerationSettings;
 
@@ -216,7 +219,7 @@ mod tests {
         };
         let cfg = build_child_config(
             &parent,
-            model.clone(),
+            vec![model.clone()],
             Vec::new(),
             None,
             None,
@@ -224,7 +227,7 @@ mod tests {
             Arc::new(HumanInteractionCoordinator::new()),
         )
         .unwrap();
-        assert_eq!(cfg.model, model);
+        assert_eq!(cfg.candidates, vec![model]);
         assert!(
             cfg.system_prompt.is_none(),
             "system prompt must be None; it lives in initial_messages"
@@ -252,6 +255,7 @@ mod tests {
             session_id: Some("parent-session".into()),
             transport: Some("proxy".into()),
             max_retry_delay_ms: Some(123),
+            retry_mode: Some(RetryMode::Persistent),
             api_key_override: Some("parent-key".into()),
             provider_headers,
             provider_metadata: HashMap::from([("tenant".into(), "parent".into())]),
@@ -269,7 +273,7 @@ mod tests {
 
         let cfg = build_child_config(
             &parent,
-            model,
+            vec![model],
             Vec::new(),
             Some("medium"),
             None,
@@ -284,6 +288,7 @@ mod tests {
         assert_eq!(cfg.session_id, None, "session_id resets");
         assert_eq!(cfg.transport.as_deref(), Some("proxy"));
         assert_eq!(cfg.max_retry_delay_ms, Some(123));
+        assert_eq!(cfg.retry_mode, Some(RetryMode::Persistent));
         assert_eq!(cfg.api_key_override.as_deref(), Some("parent-key"));
         assert_eq!(cfg.provider_metadata.get("tenant"), Some(&"parent".into()));
         assert_eq!(cfg.provider_headers.get("x-parent").unwrap(), "1");
@@ -306,10 +311,10 @@ mod tests {
     fn build_child_config_rejects_invalid_reasoning_effort() {
         let result = build_child_config(
             &AgentConfig::default(),
-            LanguageModel::Known {
+            vec![LanguageModel::Known {
                 provider_key: "test".into(),
                 model_id: "test-model".into(),
-            },
+            }],
             Vec::new(),
             Some("maximum"),
             None,

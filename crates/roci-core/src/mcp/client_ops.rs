@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::error::RociError;
 
-use super::client::{MCPClient, MCPToolCallResult};
+use super::client::{MCPClient, MCPReadResourceResult, MCPResourceSchema, MCPToolCallResult};
 use super::schema::MCPToolSchema;
 
 /// Internal operations required by MCP adapters and aggregators.
@@ -13,6 +13,8 @@ pub(super) trait MCPClientOps: Send {
     async fn initialize(&mut self) -> Result<(), RociError>;
     async fn list_tools(&mut self) -> Result<Vec<MCPToolSchema>, RociError>;
     async fn instructions(&mut self) -> Result<Option<String>, RociError>;
+    async fn list_resources(&mut self) -> Result<Vec<MCPResourceSchema>, RociError>;
+    async fn read_resource(&mut self, uri: &str) -> Result<MCPReadResourceResult, RociError>;
     async fn call_tool(
         &mut self,
         name: &str,
@@ -32,6 +34,14 @@ impl MCPClientOps for MCPClient {
 
     async fn instructions(&mut self) -> Result<Option<String>, RociError> {
         MCPClient::instructions(self)
+    }
+
+    async fn list_resources(&mut self) -> Result<Vec<MCPResourceSchema>, RociError> {
+        MCPClient::list_resources(self).await
+    }
+
+    async fn read_resource(&mut self, uri: &str) -> Result<MCPReadResourceResult, RociError> {
+        MCPClient::read_resource(self, uri).await
     }
 
     async fn call_tool(

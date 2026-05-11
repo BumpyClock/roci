@@ -14,7 +14,7 @@ fn map_transport_error(operation: &'static str, error: impl std::fmt::Display) -
 #[async_trait]
 pub(super) trait DynRoleClientTransport: Send {
     async fn send(&mut self, message: TxJsonRpcMessage<RoleClient>) -> Result<(), RociError>;
-    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>>;
+    async fn receive(&mut self) -> Result<Option<RxJsonRpcMessage<RoleClient>>, RociError>;
     async fn close(&mut self) -> Result<(), RociError>;
 }
 
@@ -56,12 +56,12 @@ where
             .map_err(|error| map_transport_error("send", error))
     }
 
-    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+    async fn receive(&mut self) -> Result<Option<RxJsonRpcMessage<RoleClient>>, RociError> {
         if self.closed {
-            return None;
+            return Ok(None);
         }
 
-        RmcpTransport::receive(&mut self.inner).await
+        Ok(RmcpTransport::receive(&mut self.inner).await)
     }
 
     async fn close(&mut self) -> Result<(), RociError> {

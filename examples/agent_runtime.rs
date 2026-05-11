@@ -67,7 +67,7 @@ async fn main() {
     let model = "openai:gpt-4o".parse().expect("valid model identifier");
 
     let config = AgentConfig {
-        model,
+        candidates: vec![model],
         system_prompt: Some("You are a helpful assistant with access to an echo tool.".into()),
         tools: vec![echo_tool],
         tool_visibility_policy: Default::default(),
@@ -85,6 +85,8 @@ async fn main() {
         transport: None,
         max_retry_delay_ms: None,
         retry_backoff: roci::agent_loop::runner::RetryBackoffPolicy::default(),
+        retry_mode: Default::default(),
+        model_health: Default::default(),
         api_key_override: None,
         provider_headers: Default::default(),
         provider_metadata: std::collections::HashMap::new(),

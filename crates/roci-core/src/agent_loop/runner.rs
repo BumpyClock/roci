@@ -15,7 +15,7 @@ use crate::agent::message::AgentMessage;
 use crate::config::RociConfig;
 use crate::context::ContextBudget;
 use crate::error::RociError;
-use crate::models::LanguageModel;
+use crate::models::{LanguageModel, ModelCandidates, ModelHealthTracker};
 use crate::provider::{self, ProviderRegistry};
 use crate::session::{LogicalPath, SessionFs};
 use crate::tools::catalog::ToolVisibilityPolicy;
@@ -23,7 +23,9 @@ use crate::tools::tool::{SandboxProvider, Tool};
 use crate::types::{AgentToolCall, AgentToolResult, GenerationSettings, ModelMessage};
 
 use super::approvals::{ApprovalDecision, ApprovalHandler, ApprovalPolicy};
-use super::events::{AgentEvent, RunEvent, RunEventPayload, RunEventStream, RunLifecycle};
+use super::events::{
+    AgentEvent, RetryMode, RunEvent, RunEventPayload, RunEventStream, RunLifecycle,
+};
 use super::types::{RunId, RunResult};
 
 /// Callback used for streaming run events.
@@ -162,6 +164,13 @@ pub type ConvertToLlmFn = Arc<
 /// Sink for high-level AgentEvent emission (separate from RunEvent).
 pub type AgentEventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
+/// Async callback that resolves an API key for the active model at request time.
+pub type GetApiKeyFn = Arc<
+    dyn Fn(LanguageModel) -> Pin<Box<dyn Future<Output = Result<String, RociError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone, Default)]
 pub struct RunHooks {
     pub compaction: Option<CompactionHandler>,
@@ -205,7 +214,8 @@ impl Default for RetryBackoffPolicy {
 #[derive(Clone)]
 pub struct RunRequest {
     pub run_id: RunId,
-    pub model: LanguageModel,
+    pub candidates: Vec<LanguageModel>,
+    pub active_candidate_index: usize,
     pub messages: Vec<ModelMessage>,
     pub settings: GenerationSettings,
     pub tools: Vec<Arc<dyn Tool>>,
@@ -225,6 +235,10 @@ pub struct RunRequest {
     pub auto_compaction: Option<AutoCompactionConfig>,
     /// Per-run retry/backoff policy for retryable provider failures.
     pub retry_backoff: RetryBackoffPolicy,
+    /// Retry behavior for transient provider failures.
+    pub retry_mode: RetryMode,
+    /// Optional per-run model health tracker.
+    pub model_health: Option<ModelHealthTracker>,
     /// Callback to get steering messages (checked between tool batches).
     pub get_steering_messages: Option<SteeringMessagesFn>,
     /// Callback to get follow-up messages (checked after inner loop ends).
@@ -244,6 +258,10 @@ pub struct RunRequest {
     pub max_retry_delay_ms: Option<u64>,
     /// Optional per-request provider API key override.
     pub api_key_override: Option<String>,
+    /// Optional provider-scoped API key overrides.
+    pub api_key_overrides: HashMap<String, String>,
+    /// Optional provider-aware callback to resolve API keys during fallback.
+    pub get_api_key: Option<GetApiKeyFn>,
     /// Optional per-request provider header overrides.
     pub provider_headers: reqwest::header::HeaderMap,
     /// Optional per-request metadata passed to providers.
@@ -270,9 +288,25 @@ pub struct RunRequest {
 
 impl RunRequest {
     pub fn new(model: LanguageModel, messages: Vec<ModelMessage>) -> Self {
-        Self {
+        Self::with_candidates(ModelCandidates::from_model(model).into_vec(), messages)
+            .expect("single-model RunRequest constructor must produce one candidate")
+    }
+
+    /// Build a request from normalized model candidates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RociError::Configuration`] when candidates are empty.
+    pub fn with_candidates(
+        candidates: Vec<LanguageModel>,
+        messages: Vec<ModelMessage>,
+    ) -> Result<Self, RociError> {
+        let candidates = ModelCandidates::new(candidates)?.into_vec();
+        let retry_backoff = RetryBackoffPolicy::default();
+        Ok(Self {
             run_id: Uuid::new_v4(),
-            model,
+            candidates,
+            active_candidate_index: 0,
             messages,
             settings: GenerationSettings::default(),
             tools: Vec::new(),
@@ -286,7 +320,11 @@ impl RunRequest {
             event_sink: None,
             hooks: RunHooks::default(),
             auto_compaction: None,
-            retry_backoff: RetryBackoffPolicy::default(),
+            retry_backoff,
+            retry_mode: RetryMode::Bounded {
+                max_attempts: retry_backoff.max_attempts.max(1),
+            },
+            model_health: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
             transform_context: None,
@@ -296,6 +334,8 @@ impl RunRequest {
             transport: None,
             max_retry_delay_ms: None,
             api_key_override: None,
+            api_key_overrides: HashMap::new(),
+            get_api_key: None,
             provider_headers: reqwest::header::HeaderMap::new(),
             provider_metadata: HashMap::new(),
             provider_payload_callback: None,
@@ -310,7 +350,32 @@ impl RunRequest {
             tool_permission_session_approvals: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
-        }
+        })
+    }
+
+    pub fn active_model(&self) -> &LanguageModel {
+        &self.candidates[self.active_candidate_index]
+    }
+
+    pub fn active_api_key_override(&self) -> Option<&str> {
+        let provider = self.active_model().provider_name();
+        self.api_key_overrides
+            .get(provider)
+            .map(String::as_str)
+            .or_else(|| {
+                let primary_provider = self.candidates.first()?.provider_name();
+                if provider == primary_provider {
+                    self.api_key_override.as_deref()
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn candidates_remaining(&self) -> usize {
+        self.candidates
+            .len()
+            .saturating_sub(self.active_candidate_index.saturating_add(1))
     }
 
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
@@ -405,11 +470,34 @@ impl RunRequest {
 
     pub fn with_retry_backoff(mut self, retry_backoff: RetryBackoffPolicy) -> Self {
         self.retry_backoff = retry_backoff;
+        if matches!(self.retry_mode, RetryMode::Bounded { .. }) {
+            self.retry_mode = RetryMode::Bounded {
+                max_attempts: retry_backoff.max_attempts,
+            };
+        }
+        self
+    }
+
+    pub fn with_retry_mode(mut self, retry_mode: RetryMode) -> Self {
+        self.retry_mode = retry_mode;
+        self
+    }
+
+    pub fn with_model_health_tracker(mut self, tracker: ModelHealthTracker) -> Self {
+        self.model_health = Some(tracker);
         self
     }
 
     pub fn with_api_key_override(mut self, key: impl Into<String>) -> Self {
-        self.api_key_override = Some(key.into());
+        let key = key.into();
+        self.api_key_overrides
+            .insert(self.active_model().provider_name().to_string(), key.clone());
+        self.api_key_override = Some(key);
+        self
+    }
+
+    pub fn with_get_api_key(mut self, get_api_key: GetApiKeyFn) -> Self {
+        self.get_api_key = Some(get_api_key);
         self
     }
 

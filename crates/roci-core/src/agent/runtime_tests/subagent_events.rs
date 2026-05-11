@@ -126,7 +126,7 @@ async fn submit_user_input_unknown_request_returns_error() {
         model_id: "test-model".into(),
     };
     let config = AgentConfig {
-        model,
+        candidates: vec![model],
         system_prompt: None,
         tools: Vec::new(),
         tool_visibility_policy: Default::default(),
@@ -146,6 +146,8 @@ async fn submit_user_input_unknown_request_returns_error() {
         transport: None,
         max_retry_delay_ms: None,
         retry_backoff: crate::agent_loop::runner::RetryBackoffPolicy::default(),
+        retry_mode: Default::default(),
+        model_health: Default::default(),
         api_key_override: None,
         provider_headers: reqwest::header::HeaderMap::new(),
         provider_metadata: HashMap::new(),

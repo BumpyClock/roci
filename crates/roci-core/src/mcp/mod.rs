@@ -9,15 +9,20 @@ mod error;
 pub mod instructions;
 mod mapping;
 pub mod schema;
+pub mod server;
 pub mod transport;
 
 pub use aggregate::{
-    MCPAggregateInitPolicy, MCPAggregateServer, MCPAggregatedTool, MCPAggregationConfig,
-    MCPCollisionPolicy, MCPToolAggregator, MCPToolRoute,
+    MCPAggregateInitPolicy, MCPAggregateServer, MCPAggregatedResource, MCPAggregatedTool,
+    MCPAggregationConfig, MCPCollisionPolicy, MCPToolAggregator, MCPToolRoute,
 };
 pub use bridge::MCPToolAdapter;
 pub use client::MCPClient;
 pub use instructions::{
-    merge_mcp_instructions, MCPInstructionMergePolicy, MCPInstructionSource, MCPServerKind,
-    MCPServerMetadata,
+    merge_mcp_instructions, MCPInstructionMergePolicy, MCPInstructionSource, MCPResourceIdentity,
+    MCPServerKind, MCPServerMetadata,
+};
+pub use server::{
+    McpCallToolResult, McpServerCore, McpServerListedTool, McpServerToolIdentity, McpToolIdentity,
+    McpToolSchema,
 };

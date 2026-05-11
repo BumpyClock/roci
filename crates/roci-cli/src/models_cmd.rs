@@ -92,7 +92,7 @@ pub(crate) async fn run_switch_smoke(
     let from = LanguageModel::from_str(&args.from)?;
     let to = LanguageModel::from_str(&args.to)?;
     let agent_config = AgentConfig {
-        model: from.clone(),
+        candidates: vec![from.clone()],
         ..AgentConfig::default()
     };
     let agent = AgentRuntime::new(registry, config, agent_config);
@@ -128,7 +128,7 @@ pub(crate) async fn run_switch_chat_smoke(
     let from = LanguageModel::from_str(&args.from)?;
     let to = LanguageModel::from_str(&args.to)?;
     let agent_config = AgentConfig {
-        model: from.clone(),
+        candidates: vec![from.clone()],
         ..AgentConfig::default()
     };
     let agent = AgentRuntime::new(registry, config, agent_config);

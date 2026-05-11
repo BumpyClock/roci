@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use roci::agent::{AgentConfig, AgentRuntime, HumanInteractionCoordinator, QueueDrainMode};
-use roci::agent_loop::{ApprovalPolicy, PreToolUseHookResult, RunStatus};
+use roci::agent_loop::{ApprovalPolicy, PreToolUseHookResult, RetryMode, RunStatus};
 use roci::attachments::{Attachment, PromptInput};
 use roci::config::RociConfig;
 use roci::mcp::{merge_mcp_instructions, MCPInstructionMergePolicy};
@@ -12,7 +12,7 @@ use roci::session::{CreateSessionOptions, LocalSessionStore, SessionConfig, Sess
 use roci::skills::merge_system_prompt_with_skills;
 use roci::tools::ToolVisibilityPolicy;
 
-use crate::cli::{ChatApprovalArg, ChatArgs};
+use crate::cli::{ChatApprovalArg, ChatArgs, ChatRetryModeArg};
 
 mod mcp;
 mod resource_prompt;
@@ -28,6 +28,9 @@ use runtime_events::RuntimeEventRenderer;
 pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ChatArgs {
         model: model_arg,
+        candidate_models,
+        retry_mode,
+        max_retry_attempts,
         system,
         temperature,
         skill_path,
@@ -42,7 +45,8 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         session_id,
         attachments,
         mcp_stdio,
-        mcp_sse,
+        mcp_streamable_http,
+        mcp_websocket,
         prompt,
     } = args;
 
@@ -60,6 +64,22 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             model_arg
         )
     })?;
+    let mut candidates = vec![model];
+    for candidate in candidate_models {
+        let parsed = candidate.parse().map_err(|_| {
+            format!(
+                "Invalid candidate model format: '{}'. Use provider:model (e.g. openai:gpt-4o)",
+                candidate
+            )
+        })?;
+        candidates.push(parsed);
+    }
+    let retry_mode = match retry_mode {
+        ChatRetryModeArg::Bounded => Some(RetryMode::Bounded {
+            max_attempts: max_retry_attempts,
+        }),
+        ChatRetryModeArg::Persistent => Some(RetryMode::Persistent),
+    };
 
     let config = RociConfig::from_env();
     let registry = Arc::new(roci::default_registry());
@@ -81,7 +101,8 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     let resource_system_prompt = build_resource_system_prompt(system, &resources);
     let skill_system_prompt =
         merge_system_prompt_with_skills(resource_system_prompt, &resources.skills.skills);
-    let mcp_runtime = build_mcp_runtime_wiring(&mcp_stdio, &mcp_sse).await?;
+    let mcp_runtime =
+        build_mcp_runtime_wiring(&mcp_stdio, &mcp_streamable_http, &mcp_websocket).await?;
     let system_prompt = merge_mcp_instructions(
         skill_system_prompt.as_deref(),
         &mcp_runtime.instructions,
@@ -117,7 +138,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         .transpose()?;
     let tools = roci_tools::builtin::tool_catalog().resolve(&tool_visibility_policy);
     let agent_config = AgentConfig {
-        model,
+        candidates,
         system_prompt,
         tools,
         tool_visibility_policy,
@@ -137,6 +158,8 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         transport: None,
         max_retry_delay_ms: None,
         retry_backoff: Default::default(),
+        retry_mode,
+        model_health: Default::default(),
         api_key_override: None,
         provider_headers: Default::default(),
         provider_metadata: HashMap::new(),

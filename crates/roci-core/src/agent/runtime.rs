@@ -57,7 +57,7 @@ use crate::config::RociConfig;
 #[cfg(test)]
 use crate::context::estimate_message_tokens;
 use crate::error::RociError;
-use crate::models::LanguageModel;
+use crate::models::{LanguageModel, ModelCandidates};
 use crate::provider::ProviderRegistry;
 #[cfg(test)]
 use crate::provider::ProviderRequest;
@@ -101,7 +101,7 @@ pub struct AgentRuntime {
     state: Arc<Mutex<AgentState>>,
     state_tx: watch::Sender<AgentState>,
     state_rx: watch::Receiver<AgentState>,
-    model: Arc<Mutex<LanguageModel>>,
+    candidates: Arc<Mutex<Vec<LanguageModel>>>,
     generation_settings: Arc<Mutex<GenerationSettings>>,
     approval_policy: Arc<Mutex<ApprovalPolicy>>,
     system_prompt: Arc<Mutex<Option<String>>>,
@@ -188,7 +188,9 @@ impl AgentRuntime {
         config: AgentConfig,
     ) -> Result<Self, RociError> {
         let runner = LoopRunner::with_registry(roci_config.clone(), registry.clone());
-        let model = Arc::new(Mutex::new(config.model.clone()));
+        let candidates = Arc::new(Mutex::new(
+            ModelCandidates::new(config.candidates.clone())?.into_vec(),
+        ));
         let generation_settings = Arc::new(Mutex::new(config.settings.clone()));
         let approval_policy = Arc::new(Mutex::new(config.approval_policy));
         let system_prompt = Arc::new(Mutex::new(config.system_prompt.clone()));
@@ -241,7 +243,7 @@ impl AgentRuntime {
             state: Arc::new(Mutex::new(AgentState::Idle)),
             state_tx,
             state_rx,
-            model,
+            candidates,
             generation_settings,
             approval_policy,
             system_prompt,

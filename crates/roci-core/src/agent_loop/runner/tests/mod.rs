@@ -5,8 +5,11 @@ use tokio::time::{timeout, Duration};
 
 use crate::agent::message::{convert_to_llm, AgentMessage};
 use crate::agent_loop::events::ToolUpdatePayload;
-use crate::agent_loop::RunStatus;
+use crate::agent_loop::{
+    FailureCategory, RetryEvent, RetryEventKind, RetryMode, RetryNextAction, RunEvent, RunStatus,
+};
 use crate::human_interaction::{HumanInteractionCoordinator, ToolPermissionDecision};
+use crate::models::LanguageModel;
 use crate::tools::arguments::ToolArguments;
 use crate::tools::catalog::ToolVisibilityPolicy;
 use crate::tools::tool::{AgentTool, ToolApproval, ToolExecutionContext, ToolUpdateCallback};
@@ -15,7 +18,10 @@ use crate::types::{ContentPart, StreamEventType};
 
 mod support;
 
-use support::{capture_agent_events, capture_events, test_model, test_runner, ProviderScenario};
+use support::{
+    capture_agent_events, capture_events, test_model, test_runner, test_runner_by_model,
+    ProviderScenario,
+};
 
 struct UpdateStreamingTool {
     params: AgentToolParameters,
@@ -281,6 +287,7 @@ mod auto_compaction;
 mod budget;
 mod overflow_recovery;
 mod request_pipeline;
+mod retry;
 mod schema_and_hooks;
 mod stream_lifecycle;
 mod tool_execution;

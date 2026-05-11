@@ -5,7 +5,10 @@ use super::{
 use crate::agent_loop::RunResult;
 use crate::attachments::{compile_prompt_input, PromptInput};
 use crate::error::RociError;
-use crate::models::LanguageModel;
+use crate::models::{
+    FileInputCapabilities, ImageInputCapabilities, LanguageModel, ModelCapabilities,
+    ModelInputCapabilities,
+};
 use crate::types::{ModelMessage, Role, Usage};
 
 impl AgentRuntime {
@@ -220,8 +223,8 @@ impl AgentRuntime {
     /// Returns [`RociError::InvalidState`] if the agent is not idle.
     pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunResult, RociError> {
         self.transition_to_running()?;
-        let model = self.model.lock().await.clone();
-        let user_message = match self.compile_user_prompt_with_model(input, &model) {
+        let candidates = self.current_candidates().await;
+        let user_message = match self.compile_user_prompt_with_candidates(input, &candidates) {
             Ok(message) => message,
             Err(err) => {
                 self.restore_idle_after_preflight_error().await;
@@ -250,21 +253,42 @@ impl AgentRuntime {
         self.prompt_user_message(user_message).await
     }
 
-    fn compile_user_prompt_with_model(
+    fn compile_user_prompt_with_candidates(
         &self,
         input: impl Into<PromptInput>,
-        model: &LanguageModel,
+        candidates: &[LanguageModel],
     ) -> Result<ModelMessage, RociError> {
         let input = input.into();
         if input.attachments.is_empty() {
             return Ok(ModelMessage::user(input.text));
         }
-        let provider = self.registry.create_provider(
-            model.provider_name(),
-            model.model_id(),
-            &self.roci_config,
-        )?;
-        Ok(compile_prompt_input(&input, provider.capabilities())?.message)
+        let capabilities = self.common_prompt_capabilities(candidates)?;
+        Ok(compile_prompt_input(&input, &capabilities)?.message)
+    }
+
+    fn common_prompt_capabilities(
+        &self,
+        candidates: &[LanguageModel],
+    ) -> Result<ModelCapabilities, RociError> {
+        if candidates.is_empty() {
+            return Err(RociError::Configuration(
+                "model candidates cannot be empty".into(),
+            ));
+        }
+        let mut common: Option<ModelCapabilities> = None;
+        for model in candidates {
+            let provider = self.registry.create_provider(
+                model.provider_name(),
+                model.model_id(),
+                &self.roci_config,
+            )?;
+            let capabilities = provider.capabilities().clone();
+            common = Some(match common {
+                Some(current) => intersect_prompt_capabilities(current, capabilities),
+                None => capabilities,
+            });
+        }
+        common.ok_or_else(|| RociError::Configuration("model candidates cannot be empty".into()))
     }
 
     async fn prompt_user_message(
@@ -312,8 +336,8 @@ impl AgentRuntime {
         input: impl Into<PromptInput>,
     ) -> Result<RunResult, RociError> {
         self.transition_to_running()?;
-        let model = self.model.lock().await.clone();
-        let user_message = match self.compile_user_prompt_with_model(input, &model) {
+        let candidates = self.current_candidates().await;
+        let user_message = match self.compile_user_prompt_with_candidates(input, &candidates) {
             Ok(message) => message,
             Err(err) => {
                 self.restore_idle_after_preflight_error().await;
@@ -395,8 +419,8 @@ impl AgentRuntime {
     /// Does nothing if the agent is idle (the message is still queued and
     /// will be picked up on the next run).
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), RociError> {
-        let model = self.model.lock().await.clone();
-        let user_message = self.compile_user_prompt_with_model(input, &model)?;
+        let candidates = self.current_candidates().await;
+        let user_message = self.compile_user_prompt_with_candidates(input, &candidates)?;
         self.steering_queue.lock().await.push(user_message);
         Ok(())
     }
@@ -406,8 +430,8 @@ impl AgentRuntime {
     /// Follow-up messages are checked when the inner loop ends (no more
     /// tool calls). If present, they extend the conversation.
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), RociError> {
-        let model = self.model.lock().await.clone();
-        let user_message = self.compile_user_prompt_with_model(input, &model)?;
+        let candidates = self.current_candidates().await;
+        let user_message = self.compile_user_prompt_with_candidates(input, &candidates)?;
         self.follow_up_queue.lock().await.push(user_message);
         Ok(())
     }
@@ -614,5 +638,139 @@ impl AgentRuntime {
                 () = queued_turn_notified.as_mut() => {}
             }
         }
+    }
+}
+
+fn intersect_prompt_capabilities(
+    mut current: ModelCapabilities,
+    next: ModelCapabilities,
+) -> ModelCapabilities {
+    current.input = ModelInputCapabilities {
+        text: crate::models::TextInputCapabilities {
+            max_text_bytes: min_optional_limit(
+                current.input.text.max_text_bytes,
+                next.input.text.max_text_bytes,
+            ),
+            max_text_tokens: min_optional_limit(
+                current.input.text.max_text_tokens,
+                next.input.text.max_text_tokens,
+            ),
+        },
+        image: intersect_image_capabilities(current.input.image, next.input.image),
+        file: intersect_file_capabilities(current.input.file, next.input.file),
+    };
+    current.supports_vision = current.input.image.is_some();
+    current
+}
+
+fn intersect_file_capabilities(
+    current: FileInputCapabilities,
+    next: FileInputCapabilities,
+) -> FileInputCapabilities {
+    FileInputCapabilities {
+        native_file_input: current.native_file_input && next.native_file_input,
+        max_files: current.max_files.min(next.max_files),
+        max_file_bytes: min_optional_limit(current.max_file_bytes, next.max_file_bytes),
+        max_total_file_bytes: min_optional_limit(
+            current.max_total_file_bytes,
+            next.max_total_file_bytes,
+        ),
+        supported_mime_types: intersect_mime_types(
+            current.supported_mime_types,
+            next.supported_mime_types,
+        ),
+    }
+}
+
+fn intersect_image_capabilities(
+    current: Option<ImageInputCapabilities>,
+    next: Option<ImageInputCapabilities>,
+) -> Option<ImageInputCapabilities> {
+    let (current, next) = (current?, next?);
+    Some(ImageInputCapabilities {
+        max_images: current.max_images.min(next.max_images),
+        max_image_bytes: min_optional_limit(current.max_image_bytes, next.max_image_bytes),
+        max_total_image_bytes: min_optional_limit(
+            current.max_total_image_bytes,
+            next.max_total_image_bytes,
+        ),
+        supported_mime_types: intersect_mime_types(
+            current.supported_mime_types,
+            next.supported_mime_types,
+        ),
+        // Conservative budgeting: use the larger token estimate while other numeric limits use min.
+        image_token_estimate: current.image_token_estimate.max(next.image_token_estimate),
+    })
+}
+
+fn min_optional_limit(current: Option<usize>, next: Option<usize>) -> Option<usize> {
+    match (current, next) {
+        (Some(current), Some(next)) => Some(current.min(next)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
+}
+
+fn intersect_mime_types(current: Vec<String>, next: Vec<String>) -> Vec<String> {
+    let next_normalized = next
+        .iter()
+        .map(|mime| mime.trim().to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    let mut seen = std::collections::HashSet::new();
+    current
+        .into_iter()
+        .filter(|mime| {
+            let normalized = mime.trim().to_ascii_lowercase();
+            next_normalized.contains(&normalized) && seen.insert(normalized)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intersect_prompt_capabilities_uses_strict_common_file_limits() {
+        let current = ModelCapabilities {
+            input: ModelInputCapabilities {
+                file: FileInputCapabilities {
+                    native_file_input: true,
+                    max_files: 4,
+                    max_file_bytes: Some(4096),
+                    max_total_file_bytes: Some(8192),
+                    supported_mime_types: vec![
+                        "text/plain".to_string(),
+                        "application/pdf".to_string(),
+                    ],
+                },
+                ..ModelInputCapabilities::default()
+            },
+            ..ModelCapabilities::default()
+        };
+        let next = ModelCapabilities {
+            input: ModelInputCapabilities {
+                file: FileInputCapabilities {
+                    native_file_input: false,
+                    max_files: 2,
+                    max_file_bytes: Some(2048),
+                    max_total_file_bytes: None,
+                    supported_mime_types: vec!["TEXT/PLAIN".to_string(), "image/png".to_string()],
+                },
+                ..ModelInputCapabilities::default()
+            },
+            ..ModelCapabilities::default()
+        };
+
+        let common = intersect_prompt_capabilities(current, next);
+
+        assert!(!common.input.file.native_file_input);
+        assert_eq!(common.input.file.max_files, 2);
+        assert_eq!(common.input.file.max_file_bytes, Some(2048));
+        assert_eq!(common.input.file.max_total_file_bytes, Some(8192));
+        assert_eq!(
+            common.input.file.supported_mime_types,
+            vec!["text/plain".to_string()]
+        );
     }
 }

@@ -30,11 +30,15 @@ pub trait MCPTransport: Send {
 }
 
 mod common;
-mod sse;
 mod stdio;
+mod streamable_http;
+mod websocket;
 
-pub use sse::SSETransport;
 pub use stdio::StdioTransport;
+pub use streamable_http::{
+    StreamableHttpAuthHeaderProvider, StreamableHttpTransport, StreamableHttpTransportConfig,
+};
+pub use websocket::{WebSocketAuthHeaderProvider, WebSocketTransport, WebSocketTransportConfig};
 
 #[cfg(test)]
 mod test_support;

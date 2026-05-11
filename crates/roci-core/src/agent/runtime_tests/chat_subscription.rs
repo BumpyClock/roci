@@ -22,9 +22,9 @@ fn runtime_with_chat_provider() -> AgentRuntime {
 fn runtime_with_chat_provider_config(chat: ChatRuntimeConfig) -> AgentRuntime {
     let registry = registry_with_streaming_provider("stub", 8, 3);
     let mut config = test_agent_config();
-    config.model = "stub:chat-subscription"
+    config.candidates = vec!["stub:chat-subscription"
         .parse()
-        .expect("stub model should parse");
+        .expect("stub model should parse")];
     config.chat = chat;
     AgentRuntime::new(registry, test_config(), config)
 }
@@ -55,6 +55,7 @@ fn payload_name(payload: &AgentRuntimeEventPayload) -> &'static str {
         AgentRuntimeEventPayload::ReasoningUpdated { .. } => "reasoning_updated",
         AgentRuntimeEventPayload::PlanUpdated { .. } => "plan_updated",
         AgentRuntimeEventPayload::DiffUpdated { .. } => "diff_updated",
+        AgentRuntimeEventPayload::Retry { .. } => "retry",
         AgentRuntimeEventPayload::PlanWritten { .. } => "plan_written",
         AgentRuntimeEventPayload::WorkspaceUpdated { .. } => "workspace_updated",
         AgentRuntimeEventPayload::ArtifactCreated { .. } => "artifact_created",
@@ -346,7 +347,7 @@ async fn subscribe_before_prompt_receives_live_semantic_events_in_order() {
 async fn reasoning_updates_flow_through_subscription_and_replay() {
     let registry = registry_with_reasoning_provider("stub");
     let mut config = test_agent_config();
-    config.model = "stub:reasoning".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:reasoning".parse().expect("stub model should parse")];
     let agent = AgentRuntime::new(registry, test_config(), config);
     let mut sub = agent.subscribe(None).await;
 
@@ -456,7 +457,7 @@ async fn slow_event_store_does_not_fail_long_stream() {
     let store = Arc::new(BlockOnAppendStore::block_on_append(4));
     let registry = registry_with_streaming_chunks_provider("stub", STREAM_CHUNKS);
     let mut config = test_agent_config();
-    config.model = "stub:long-stream".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:long-stream".parse().expect("stub model should parse")];
     config.chat = ChatRuntimeConfig {
         event_store: Some(store.clone()),
         ..ChatRuntimeConfig::default()

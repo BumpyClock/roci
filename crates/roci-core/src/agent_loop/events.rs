@@ -9,6 +9,77 @@ use crate::types::{AgentToolCall, AgentToolResult, ModelMessage, TextStreamDelta
 use super::approvals::{ApprovalDecision, ApprovalRequest};
 use super::types::RunId;
 
+/// Retry behavior for provider failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryMode {
+    Bounded { max_attempts: u32 },
+    Persistent,
+}
+
+impl Default for RetryMode {
+    fn default() -> Self {
+        Self::Bounded { max_attempts: 3 }
+    }
+}
+
+/// Retry lifecycle event kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryEventKind {
+    RetryScheduled,
+    RetryResuming,
+    RetryCanceled,
+    CandidateAdvancing,
+    RetryExhausted,
+}
+
+/// Provider failure category used for retry and health decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    RateLimit,
+    Network,
+    Server,
+    Timeout,
+    Overflow,
+    Auth,
+    Configuration,
+    InvalidRequest,
+    Tool,
+    Canceled,
+    Unknown,
+}
+
+/// Action selected after a retry decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryNextAction {
+    Sleep,
+    ResumeSameCandidate,
+    AdvanceCandidate,
+    ReturnFailure,
+    Cancel,
+}
+
+/// Retry and candidate-advancement event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryEvent {
+    pub kind: RetryEventKind,
+    pub run_id: RunId,
+    pub provider: String,
+    pub model_id: String,
+    pub candidate_index: usize,
+    pub attempt: u32,
+    pub retry_mode: RetryMode,
+    pub failure_category: FailureCategory,
+    pub sleep_ms: Option<u64>,
+    pub elapsed_retry_ms: u64,
+    pub candidates_remaining: usize,
+    pub partial_output_seen: bool,
+    pub next_action: RetryNextAction,
+}
+
 /// Stream category for events.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +141,9 @@ pub enum RunEventPayload {
     },
     Error {
         message: String,
+    },
+    Retry {
+        event: RetryEvent,
     },
 }
 

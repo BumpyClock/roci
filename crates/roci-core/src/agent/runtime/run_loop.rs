@@ -4,13 +4,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::types::drain_queue;
 use super::{AgentRuntime, AgentRuntimeError, CollaborationMode, ThreadId, TurnId, TurnStatus};
+use crate::agent_loop::events::RunEventPayload;
 use crate::agent_loop::runner::{
     AutoCompactionConfig, BeforeAgentStartHookPayload, BeforeAgentStartHookResult,
-    CompactionHandler, FollowUpMessagesFn, RunHooks, SteeringMessagesFn,
+    CompactionHandler, FollowUpMessagesFn, RunEventSink, RunHooks, SteeringMessagesFn,
 };
 use crate::agent_loop::ApprovalPolicy;
 use crate::agent_loop::{RunHandle, RunRequest, RunResult, RunStatus, Runner};
 use crate::error::RociError;
+use crate::models::{ModelCandidates, ModelHealthTracker};
 use crate::tools::catalog::{ToolCatalog, ToolOrigin};
 use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
@@ -190,6 +192,7 @@ impl AgentRuntime {
             initial_messages.len(),
             options.collaboration_mode,
         );
+        let retry_event_sink = self.build_retry_event_sink(turn_id, chat_projection_error.clone());
 
         if self.chat_turn_status(turn_id)? == TurnStatus::Canceled {
             *self.is_streaming.lock().await = false;
@@ -243,7 +246,9 @@ impl AgentRuntime {
             cb
         };
 
-        let model = self.model.lock().await.clone();
+        let candidates = self.candidates.lock().await.clone();
+        let candidates = ModelCandidates::new(candidates)?;
+        let primary_model = candidates.primary().clone();
 
         let tools = match self.resolve_tools_for_run().await {
             Ok(tools) => tools,
@@ -258,12 +263,15 @@ impl AgentRuntime {
         // Freeze session usage into the request before dispatching.
         let session_usage_snapshot = self.session_usage.lock().await.clone();
 
-        let mut request = RunRequest::new(model, initial_messages)
+        let mut request = RunRequest::with_candidates(candidates.into_vec(), initial_messages)?
             .with_tools(tools)
             .with_steering_messages(steering_fn)
             .with_follow_up_messages(follow_up_fn)
             .with_approval_policy(options.approval_policy)
             .with_agent_event_sink(intercepting_sink)
+            .with_model_health_tracker(ModelHealthTracker::new_session(
+                self.config.model_health.clone(),
+            ))
             .with_prior_session_usage(
                 session_usage_snapshot.input_tokens as usize,
                 session_usage_snapshot.output_tokens as usize,
@@ -297,7 +305,7 @@ impl AgentRuntime {
             let hook_cancel_token = CancellationToken::new();
             let hook_payload = BeforeAgentStartHookPayload {
                 run_id: request.run_id,
-                model: request.model.clone(),
+                model: request.active_model().clone(),
                 messages: request.messages.clone(),
                 cancellation_token: hook_cancel_token.clone(),
             };
@@ -335,7 +343,7 @@ impl AgentRuntime {
             let session_before_compact = self.config.session_before_compact.clone();
             let registry = self.registry.clone();
             let roci_config = self.roci_config.clone();
-            let run_model = request.model.clone();
+            let run_model = primary_model.clone();
             let compaction_hook: CompactionHandler = Arc::new(move |messages, _cancel| {
                 let compaction_settings = compaction_settings.clone();
                 let session_before_compact = session_before_compact.clone();
@@ -378,9 +386,15 @@ impl AgentRuntime {
         if let Some(max_retry_delay_ms) = self.config.max_retry_delay_ms {
             request = request.with_max_retry_delay_ms(max_retry_delay_ms);
         }
-        request = request.with_retry_backoff(self.config.retry_backoff);
+        request = request
+            .with_retry_backoff(self.config.retry_backoff)
+            .with_retry_mode(self.config.effective_retry_mode()?);
+        request = request.with_event_sink(retry_event_sink);
         if let Some(ref api_key_override) = self.config.api_key_override {
             request = request.with_api_key_override(api_key_override.clone());
+        }
+        if let Some(ref get_api_key) = self.config.get_api_key {
+            request = request.with_get_api_key(get_api_key.clone());
         }
         if !self.config.provider_headers.is_empty() {
             request = request.with_provider_headers(self.config.provider_headers.clone());
@@ -399,14 +413,14 @@ impl AgentRuntime {
         }
 
         let run_result = async {
-            let provider_has_config_key = self
-                .roci_config
-                .get_api_key(request.model.provider_name())
-                .is_some();
-            if request.api_key_override.is_none() && !provider_has_config_key {
-                if let Some(ref get_key) = self.config.get_api_key {
-                    let key = get_key().await?;
-                    request = request.with_api_key_override(key);
+            let active_model = request.active_model().clone();
+            let active_provider = active_model.provider_name().to_string();
+            if request.active_api_key_override().is_none()
+                && self.roci_config.get_api_key(&active_provider).is_none()
+            {
+                if let Some(ref get_key) = request.get_api_key {
+                    let key = get_key(active_model).await?;
+                    request.api_key_overrides.insert(active_provider, key);
                 }
             }
 
@@ -539,6 +553,42 @@ impl AgentRuntime {
             }
         }
         run_result
+    }
+
+    fn build_retry_event_sink(
+        &self,
+        turn_id: TurnId,
+        projection_error: std::sync::Arc<std::sync::Mutex<Option<AgentRuntimeError>>>,
+    ) -> RunEventSink {
+        let chat_projector = self.chat_projector.clone();
+        let runtime_event_publish_tx = self.runtime_event_publish_tx.clone();
+        let runtime_event_send_lock = self.runtime_event_send_lock.clone();
+        std::sync::Arc::new(move |event| {
+            let RunEventPayload::Retry { event } = event.payload else {
+                return;
+            };
+            let projection_result = chat_projector
+                .lock()
+                .map_err(|_| AgentRuntimeError::ProjectionFailed {
+                    message: "chat projector lock poisoned".into(),
+                })
+                .and_then(|mut projector| projector.record_retry(turn_id, event))
+                .and_then(|event| {
+                    AgentRuntime::queue_runtime_event_to(
+                        &runtime_event_publish_tx,
+                        &runtime_event_send_lock,
+                        event,
+                        projection_error.clone(),
+                    )
+                });
+            if let Err(err) = projection_result {
+                if let Ok(mut stored_error) = projection_error.lock() {
+                    if stored_error.is_none() {
+                        *stored_error = Some(err);
+                    }
+                }
+            }
+        })
     }
 
     async fn project_structured_plan(

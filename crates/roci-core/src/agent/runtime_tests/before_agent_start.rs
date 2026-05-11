@@ -7,7 +7,7 @@ async fn before_agent_start_hook_can_replace_initial_messages() {
     let created_models = Arc::new(Mutex::new(Vec::new()));
     let registry = registry_with_summary_provider("stub", "summary", created_models);
     let mut config = test_agent_config();
-    config.model = "stub:run-model".parse().expect("stub model should parse");
+    config.candidates = vec!["stub:run-model".parse().expect("stub model should parse")];
     config.before_agent_start = Some(Arc::new(|payload| {
         Box::pin(async move {
             assert!(!payload.cancellation_token.is_cancelled());

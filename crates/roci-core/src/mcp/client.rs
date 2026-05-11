@@ -5,7 +5,10 @@ use std::sync::Arc;
 use crate::error::RociError;
 use crate::human_interaction::HumanInteractionCoordinator;
 use rmcp::{
-    model::{CallToolRequestParams, CallToolResult, JsonObject, ProtocolVersion},
+    model::{
+        CallToolRequestParams, CallToolResult, JsonObject, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResult, Resource,
+    },
     service::{ClientInitializeError, ServiceError},
 };
 
@@ -29,6 +32,21 @@ pub struct MCPToolCallResult {
     pub structured_content: Option<serde_json::Value>,
     pub text_content: Option<String>,
     pub content: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MCPResourceSchema {
+    pub uri: String,
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+    pub size: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MCPReadResourceResult {
+    pub contents: Vec<serde_json::Value>,
 }
 
 impl MCPToolCallResult {
@@ -171,6 +189,60 @@ impl MCPClient {
         Ok(tools.into_iter().map(map_mcp_tool_schema).collect())
     }
 
+    /// List available resources from the MCP server.
+    pub async fn list_resources(&mut self) -> Result<Vec<MCPResourceSchema>, RociError> {
+        self.ensure_initialized()?;
+
+        let resources = match self.list_resources_from_active_session().await {
+            Ok(resources) => resources,
+            Err(error) if Self::should_reconnect_after_service_error(&error) => {
+                self.reset_for_reconnect()?;
+                self.initialize().await?;
+                self.list_resources_from_active_session()
+                    .await
+                    .map_err(|retry_error| map_service_error("list_resources", retry_error))?
+            }
+            Err(error) => return Err(map_service_error("list_resources", error)),
+        };
+
+        Ok(resources
+            .into_iter()
+            .map(|resource| MCPResourceSchema {
+                uri: resource.raw.uri,
+                name: resource.raw.name,
+                title: resource.raw.title,
+                description: resource.raw.description,
+                mime_type: resource.raw.mime_type,
+                size: resource.raw.size,
+            })
+            .collect())
+    }
+
+    /// Read one MCP resource by upstream URI.
+    pub async fn read_resource(&mut self, uri: &str) -> Result<MCPReadResourceResult, RociError> {
+        self.ensure_initialized()?;
+
+        let result = match self.read_resource_from_active_session(uri).await {
+            Ok(result) => result,
+            Err(error) if Self::should_reconnect_after_service_error(&error) => {
+                self.reset_for_reconnect()?;
+                self.initialize().await?;
+                self.read_resource_from_active_session(uri)
+                    .await
+                    .map_err(|retry_error| map_service_error("read_resource", retry_error))?
+            }
+            Err(error) => return Err(map_service_error("read_resource", error)),
+        };
+
+        Ok(MCPReadResourceResult {
+            contents: result
+                .contents
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
     /// Execute a tool on the MCP server.
     pub async fn call_tool(
         &mut self,
@@ -273,6 +345,33 @@ impl MCPClient {
                 name: name.to_owned().into(),
                 arguments,
                 task: None,
+            })
+            .await
+    }
+
+    async fn list_resources_from_active_session(&mut self) -> Result<Vec<Resource>, ServiceError> {
+        let session = self.session.as_mut().ok_or(ServiceError::TransportClosed)?;
+
+        match session.list_all_resources().await {
+            Ok(resources) => Ok(resources),
+            Err(ServiceError::UnexpectedResponse) => session
+                .list_resources(None)
+                .await
+                .map(|page| page.resources),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn read_resource_from_active_session(
+        &mut self,
+        uri: &str,
+    ) -> Result<ReadResourceResult, ServiceError> {
+        let session = self.session.as_mut().ok_or(ServiceError::TransportClosed)?;
+
+        session
+            .read_resource(ReadResourceRequestParams {
+                meta: None,
+                uri: uri.to_owned(),
             })
             .await
     }

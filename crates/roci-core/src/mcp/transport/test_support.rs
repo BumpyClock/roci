@@ -63,11 +63,11 @@ impl DynRoleClientTransport for MockInnerTransport {
         Ok(())
     }
 
-    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+    async fn receive(&mut self) -> Result<Option<RxJsonRpcMessage<RoleClient>>, RociError> {
         if let Some(delay_ms) = self.receive_delay_ms {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
-        self.receive_queue.pop_front().unwrap_or(None)
+        Ok(self.receive_queue.pop_front().unwrap_or(None))
     }
 
     async fn close(&mut self) -> Result<(), RociError> {

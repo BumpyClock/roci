@@ -36,10 +36,12 @@ impl AgentRuntime {
     pub async fn compact(&self) -> Result<(), RociError> {
         let state_guard = self.lock_state_for_idle_mutation()?;
         let model = self
-            .model
+            .candidates
             .try_lock()
             .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?
-            .clone();
+            .first()
+            .cloned()
+            .ok_or_else(|| RociError::Configuration("model candidates cannot be empty".into()))?;
         let messages = self
             .messages
             .try_lock()
@@ -89,10 +91,12 @@ impl AgentRuntime {
     ) -> Result<AgentMessage, RociError> {
         let state_guard = self.lock_state_for_idle_mutation()?;
         let model = self
-            .model
+            .candidates
             .try_lock()
             .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?
-            .clone();
+            .first()
+            .cloned()
+            .ok_or_else(|| RociError::Configuration("model candidates cannot be empty".into()))?;
         let existing_messages = self
             .messages
             .try_lock()

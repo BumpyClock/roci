@@ -51,7 +51,7 @@ fn make_base_config() -> AgentConfig {
     use crate::types::GenerationSettings;
 
     AgentConfig {
-        model: make_test_model(),
+        candidates: vec![make_test_model()],
         system_prompt: None,
         tools: Vec::new(),
         tool_visibility_policy: Default::default(),
@@ -71,6 +71,8 @@ fn make_base_config() -> AgentConfig {
         transport: None,
         max_retry_delay_ms: None,
         retry_backoff: RetryBackoffPolicy::default(),
+        retry_mode: Default::default(),
+        model_health: Default::default(),
         api_key_override: None,
         provider_headers: reqwest::header::HeaderMap::new(),
         provider_metadata: HashMap::new(),
@@ -391,10 +393,10 @@ fn make_blocking_ask_user_supervisor() -> SubagentSupervisor {
     );
 
     let mut base_config = make_base_config();
-    base_config.model = LanguageModel::Known {
+    base_config.candidates = vec![LanguageModel::Known {
         provider_key: "test".into(),
         model_id: "test-model".into(),
-    };
+    }];
     base_config.tools = vec![ask_user_tool];
 
     let mut profile_registry = SubagentProfileRegistry::with_builtins();

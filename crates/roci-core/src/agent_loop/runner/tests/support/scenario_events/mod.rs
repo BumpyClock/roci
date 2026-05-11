@@ -20,6 +20,7 @@ pub(super) fn events_for_scenario(
         | ProviderScenario::RateLimitedWithoutRetryHint
         | ProviderScenario::RetryableTimeoutThenComplete
         | ProviderScenario::RetryableTimeoutExhausted
+        | ProviderScenario::StreamTimeoutThenComplete
         | ProviderScenario::ContextOverflowThenComplete
         | ProviderScenario::ContextOverflowAlways
         | ProviderScenario::UntypedOverflowError

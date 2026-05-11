@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::compaction::{extract_file_operations, FileOperationSet};
+pub use crate::agent_loop::runner::GetApiKeyFn;
 use crate::context::{estimate_message_tokens, PreparedCompaction};
 use crate::error::RociError;
 use crate::resource::{BranchSummarySettings, CompactionSettings};
@@ -65,22 +66,6 @@ pub struct AgentSnapshot {
     pub is_streaming: bool,
     pub last_error: Option<String>,
 }
-
-/// Async callback that resolves an API key at request time.
-///
-/// Enables token rotation and dynamic key resolution without rebuilding the
-/// agent. The callback is invoked once per run, before the [`crate::agent_loop::RunRequest`]
-/// is dispatched to the inner loop.
-///
-/// # Example
-///
-/// ```ignore
-/// let get_key: GetApiKeyFn = Arc::new(|| {
-///     Box::pin(async { Ok("sk-live-rotated-key".to_string()) })
-/// });
-/// ```
-pub type GetApiKeyFn =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, RociError>> + Send>> + Send + Sync>;
 
 /// Outcome returned by `session_before_compact`.
 #[derive(Debug, Clone, PartialEq, Eq)]

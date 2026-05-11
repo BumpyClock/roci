@@ -35,34 +35,6 @@ use crate::types::{
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 
-// ---------------------------------------------------------------------------
-// Dummy provider factory so model resolution succeeds in tests
-// ---------------------------------------------------------------------------
-
-struct TestProviderFactory;
-
-impl ProviderFactory for TestProviderFactory {
-    fn provider_keys(&self) -> &[&str] {
-        &["test"]
-    }
-
-    fn create(
-        &self,
-        _config: &RociConfig,
-        _provider_key: &str,
-        _model_id: &str,
-    ) -> Result<Box<dyn ModelProvider>, TestRociError> {
-        Err(TestRociError::Configuration("test provider stub".into()))
-    }
-}
-
-/// Build a ProviderRegistry with a "test" provider registered.
-fn test_registry() -> Arc<ProviderRegistry> {
-    let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(TestProviderFactory));
-    Arc::new(registry)
-}
-
 /// Build a RociConfig with a "test" API key set.
 fn test_roci_config() -> RociConfig {
     let config = RociConfig::default();
@@ -96,6 +68,34 @@ fn make_test_model() -> LanguageModel {
     }
 }
 
+struct CredentialFlagFactory {
+    keys: &'static [&'static str],
+    requires_credentials: bool,
+}
+
+impl ProviderFactory for CredentialFlagFactory {
+    fn provider_keys(&self) -> &[&str] {
+        self.keys
+    }
+
+    fn requires_credentials(&self, _provider_key: &str) -> bool {
+        self.requires_credentials
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, TestRociError> {
+        Ok(Box::new(BlockingStreamProvider {
+            provider_key: provider_key.to_string(),
+            model_id: model_id.to_string(),
+            capabilities: crate::models::capabilities::ModelCapabilities::default(),
+        }))
+    }
+}
+
 fn make_base_config() -> AgentConfig {
     use crate::agent::runtime::QueueDrainMode;
     use crate::agent_loop::runner::RetryBackoffPolicy;
@@ -103,7 +103,7 @@ fn make_base_config() -> AgentConfig {
     use crate::types::GenerationSettings;
 
     AgentConfig {
-        model: make_test_model(),
+        candidates: vec![make_test_model()],
         system_prompt: None,
         tools: Vec::new(),
         tool_visibility_policy: Default::default(),
@@ -123,6 +123,8 @@ fn make_base_config() -> AgentConfig {
         transport: None,
         max_retry_delay_ms: None,
         retry_backoff: RetryBackoffPolicy::default(),
+        retry_mode: Default::default(),
+        model_health: Default::default(),
         api_key_override: None,
         provider_headers: reqwest::header::HeaderMap::new(),
         provider_metadata: HashMap::new(),
@@ -218,10 +220,26 @@ fn make_supervisor_with_mock_config(
     base_config: AgentConfig,
     profile_registry: SubagentProfileRegistry,
 ) -> MockSupervisorParts {
-    let registry = test_registry();
-    let roci_config = test_roci_config();
-    let sup_config = SubagentSupervisorConfig::default();
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(Arc::new(CredentialFlagFactory {
+        keys: &["test"],
+        requires_credentials: true,
+    }));
+    make_supervisor_with_mock_config_and_registry(
+        base_config,
+        profile_registry,
+        Arc::new(provider_registry),
+        test_roci_config(),
+    )
+}
 
+fn make_supervisor_with_mock_config_and_registry(
+    base_config: AgentConfig,
+    profile_registry: SubagentProfileRegistry,
+    registry: Arc<ProviderRegistry>,
+    roci_config: RociConfig,
+) -> MockSupervisorParts {
+    let sup_config = SubagentSupervisorConfig::default();
     let (mock, captured, captured_config) = MockLauncher::new();
 
     #[cfg(feature = "agent")]
@@ -234,9 +252,9 @@ fn make_supervisor_with_mock_config(
     let semaphore = Arc::new(Semaphore::new(sup_config.max_concurrent));
 
     let supervisor = SubagentSupervisor {
+        config: sup_config,
         registry,
         roci_config,
-        config: sup_config,
         profile_registry,
         prompt_policy: SubagentPromptPolicy::default(),
         base_config,
@@ -343,11 +361,18 @@ async fn spawn_applies_tool_policy_and_reasoning_effort() {
         tools: ToolPolicy::Replace {
             tools: vec!["read".into(), "shell".into()],
         },
-        models: vec![ModelCandidate {
-            provider: "test".into(),
-            model: "test-model".into(),
-            reasoning_effort: Some("high".into()),
-        }],
+        models: vec![
+            ModelCandidate {
+                provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: Some("high".into()),
+            },
+            ModelCandidate {
+                provider: "local".into(),
+                model: "fallback-model".into(),
+                reasoning_effort: None,
+            },
+        ],
         ..Default::default()
     });
     let (supervisor, _, captured_config) =
@@ -369,8 +394,87 @@ async fn spawn_applies_tool_policy_and_reasoning_effort() {
 
     let cfg = captured_config.lock().await.clone().unwrap();
     assert_eq!(captured_tool_names(&cfg), vec!["read", "shell"]);
+    assert_eq!(
+        cfg.candidates,
+        vec![
+            LanguageModel::Known {
+                provider_key: "test".into(),
+                model_id: "test-model".into(),
+            },
+            LanguageModel::Known {
+                provider_key: "local".into(),
+                model_id: "fallback-model".into(),
+            },
+        ]
+    );
     assert_eq!(cfg.settings.temperature, Some(0.4));
     assert_eq!(cfg.settings.reasoning_effort, Some(ReasoningEffort::High));
+
+    handle.abort().await;
+}
+
+#[tokio::test]
+async fn spawn_filters_unauth_remote_primary_to_local_fallback() {
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(Arc::new(CredentialFlagFactory {
+        keys: &["remote"],
+        requires_credentials: true,
+    }));
+    provider_registry.register(Arc::new(CredentialFlagFactory {
+        keys: &["local"],
+        requires_credentials: false,
+    }));
+
+    let mut profile_registry = SubagentProfileRegistry::new();
+    profile_registry.register(SubagentProfile {
+        name: "test:fallback".into(),
+        system_prompt: Some("Fallback sub-agent".into()),
+        models: vec![
+            ModelCandidate {
+                provider: "remote".into(),
+                model: "remote-model".into(),
+                reasoning_effort: Some("high".into()),
+            },
+            ModelCandidate {
+                provider: "local".into(),
+                model: "local-model".into(),
+                reasoning_effort: Some("medium".into()),
+            },
+        ],
+        ..Default::default()
+    });
+
+    let (supervisor, _, captured_config) = make_supervisor_with_mock_config_and_registry(
+        make_base_config(),
+        profile_registry,
+        Arc::new(provider_registry),
+        RociConfig::default(),
+    );
+
+    let handle = supervisor
+        .spawn_with_context(
+            SubagentSpec {
+                profile: "test:fallback".into(),
+                label: None,
+                input: SubagentInput::Prompt {
+                    task: "use fallback".into(),
+                },
+                overrides: Default::default(),
+            },
+            SubagentContext::default(),
+        )
+        .await
+        .unwrap();
+
+    let cfg = captured_config.lock().await.clone().unwrap();
+    assert_eq!(
+        cfg.candidates,
+        vec![LanguageModel::Known {
+            provider_key: "local".into(),
+            model_id: "local-model".into(),
+        }]
+    );
+    assert_eq!(cfg.settings.reasoning_effort, Some(ReasoningEffort::Medium));
 
     handle.abort().await;
 }

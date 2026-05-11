@@ -16,6 +16,7 @@ pub struct Cli {
 
 /// Top-level CLI commands.
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Authentication management
     Auth(AuthArgs),
@@ -152,12 +153,35 @@ fn parse_speech_speed(value: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_max_retry_attempts(value: &str) -> Result<u32, String> {
+    let attempts = value
+        .parse::<u32>()
+        .map_err(|_| "max-retry-attempts must be >= 1".to_string())?;
+    if attempts >= 1 {
+        Ok(attempts)
+    } else {
+        Err("max-retry-attempts must be >= 1".to_string())
+    }
+}
+
 /// Arguments for the `chat` subcommand.
 #[derive(Parser, Debug)]
 pub struct ChatArgs {
     /// Model to use (format: provider:model, e.g., openai:gpt-4o or codex:gpt-5.3-codex-spark)
     #[arg(short, long, default_value = "openai:gpt-4o")]
     pub model: String,
+
+    /// Additional fallback model candidate to try after the primary model. Repeatable.
+    #[arg(long = "candidate-model", value_name = "PROVIDER:MODEL")]
+    pub candidate_models: Vec<String>,
+
+    /// Retry mode for provider failures.
+    #[arg(long = "retry-mode", value_enum, default_value_t = ChatRetryModeArg::Bounded)]
+    pub retry_mode: ChatRetryModeArg,
+
+    /// Maximum attempts per candidate when --retry-mode=bounded. Includes the first attempt.
+    #[arg(long = "max-retry-attempts", default_value_t = 3, value_parser = parse_max_retry_attempts)]
+    pub max_retry_attempts: u32,
 
     /// System prompt
     #[arg(short, long)]
@@ -217,11 +241,17 @@ pub struct ChatArgs {
     #[arg(long = "mcp-stdio", value_name = "SPEC")]
     pub mcp_stdio: Vec<String>,
 
-    /// MCP SSE server spec (repeatable). Format: `key=value` pairs separated by commas.
+    /// MCP streamable HTTP server spec (repeatable). Format: `key=value` pairs separated by commas.
     /// Keys: `id`, `label`, `url`, `auth_token`, `header` (`header` value uses `Name:Value`; repeatable).
-    /// Example: `--mcp-sse 'id=remote,label=Remote Docs,url=http://localhost:3000/mcp,header=x-env:dev'`
-    #[arg(long = "mcp-sse", value_name = "SPEC")]
-    pub mcp_sse: Vec<String>,
+    /// Example: `--mcp-streamable-http 'id=remote,label=Remote Docs,url=http://localhost:3000/mcp,header=x-env:dev'`
+    #[arg(long = "mcp-streamable-http", value_name = "SPEC")]
+    pub mcp_streamable_http: Vec<String>,
+
+    /// MCP WebSocket server spec (repeatable). Format: `key=value` pairs separated by commas.
+    /// Keys: `id`, `label`, `url`, `auth_token`, `header` (`header` value uses `Name:Value`; repeatable).
+    /// Example: `--mcp-websocket 'id=remote,label=Remote WS,url=ws://localhost:3000/mcp,header=x-env:dev'`
+    #[arg(long = "mcp-websocket", value_name = "SPEC")]
+    pub mcp_websocket: Vec<String>,
 
     /// User prompt (positional)
     pub prompt: Option<String>,
@@ -233,6 +263,13 @@ pub enum ChatApprovalArg {
     Ask,
     Always,
     Never,
+}
+
+/// CLI-local retry mode values for chat.
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ChatRetryModeArg {
+    Bounded,
+    Persistent,
 }
 
 /// Arguments for the `models` subcommand group.
@@ -510,6 +547,9 @@ mod tests {
         match cli.command {
             Commands::Chat(args) => {
                 assert_eq!(args.model, "openai:gpt-4o");
+                assert!(args.candidate_models.is_empty());
+                assert_eq!(args.retry_mode, ChatRetryModeArg::Bounded);
+                assert_eq!(args.max_retry_attempts, 3);
                 assert!(args.system.is_none());
                 assert!(args.temperature.is_none());
                 assert!(args.skill_path.is_empty());
@@ -523,7 +563,8 @@ mod tests {
                 assert!(args.session_root.is_none());
                 assert!(args.session_id.is_none());
                 assert!(args.mcp_stdio.is_empty());
-                assert!(args.mcp_sse.is_empty());
+                assert!(args.mcp_streamable_http.is_empty());
+                assert!(args.mcp_websocket.is_empty());
                 assert!(args.prompt.is_none());
             }
             other => panic!("expected Chat, got {other:?}"),
@@ -762,6 +803,9 @@ mod tests {
         match cli.command {
             Commands::Chat(args) => {
                 assert_eq!(args.model, "anthropic:claude-4-sonnet");
+                assert!(args.candidate_models.is_empty());
+                assert_eq!(args.retry_mode, ChatRetryModeArg::Bounded);
+                assert_eq!(args.max_retry_attempts, 3);
                 assert_eq!(args.system.as_deref(), Some("You are helpful"));
                 assert!((args.temperature.unwrap() - 0.7).abs() < f64::EPSILON);
                 assert!(args.skill_path.is_empty());
@@ -775,7 +819,8 @@ mod tests {
                 assert!(args.session_root.is_none());
                 assert!(args.session_id.is_none());
                 assert!(args.mcp_stdio.is_empty());
-                assert!(args.mcp_sse.is_empty());
+                assert!(args.mcp_streamable_http.is_empty());
+                assert!(args.mcp_websocket.is_empty());
                 assert_eq!(args.prompt.as_deref(), Some("Hello world"));
             }
             other => panic!("expected Chat, got {other:?}"),
@@ -792,7 +837,8 @@ mod tests {
                 assert!(args.skill_path.is_empty());
                 assert!(args.skill_root.is_empty());
                 assert!(args.mcp_stdio.is_empty());
-                assert!(args.mcp_sse.is_empty());
+                assert!(args.mcp_streamable_http.is_empty());
+                assert!(args.mcp_websocket.is_empty());
             }
             other => panic!("expected Chat, got {other:?}"),
         }
@@ -1031,6 +1077,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_chat_with_candidate_models_and_retry_controls() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--model",
+            "openai:gpt-4o",
+            "--candidate-model",
+            "anthropic:claude-sonnet-4-5",
+            "--candidate-model",
+            "google:gemini-2.5-pro",
+            "--retry-mode",
+            "bounded",
+            "--max-retry-attempts",
+            "1",
+            "Hi",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.model, "openai:gpt-4o");
+                assert_eq!(
+                    args.candidate_models,
+                    vec![
+                        "anthropic:claude-sonnet-4-5".to_string(),
+                        "google:gemini-2.5-pro".to_string()
+                    ]
+                );
+                assert_eq!(args.retry_mode, ChatRetryModeArg::Bounded);
+                assert_eq!(args.max_retry_attempts, 1);
+                assert_eq!(args.prompt.as_deref(), Some("Hi"));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_rejects_zero_retry_attempts() {
+        let err = Cli::try_parse_from(["roci-agent", "chat", "--max-retry-attempts", "0", "Hi"])
+            .expect_err("zero retry attempts should fail parsing");
+
+        assert!(err.to_string().contains("max-retry-attempts must be >= 1"));
+    }
+
+    #[test]
+    fn parse_chat_with_persistent_retry_mode() {
+        let cli = Cli::try_parse_from(["roci-agent", "chat", "--retry-mode", "persistent", "Hi"])
+            .unwrap();
+
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.retry_mode, ChatRetryModeArg::Persistent);
+                assert_eq!(args.prompt.as_deref(), Some("Hi"));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_chat_with_repeatable_mcp_specs() {
         let cli = Cli::try_parse_from([
             "roci-agent",
@@ -1039,10 +1144,12 @@ mod tests {
             "id=local,command=npx,arg=-y,arg=@modelcontextprotocol/server-filesystem",
             "--mcp-stdio",
             "command=uvx,arg=echo",
-            "--mcp-sse",
+            "--mcp-streamable-http",
             "id=docs,url=http://localhost:3000/mcp,header=x-env:dev",
-            "--mcp-sse",
+            "--mcp-streamable-http",
             "url=https://example.com/mcp,auth_token=secret",
+            "--mcp-websocket",
+            "id=ws,url=ws://localhost:3001/mcp,header=x-env:test",
             "Hi",
         ])
         .unwrap();
@@ -1058,11 +1165,15 @@ mod tests {
                     ]
                 );
                 assert_eq!(
-                    args.mcp_sse,
+                    args.mcp_streamable_http,
                     vec![
                         "id=docs,url=http://localhost:3000/mcp,header=x-env:dev".to_string(),
                         "url=https://example.com/mcp,auth_token=secret".to_string()
                     ]
+                );
+                assert_eq!(
+                    args.mcp_websocket,
+                    vec!["id=ws,url=ws://localhost:3001/mcp,header=x-env:test".to_string()]
                 );
                 assert_eq!(args.prompt.as_deref(), Some("Hi"));
             }

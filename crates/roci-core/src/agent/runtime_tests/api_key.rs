@@ -2,21 +2,25 @@ use super::support::*;
 use super::*;
 use std::sync::Arc;
 
+fn key_test_model() -> LanguageModel {
+    "openai:gpt-4o".parse().unwrap()
+}
+
 #[tokio::test]
 async fn get_api_key_callback_returns_resolved_key() {
     let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = call_count.clone();
 
-    let get_key: GetApiKeyFn = Arc::new(move || {
+    let get_key: GetApiKeyFn = Arc::new(move |_model| {
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async { Ok("sk-live-rotated-key".to_string()) })
     });
 
-    let key = get_key().await.unwrap();
+    let key = get_key(key_test_model()).await.unwrap();
     assert_eq!(key, "sk-live-rotated-key");
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    let key2 = get_key().await.unwrap();
+    let key2 = get_key(key_test_model()).await.unwrap();
     assert_eq!(key2, "sk-live-rotated-key");
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
@@ -35,7 +39,7 @@ async fn static_key_works_without_callback() {
 
 #[tokio::test]
 async fn get_api_key_error_propagates() {
-    let get_key: GetApiKeyFn = Arc::new(|| {
+    let get_key: GetApiKeyFn = Arc::new(|_model| {
         Box::pin(async {
             Err(RociError::Authentication(
                 "Token refresh failed".to_string(),
@@ -43,7 +47,7 @@ async fn get_api_key_error_propagates() {
         })
     });
 
-    let result = get_key().await;
+    let result = get_key(key_test_model()).await;
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -53,7 +57,7 @@ async fn get_api_key_error_propagates() {
 
 #[tokio::test]
 async fn prompt_get_api_key_error_restores_idle_state() {
-    let get_key: GetApiKeyFn = Arc::new(|| {
+    let get_key: GetApiKeyFn = Arc::new(|_model| {
         Box::pin(async {
             Err(RociError::Authentication(
                 "Token refresh failed".to_string(),
@@ -109,7 +113,7 @@ async fn get_api_key_callback_is_skipped_when_config_key_exists() {
     roci_config.set_api_key("openai", "sk-from-config".to_string());
     let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let callback_calls_for_hook = callback_calls.clone();
-    let get_key: GetApiKeyFn = Arc::new(move || {
+    let get_key: GetApiKeyFn = Arc::new(move |_model| {
         let callback_calls_for_hook = callback_calls_for_hook.clone();
         Box::pin(async move {
             callback_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -138,7 +142,7 @@ async fn get_api_key_callback_is_skipped_when_config_key_exists() {
 async fn get_api_key_callback_is_skipped_when_request_override_exists() {
     let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let callback_calls_for_hook = callback_calls.clone();
-    let get_key: GetApiKeyFn = Arc::new(move || {
+    let get_key: GetApiKeyFn = Arc::new(move |_model| {
         let callback_calls_for_hook = callback_calls_for_hook.clone();
         Box::pin(async move {
             callback_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -169,12 +173,12 @@ async fn get_api_key_callback_can_rotate_keys() {
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let get_key: GetApiKeyFn = Arc::new(move || {
+    let get_key: GetApiKeyFn = Arc::new(move |_model| {
         let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move { Ok(format!("sk-key-{}", n)) })
     });
 
-    assert_eq!(get_key().await.unwrap(), "sk-key-0");
-    assert_eq!(get_key().await.unwrap(), "sk-key-1");
-    assert_eq!(get_key().await.unwrap(), "sk-key-2");
+    assert_eq!(get_key(key_test_model()).await.unwrap(), "sk-key-0");
+    assert_eq!(get_key(key_test_model()).await.unwrap(), "sk-key-1");
+    assert_eq!(get_key(key_test_model()).await.unwrap(), "sk-key-2");
 }

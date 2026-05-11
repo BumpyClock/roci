@@ -7,7 +7,7 @@ async fn session_before_tree_can_override_branch_summary_and_receive_preparation
     let payload_capture = Arc::new(Mutex::new(None));
     let payload_capture_for_hook = payload_capture.clone();
     let mut config = test_agent_config();
-    config.model = "run:run-model".parse().expect("run model should parse");
+    config.candidates = vec!["run:run-model".parse().expect("run model should parse")];
     config.session_before_tree = Some(Arc::new(move |payload| {
         let payload_capture_for_hook = payload_capture_for_hook.clone();
         Box::pin(async move {
@@ -60,7 +60,7 @@ async fn session_before_tree_can_override_branch_summary_and_receive_preparation
 #[tokio::test]
 async fn session_before_tree_can_cancel_branch_summary() {
     let mut config = test_agent_config();
-    config.model = "run:run-model".parse().expect("run model should parse");
+    config.candidates = vec!["run:run-model".parse().expect("run model should parse")];
     config.session_before_tree = Some(Arc::new(|_payload| {
         Box::pin(async { Ok(SessionBeforeTreeOutcome::Cancel) })
     }));
