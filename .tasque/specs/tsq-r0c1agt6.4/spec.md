@@ -50,9 +50,9 @@ Add semantic runtime payload variants to `AgentRuntimeEventPayload`:
 
 - `SubagentStarted { subagent: SubagentRuntimeSnapshot }`
 - `SubagentProgress { subagent: SubagentRuntimeSnapshot, message: Option<String> }`
-- `SubagentToolCallStarted { subagent: SubagentRuntimeSnapshot, tool: ToolExecutionSnapshot }`
-- `SubagentToolCallCompleted { subagent: SubagentRuntimeSnapshot, tool: ToolExecutionSnapshot }`
-- `SubagentMessage { subagent: SubagentRuntimeSnapshot, message: MessageSnapshot }`
+- `SubagentToolCallStarted { subagent: SubagentRuntimeSnapshot, tool: SubagentToolCallSnapshot }`
+- `SubagentToolCallCompleted { subagent: SubagentRuntimeSnapshot, tool: SubagentToolCallSnapshot }`
+- `SubagentMessage { subagent: SubagentRuntimeSnapshot, message: SubagentMessageSnapshot }`
 - `SubagentNeedsInput { subagent: SubagentRuntimeSnapshot, question: String, context: Option<String> }`
 - `SubagentCompleted { subagent: SubagentRuntimeSnapshot, result: DelegateSubagentResult }`
 - `SubagentFailed { subagent: SubagentRuntimeSnapshot, error: String }`
@@ -77,6 +77,13 @@ in this slice. `parent_tool_call_id` is captured from `ToolExecutionContext` whe
 a management tool is invoked by the model. `child_thread_id` is captured from
 the child runtime handle. `sequence` is maintained by the runtime event bridge
 per subagent.
+
+The routing controller exposes a read-only metadata lookup for the bridge:
+
+- `SubagentRoutingMetadata { subagent_id, profile_id, label, model, parent_tool_call_id, child_thread_id, source_subagent_id, target_subagent_id }`
+
+The event bridge owns a per-subagent sequence counter and combines controller
+metadata with each incoming `SubagentEvent` to produce `SubagentRuntimeSnapshot`.
 
 Child message/tool event payloads use subagent-specific snapshots rather than
 reusing parent `MessageSnapshot` / `ToolExecutionSnapshot` IDs:
