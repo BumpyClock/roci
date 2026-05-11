@@ -26,14 +26,20 @@ Add runtime config for subagents to `AgentConfig`:
 - `profiles: SubagentProfileRegistry`
 - `supervisor: SubagentSupervisorConfig`
 - `enabled: bool`
+- `main_profile: Option<SubagentProfileRef>`
 
 `enabled = false` disables management tool injection even if profiles exist. `None` means subagents are not configured.
+`main_profile` selects the profile projection applied to the parent/default
+runtime. If absent, runtime uses the configured default profile when one exists;
+if neither exists, no parent/default profile projection is applied. Delegation
+can still use the default profile error behavior from `.3`.
 
 `AgentRuntime` builds a `SubagentRoutingController` from the same `ProviderRegistry`, `RociConfig`, parent config, supervisor config, and profile registry. The child base config must clear subagent config before controller construction so child runtimes do not receive management tools by default.
 
 Runtime tool resolution must:
 
 - Resolve existing static and dynamic tools as today.
+- Apply parent/default profile native tool projection before exposing model schemas or dispatch. `default_agent_excluded_tools` must hide tools from both model-visible schema and execution.
 - Add `SubagentRoutingTools` only for the main/default runtime when subagents are configured and enabled.
 - Keep tool schema and dispatch aligned by adding actual `Tool` implementations to the same catalog that feeds model-visible schemas and execution.
 - Keep child runtimes recursion-disabled by clearing subagent config in `build_child_config`.
@@ -66,7 +72,20 @@ Add semantic runtime payload variants to `AgentRuntimeEventPayload`:
 - `target_subagent_id`
 - `sequence`
 
-`source_subagent_id` and `target_subagent_id` stay optional seams for future peer routing.
+`parent_turn_id`, `source_subagent_id`, and `target_subagent_id` stay optional
+in this slice. `parent_tool_call_id` is captured from `ToolExecutionContext` when
+a management tool is invoked by the model. `child_thread_id` is captured from
+the child runtime handle. `sequence` is maintained by the runtime event bridge
+per subagent.
+
+Child message/tool event payloads use subagent-specific snapshots rather than
+reusing parent `MessageSnapshot` / `ToolExecutionSnapshot` IDs:
+
+- `SubagentMessageSnapshot { role, text, status }`
+- `SubagentToolCallSnapshot { tool_call_id, tool_name, args, result, status }`
+
+This avoids fabricating parent-thread message/tool IDs before full child thread
+projection is designed.
 
 ## Behavior
 
@@ -89,6 +108,7 @@ Semantic events:
 - Translate child human input request events to `SubagentNeedsInput`.
 - Do not project `SubagentEvent::AgentEvent` or raw child `AgentEvent` directly into `AgentRuntimeEventPayload`.
 - Publish semantic events through the same runtime event store/broadcast path as other chat runtime events.
+- `SubagentRoutingController` exposes `subscribe()` to allow runtime-owned bridge subscription without exposing supervisor internals.
 
 ## Test plan
 
@@ -96,6 +116,8 @@ Focused tests:
 
 - Runtime with subagents enabled exposes management tools.
 - Runtime with subagents disabled does not expose management tools.
+- Runtime applies `default_agent_excluded_tools` to parent/default tool schema and dispatch.
+- Runtime-injected `delegate_subagent` executes through the actual tool dispatch path.
 - Child config built by `build_child_config` clears subagent config and does not recurse.
 - Tool schemas and dispatch include injected management tools.
 - Runtime projects `SubagentStarted` and terminal events for a fake subagent run.
@@ -116,6 +138,7 @@ Live `roci-cli` verification is deferred to `.6` because `.4` does not load CLI 
 ## Acceptance criteria
 
 - `AgentRuntime` can inject management tools when configured.
+- `AgentRuntime` hides parent/default denied tools from schema and dispatch.
 - Child runtimes are recursion-disabled by default.
 - Semantic runtime payloads exist for subagent lifecycle/message/tool/input events.
 - Raw child `AgentEvent` is not a public runtime event payload.
