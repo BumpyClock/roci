@@ -76,7 +76,11 @@ pub struct AgentConfig {
     pub before_agent_start: Option<BeforeAgentStartHook>,
     /// Optional sink for high-level [`crate::agent_loop::AgentEvent`] emission.
     pub event_sink: Option<AgentEventSink>,
-    /// Tool approval policy for each run.
+    /// Structured tool approval ruleset for each run.
+    ///
+    /// Hosts own approval UX and persistence. Core owns policy evaluation and
+    /// precedence. Use [`ApprovalPolicy::ask`], [`ApprovalPolicy::always`], or
+    /// [`ApprovalPolicy::never`] for preset behavior.
     pub approval_policy: ApprovalPolicy,
     /// Optional host-owned approval resolver.
     pub approval_handler: Option<ApprovalHandler>,
@@ -171,7 +175,7 @@ impl Default for AgentConfig {
             convert_to_llm: None,
             before_agent_start: None,
             event_sink: None,
-            approval_policy: ApprovalPolicy::Ask,
+            approval_policy: ApprovalPolicy::ask(),
             approval_handler: None,
             session_id: None,
             session: None,

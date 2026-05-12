@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 pub trait CommandClassifier: Send + Sync {
     fn classify(&self, input: CommandInput) -> CommandInsight;
 }
@@ -13,7 +15,8 @@ pub struct CommandInput {
     pub platform: Option<CommandPlatform>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShellKind {
     Sh,
     Bash,
@@ -23,13 +26,15 @@ pub enum ShellKind {
     Cmd,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommandPlatform {
     Unix,
     Windows,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommandCategory {
     ReadOnly,
     WritesFilesystem,
@@ -42,14 +47,15 @@ pub enum CommandCategory {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommandConfidence {
     High,
     Medium,
     Low,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandInsight {
     pub normalized_command: String,
     pub primary_executable: Option<String>,

@@ -5,7 +5,7 @@ async fn tool_with_schema_rejects_bad_args_through_runner() {
     let (sink, events) = capture_events();
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
     request.tools = vec![schema_tool()];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -39,7 +39,7 @@ async fn tool_with_schema_accepts_valid_args_through_runner() {
     let (sink, events) = capture_events();
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
     request.tools = vec![schema_tool()];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -67,7 +67,7 @@ async fn tool_with_type_mismatch_rejects_through_runner() {
     let (sink, events) = capture_events();
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
     request.tools = vec![schema_tool()];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -101,7 +101,7 @@ async fn pre_tool_use_hook_can_block_and_skip_tool_execution() {
     let executions = Arc::new(AtomicUsize::new(0));
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
     request.tools = vec![tracked_schema_path_tool(executions.clone())];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
     request.hooks = RunHooks {
         compaction: None,
@@ -144,7 +144,7 @@ async fn pre_tool_use_hook_replace_args_are_used_by_tool() {
     let executions = Arc::new(AtomicUsize::new(0));
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
     request.tools = vec![tracked_schema_path_tool(executions.clone())];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
     request.hooks = RunHooks {
         compaction: None,
@@ -183,7 +183,7 @@ async fn pre_tool_use_hook_error_returns_synthetic_tool_error() {
     let executions = Arc::new(AtomicUsize::new(0));
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
     request.tools = vec![tracked_schema_path_tool(executions.clone())];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
     request.hooks = RunHooks {
         compaction: None,
@@ -223,7 +223,7 @@ async fn post_tool_use_hook_can_mutate_tool_result() {
     let executions = Arc::new(AtomicUsize::new(0));
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
     request.tools = vec![tracked_schema_path_tool(executions.clone())];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
     request.hooks = RunHooks {
         compaction: None,
@@ -272,7 +272,7 @@ async fn post_tool_use_hook_runs_for_skipped_synthetic_errors() {
             Arc::new(AtomicUsize::new(0)),
         ),
     ];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
     let seen_calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let seen_calls_for_hook = seen_calls.clone();
@@ -336,7 +336,7 @@ async fn post_tool_use_hook_error_returns_deterministic_synthetic_error() {
     let executions = Arc::new(AtomicUsize::new(0));
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
     request.tools = vec![tracked_schema_path_tool(executions.clone())];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
     request.hooks = RunHooks {
         compaction: None,

@@ -88,7 +88,7 @@ impl SubagentLauncher for InProcessLauncher {
 /// - `event_sink`: replace with child forwarding sink.
 /// - hooks/callbacks: reset (`transform_context`, `convert_to_llm`,
 ///   `before_agent_start`, session hooks, tool hooks, provider payload callback).
-/// - approval policy/handler: inherit from parent.
+/// - approval policy/handler: clone parent ruleset and inherit handler.
 /// - session fields: reset. Child persistence needs child-specific session resources.
 /// - provider fields: inherit transport, retry, API key, headers, metadata, key fn.
 /// - tools: replace with profile-selected child tools.
@@ -118,7 +118,7 @@ pub(super) fn build_child_config(
         tools,
         tool_visibility_policy: parent.tool_visibility_policy.clone(),
         event_sink,
-        approval_policy: parent.approval_policy,
+        approval_policy: parent.approval_policy.clone(),
         approval_handler: parent.approval_handler.clone(),
         #[cfg(feature = "agent")]
         human_interaction_coordinator: Some(coordinator),
@@ -278,7 +278,7 @@ mod tests {
             pre_tool_use: Some(Arc::new(|_, _| {
                 Box::pin(async { Ok(PreToolUseHookResult::Continue) })
             })),
-            approval_policy: ApprovalPolicy::Never,
+            approval_policy: ApprovalPolicy::never(),
             session_id: Some("parent-session".into()),
             session: Some(crate::session::SessionConfig::new(
                 crate::session::SessionId::parse("parent-durable-session").unwrap(),
@@ -315,7 +315,7 @@ mod tests {
 
         assert_eq!(cfg.system_prompt, None, "system_prompt resets");
         assert!(cfg.event_sink.is_none(), "event_sink is replacement-only");
-        assert_eq!(cfg.approval_policy, ApprovalPolicy::Never);
+        assert_eq!(cfg.approval_policy, ApprovalPolicy::never());
         assert_eq!(cfg.session_id, None, "session_id resets");
         assert_eq!(cfg.session, None, "durable session config resets");
         assert_eq!(cfg.transport.as_deref(), Some("proxy"));

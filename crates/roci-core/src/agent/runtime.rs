@@ -196,7 +196,7 @@ impl AgentRuntime {
             ModelCandidates::new(config.candidates.clone())?.into_vec(),
         ));
         let generation_settings = Arc::new(Mutex::new(config.settings.clone()));
-        let approval_policy = Arc::new(Mutex::new(config.approval_policy));
+        let approval_policy = Arc::new(Mutex::new(config.approval_policy.clone()));
         let system_prompt = Arc::new(Mutex::new(config.system_prompt.clone()));
         let tools = Arc::new(Mutex::new(config.tools.clone()));
         let dynamic_tool_providers = Arc::new(Mutex::new(config.dynamic_tool_providers.clone()));

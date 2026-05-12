@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use super::arguments::ToolArguments;
 use super::types::AgentToolParameters;
@@ -105,7 +106,7 @@ impl std::fmt::Debug for ToolExecutionContext {
 pub type ToolUpdateCallback =
     Arc<dyn Fn(crate::agent_loop::events::ToolUpdatePayload) + Send + Sync>;
 
-/// Safety metadata used by `ApprovalPolicy::Ask`.
+/// Safety metadata used by the `ApprovalPolicy::ask()` preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSafety {
     /// Reads local or remote state without intentional mutation.
@@ -115,7 +116,8 @@ pub enum ToolSafety {
 }
 
 /// Tool-level approval category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolApprovalKind {
     CommandExecution,
     FileChange,
@@ -128,9 +130,9 @@ pub enum ToolApprovalKind {
 /// Approval behavior declared by a tool implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolApproval {
-    /// Safe to execute without prompting under `ApprovalPolicy::Ask`.
+    /// Safe to execute without prompting under the `ApprovalPolicy::ask()` preset.
     AutoAccept { safety: ToolSafety },
-    /// Prompt before execution under `ApprovalPolicy::Ask`.
+    /// Prompt before execution under the `ApprovalPolicy::ask()` preset.
     RequiresApproval { kind: ToolApprovalKind },
 }
 
@@ -173,7 +175,7 @@ pub trait Tool: Send + Sync {
     /// JSON Schema parameters.
     fn parameters(&self) -> &AgentToolParameters;
 
-    /// Approval metadata for `ApprovalPolicy::Ask`.
+    /// Approval metadata for the `ApprovalPolicy::ask()` preset.
     ///
     /// Custom, dynamic, and unknown tools are approval-required by default.
     fn approval(&self) -> ToolApproval {
@@ -242,7 +244,7 @@ impl AgentTool {
         }
     }
 
-    /// Set approval metadata for `ApprovalPolicy::Ask`.
+    /// Set approval metadata for the `ApprovalPolicy::ask()` preset.
     pub fn with_approval(mut self, approval: ToolApproval) -> Self {
         self.approval = approval;
         self

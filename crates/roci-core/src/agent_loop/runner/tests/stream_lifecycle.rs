@@ -58,7 +58,7 @@ async fn message_lifecycle_events_cover_prompt_and_tool_results() {
     let (agent_sink, agent_events) = capture_agent_events();
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run update tool")]);
     request.tools = vec![update_streaming_tool(false)];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.agent_event_sink = Some(agent_sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -204,7 +204,7 @@ async fn tool_execution_updates_stream_with_deterministic_order() {
     let (agent_sink, agent_events) = capture_agent_events();
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run update tool")]);
     request.tools = vec![update_streaming_tool(false)];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.agent_event_sink = Some(agent_sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -300,7 +300,7 @@ async fn canceling_during_tool_execution_emits_error_end_event() {
     let (agent_sink, agent_events) = capture_agent_events();
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("cancel update tool")]);
     request.tools = vec![update_streaming_tool(true)];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.agent_event_sink = Some(agent_sink);
 
     let mut handle = runner.start(request).await.expect("start run");

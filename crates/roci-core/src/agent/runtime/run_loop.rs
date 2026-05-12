@@ -214,7 +214,7 @@ impl AgentRuntime {
         if mode == CollaborationMode::Plan {
             settings = plan_mode_settings(settings);
         }
-        let default_approval_policy = *self.approval_policy.lock().await;
+        let default_approval_policy = self.approval_policy.lock().await.clone();
         TurnRunOptions {
             settings,
             approval_policy: approval_policy.unwrap_or(default_approval_policy),

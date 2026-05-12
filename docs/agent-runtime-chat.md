@@ -47,6 +47,11 @@ runtime state.
   - Idle-only default update for later turns.
 - `set_approval_policy(policy: ApprovalPolicy) -> Result<(), RociError>` (async)
   - Idle-only default update for later turns.
+  - `ApprovalPolicy` is a structured approval ruleset. Presets are constructors:
+    `ApprovalPolicy::ask()`, `ApprovalPolicy::always()`, and
+    `ApprovalPolicy::never()`.
+  - Host apps own approval UI and policy persistence. Core owns evaluation,
+    precedence, redacted previews, and suggested grants.
 - `prompt(input: impl Into<PromptInput>) -> Result<RunResult, RociError>` (async)
   - Resolves attachments, downgrades safe unsupported media to marker text,
     and preflights resource limits before mutating runtime state.

@@ -945,7 +945,7 @@ async fn idle_settings_mutator_and_per_turn_override_freeze_effective_settings()
                 max_tokens: Some(22),
                 ..GenerationSettings::default()
             }),
-            approval_policy: Some(ApprovalPolicy::Never),
+            approval_policy: Some(ApprovalPolicy::never()),
             collaboration_mode: None,
         })
         .await

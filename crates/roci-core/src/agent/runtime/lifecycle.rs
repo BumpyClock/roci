@@ -80,7 +80,7 @@ impl AgentRuntime {
         let options = self
             .current_turn_options(
                 request.generation_settings.clone(),
-                request.approval_policy,
+                request.approval_policy.clone(),
                 request.collaboration_mode,
             )
             .await;

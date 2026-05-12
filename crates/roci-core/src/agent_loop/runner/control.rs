@@ -1,5 +1,7 @@
 use super::super::approvals::{
-    ApprovalDecision, ApprovalHandler, ApprovalKind, ApprovalPolicy, ApprovalRequest,
+    ApprovalAction, ApprovalContext, ApprovalDecision, ApprovalEvaluation,
+    ApprovalFilesystemAccess, ApprovalGrant, ApprovalGrantKey, ApprovalHandler, ApprovalKind,
+    ApprovalPolicy, ApprovalRequest,
 };
 use super::super::events::{AgentEvent, RunEvent, RunEventPayload, RunEventStream, RunLifecycle};
 use super::super::types::{RunId, RunResult};
@@ -211,66 +213,205 @@ pub(super) async fn resolve_approval(
     call: &AgentToolCall,
     tool: Option<&dyn Tool>,
 ) -> ApprovalDecision {
-    match policy {
-        ApprovalPolicy::Always => ApprovalDecision::Accept,
-        ApprovalPolicy::Never => ApprovalDecision::Decline,
-        ApprovalPolicy::Ask => {
-            let approval = tool
-                .map(Tool::approval)
-                .unwrap_or_else(|| ToolApproval::requires_approval(ToolApprovalKind::Other));
-            let ToolApproval::RequiresApproval { kind: tool_kind } = approval else {
-                return ApprovalDecision::Accept;
-            };
-            let kind = approval_kind_for_tool_metadata(tool_kind);
-            let permission_kind = permission_kind_for_tool_metadata(tool_kind, tool.is_some());
-            let session_key = ToolPermissionSessionKey::for_tool_call(permission_kind, call);
-            if session_approvals.lock().await.contains(&session_key) {
+    let approval = tool
+        .map(Tool::approval)
+        .unwrap_or_else(|| ToolApproval::requires_approval(ToolApprovalKind::Other));
+    let tool_kind = match approval {
+        ToolApproval::AutoAccept { .. } => None,
+        ToolApproval::RequiresApproval { kind } => Some(kind),
+    };
+    let permission_kind = permission_kind_for_tool_metadata(tool_kind, tool.is_some());
+    let session_key = ToolPermissionSessionKey::for_tool_call(permission_kind, call);
+    let grant_key = ApprovalGrantKey::new(
+        permission_kind,
+        call.name.clone(),
+        call.recipient.clone(),
+        Some(call.arguments.clone()),
+        None,
+    );
+    let legacy_session_hit = session_approvals.lock().await.contains(&session_key);
+    let evaluation_policy = if legacy_session_hit {
+        let mut policy = policy.clone();
+        policy.session_grants.grants.push(ApprovalGrant::Exact {
+            key: grant_key.clone(),
+        });
+        policy
+    } else {
+        policy.clone()
+    };
+    let context = ApprovalContext {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        tool_kind,
+        preview: serde_json::json!({
+            "tool_name": call.name.clone(),
+            "tool_call_id": call.id.clone(),
+        }),
+        metadata: serde_json::Value::Null,
+        command: approval_command_insight(call, tool_kind),
+        filesystem: approval_filesystem_accesses(call),
+        sandbox: None,
+        mcp: None,
+        network: None,
+        grant_key: Some(grant_key),
+    };
+    let evaluation = evaluation_policy.evaluate(&context);
+
+    match evaluation.action {
+        ApprovalAction::Allow => {
+            if legacy_session_hit && evaluation.matched_session_grant {
                 return ApprovalDecision::AcceptForSession;
             }
-            let request = ApprovalRequest {
-                id: call.id.clone(),
-                kind,
-                reason: Some(format!("Tool: {}", call.name)),
-                payload: serde_json::json!({
-                    "tool_name": call.name.clone(),
-                    "tool_call_id": call.id.clone(),
-                    "arguments": call.arguments.clone(),
-                }),
-                suggested_policy_change: None,
-            };
-            emitter.emit(
-                RunEventStream::Approval,
-                RunEventPayload::ApprovalRequired {
-                    request: request.clone(),
-                },
-            );
-            agent_emitter.emit(AgentEvent::Approval {
-                request: request.clone(),
-            });
-            let decision = if let Some(coordinator) = coordinator {
-                resolve_tool_permission(
-                    coordinator,
-                    agent_emitter,
-                    call,
-                    request.clone(),
-                    permission_kind,
-                    Some(session_key.clone()),
-                )
-                .await
-            } else if let Some(handler) = handler {
-                handler(request.clone()).await
-            } else {
-                ApprovalDecision::Decline
-            };
-            if matches!(decision, ApprovalDecision::AcceptForSession) {
-                session_approvals.lock().await.insert(session_key);
-            }
-            agent_emitter.emit(AgentEvent::ApprovalResolved {
-                request_id: request.id,
-                decision,
-            });
-            decision
+            return ApprovalDecision::Accept;
         }
+        ApprovalAction::Deny => return ApprovalDecision::Decline,
+        ApprovalAction::Ask => {}
+    }
+
+    if matches!(approval, ToolApproval::AutoAccept { .. })
+        && matches!(policy.default_action, ApprovalAction::Ask)
+        && evaluation.matched_rules.is_empty()
+        && evaluation.safety_floors.is_empty()
+    {
+        return ApprovalDecision::Accept;
+    }
+
+    let kind = approval_kind_for_tool_metadata(tool_kind.unwrap_or(ToolApprovalKind::Other));
+    let request = ApprovalRequest {
+        id: call.id.clone(),
+        kind,
+        reason: evaluation
+            .reason
+            .clone()
+            .or_else(|| Some(format!("Tool: {}", call.name))),
+        payload: serde_json::json!({
+            "tool_name": call.name.clone(),
+            "tool_call_id": call.id.clone(),
+            "preview": context.preview,
+            "evaluation": sanitized_evaluation_for_payload(&evaluation),
+        }),
+        suggested_policy_change: None,
+    };
+    emitter.emit(
+        RunEventStream::Approval,
+        RunEventPayload::ApprovalRequired {
+            request: request.clone(),
+        },
+    );
+    agent_emitter.emit(AgentEvent::Approval {
+        request: request.clone(),
+    });
+    let decision = if let Some(coordinator) = coordinator {
+        resolve_tool_permission(
+            coordinator,
+            agent_emitter,
+            call,
+            request.clone(),
+            permission_kind,
+            Some(session_key.clone()),
+        )
+        .await
+    } else if let Some(handler) = handler {
+        handler(request.clone()).await
+    } else {
+        ApprovalDecision::Decline
+    };
+    if matches!(decision, ApprovalDecision::AcceptForSession) {
+        session_approvals.lock().await.insert(session_key);
+    }
+    agent_emitter.emit(AgentEvent::ApprovalResolved {
+        request_id: request.id,
+        decision,
+    });
+    decision
+}
+
+fn approval_command_insight(
+    call: &AgentToolCall,
+    tool_kind: Option<ToolApprovalKind>,
+) -> Option<crate::security::command::CommandInsight> {
+    if tool_kind != Some(ToolApprovalKind::CommandExecution) {
+        return None;
+    }
+    call.arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(crate::security::command::classify_shell_command)
+}
+
+fn approval_filesystem_accesses(call: &AgentToolCall) -> Vec<ApprovalFilesystemAccess> {
+    let operation = match call.name.as_str() {
+        "read_file" => Some(crate::security::filesystem::PathOperation::Read),
+        "write_file" => Some(crate::security::filesystem::PathOperation::Write),
+        "list_directory" => Some(crate::security::filesystem::PathOperation::List),
+        "grep" => Some(crate::security::filesystem::PathOperation::Search),
+        _ => None,
+    };
+    let Some(operation) = operation else {
+        return Vec::new();
+    };
+    let path = call
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| default_approval_filesystem_path(&call.name).unwrap_or(""));
+    if path.is_empty() {
+        return Vec::new();
+    }
+
+    // These path facts drive approval rule matching. Enforcement remains in
+    // FilesystemPolicy/tool execution once hosts configure restrictions.
+    vec![ApprovalFilesystemAccess {
+        operation,
+        decision: crate::security::filesystem::FilesystemDecision {
+            allowed: true,
+            normalized_path: Some(normalize_approval_path(path)),
+            reason: "approval context path fact".to_string(),
+            matched_boundary: None,
+        },
+    }]
+}
+
+fn default_approval_filesystem_path(tool_name: &str) -> Option<&'static str> {
+    // Grep searches the current working directory when no path is provided.
+    (tool_name == "grep").then_some(".")
+}
+
+fn normalize_approval_path(path: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .map(|path| crate::security::filesystem::lexical_normalize(&path))
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to resolve cwd for approval path fact");
+            crate::security::filesystem::lexical_normalize(&path)
+        })
+}
+
+fn sanitized_evaluation_for_payload(evaluation: &ApprovalEvaluation) -> ApprovalEvaluation {
+    let mut sanitized = evaluation.clone();
+    sanitized.suggested_grant = evaluation
+        .suggested_grant
+        .as_ref()
+        .and_then(sanitized_grant_for_payload);
+    sanitized
+}
+
+fn sanitized_grant_for_payload(grant: &ApprovalGrant) -> Option<ApprovalGrant> {
+    match grant {
+        ApprovalGrant::Exact { key } => Some(ApprovalGrant::Exact {
+            key: ApprovalGrantKey {
+                permission_kind: key.permission_kind,
+                tool_name: key.tool_name.clone(),
+                recipient_or_server: key.recipient_or_server.clone(),
+                arguments_digest: key.arguments_digest.clone(),
+                tool_provided_key: None,
+            },
+        }),
+        ApprovalGrant::Rule { .. } => None,
     }
 }
 
@@ -415,17 +556,17 @@ fn approval_kind_for_tool_metadata(kind: ToolApprovalKind) -> ApprovalKind {
 }
 
 fn permission_kind_for_tool_metadata(
-    kind: ToolApprovalKind,
+    kind: Option<ToolApprovalKind>,
     known_tool: bool,
 ) -> ToolPermissionKind {
     match kind {
-        ToolApprovalKind::CommandExecution => ToolPermissionKind::Shell,
-        ToolApprovalKind::FileChange => ToolPermissionKind::Write,
-        ToolApprovalKind::Read => ToolPermissionKind::Read,
-        ToolApprovalKind::Mcp => ToolPermissionKind::Mcp,
-        ToolApprovalKind::CustomTool => ToolPermissionKind::CustomTool,
-        ToolApprovalKind::Other if known_tool => ToolPermissionKind::CustomTool,
-        ToolApprovalKind::Other => ToolPermissionKind::Other,
+        Some(ToolApprovalKind::CommandExecution) => ToolPermissionKind::Shell,
+        Some(ToolApprovalKind::FileChange) => ToolPermissionKind::Write,
+        Some(ToolApprovalKind::Read) => ToolPermissionKind::Read,
+        Some(ToolApprovalKind::Mcp) => ToolPermissionKind::Mcp,
+        Some(ToolApprovalKind::CustomTool) => ToolPermissionKind::CustomTool,
+        Some(ToolApprovalKind::Other) if known_tool => ToolPermissionKind::CustomTool,
+        Some(ToolApprovalKind::Other) | None => ToolPermissionKind::Other,
     }
 }
 
@@ -443,6 +584,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
+    use crate::agent_loop::approvals::{ApprovalMatcher, ApprovalRule};
     use crate::human_interaction::ToolPermissionDecision;
     use crate::tools::{AgentTool, AgentToolParameters};
     use uuid::Uuid;
@@ -521,7 +663,7 @@ mod tests {
         let decision = resolve_approval(
             &emitter,
             &agent_emitter,
-            &ApprovalPolicy::Ask,
+            &ApprovalPolicy::ask(),
             None,
             Some(&coordinator),
             &approvals,
@@ -561,7 +703,7 @@ mod tests {
         let shell_decision = resolve_approval(
             &emitter,
             &agent_emitter,
-            &ApprovalPolicy::Ask,
+            &ApprovalPolicy::ask(),
             None,
             None,
             &approvals,
@@ -572,7 +714,7 @@ mod tests {
         let write_decision = resolve_approval(
             &emitter,
             &agent_emitter,
-            &ApprovalPolicy::Ask,
+            &ApprovalPolicy::ask(),
             None,
             None,
             &approvals,
@@ -608,6 +750,187 @@ mod tests {
                 (ApprovalKind::FileChange, "write_file".to_string()),
             ]
         );
+        for event in events.iter() {
+            let RunEventPayload::ApprovalRequired { request } = &event.payload else {
+                continue;
+            };
+            assert!(
+                request.payload.get("arguments").is_none(),
+                "approval payload must not expose raw tool arguments"
+            );
+            assert!(request.payload.get("preview").is_some());
+            assert!(request.payload.get("evaluation").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn always_policy_prompts_for_destructive_shell_floor() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+        let shell = tool(
+            "shell",
+            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
+        );
+        let approvals = session_approvals();
+        let call = AgentToolCall {
+            id: "shell-call".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": "rm -rf target" }),
+            recipient: None,
+        };
+
+        let decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::always(),
+            None,
+            None,
+            &approvals,
+            &call,
+            Some(&shell),
+        )
+        .await;
+
+        assert_eq!(decision, ApprovalDecision::Decline);
+        let events = events.lock().expect("event lock");
+        let RunEventPayload::ApprovalRequired { request } = &events[0].payload else {
+            panic!("expected approval request");
+        };
+        assert_eq!(
+            request
+                .payload
+                .pointer("/evaluation/action")
+                .and_then(serde_json::Value::as_str),
+            Some("ask")
+        );
+        assert_eq!(
+            request
+                .payload
+                .pointer("/evaluation/safety_floors/0/id")
+                .and_then(serde_json::Value::as_str),
+            Some("destructive_command")
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_payload_omits_nested_raw_arguments() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+        let shell = tool(
+            "shell",
+            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
+        );
+        let approvals = session_approvals();
+        let call = AgentToolCall {
+            id: "shell-call".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": "rm -rf sk-secret-leak-123" }),
+            recipient: None,
+        };
+
+        let decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::always(),
+            None,
+            None,
+            &approvals,
+            &call,
+            Some(&shell),
+        )
+        .await;
+
+        assert_eq!(decision, ApprovalDecision::Decline);
+        let events = events.lock().expect("event lock");
+        let RunEventPayload::ApprovalRequired { request } = &events[0].payload else {
+            panic!("expected approval request");
+        };
+        let payload = serde_json::to_string(&request.payload).expect("payload serializes");
+        assert!(!payload.contains("sk-secret-leak-123"));
+        assert!(request.payload.get("evaluation").is_some());
+    }
+
+    #[tokio::test]
+    async fn grep_without_path_uses_current_directory_for_filesystem_matchers() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+        let grep = tool("grep", ToolApproval::safe_read_only());
+        let approvals = session_approvals();
+        let call = AgentToolCall {
+            id: "grep-call".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({ "pattern": "needle" }),
+            recipient: None,
+        };
+        let mut policy = ApprovalPolicy::always();
+        policy.rules.push(ApprovalRule::new(
+            "ask-grep-cwd",
+            ApprovalAction::Ask,
+            ApprovalMatcher::FilesystemPath {
+                operation: crate::security::filesystem::PathOperation::Search,
+                path: std::env::current_dir().expect("current dir"),
+            },
+        ));
+
+        let decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &policy,
+            None,
+            None,
+            &approvals,
+            &call,
+            Some(&grep),
+        )
+        .await;
+
+        assert_eq!(decision, ApprovalDecision::Decline);
+        let events = events.lock().expect("event lock");
+        let request_count = events
+            .iter()
+            .filter(|event| matches!(event.payload, RunEventPayload::ApprovalRequired { .. }))
+            .count();
+        assert_eq!(request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn filesystem_boundary_matchers_use_lexically_normalized_path_facts() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+        let read_file = tool("read_file", ToolApproval::safe_read_only());
+        let approvals = session_approvals();
+        let call = AgentToolCall {
+            id: "read-call".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": "../secret" }),
+            recipient: None,
+        };
+        let mut policy = ApprovalPolicy::always();
+        policy.rules.push(ApprovalRule::new(
+            "ask-cwd",
+            ApprovalAction::Ask,
+            ApprovalMatcher::FilesystemBoundary {
+                operation: crate::security::filesystem::PathOperation::Read,
+                boundary: crate::security::filesystem::PathBoundary::root(
+                    std::env::current_dir().expect("current dir"),
+                ),
+            },
+        ));
+
+        let decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &policy,
+            None,
+            None,
+            &approvals,
+            &call,
+            Some(&read_file),
+        )
+        .await;
+
+        assert_eq!(decision, ApprovalDecision::Accept);
+        assert!(events.lock().expect("event lock").is_empty());
     }
 
     #[tokio::test]
@@ -620,7 +943,7 @@ mod tests {
         let decision = resolve_approval(
             &emitter,
             &agent_emitter,
-            &ApprovalPolicy::Ask,
+            &ApprovalPolicy::ask(),
             None,
             None,
             &approvals,
@@ -648,7 +971,7 @@ mod tests {
         let custom_decision = resolve_approval(
             &emitter,
             &agent_emitter,
-            &ApprovalPolicy::Ask,
+            &ApprovalPolicy::ask(),
             None,
             None,
             &approvals,
@@ -659,7 +982,7 @@ mod tests {
         let unknown_decision = resolve_approval(
             &emitter,
             &agent_emitter,
-            &ApprovalPolicy::Ask,
+            &ApprovalPolicy::ask(),
             None,
             None,
             &approvals,
@@ -735,7 +1058,7 @@ mod tests {
             let decision = resolve_approval(
                 &emitter,
                 &agent_emitter,
-                &ApprovalPolicy::Ask,
+                &ApprovalPolicy::ask(),
                 None,
                 Some(&coordinator),
                 &approvals,
@@ -781,7 +1104,7 @@ mod tests {
             let decision = resolve_approval(
                 &emitter,
                 &agent_emitter,
-                &ApprovalPolicy::Ask,
+                &ApprovalPolicy::ask(),
                 None,
                 Some(&coordinator),
                 &approvals,
@@ -799,5 +1122,58 @@ mod tests {
             .filter(|event| matches!(event, AgentEvent::HumanInteractionRequested { .. }))
             .count();
         assert_eq!(request_count, 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_session_grant_does_not_override_explicit_ask_rule() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+        let approvals = session_approvals();
+        let call = AgentToolCall {
+            id: "shell-call".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": "echo cached" }),
+            recipient: None,
+        };
+        let shell = tool(
+            "shell",
+            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
+        );
+        approvals
+            .lock()
+            .await
+            .insert(ToolPermissionSessionKey::for_tool_call(
+                ToolPermissionKind::Shell,
+                &call,
+            ));
+        let mut policy = ApprovalPolicy::always();
+        policy.rules.push(ApprovalRule::new(
+            "ask-shell",
+            ApprovalAction::Ask,
+            ApprovalMatcher::ToolName {
+                name: "shell".to_string(),
+            },
+        ));
+
+        let decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &policy,
+            None,
+            None,
+            &approvals,
+            &call,
+            Some(&shell),
+        )
+        .await;
+
+        assert_eq!(decision, ApprovalDecision::Decline);
+        let request_count = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter(|event| matches!(event.payload, RunEventPayload::ApprovalRequired { .. }))
+            .count();
+        assert_eq!(request_count, 1);
     }
 }

@@ -49,7 +49,7 @@ async fn run_request_threads_session_context_to_tools() {
     ));
     let request = RunRequest::new(test_model(), vec![ModelMessage::user("run tool")])
         .with_tools(vec![noop_tool])
-        .with_approval_policy(ApprovalPolicy::Always)
+        .with_approval_policy(ApprovalPolicy::always())
         .with_session_context(session_fs, session_cwd);
 
     let handle = runner.start(request).await.expect("start run");
@@ -89,7 +89,7 @@ async fn run_request_threads_sandbox_provider_to_tools() {
     ));
     let request = RunRequest::new(test_model(), vec![ModelMessage::user("run tool")])
         .with_tools(vec![noop_tool])
-        .with_approval_policy(ApprovalPolicy::Always)
+        .with_approval_policy(ApprovalPolicy::always())
         .with_sandbox_provider(sandbox_provider.clone());
 
     let handle = runner.start(request).await.expect("start run");
@@ -128,7 +128,7 @@ async fn tool_visibility_policy_filters_provider_tool_definitions() {
             ),
         ])
         .with_tool_visibility_policy(ToolVisibilityPolicy::allow_only(["read"]))
-        .with_approval_policy(ApprovalPolicy::Always);
+        .with_approval_policy(ApprovalPolicy::always());
 
     let handle = runner.start(request).await.expect("start run");
     let result = timeout(Duration::from_secs(2), handle.wait())
@@ -155,7 +155,7 @@ async fn tool_visibility_policy_can_hide_all_provider_tools() {
             max_active_calls,
         )])
         .with_tool_visibility_policy(ToolVisibilityPolicy::no_tools())
-        .with_approval_policy(ApprovalPolicy::Always);
+        .with_approval_policy(ApprovalPolicy::always());
 
     let handle = runner.start(request).await.expect("start run");
     let result = timeout(Duration::from_secs(2), handle.wait())
@@ -213,7 +213,7 @@ async fn steering_skip_emits_tool_and_message_lifecycle_for_skipped_calls() {
             max_active_calls,
         ),
     ];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.agent_event_sink = Some(agent_sink);
 
     let steering_tick = Arc::new(AtomicUsize::new(0));
@@ -295,7 +295,7 @@ async fn tool_failures_are_bounded_with_deterministic_reason() {
     let (sink, events) = capture_events();
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run tool")]);
     request.tools = vec![failing_tool()];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
     request
         .metadata
@@ -364,7 +364,7 @@ async fn parallel_safe_tools_execute_concurrently_and_append_results_in_call_ord
             max_active_calls.clone(),
         ),
     ];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -418,7 +418,7 @@ async fn mutating_tools_remain_serialized_even_when_safe_tools_exist() {
             max_active_calls.clone(),
         ),
     ];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -470,7 +470,7 @@ async fn mixed_text_and_parallel_tools_are_batched_before_single_followup() {
             Arc::new(AtomicUsize::new(0)),
         ),
     ];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -510,7 +510,7 @@ async fn duplicate_tool_call_deltas_are_deduplicated_by_call_id() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     )];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -568,7 +568,7 @@ async fn approval_uses_same_duplicate_named_tool_instance_as_execution() {
         .with_approval(ToolApproval::safe_read_only()),
     );
     request.tools = vec![unsafe_read, safe_read];
-    request.approval_policy = ApprovalPolicy::Ask;
+    request.approval_policy = ApprovalPolicy::ask();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");
@@ -609,7 +609,7 @@ async fn tool_permission_denial_returns_tool_denial_result() {
         AgentToolParameters::empty(),
         |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({ "executed": true })) },
     ))];
-    request.approval_policy = ApprovalPolicy::Ask;
+    request.approval_policy = ApprovalPolicy::ask();
     request.event_sink = Some(sink);
     request.agent_event_sink = Some(agent_sink);
     request.human_interaction_coordinator = Some(coordinator);
@@ -646,7 +646,7 @@ async fn tool_permission_cancel_aborts_run() {
         AgentToolParameters::empty(),
         |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({ "executed": true })) },
     ))];
-    request.approval_policy = ApprovalPolicy::Ask;
+    request.approval_policy = ApprovalPolicy::ask();
     request.event_sink = Some(sink);
     request.agent_event_sink = Some(agent_sink);
     request.human_interaction_coordinator = Some(coordinator);
@@ -680,7 +680,7 @@ async fn stream_end_without_done_falls_back_to_tool_execution_and_completion() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     )];
-    request.approval_policy = ApprovalPolicy::Always;
+    request.approval_policy = ApprovalPolicy::always();
     request.event_sink = Some(sink);
 
     let handle = runner.start(request).await.expect("start run");

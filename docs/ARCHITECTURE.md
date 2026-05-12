@@ -133,6 +133,9 @@ use logical paths under `files/`.
   - `crates/roci-core/src/agent/runtime/{chat,types,config,state,lifecycle,mutations,run_loop,events,summary}.rs` contains runtime internals by concern.
   - `crates/roci-core/src/agent/runtime_tests/` contains `agent::runtime::tests::*` (support + domain test modules).
 - `agent_loop::runner` executes provider turns, streaming, tool execution, approvals, retries, and event emission.
+- `agent_loop::ApprovalPolicy` is the structured approval ruleset. Presets are
+  constructors (`ask`, `always`, `never`); host apps own approval UI/persistence,
+  while core owns evaluation and precedence.
 - `agent::Agent` is the simple conversation API. When tools are attached it delegates to `agent_loop::LoopRunner`, so approvals and tool hooks follow the same path as `AgentRuntime`.
 - Compaction is supported in two modes:
   - automatic pre-provider compaction in the run loop when reserved context budget would be exceeded

@@ -246,9 +246,9 @@ fn demo_post_tool_use_hook(tool_name: &str, tool_call_id: &str) {
 
 fn approval_policy_from_arg(arg: ChatApprovalArg) -> ApprovalPolicy {
     match arg {
-        ChatApprovalArg::Ask => ApprovalPolicy::Ask,
-        ChatApprovalArg::Always => ApprovalPolicy::Always,
-        ChatApprovalArg::Never => ApprovalPolicy::Never,
+        ChatApprovalArg::Ask => ApprovalPolicy::ask(),
+        ChatApprovalArg::Always => ApprovalPolicy::always(),
+        ChatApprovalArg::Never => ApprovalPolicy::never(),
     }
 }
 
@@ -268,9 +268,11 @@ fn tool_visibility_policy_from_args<'a>(
 mod tests {
     use std::path::PathBuf;
 
+    use roci::agent_loop::ApprovalAction;
     use roci::attachments::Attachment;
 
-    use super::build_prompt_input;
+    use super::{approval_policy_from_arg, build_prompt_input};
+    use crate::cli::ChatApprovalArg;
 
     #[test]
     fn copilot_provider_available_in_default_registry() {
@@ -299,5 +301,21 @@ mod tests {
                 _ => panic!("expected file attachment"),
             }
         }
+    }
+
+    #[test]
+    fn approval_arg_maps_to_policy_presets() {
+        assert_eq!(
+            approval_policy_from_arg(ChatApprovalArg::Ask).default_action,
+            ApprovalAction::Ask
+        );
+        assert_eq!(
+            approval_policy_from_arg(ChatApprovalArg::Always).default_action,
+            ApprovalAction::Allow
+        );
+        assert_eq!(
+            approval_policy_from_arg(ChatApprovalArg::Never).default_action,
+            ApprovalAction::Deny
+        );
     }
 }

@@ -314,7 +314,7 @@ impl RunRequest {
             session_cwd: None,
             sandbox_provider: None,
             tool_visibility_policy: ToolVisibilityPolicy::default(),
-            approval_policy: ApprovalPolicy::Ask,
+            approval_policy: ApprovalPolicy::ask(),
             approval_handler: None,
             metadata: HashMap::new(),
             event_sink: None,

@@ -1,20 +1,24 @@
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PathResolutionMode {
     Lexical,
     CanonicalizeExisting,
     CanonicalizeBestEffort,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SymlinkPolicy {
     DenySymlinks,
     FollowIfTargetAllowed,
     AllowLexical,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathBoundary {
     pub root: PathBuf,
     pub glob: Option<String>,
@@ -26,7 +30,8 @@ impl PathBoundary {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PathOperation {
     Read,
     Write,
@@ -36,14 +41,14 @@ pub enum PathOperation {
     Search,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathAccessRequest {
     pub operation: PathOperation,
     pub path: PathBuf,
     pub cwd: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemDecision {
     pub allowed: bool,
     pub normalized_path: Option<PathBuf>,
@@ -140,8 +145,8 @@ impl FilesystemPolicy {
                                             allowed: false,
                                             normalized_path: Some(normalized_path),
                                             reason: format!(
-                                            "denied: failed to inspect symlink components: {error}"
-                                        ),
+                                                "denied: failed to inspect symlink components: {error}"
+                                            ),
                                             matched_boundary: Some(normalized_boundary),
                                         };
                                     }
@@ -237,7 +242,7 @@ impl FilesystemPolicy {
 }
 
 impl PathBoundary {
-    fn matches(&self, path: &Path) -> bool {
+    pub(crate) fn matches(&self, path: &Path) -> bool {
         if !(path == self.root || path.starts_with(&self.root)) {
             return false;
         }
@@ -265,7 +270,7 @@ fn absolute_path(path: &Path, cwd: Option<&Path>) -> Result<PathBuf, String> {
         .ok_or_else(|| "denied: relative path requires cwd when restrictions exist".to_string())
 }
 
-fn lexical_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 
     for component in path.components() {

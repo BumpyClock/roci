@@ -44,7 +44,7 @@ impl Agent {
             registry,
             system_prompt: None,
             tools: Vec::new(),
-            approval_policy: ApprovalPolicy::Ask,
+            approval_policy: ApprovalPolicy::ask(),
             approval_handler: None,
             settings: GenerationSettings::default(),
             conversation: Conversation::new(),
@@ -77,14 +77,14 @@ impl Agent {
 
     /// Set the tool approval policy for this agent.
     ///
-    /// Defaults to [`ApprovalPolicy::Ask`]: explicitly safe tools run
+    /// Defaults to [`ApprovalPolicy::ask`]: explicitly safe tools run
     /// automatically; mutating/custom tools require an approval handler.
     pub fn with_approval_policy(mut self, policy: ApprovalPolicy) -> Self {
         self.approval_policy = policy;
         self
     }
 
-    /// Set the approval handler used when [`ApprovalPolicy::Ask`] requires a decision.
+    /// Set the approval handler used when [`ApprovalPolicy::ask`] requires a decision.
     pub fn with_approval_handler(mut self, handler: ApprovalHandler) -> Self {
         self.approval_handler = Some(handler);
         self
@@ -216,7 +216,7 @@ impl Agent {
         let mut request =
             RunRequest::with_candidates(self.candidates.as_slice().to_vec(), messages)?
                 .with_tools(self.tools.clone())
-                .with_approval_policy(self.approval_policy);
+                .with_approval_policy(self.approval_policy.clone());
         if let Some(handler) = &self.approval_handler {
             request = request.with_approval_handler(handler.clone());
         }
