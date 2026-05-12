@@ -6,7 +6,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::{
-    AgentTool, AgentToolParameters, Tool, ToolApproval, ToolArguments, ToolExecutionContext,
+    AgentTool, AgentToolParameters, Tool, ToolArguments, ToolExecutionContext, ToolSafetyKind,
+    ToolSafetyPlan, ToolSafetySummary,
 };
 
 use super::routing::SubagentRoutingController;
@@ -80,7 +81,7 @@ impl SubagentRoutingTools {
                     }
                 },
             )
-            .with_approval(ToolApproval::safe_host_input()),
+            .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
         )
     }
 
@@ -106,7 +107,7 @@ impl SubagentRoutingTools {
                     }
                 },
             )
-            .with_approval(ToolApproval::safe_host_input()),
+            .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
         )
     }
 
@@ -128,7 +129,7 @@ impl SubagentRoutingTools {
                     }
                 },
             )
-            .with_approval(ToolApproval::safe_host_input()),
+            .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
         )
     }
 
@@ -150,7 +151,7 @@ impl SubagentRoutingTools {
                     }
                 },
             )
-            .with_approval(ToolApproval::safe_host_input()),
+            .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
         )
     }
 
@@ -183,8 +184,17 @@ impl SubagentRoutingTools {
                     }
                 },
             )
-            .with_approval(ToolApproval::safe_host_input()),
+            .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
         )
+    }
+}
+
+fn host_input_safety_summary() -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: false,
+        destructive_by_default: false,
+        concurrency_safe_by_default: false,
+        approval_kind: ToolSafetyKind::Other,
     }
 }
 

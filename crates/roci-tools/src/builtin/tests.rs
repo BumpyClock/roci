@@ -4,8 +4,12 @@ use std::time::Duration;
 
 use roci::error::RociError;
 use roci::prelude::{LocalSessionFs, LogicalPath};
+use roci::security::command::classify_shell_command;
 use roci::tools::arguments::ToolArguments;
-use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
+use roci::tools::tool::{
+    AgentTool, Tool, ToolActionFloor, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan,
+    ToolSafetySummary,
+};
 use roci::tools::types::AgentToolParameters;
 
 use super::common::{truncate_utf8, READ_FILE_MAX_BYTES, SHELL_OUTPUT_MAX_BYTES};
@@ -58,21 +62,109 @@ fn tool_catalog_marks_all_tools_as_builtin() {
 }
 
 #[test]
-fn builtins_declare_expected_approval_metadata() {
-    assert_eq!(read_file_tool().approval(), ToolApproval::safe_read_only());
+fn builtins_declare_expected_safety_plans() {
+    let read_summary = ToolSafetySummary {
+        read_only_by_default: true,
+        destructive_by_default: false,
+        concurrency_safe_by_default: true,
+        approval_kind: ToolSafetyKind::Read,
+    };
+    let write_summary = ToolSafetySummary {
+        read_only_by_default: false,
+        destructive_by_default: false,
+        concurrency_safe_by_default: false,
+        approval_kind: ToolSafetyKind::FileChange,
+    };
+    let command_summary = ToolSafetySummary {
+        approval_kind: ToolSafetyKind::CommandExecution,
+        ..ToolSafetySummary::default()
+    };
+    let host_input_summary = ToolSafetySummary::default();
+
+    let read_file = read_file_tool();
+    assert_eq!(read_file.safety_summary(), read_summary);
     assert_eq!(
-        list_directory_tool().approval(),
-        ToolApproval::safe_read_only()
+        read_file.safety(&args(serde_json::json!({"path": "Cargo.toml"}))),
+        ToolSafetyPlan::file_read("Cargo.toml")
     );
-    assert_eq!(grep_tool().approval(), ToolApproval::safe_read_only());
-    assert_eq!(ask_user_tool().approval(), ToolApproval::safe_host_input());
     assert_eq!(
-        shell_tool().approval(),
-        ToolApproval::requires_approval(ToolApprovalKind::CommandExecution)
+        read_file.safety(&args(serde_json::json!({}))),
+        ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read)
+    );
+
+    let list_directory = list_directory_tool();
+    assert_eq!(list_directory.safety_summary(), read_summary);
+    assert_eq!(
+        list_directory.safety(&args(serde_json::json!({"path": "crates"}))),
+        ToolSafetyPlan::file_list("crates")
     );
     assert_eq!(
-        write_file_tool().approval(),
-        ToolApproval::requires_approval(ToolApprovalKind::FileChange)
+        list_directory.safety(&args(serde_json::json!({}))),
+        ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read)
+    );
+
+    let grep = grep_tool();
+    assert_eq!(grep.safety_summary(), read_summary);
+    assert_eq!(
+        grep.safety(&args(
+            serde_json::json!({"pattern": "AgentTool", "path": "crates"})
+        )),
+        ToolSafetyPlan::file_search("crates")
+    );
+    assert_eq!(
+        grep.safety(&args(serde_json::json!({"pattern": "AgentTool"}))),
+        ToolSafetyPlan::file_search(".")
+    );
+
+    let write_file = write_file_tool();
+    assert_eq!(write_file.safety_summary(), write_summary);
+    assert_eq!(
+        write_file.safety(&args(
+            serde_json::json!({"path": "out.txt", "content": "ok"})
+        )),
+        ToolSafetyPlan::file_write("out.txt")
+    );
+    assert_eq!(
+        write_file.safety(&args(serde_json::json!({"content": "ok"}))),
+        ToolSafetyPlan::approval_required(ToolSafetyKind::FileChange)
+    );
+
+    let ask_user = ask_user_tool();
+    assert_eq!(ask_user.safety_summary(), host_input_summary);
+    assert_eq!(
+        ask_user.safety(&args(serde_json::json!({"kind": "question"}))),
+        ToolSafetyPlan::host_input()
+    );
+
+    let shell = shell_tool();
+    assert_eq!(shell.safety_summary(), command_summary);
+    assert_eq!(
+        shell.safety(&args(serde_json::json!({"command": "git status"}))),
+        ToolSafetyPlan::from_command_insight(classify_shell_command("git status"))
+    );
+
+    let invalid_shell = shell.safety(&args(serde_json::json!({})));
+    assert!(!invalid_shell.read_only);
+    assert!(!invalid_shell.destructive);
+    assert!(!invalid_shell.concurrency_safe);
+    assert_eq!(
+        invalid_shell.approval.kind,
+        ToolSafetyKind::CommandExecution
+    );
+    assert!(invalid_shell
+        .approval
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Missing string argument: command"));
+
+    let destructive_shell = shell.safety(&args(
+        serde_json::json!({"command": "eval 'rm -rf /tmp/roci-tool-safety'"}),
+    ));
+    assert!(destructive_shell.destructive);
+    assert_eq!(
+        destructive_shell.approval.action_floor,
+        Some(ToolActionFloor::Ask)
     );
 }
 

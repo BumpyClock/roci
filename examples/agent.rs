@@ -23,7 +23,15 @@ async fn main() -> roci::error::Result<()> {
                 Ok(serde_json::json!({"result": expr, "note": "evaluation stub"}))
             },
         )
-        .with_approval(roci::tools::ToolApproval::safe_read_only()),
+        .with_static_safety(
+            roci::tools::ToolSafetyPlan::safe_read_only(roci::tools::ToolSafetyKind::CustomTool),
+            roci::tools::ToolSafetySummary {
+                read_only_by_default: true,
+                destructive_by_default: false,
+                concurrency_safe_by_default: true,
+                approval_kind: roci::tools::ToolSafetyKind::CustomTool,
+            },
+        ),
     );
 
     let mut agent = roci::agent::Agent::new(model, registry)

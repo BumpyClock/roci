@@ -5,8 +5,8 @@ use crate::models::ModelCapabilities;
 use crate::provider::{ModelProvider, ProviderFactory, ProviderRequest, ProviderResponse};
 use crate::tools::tool::Tool;
 use crate::tools::{
-    AgentTool, AgentToolParameters, AskUserPrompt, ToolApproval, UserInputRequest,
-    UserInputResponse, UserInputResult,
+    AgentTool, AgentToolParameters, AskUserPrompt, ToolSafetyKind, ToolSafetyPlan,
+    ToolSafetySummary, UserInputRequest, UserInputResponse, UserInputResult,
 };
 use crate::types::{AgentToolCall, StreamEventType, TextStreamDelta, Usage};
 use async_trait::async_trait;
@@ -18,6 +18,15 @@ use tokio::time::{sleep, timeout};
 
 struct AskUserFactory {
     calls: Arc<AtomicUsize>,
+}
+
+fn host_input_safety_summary() -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: false,
+        destructive_by_default: false,
+        concurrency_safe_by_default: false,
+        approval_kind: ToolSafetyKind::Other,
+    }
 }
 
 impl ProviderFactory for AskUserFactory {
@@ -167,7 +176,7 @@ async fn prompt_emits_user_input_event_and_submit_user_input_unblocks_tool() {
                 Ok(serde_json::json!({ "answer": answer }))
             },
         )
-        .with_approval(ToolApproval::safe_host_input()),
+        .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
     );
 
     let agent_slot: Arc<Mutex<Option<Arc<AgentRuntime>>>> = Arc::new(Mutex::new(None));
@@ -263,7 +272,7 @@ async fn abort_while_waiting_for_user_input_unblocks_run() {
                 Ok(serde_json::json!({ "answer": answer }))
             },
         )
-        .with_approval(ToolApproval::safe_host_input()),
+        .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
     );
 
     let (request_seen_tx, request_seen_rx) = oneshot::channel();

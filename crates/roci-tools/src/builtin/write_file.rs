@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
-use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
+use roci::tools::arguments::ToolArguments;
+use roci::tools::tool::{
+    AgentTool, Tool, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
+};
 use roci::tools::types::AgentToolParameters;
 
 use super::common::resolve_session_path;
@@ -66,7 +69,21 @@ pub fn write_file_tool() -> Arc<dyn Tool> {
             }))
         },
     );
-    Arc::new(tool.with_approval(ToolApproval::requires_approval(
-        ToolApprovalKind::FileChange,
-    )))
+    Arc::new(tool.with_safety(write_file_safety_summary(), write_file_safety))
+}
+
+fn write_file_safety(args: &ToolArguments) -> ToolSafetyPlan {
+    match args.get_str("path") {
+        Ok(path) => ToolSafetyPlan::file_write(path),
+        Err(_) => ToolSafetyPlan::approval_required(ToolSafetyKind::FileChange),
+    }
+}
+
+fn write_file_safety_summary() -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: false,
+        destructive_by_default: false,
+        concurrency_safe_by_default: false,
+        approval_kind: ToolSafetyKind::FileChange,
+    }
 }

@@ -30,8 +30,6 @@ const RUNNER_MAX_ITERATION_EXTENSIONS_KEYS: [&str; 3] = [
     "agent_loop.max_iteration_extensions",
     "max_iteration_extensions",
 ];
-const PARALLEL_SAFE_TOOL_NAMES: [&str; 6] =
-    ["read", "ls", "find", "grep", "web_search", "web_fetch"];
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RunnerLimits {
@@ -100,10 +98,4 @@ fn parse_positive_usize(value: &str) -> Option<usize> {
     } else {
         Some(parsed)
     }
-}
-
-pub(super) fn is_parallel_safe_tool(tool_name: &str) -> bool {
-    PARALLEL_SAFE_TOOL_NAMES
-        .iter()
-        .any(|candidate| candidate == &tool_name)
 }

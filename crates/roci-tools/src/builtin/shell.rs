@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
-use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext};
+use roci::security::command::classify_shell_command;
+use roci::tools::arguments::ToolArguments;
+use roci::tools::tool::{
+    AgentTool, Tool, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
+};
 use roci::tools::types::AgentToolParameters;
 
 use super::common::{
@@ -85,7 +89,25 @@ pub fn shell_tool() -> Arc<dyn Tool> {
             }))
         },
     );
-    Arc::new(tool.with_approval(ToolApproval::requires_approval(
-        ToolApprovalKind::CommandExecution,
-    )))
+    Arc::new(tool.with_safety(shell_safety_summary(), shell_safety))
+}
+
+fn shell_safety(args: &ToolArguments) -> ToolSafetyPlan {
+    match args.get_str("command") {
+        Ok(command) => ToolSafetyPlan::from_command_insight(classify_shell_command(command)),
+        Err(err) => {
+            let mut plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);
+            plan.approval.reason = Some(format!("invalid shell arguments: {err}"));
+            plan
+        }
+    }
+}
+
+fn shell_safety_summary() -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: false,
+        destructive_by_default: false,
+        concurrency_safe_by_default: false,
+        approval_kind: ToolSafetyKind::CommandExecution,
+    }
 }

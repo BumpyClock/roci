@@ -2,10 +2,63 @@ use super::*;
 
 use crate::session::{LocalSessionFs, LogicalPath, SessionFs};
 use crate::tools::SandboxProvider;
+use crate::tools::{ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary};
 
 #[derive(Debug, Default)]
 struct RecordingSandboxProvider {
     calls: std::sync::Mutex<Vec<(String, LogicalPath)>>,
+}
+
+fn read_only_safety_summary(kind: ToolSafetyKind) -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: true,
+        destructive_by_default: false,
+        concurrency_safe_by_default: true,
+        approval_kind: kind,
+    }
+}
+
+fn tracked_safe_success_tool(
+    name: &str,
+    delay: Duration,
+    active_calls: Arc<AtomicUsize>,
+    max_active_calls: Arc<AtomicUsize>,
+) -> Arc<dyn Tool> {
+    let tool_name = name.to_string();
+    Arc::new(
+        AgentTool::new(
+            tool_name.clone(),
+            format!("{tool_name} tool"),
+            AgentToolParameters::empty(),
+            move |_args, _ctx: ToolExecutionContext| {
+                let tool_name = tool_name.clone();
+                let active_calls = active_calls.clone();
+                let max_active_calls = max_active_calls.clone();
+                async move {
+                    let active_now = active_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut observed_max = max_active_calls.load(Ordering::SeqCst);
+                    while active_now > observed_max {
+                        match max_active_calls.compare_exchange(
+                            observed_max,
+                            active_now,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => break,
+                            Err(next) => observed_max = next,
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    active_calls.fetch_sub(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({ "tool": tool_name }))
+                }
+            },
+        )
+        .with_static_safety(
+            ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+            read_only_safety_summary(ToolSafetyKind::Read),
+        ),
+    )
 }
 
 #[async_trait]
@@ -351,13 +404,13 @@ async fn parallel_safe_tools_execute_concurrently_and_append_results_in_call_ord
     let max_active_calls = Arc::new(AtomicUsize::new(0));
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("parallel tools")]);
     request.tools = vec![
-        tracked_success_tool(
+        tracked_safe_success_tool(
             "read",
             Duration::from_millis(150),
             active_calls.clone(),
             max_active_calls.clone(),
         ),
-        tracked_success_tool(
+        tracked_safe_success_tool(
             "ls",
             Duration::from_millis(150),
             active_calls,
@@ -411,8 +464,14 @@ async fn mutating_tools_remain_serialized_even_when_safe_tools_exist() {
             active_calls.clone(),
             max_active_calls.clone(),
         ),
-        tracked_success_tool(
+        tracked_safe_success_tool(
             "read",
+            Duration::from_millis(150),
+            active_calls.clone(),
+            max_active_calls.clone(),
+        ),
+        tracked_safe_success_tool(
+            "ls",
             Duration::from_millis(150),
             active_calls,
             max_active_calls.clone(),
@@ -426,7 +485,7 @@ async fn mutating_tools_remain_serialized_even_when_safe_tools_exist() {
         .await
         .expect("run wait timeout");
     assert_eq!(result.status, RunStatus::Completed);
-    assert_eq!(max_active_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(max_active_calls.load(Ordering::SeqCst), 2);
 
     let requests = requests.lock().expect("request lock");
     assert!(requests.len() >= 2);
@@ -437,17 +496,29 @@ async fn mutating_tools_remain_serialized_even_when_safe_tools_exist() {
     );
     assert_eq!(
         tool_result_ids_from_messages(second_request_messages),
-        vec!["mutating-call-1".to_string(), "safe-read-2".to_string()]
+        vec![
+            "mutating-call-1".to_string(),
+            "safe-read-2".to_string(),
+            "safe-ls-3".to_string(),
+        ]
     );
 
     let events = events.lock().expect("event lock");
     assert_eq!(
         tool_result_ids_from_events(events.as_slice()),
-        vec!["mutating-call-1".to_string(), "safe-read-2".to_string()]
+        vec![
+            "mutating-call-1".to_string(),
+            "safe-read-2".to_string(),
+            "safe-ls-3".to_string(),
+        ]
     );
     assert_eq!(
         tool_call_completed_ids_from_events(events.as_slice()),
-        vec!["mutating-call-1".to_string(), "safe-read-2".to_string()]
+        vec![
+            "mutating-call-1".to_string(),
+            "safe-read-2".to_string(),
+            "safe-ls-3".to_string(),
+        ]
     );
 }
 
@@ -457,13 +528,13 @@ async fn mixed_text_and_parallel_tools_are_batched_before_single_followup() {
     let (sink, events) = capture_events();
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("mixed stream")]);
     request.tools = vec![
-        tracked_success_tool(
+        tracked_safe_success_tool(
             "read",
             Duration::from_millis(80),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         ),
-        tracked_success_tool(
+        tracked_safe_success_tool(
             "ls",
             Duration::from_millis(80),
             Arc::new(AtomicUsize::new(0)),
@@ -565,7 +636,10 @@ async fn approval_uses_same_duplicate_named_tool_instance_as_execution() {
                 Ok(serde_json::json!({ "executed": "safe-read" }))
             },
         )
-        .with_approval(ToolApproval::safe_read_only()),
+        .with_static_safety(
+            ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+            read_only_safety_summary(ToolSafetyKind::Read),
+        ),
     );
     request.tools = vec![unsafe_read, safe_read];
     request.approval_policy = ApprovalPolicy::ask();

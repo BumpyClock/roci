@@ -9,7 +9,18 @@ use super::*;
 use crate::agent_loop::ApprovalDecision;
 use crate::models::ModelCapabilities;
 use crate::provider::{ModelProvider, ProviderFactory, ProviderRequest, ProviderResponse};
-use crate::tools::{AgentTool, AgentToolParameters, ToolApproval};
+use crate::tools::{
+    AgentTool, AgentToolParameters, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
+};
+
+fn read_only_safety_summary() -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: true,
+        destructive_by_default: false,
+        concurrency_safe_by_default: true,
+        approval_kind: ToolSafetyKind::Read,
+    }
+}
 
 struct ToolLoopFactory {
     provider_calls: Arc<AtomicUsize>,
@@ -170,7 +181,10 @@ async fn execute_with_tool_uses_runner_tool_path() {
             }
         },
     )
-    .with_approval(ToolApproval::safe_read_only());
+    .with_static_safety(
+        ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+        read_only_safety_summary(),
+    );
     let model: LanguageModel = "stub:test-model".parse().expect("test model parses");
     let mut agent = Agent::new(model, Arc::new(registry)).with_tool(Box::new(tool));
 
@@ -203,7 +217,10 @@ async fn stream_with_tool_emits_deltas_and_updates_conversation() {
             }
         },
     )
-    .with_approval(ToolApproval::safe_read_only());
+    .with_static_safety(
+        ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+        read_only_safety_summary(),
+    );
     let model: LanguageModel = "stub:test-model".parse().expect("test model parses");
     let mut agent = Agent::new(model, Arc::new(registry)).with_tool(Box::new(tool));
 
@@ -249,7 +266,10 @@ async fn dropping_tool_stream_after_delta_stops_without_extra_provider_calls() {
             }
         },
     )
-    .with_approval(ToolApproval::safe_read_only());
+    .with_static_safety(
+        ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+        read_only_safety_summary(),
+    );
     let model: LanguageModel = "stub:test-model".parse().expect("test model parses");
     let mut agent = Agent::new(model, Arc::new(registry)).with_tool(Box::new(tool));
 

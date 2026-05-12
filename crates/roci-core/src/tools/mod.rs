@@ -17,8 +17,9 @@ pub use dynamic::{DynamicTool, DynamicToolAdapter, DynamicToolProvider};
 #[cfg(feature = "agent")]
 pub use tool::ToolUpdateCallback;
 pub use tool::{
-    AgentTool, SandboxProvider, Tool, ToolApproval, ToolApprovalKind, ToolExecutionContext,
-    ToolSafety,
+    AgentTool, SandboxProvider, Tool, ToolActionFloor, ToolApprovalRequirement,
+    ToolExecutionContext, ToolFilesystemAccess, ToolResourceAccess, ToolResourceAccessMode,
+    ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
 };
 pub use types::AgentToolParameters;
 pub use user_input::{

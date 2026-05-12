@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use roci::error::RociError;
 use roci::prelude::{LogicalPath, SessionFileKind, SessionFs};
-use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolExecutionContext};
+use roci::tools::arguments::ToolArguments;
+use roci::tools::tool::{
+    AgentTool, Tool, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
+};
 use roci::tools::types::AgentToolParameters;
 
 use super::common::{resolve_session_path, truncate_utf8, GREP_OUTPUT_MAX_BYTES};
@@ -77,7 +80,20 @@ pub fn grep_tool() -> Arc<dyn Tool> {
             }))
         },
     );
-    Arc::new(tool.with_approval(ToolApproval::safe_read_only()))
+    Arc::new(tool.with_safety(grep_safety_summary(), grep_safety))
+}
+
+fn grep_safety(args: &ToolArguments) -> ToolSafetyPlan {
+    ToolSafetyPlan::file_search(args.get_str_opt("path").unwrap_or("."))
+}
+
+fn grep_safety_summary() -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: true,
+        destructive_by_default: false,
+        concurrency_safe_by_default: true,
+        approval_kind: ToolSafetyKind::Read,
+    }
 }
 
 fn session_grep(

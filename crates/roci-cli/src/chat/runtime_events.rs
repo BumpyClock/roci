@@ -378,7 +378,11 @@ fn prompt_for_approval(request: ApprovalRequest) -> ApprovalDecision {
     }
 
     loop {
-        eprint!("  approve? [y]es/[a] session/[n]o/[c]ancel: ");
+        if request.allow_session {
+            eprint!("  approve? [y]es/[a] session/[n]o/[c]ancel: ");
+        } else {
+            eprint!("  approve? [y]es/[n]o/[c]ancel: ");
+        }
         let _ = io::stderr().flush();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_err() {
@@ -388,10 +392,16 @@ fn prompt_for_approval(request: ApprovalRequest) -> ApprovalDecision {
 
         match input.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => return ApprovalDecision::Accept,
-            "a" | "session" | "always" => return ApprovalDecision::AcceptForSession,
+            "a" | "session" | "always" if request.allow_session => {
+                return ApprovalDecision::AcceptForSession;
+            }
+            "a" | "session" | "always" => {
+                eprintln!("  session approval unavailable for this request");
+            }
             "" | "n" | "no" => return ApprovalDecision::Decline,
             "c" | "cancel" => return ApprovalDecision::Cancel,
-            _ => eprintln!("  enter y, a, n, or c"),
+            _ if request.allow_session => eprintln!("  enter y, a, n, or c"),
+            _ => eprintln!("  enter y, n, or c"),
         }
     }
 }
@@ -989,6 +999,7 @@ mod tests {
         ApprovalRequest {
             id: "approval_1".to_string(),
             kind: ApprovalKind::CommandExecution,
+            allow_session: true,
             reason: Some("Run shell".to_string()),
             payload: serde_json::json!({ "tool_name": "shell" }),
             suggested_policy_change: None,

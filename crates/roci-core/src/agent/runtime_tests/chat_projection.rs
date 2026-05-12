@@ -31,6 +31,7 @@ fn approval_request(id: &str) -> ApprovalRequest {
     ApprovalRequest {
         id: id.to_string(),
         kind: ApprovalKind::CommandExecution,
+        allow_session: true,
         reason: Some("run shell".to_string()),
         payload: serde_json::json!({ "tool_name": "shell" }),
         suggested_policy_change: None,
@@ -222,6 +223,7 @@ fn approval_lifecycle_projects_required_resolved_and_canceled_snapshots() {
     let request = ApprovalRequest {
         id: "approval-1".to_string(),
         kind: ApprovalKind::CommandExecution,
+        allow_session: true,
         reason: Some("run shell".to_string()),
         payload: serde_json::json!({ "tool_name": "shell" }),
         suggested_policy_change: None,
@@ -275,6 +277,7 @@ fn cancel_turn_marks_pending_approvals_canceled() {
     let request = ApprovalRequest {
         id: "approval-1".to_string(),
         kind: ApprovalKind::CommandExecution,
+        allow_session: true,
         reason: Some("run shell".to_string()),
         payload: serde_json::json!({ "tool_name": "shell" }),
         suggested_policy_change: None,

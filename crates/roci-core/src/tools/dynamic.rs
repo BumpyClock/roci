@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::arguments::ToolArguments;
-use super::tool::{Tool, ToolApproval, ToolExecutionContext};
+use super::tool::{Tool, ToolExecutionContext, ToolSafetyPlan, ToolSafetySummary};
 use super::types::AgentToolParameters;
 use crate::error::RociError;
 
@@ -15,11 +15,12 @@ pub struct DynamicTool {
     pub name: String,
     pub description: String,
     pub parameters: AgentToolParameters,
-    pub approval: ToolApproval,
+    pub safety: ToolSafetyPlan,
+    pub safety_summary: ToolSafetySummary,
 }
 
 impl DynamicTool {
-    /// Create a dynamic tool with approval required by default.
+    /// Create a dynamic tool with fail-closed safety metadata by default.
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -29,13 +30,15 @@ impl DynamicTool {
             name: name.into(),
             description: description.into(),
             parameters,
-            approval: ToolApproval::requires_approval(super::tool::ToolApprovalKind::Other),
+            safety: ToolSafetyPlan::default(),
+            safety_summary: ToolSafetySummary::default(),
         }
     }
 
-    /// Set explicit approval metadata for a dynamic tool.
-    pub fn with_approval(mut self, approval: ToolApproval) -> Self {
-        self.approval = approval;
+    /// Set explicit safety metadata for a dynamic tool.
+    pub fn with_safety(mut self, plan: ToolSafetyPlan, summary: ToolSafetySummary) -> Self {
+        self.safety = plan;
+        self.safety_summary = summary;
         self
     }
 }
@@ -61,7 +64,8 @@ pub struct DynamicToolAdapter {
     name: String,
     description: String,
     parameters: AgentToolParameters,
-    approval: ToolApproval,
+    safety: ToolSafetyPlan,
+    safety_summary: ToolSafetySummary,
 }
 
 impl DynamicToolAdapter {
@@ -72,7 +76,8 @@ impl DynamicToolAdapter {
             name: tool.name,
             description: tool.description,
             parameters: tool.parameters,
-            approval: tool.approval,
+            safety: tool.safety,
+            safety_summary: tool.safety_summary,
         }
     }
 }
@@ -91,8 +96,12 @@ impl Tool for DynamicToolAdapter {
         &self.parameters
     }
 
-    fn approval(&self) -> ToolApproval {
-        self.approval
+    fn safety(&self, _args: &ToolArguments) -> ToolSafetyPlan {
+        self.safety.clone()
+    }
+
+    fn safety_summary(&self) -> ToolSafetySummary {
+        self.safety_summary
     }
 
     async fn execute(
@@ -106,7 +115,7 @@ impl Tool for DynamicToolAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tool::ToolApprovalKind;
+    use super::super::tool::ToolSafetyKind;
     use super::*;
 
     struct NoopProvider;
@@ -128,23 +137,36 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tool_defaults_to_approval_required() {
+    fn dynamic_tool_defaults_to_fail_closed_safety() {
         let tool = DynamicTool::new("dynamic", "dynamic tool", AgentToolParameters::empty());
 
-        assert_eq!(
-            tool.approval,
-            ToolApproval::requires_approval(ToolApprovalKind::Other)
-        );
+        assert_eq!(tool.safety, ToolSafetyPlan::default());
+        assert_eq!(tool.safety_summary, ToolSafetySummary::default());
+        assert_eq!(tool.safety.approval.kind, ToolSafetyKind::Other);
+        assert!(!tool.safety.read_only);
+        assert!(!tool.safety.destructive);
+        assert!(!tool.safety.concurrency_safe);
     }
 
     #[test]
-    fn dynamic_tool_adapter_uses_declared_approval_metadata() {
+    fn dynamic_tool_adapter_uses_declared_safety_metadata() {
+        let plan = ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read);
+        let summary = ToolSafetySummary {
+            read_only_by_default: true,
+            destructive_by_default: false,
+            concurrency_safe_by_default: true,
+            approval_kind: ToolSafetyKind::Read,
+        };
         let adapter = DynamicToolAdapter::new(
             Arc::new(NoopProvider),
             DynamicTool::new("dynamic", "dynamic tool", AgentToolParameters::empty())
-                .with_approval(ToolApproval::safe_read_only()),
+                .with_safety(plan.clone(), summary),
         );
 
-        assert_eq!(adapter.approval(), ToolApproval::safe_read_only());
+        assert_eq!(
+            adapter.safety(&ToolArguments::new(serde_json::json!({}))),
+            plan
+        );
+        assert_eq!(adapter.safety_summary(), summary);
     }
 }

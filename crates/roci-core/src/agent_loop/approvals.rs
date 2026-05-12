@@ -117,7 +117,7 @@ pub enum ApprovalMatcher {
         name: String,
     },
     ToolKind {
-        kind: crate::tools::ToolApprovalKind,
+        kind: crate::tools::ToolSafetyKind,
     },
     CommandExecutable {
         executable: String,
@@ -163,7 +163,7 @@ pub struct ApprovalContext {
     pub tool_call_id: String,
     pub tool_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_kind: Option<crate::tools::ToolApprovalKind>,
+    pub tool_kind: Option<crate::tools::ToolSafetyKind>,
     #[serde(default)]
     pub preview: serde_json::Value,
     #[serde(default)]
@@ -172,6 +172,8 @@ pub struct ApprovalContext {
     pub command: Option<crate::security::command::CommandInsight>,
     #[serde(default)]
     pub filesystem: Vec<ApprovalFilesystemAccess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_floor: Option<ApprovalSafetyFloor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,7 +403,9 @@ fn action_rank(action: ApprovalAction) -> u8 {
 
 fn built_in_safety_floors(context: &ApprovalContext) -> Vec<ApprovalSafetyFloor> {
     let mut floors = Vec::new();
-    if let Some(command) = &context.command {
+    if let Some(floor) = &context.action_floor {
+        floors.push(floor.clone());
+    } else if let Some(command) = &context.command {
         if command
             .categories
             .contains(&crate::security::command::CommandCategory::DestructiveDelete)
@@ -578,12 +582,18 @@ pub enum ApprovalKind {
 pub struct ApprovalRequest {
     pub id: String,
     pub kind: ApprovalKind,
+    #[serde(default = "default_approval_request_allow_session")]
+    pub allow_session: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default)]
     pub payload: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_policy_change: Option<ExecPolicyUpdate>,
+}
+
+fn default_approval_request_allow_session() -> bool {
+    true
 }
 
 /// Optional execpolicy update suggestion.
@@ -617,11 +627,12 @@ mod tests {
         ApprovalContext {
             tool_call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
-            tool_kind: Some(crate::tools::ToolApprovalKind::CommandExecution),
+            tool_kind: Some(crate::tools::ToolSafetyKind::CommandExecution),
             preview: serde_json::json!({"command": "echo hi"}),
             metadata: serde_json::Value::Null,
             command: None,
             filesystem: Vec::new(),
+            action_floor: None,
             sandbox: None,
             mcp: None,
             network: None,
@@ -736,7 +747,7 @@ mod tests {
                     "ask-kind",
                     ApprovalAction::Ask,
                     ApprovalMatcher::ToolKind {
-                        kind: crate::tools::ToolApprovalKind::CommandExecution,
+                        kind: crate::tools::ToolSafetyKind::CommandExecution,
                     },
                 ),
                 ApprovalRule::new(

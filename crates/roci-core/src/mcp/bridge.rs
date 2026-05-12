@@ -56,14 +56,11 @@ impl DynamicToolProvider for MCPToolAdapter {
 }
 
 fn map_mcp_tool_to_dynamic(tool: MCPToolSchema) -> DynamicTool {
-    DynamicTool {
-        name: tool.name,
-        description: tool.description.unwrap_or_default(),
-        parameters: AgentToolParameters::from_schema(tool.input_schema),
-        approval: crate::tools::ToolApproval::requires_approval(
-            crate::tools::ToolApprovalKind::Other,
-        ),
-    }
+    DynamicTool::new(
+        tool.name,
+        tool.description.unwrap_or_default(),
+        AgentToolParameters::from_schema(tool.input_schema),
+    )
 }
 
 #[cfg(test)]
@@ -169,6 +166,11 @@ mod tests {
         assert_eq!(dynamic.name, "search");
         assert_eq!(dynamic.description, "query index");
         assert_eq!(dynamic.parameters.schema["type"], "object");
+        assert_eq!(dynamic.safety, crate::tools::ToolSafetyPlan::default());
+        assert_eq!(
+            dynamic.safety_summary,
+            crate::tools::ToolSafetySummary::default()
+        );
     }
 
     #[tokio::test]

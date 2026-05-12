@@ -7,7 +7,9 @@ use crate::agent::subagents::{
     ModelCandidate, SubagentProfile, SubagentProfileRegistry, SubagentSupervisorConfig,
 };
 use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
-use crate::tools::{AgentToolParameters, ToolApproval, ToolApprovalKind, ToolVisibilityPolicy};
+use crate::tools::{
+    AgentToolParameters, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary, ToolVisibilityPolicy,
+};
 #[cfg(feature = "agent")]
 use crate::tools::{ToolArguments, ToolExecutionContext};
 use std::sync::Arc;
@@ -47,7 +49,8 @@ async fn resolve_tools_for_run_merges_static_and_dynamic_tools() {
             name: "dynamic".into(),
             description: "dynamic tool".into(),
             parameters: AgentToolParameters::empty(),
-            approval: ToolApproval::requires_approval(ToolApprovalKind::Other),
+            safety: ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
+            safety_summary: ToolSafetySummary::default(),
         }]));
 
     let mut config = test_agent_config();
@@ -76,7 +79,8 @@ async fn resolve_tools_for_run_applies_visibility_policy_to_static_and_dynamic_t
             name: "dynamic".into(),
             description: "dynamic tool".into(),
             parameters: AgentToolParameters::empty(),
-            approval: ToolApproval::requires_approval(ToolApprovalKind::Other),
+            safety: ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
+            safety_summary: ToolSafetySummary::default(),
         }]));
 
     let mut config = test_agent_config();

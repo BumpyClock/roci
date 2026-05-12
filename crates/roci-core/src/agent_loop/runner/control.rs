@@ -1,7 +1,7 @@
 use super::super::approvals::{
     ApprovalAction, ApprovalContext, ApprovalDecision, ApprovalEvaluation,
     ApprovalFilesystemAccess, ApprovalGrant, ApprovalGrantKey, ApprovalHandler, ApprovalKind,
-    ApprovalPolicy, ApprovalRequest,
+    ApprovalPolicy, ApprovalRequest, ApprovalSafetyFloor,
 };
 use super::super::events::{AgentEvent, RunEvent, RunEventPayload, RunEventStream, RunLifecycle};
 use super::super::types::{RunId, RunResult};
@@ -15,7 +15,8 @@ use crate::human_interaction::{
     HumanInteractionSource, ToolPermissionKind, ToolPermissionRequest, ToolPermissionResponse,
     ToolPermissionSessionApprovals, ToolPermissionSessionKey,
 };
-use crate::tools::{Tool, ToolApproval, ToolApprovalKind};
+use crate::tools::ToolFilesystemAccess;
+use crate::tools::{Tool, ToolActionFloor, ToolSafetyKind, ToolSafetyPlan};
 use crate::types::{AgentToolCall, ModelMessage, StreamEventType, TextStreamDelta};
 
 pub(super) fn emit_failed_result(
@@ -212,29 +213,33 @@ pub(super) async fn resolve_approval(
     session_approvals: &ToolPermissionSessionApprovals,
     call: &AgentToolCall,
     tool: Option<&dyn Tool>,
+    safety_plan: &ToolSafetyPlan,
 ) -> ApprovalDecision {
-    let approval = tool
-        .map(Tool::approval)
-        .unwrap_or_else(|| ToolApproval::requires_approval(ToolApprovalKind::Other));
-    let tool_kind = match approval {
-        ToolApproval::AutoAccept { .. } => None,
-        ToolApproval::RequiresApproval { kind } => Some(kind),
-    };
+    let tool_kind = safety_plan.approval.kind;
+    let allow_session = safety_plan.approval.allow_session;
     let permission_kind = permission_kind_for_tool_metadata(tool_kind, tool.is_some());
-    let session_key = ToolPermissionSessionKey::for_tool_call(permission_kind, call);
-    let grant_key = ApprovalGrantKey::new(
-        permission_kind,
-        call.name.clone(),
-        call.recipient.clone(),
-        Some(call.arguments.clone()),
-        None,
-    );
-    let legacy_session_hit = session_approvals.lock().await.contains(&session_key);
+    let session_key =
+        allow_session.then(|| ToolPermissionSessionKey::for_tool_call(permission_kind, call));
+    let grant_key = allow_session.then(|| {
+        ApprovalGrantKey::new(
+            permission_kind,
+            call.name.clone(),
+            call.recipient.clone(),
+            Some(call.arguments.clone()),
+            None,
+        )
+    });
+    let legacy_session_hit = match &session_key {
+        Some(session_key) => session_approvals.lock().await.contains(session_key),
+        None => false,
+    };
     let evaluation_policy = if legacy_session_hit {
         let mut policy = policy.clone();
-        policy.session_grants.grants.push(ApprovalGrant::Exact {
-            key: grant_key.clone(),
-        });
+        if let Some(grant_key) = &grant_key {
+            policy.session_grants.grants.push(ApprovalGrant::Exact {
+                key: grant_key.clone(),
+            });
+        }
         policy
     } else {
         policy.clone()
@@ -242,24 +247,25 @@ pub(super) async fn resolve_approval(
     let context = ApprovalContext {
         tool_call_id: call.id.clone(),
         tool_name: call.name.clone(),
-        tool_kind,
+        tool_kind: Some(tool_kind),
         preview: serde_json::json!({
             "tool_name": call.name.clone(),
             "tool_call_id": call.id.clone(),
         }),
         metadata: serde_json::Value::Null,
-        command: approval_command_insight(call, tool_kind),
-        filesystem: approval_filesystem_accesses(call),
+        command: safety_plan.command.clone(),
+        filesystem: safety_plan_filesystem_accesses(safety_plan),
+        action_floor: approval_action_floor_for_plan(safety_plan),
         sandbox: None,
         mcp: None,
         network: None,
-        grant_key: Some(grant_key),
+        grant_key,
     };
     let evaluation = evaluation_policy.evaluate(&context);
 
     match evaluation.action {
         ApprovalAction::Allow => {
-            if legacy_session_hit && evaluation.matched_session_grant {
+            if allow_session && legacy_session_hit && evaluation.matched_session_grant {
                 return ApprovalDecision::AcceptForSession;
             }
             return ApprovalDecision::Accept;
@@ -268,7 +274,7 @@ pub(super) async fn resolve_approval(
         ApprovalAction::Ask => {}
     }
 
-    if matches!(approval, ToolApproval::AutoAccept { .. })
+    if safety_plan.approval.auto_accept_under_ask
         && matches!(policy.default_action, ApprovalAction::Ask)
         && evaluation.matched_rules.is_empty()
         && evaluation.safety_floors.is_empty()
@@ -276,18 +282,22 @@ pub(super) async fn resolve_approval(
         return ApprovalDecision::Accept;
     }
 
-    let kind = approval_kind_for_tool_metadata(tool_kind.unwrap_or(ToolApprovalKind::Other));
+    let kind = approval_kind_for_tool_metadata(tool_kind);
     let request = ApprovalRequest {
         id: call.id.clone(),
         kind,
+        allow_session,
         reason: evaluation
             .reason
             .clone()
+            .or_else(|| safety_plan.approval.reason.clone())
             .or_else(|| Some(format!("Tool: {}", call.name))),
         payload: serde_json::json!({
             "tool_name": call.name.clone(),
             "tool_call_id": call.id.clone(),
             "preview": context.preview,
+            "command": sanitized_command_for_payload(context.command.as_ref()),
+            "filesystem": context.filesystem,
             "evaluation": sanitized_evaluation_for_payload(&evaluation),
         }),
         suggested_policy_change: None,
@@ -308,7 +318,7 @@ pub(super) async fn resolve_approval(
             call,
             request.clone(),
             permission_kind,
-            Some(session_key.clone()),
+            session_key.clone(),
         )
         .await
     } else if let Some(handler) = handler {
@@ -316,7 +326,14 @@ pub(super) async fn resolve_approval(
     } else {
         ApprovalDecision::Decline
     };
-    if matches!(decision, ApprovalDecision::AcceptForSession) {
+    let decision = if allow_session {
+        decision
+    } else if matches!(decision, ApprovalDecision::AcceptForSession) {
+        ApprovalDecision::Accept
+    } else {
+        decision
+    };
+    if let (ApprovalDecision::AcceptForSession, Some(session_key)) = (decision, session_key) {
         session_approvals.lock().await.insert(session_key);
     }
     agent_emitter.emit(AgentEvent::ApprovalResolved {
@@ -326,55 +343,42 @@ pub(super) async fn resolve_approval(
     decision
 }
 
-fn approval_command_insight(
-    call: &AgentToolCall,
-    tool_kind: Option<ToolApprovalKind>,
-) -> Option<crate::security::command::CommandInsight> {
-    if tool_kind != Some(ToolApprovalKind::CommandExecution) {
-        return None;
-    }
-    call.arguments
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .map(crate::security::command::classify_shell_command)
+fn safety_plan_filesystem_accesses(safety_plan: &ToolSafetyPlan) -> Vec<ApprovalFilesystemAccess> {
+    safety_plan
+        .filesystem
+        .iter()
+        .map(approval_filesystem_access)
+        .collect()
 }
 
-fn approval_filesystem_accesses(call: &AgentToolCall) -> Vec<ApprovalFilesystemAccess> {
-    let operation = match call.name.as_str() {
-        "read_file" => Some(crate::security::filesystem::PathOperation::Read),
-        "write_file" => Some(crate::security::filesystem::PathOperation::Write),
-        "list_directory" => Some(crate::security::filesystem::PathOperation::List),
-        "grep" => Some(crate::security::filesystem::PathOperation::Search),
-        _ => None,
-    };
-    let Some(operation) = operation else {
-        return Vec::new();
-    };
-    let path = call
-        .arguments
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| default_approval_filesystem_path(&call.name).unwrap_or(""));
-    if path.is_empty() {
-        return Vec::new();
-    }
-
-    // These path facts drive approval rule matching. Enforcement remains in
-    // FilesystemPolicy/tool execution once hosts configure restrictions.
-    vec![ApprovalFilesystemAccess {
-        operation,
+fn approval_filesystem_access(access: &ToolFilesystemAccess) -> ApprovalFilesystemAccess {
+    let path = access.path.to_string_lossy();
+    ApprovalFilesystemAccess {
+        operation: access.operation,
         decision: crate::security::filesystem::FilesystemDecision {
             allowed: true,
-            normalized_path: Some(normalize_approval_path(path)),
+            normalized_path: Some(normalize_approval_path(&path)),
             reason: "approval context path fact".to_string(),
             matched_boundary: None,
         },
-    }]
+    }
 }
 
-fn default_approval_filesystem_path(tool_name: &str) -> Option<&'static str> {
-    // Grep searches the current working directory when no path is provided.
-    (tool_name == "grep").then_some(".")
+fn approval_action_floor_for_plan(safety_plan: &ToolSafetyPlan) -> Option<ApprovalSafetyFloor> {
+    let floor = safety_plan.approval.action_floor?;
+    let effect = match floor {
+        ToolActionFloor::Ask => ApprovalAction::Ask,
+        ToolActionFloor::Deny => ApprovalAction::Deny,
+    };
+    Some(ApprovalSafetyFloor {
+        id: "tool_action_floor".to_string(),
+        effect,
+        reason: safety_plan
+            .approval
+            .reason
+            .clone()
+            .unwrap_or_else(|| "tool safety plan requires approval floor".to_string()),
+    })
 }
 
 fn normalize_approval_path(path: &str) -> std::path::PathBuf {
@@ -398,6 +402,20 @@ fn sanitized_evaluation_for_payload(evaluation: &ApprovalEvaluation) -> Approval
         .as_ref()
         .and_then(sanitized_grant_for_payload);
     sanitized
+}
+
+fn sanitized_command_for_payload(
+    command: Option<&crate::security::command::CommandInsight>,
+) -> serde_json::Value {
+    let Some(command) = command else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "primary_executable": command.primary_executable.clone(),
+        "categories": command.categories.clone(),
+        "confidence": command.confidence.clone(),
+        "reasons": command.reasons.clone(),
+    })
 }
 
 fn sanitized_grant_for_payload(grant: &ApprovalGrant) -> Option<ApprovalGrant> {
@@ -501,6 +519,7 @@ pub(super) async fn resolve_iteration_limit_approval(
     let request = ApprovalRequest {
         id: format!("run-{run_id}-continue-{attempt}"),
         kind: ApprovalKind::Other,
+        allow_session: false,
         reason: Some(format!(
             "Reached iteration limit ({current_limit}). Continue for {extension} more iterations?"
         )),
@@ -544,29 +563,26 @@ pub(super) struct IterationLimitApprovalContext {
     pub(super) attempt: usize,
 }
 
-fn approval_kind_for_tool_metadata(kind: ToolApprovalKind) -> ApprovalKind {
+fn approval_kind_for_tool_metadata(kind: ToolSafetyKind) -> ApprovalKind {
     match kind {
-        ToolApprovalKind::CommandExecution => ApprovalKind::CommandExecution,
-        ToolApprovalKind::FileChange => ApprovalKind::FileChange,
-        ToolApprovalKind::Read
-        | ToolApprovalKind::Mcp
-        | ToolApprovalKind::CustomTool
-        | ToolApprovalKind::Other => ApprovalKind::Other,
+        ToolSafetyKind::CommandExecution => ApprovalKind::CommandExecution,
+        ToolSafetyKind::FileChange => ApprovalKind::FileChange,
+        ToolSafetyKind::Read
+        | ToolSafetyKind::Mcp
+        | ToolSafetyKind::CustomTool
+        | ToolSafetyKind::Other => ApprovalKind::Other,
     }
 }
 
-fn permission_kind_for_tool_metadata(
-    kind: Option<ToolApprovalKind>,
-    known_tool: bool,
-) -> ToolPermissionKind {
+fn permission_kind_for_tool_metadata(kind: ToolSafetyKind, known_tool: bool) -> ToolPermissionKind {
     match kind {
-        Some(ToolApprovalKind::CommandExecution) => ToolPermissionKind::Shell,
-        Some(ToolApprovalKind::FileChange) => ToolPermissionKind::Write,
-        Some(ToolApprovalKind::Read) => ToolPermissionKind::Read,
-        Some(ToolApprovalKind::Mcp) => ToolPermissionKind::Mcp,
-        Some(ToolApprovalKind::CustomTool) => ToolPermissionKind::CustomTool,
-        Some(ToolApprovalKind::Other) if known_tool => ToolPermissionKind::CustomTool,
-        Some(ToolApprovalKind::Other) | None => ToolPermissionKind::Other,
+        ToolSafetyKind::CommandExecution => ToolPermissionKind::Shell,
+        ToolSafetyKind::FileChange => ToolPermissionKind::Write,
+        ToolSafetyKind::Read => ToolPermissionKind::Read,
+        ToolSafetyKind::Mcp => ToolPermissionKind::Mcp,
+        ToolSafetyKind::CustomTool => ToolPermissionKind::CustomTool,
+        ToolSafetyKind::Other if known_tool => ToolPermissionKind::CustomTool,
+        ToolSafetyKind::Other => ToolPermissionKind::Other,
     }
 }
 
@@ -586,7 +602,7 @@ mod tests {
 
     use crate::agent_loop::approvals::{ApprovalMatcher, ApprovalRule};
     use crate::human_interaction::ToolPermissionDecision;
-    use crate::tools::{AgentTool, AgentToolParameters};
+    use crate::tools::{AgentTool, AgentToolParameters, ToolSafetySummary};
     use uuid::Uuid;
 
     fn emitter_with_events() -> (RunEventEmitter, Arc<Mutex<Vec<RunEvent>>>) {
@@ -607,14 +623,22 @@ mod tests {
         }
     }
 
-    fn tool(name: &str, approval: ToolApproval) -> AgentTool {
+    fn safety_summary(kind: ToolSafetyKind) -> ToolSafetySummary {
+        ToolSafetySummary {
+            approval_kind: kind,
+            ..ToolSafetySummary::default()
+        }
+    }
+
+    fn tool(name: &str, plan: ToolSafetyPlan) -> AgentTool {
+        let summary = safety_summary(plan.approval.kind);
         AgentTool::new(
             name,
             format!("{name} tool"),
             AgentToolParameters::empty(),
             |_args, _ctx| async { Ok(serde_json::json!({})) },
         )
-        .with_approval(approval)
+        .with_static_safety(plan, summary)
     }
 
     fn session_approvals() -> ToolPermissionSessionApprovals {
@@ -660,14 +684,16 @@ mod tests {
         )
     }
 
-    async fn routed_permission_kind(tool_kind: Option<ToolApprovalKind>) -> ToolPermissionKind {
+    async fn routed_permission_kind(tool_kind: Option<ToolSafetyKind>) -> ToolPermissionKind {
         let (emitter, _events) = emitter_with_events();
         let (agent_emitter, agent_events, coordinator) =
             responding_permission_emitter(ToolPermissionDecision::AllowOnce);
         let approvals = session_approvals();
         let call = tool_call("permission_tool");
-        let owned_tool =
-            tool_kind.map(|kind| tool("permission_tool", ToolApproval::requires_approval(kind)));
+        let safety_plan = tool_kind
+            .map(ToolSafetyPlan::approval_required)
+            .unwrap_or_default();
+        let owned_tool = tool_kind.map(|_| tool("permission_tool", safety_plan.clone()));
 
         let decision = resolve_approval(
             &emitter,
@@ -678,6 +704,7 @@ mod tests {
             &approvals,
             &call,
             owned_tool.as_ref().map(|tool| tool as &dyn Tool),
+            &safety_plan,
         )
         .await;
         assert_eq!(decision, ApprovalDecision::Accept);
@@ -699,14 +726,10 @@ mod tests {
     async fn ask_policy_requires_approval_for_shell_and_write_file() {
         let (emitter, events) = emitter_with_events();
         let agent_emitter = AgentEventEmitter::new(None);
-        let shell = tool(
-            "shell",
-            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
-        );
-        let write_file = tool(
-            "write_file",
-            ToolApproval::requires_approval(ToolApprovalKind::FileChange),
-        );
+        let shell_plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);
+        let write_plan = ToolSafetyPlan::approval_required(ToolSafetyKind::FileChange);
+        let shell = tool("shell", shell_plan.clone());
+        let write_file = tool("write_file", write_plan.clone());
         let approvals = session_approvals();
 
         let shell_decision = resolve_approval(
@@ -718,6 +741,7 @@ mod tests {
             &approvals,
             &tool_call("shell"),
             Some(&shell),
+            &shell_plan,
         )
         .await;
         let write_decision = resolve_approval(
@@ -729,6 +753,7 @@ mod tests {
             &approvals,
             &tool_call("write_file"),
             Some(&write_file),
+            &write_plan,
         )
         .await;
 
@@ -776,10 +801,10 @@ mod tests {
     async fn always_policy_prompts_for_destructive_shell_floor() {
         let (emitter, events) = emitter_with_events();
         let agent_emitter = AgentEventEmitter::new(None);
-        let shell = tool(
-            "shell",
-            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
+        let shell_plan = ToolSafetyPlan::from_command_insight(
+            crate::security::command::classify_shell_command("rm -rf target"),
         );
+        let shell = tool("shell", shell_plan.clone());
         let approvals = session_approvals();
         let call = AgentToolCall {
             id: "shell-call".to_string(),
@@ -797,6 +822,7 @@ mod tests {
             &approvals,
             &call,
             Some(&shell),
+            &shell_plan,
         )
         .await;
 
@@ -815,14 +841,41 @@ mod tests {
         assert_eq!(
             request
                 .payload
-                .pointer("/evaluation/safety_floors/0/id")
+                .pointer("/evaluation/safety_floors/0/effect")
                 .and_then(serde_json::Value::as_str),
-            Some("destructive_command")
+            Some("ask")
         );
     }
 
     #[tokio::test]
-    async fn approval_payload_omits_nested_raw_arguments() {
+    async fn deny_action_floor_declines_without_prompt() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+        let mut plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);
+        plan.approval.action_floor = Some(ToolActionFloor::Deny);
+        plan.approval.reason = Some("blocked by tool safety plan".to_string());
+        let shell = tool("shell", plan.clone());
+        let approvals = session_approvals();
+
+        let decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::always(),
+            None,
+            None,
+            &approvals,
+            &tool_call("shell"),
+            Some(&shell),
+            &plan,
+        )
+        .await;
+
+        assert_eq!(decision, ApprovalDecision::Decline);
+        assert!(events.lock().expect("event lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_payload_includes_safety_facts_and_omits_raw_arguments() {
         let (emitter, events) = emitter_with_events();
         let agent_events = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
         let sink_agent_events = agent_events.clone();
@@ -833,10 +886,15 @@ mod tests {
                 .push(event);
         });
         let agent_emitter = AgentEventEmitter::new(Some(agent_sink));
-        let shell = tool(
-            "shell",
-            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
+        let shell_plan = ToolSafetyPlan::from_command_insight(
+            crate::security::command::classify_shell_command("rm -rf sk-secret-leak-123"),
         );
+        let mut shell_plan = shell_plan;
+        shell_plan.filesystem.push(ToolFilesystemAccess {
+            operation: crate::security::filesystem::PathOperation::Delete,
+            path: "target/tmp".into(),
+        });
+        let shell = tool("shell", shell_plan.clone());
         let approvals = session_approvals();
         let call = AgentToolCall {
             id: "shell-call".to_string(),
@@ -854,6 +912,7 @@ mod tests {
             &approvals,
             &call,
             Some(&shell),
+            &shell_plan,
         )
         .await;
 
@@ -864,7 +923,16 @@ mod tests {
         };
         let payload = serde_json::to_string(&request.payload).expect("payload serializes");
         assert!(!payload.contains("sk-secret-leak-123"));
+        assert!(!payload.contains("normalized_command"));
         assert!(request.payload.get("arguments").is_none());
+        assert_eq!(
+            request
+                .payload
+                .pointer("/command/primary_executable")
+                .and_then(serde_json::Value::as_str),
+            Some("rm")
+        );
+        assert!(request.payload.get("filesystem").is_some());
         assert!(request.payload.get("evaluation").is_some());
 
         let agent_events = agent_events.lock().expect("agent event lock");
@@ -878,6 +946,7 @@ mod tests {
         let agent_payload =
             serde_json::to_string(&agent_request.payload).expect("agent payload serializes");
         assert!(!agent_payload.contains("sk-secret-leak-123"));
+        assert!(!agent_payload.contains("normalized_command"));
         assert!(agent_request.payload.get("arguments").is_none());
     }
 
@@ -885,7 +954,8 @@ mod tests {
     async fn grep_without_path_uses_current_directory_for_filesystem_matchers() {
         let (emitter, events) = emitter_with_events();
         let agent_emitter = AgentEventEmitter::new(None);
-        let grep = tool("grep", ToolApproval::safe_read_only());
+        let grep_plan = ToolSafetyPlan::file_search(".");
+        let grep = tool("grep", grep_plan.clone());
         let approvals = session_approvals();
         let call = AgentToolCall {
             id: "grep-call".to_string(),
@@ -912,6 +982,7 @@ mod tests {
             &approvals,
             &call,
             Some(&grep),
+            &grep_plan,
         )
         .await;
 
@@ -928,7 +999,8 @@ mod tests {
     async fn filesystem_boundary_matchers_use_lexically_normalized_path_facts() {
         let (emitter, events) = emitter_with_events();
         let agent_emitter = AgentEventEmitter::new(None);
-        let read_file = tool("read_file", ToolApproval::safe_read_only());
+        let read_plan = ToolSafetyPlan::file_read("../secret");
+        let read_file = tool("read_file", read_plan.clone());
         let approvals = session_approvals();
         let call = AgentToolCall {
             id: "read-call".to_string(),
@@ -957,6 +1029,7 @@ mod tests {
             &approvals,
             &call,
             Some(&read_file),
+            &read_plan,
         )
         .await;
 
@@ -968,7 +1041,8 @@ mod tests {
     async fn ask_policy_auto_accepts_explicit_safe_tools() {
         let (emitter, events) = emitter_with_events();
         let agent_emitter = AgentEventEmitter::new(None);
-        let read_file = tool("read_file", ToolApproval::safe_read_only());
+        let read_plan = ToolSafetyPlan::file_read("README.md");
+        let read_file = tool("read_file", read_plan.clone());
         let approvals = session_approvals();
 
         let decision = resolve_approval(
@@ -980,11 +1054,79 @@ mod tests {
             &approvals,
             &tool_call("read_file"),
             Some(&read_file),
+            &read_plan,
         )
         .await;
 
         assert_eq!(decision, ApprovalDecision::Accept);
         assert!(events.lock().expect("event lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn allow_session_false_auto_accepts_and_downgrades_session_accept() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+        let approvals = session_approvals();
+        let host_plan = ToolSafetyPlan::host_input();
+        let host_tool = tool("ask_user", host_plan.clone());
+
+        let auto_decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::ask(),
+            None,
+            None,
+            &approvals,
+            &tool_call("ask_user"),
+            Some(&host_tool),
+            &host_plan,
+        )
+        .await;
+
+        assert_eq!(auto_decision, ApprovalDecision::Accept);
+        assert!(events.lock().expect("event lock").is_empty());
+        assert!(approvals.lock().await.is_empty());
+
+        let (emitter, _events) = emitter_with_events();
+        let (agent_emitter, agent_events, coordinator) =
+            responding_permission_emitter(ToolPermissionDecision::AllowForSession);
+        let mut policy = ApprovalPolicy::ask();
+        policy.rules.push(ApprovalRule::new(
+            "ask-host-input",
+            ApprovalAction::Ask,
+            ApprovalMatcher::ToolName {
+                name: "ask_user".to_string(),
+            },
+        ));
+
+        let prompted_decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &policy,
+            None,
+            Some(&coordinator),
+            &approvals,
+            &tool_call("ask_user"),
+            Some(&host_tool),
+            &host_plan,
+        )
+        .await;
+
+        assert_eq!(prompted_decision, ApprovalDecision::Accept);
+        assert!(approvals.lock().await.is_empty());
+        let events = agent_events.lock().expect("agent event lock");
+        let permission = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::HumanInteractionRequested { request } => match &request.payload {
+                    HumanInteractionPayload::ToolPermission(permission) => Some(permission),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("tool permission request");
+        assert!(!permission.approval.allow_session);
+        assert!(permission.session_key.is_none());
     }
 
     #[tokio::test]
@@ -999,6 +1141,8 @@ mod tests {
             AgentToolParameters::empty(),
             |_args, _ctx| async { Ok(serde_json::json!({})) },
         );
+        let custom_plan = ToolSafetyPlan::default();
+        let unknown_plan = ToolSafetyPlan::default();
         let custom_decision = resolve_approval(
             &emitter,
             &agent_emitter,
@@ -1008,6 +1152,7 @@ mod tests {
             &approvals,
             &tool_call("custom_tool"),
             Some(&custom),
+            &custom_plan,
         )
         .await;
         let unknown_decision = resolve_approval(
@@ -1019,6 +1164,7 @@ mod tests {
             &approvals,
             &tool_call("unknown_tool"),
             None,
+            &unknown_plan,
         )
         .await;
 
@@ -1036,27 +1182,27 @@ mod tests {
     #[tokio::test]
     async fn tool_permission_requests_cover_all_permission_kinds() {
         assert_eq!(
-            routed_permission_kind(Some(ToolApprovalKind::CommandExecution)).await,
+            routed_permission_kind(Some(ToolSafetyKind::CommandExecution)).await,
             ToolPermissionKind::Shell
         );
         assert_eq!(
-            routed_permission_kind(Some(ToolApprovalKind::FileChange)).await,
+            routed_permission_kind(Some(ToolSafetyKind::FileChange)).await,
             ToolPermissionKind::Write
         );
         assert_eq!(
-            routed_permission_kind(Some(ToolApprovalKind::Read)).await,
+            routed_permission_kind(Some(ToolSafetyKind::Read)).await,
             ToolPermissionKind::Read
         );
         assert_eq!(
-            routed_permission_kind(Some(ToolApprovalKind::Mcp)).await,
+            routed_permission_kind(Some(ToolSafetyKind::Mcp)).await,
             ToolPermissionKind::Mcp
         );
         assert_eq!(
-            routed_permission_kind(Some(ToolApprovalKind::CustomTool)).await,
+            routed_permission_kind(Some(ToolSafetyKind::CustomTool)).await,
             ToolPermissionKind::CustomTool
         );
         assert_eq!(
-            routed_permission_kind(Some(ToolApprovalKind::Other)).await,
+            routed_permission_kind(Some(ToolSafetyKind::Other)).await,
             ToolPermissionKind::CustomTool
         );
         assert_eq!(
@@ -1082,10 +1228,8 @@ mod tests {
             let (agent_emitter, _agent_events, coordinator) =
                 responding_permission_emitter(permission_decision);
             let approvals = session_approvals();
-            let shell = tool(
-                "shell",
-                ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
-            );
+            let shell_plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);
+            let shell = tool("shell", shell_plan.clone());
             let decision = resolve_approval(
                 &emitter,
                 &agent_emitter,
@@ -1095,6 +1239,7 @@ mod tests {
                 &approvals,
                 &tool_call("shell"),
                 Some(&shell),
+                &shell_plan,
             )
             .await;
 
@@ -1108,10 +1253,8 @@ mod tests {
         let (agent_emitter, agent_events, coordinator) =
             responding_permission_emitter(ToolPermissionDecision::AllowForSession);
         let approvals = session_approvals();
-        let shell = tool(
-            "shell",
-            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
-        );
+        let shell_plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);
+        let shell = tool("shell", shell_plan.clone());
         let first_call = AgentToolCall {
             id: "first".to_string(),
             name: "shell".to_string(),
@@ -1140,6 +1283,7 @@ mod tests {
             &approvals,
             &first_call,
             Some(&shell),
+            &shell_plan,
         )
         .await;
         assert_eq!(first_decision, ApprovalDecision::AcceptForSession);
@@ -1154,6 +1298,7 @@ mod tests {
             &approvals,
             &second_call,
             Some(&shell),
+            &shell_plan,
         )
         .await;
         assert_eq!(second_decision, ApprovalDecision::AcceptForSession);
@@ -1168,6 +1313,7 @@ mod tests {
             &approvals,
             &different_args,
             Some(&shell),
+            &shell_plan,
         )
         .await;
         assert_eq!(different_decision, ApprovalDecision::AcceptForSession);
@@ -1185,10 +1331,8 @@ mod tests {
             arguments: serde_json::json!({ "command": "echo cached" }),
             recipient: None,
         };
-        let shell = tool(
-            "shell",
-            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
-        );
+        let shell_plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);
+        let shell = tool("shell", shell_plan.clone());
         approvals
             .lock()
             .await
@@ -1214,6 +1358,7 @@ mod tests {
             &approvals,
             &call,
             Some(&shell),
+            &shell_plan,
         )
         .await;
 
@@ -1238,10 +1383,8 @@ mod tests {
             arguments: serde_json::json!({ "command": "echo cached" }),
             recipient: None,
         };
-        let shell = tool(
-            "shell",
-            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
-        );
+        let shell_plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);
+        let shell = tool("shell", shell_plan.clone());
         approvals
             .lock()
             .await
@@ -1267,6 +1410,7 @@ mod tests {
             &approvals,
             &call,
             Some(&shell),
+            &shell_plan,
         )
         .await;
 

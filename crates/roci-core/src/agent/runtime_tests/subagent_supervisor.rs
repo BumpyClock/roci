@@ -29,7 +29,8 @@ use crate::provider::{
 };
 use crate::tools::tool::Tool;
 use crate::tools::{
-    AgentTool, AgentToolParameters, AskUserPrompt, ToolApproval, UserInputRequest, UserInputResult,
+    AgentTool, AgentToolParameters, AskUserPrompt, ToolSafetyKind, ToolSafetyPlan,
+    ToolSafetySummary, UserInputRequest, UserInputResult,
 };
 use crate::types::{ModelMessage, Role, StreamEventType, TextStreamDelta, Usage};
 
@@ -41,6 +42,15 @@ fn make_test_model() -> LanguageModel {
     LanguageModel::Known {
         provider_key: "test".into(),
         model_id: "test-model".into(),
+    }
+}
+
+fn host_input_safety_summary() -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: false,
+        destructive_by_default: false,
+        concurrency_safe_by_default: false,
+        approval_kind: ToolSafetyKind::Other,
     }
 }
 
@@ -393,7 +403,7 @@ fn make_blocking_ask_user_supervisor() -> SubagentSupervisor {
                 Ok(serde_json::json!({ "answer": answer }))
             },
         )
-        .with_approval(ToolApproval::safe_host_input()),
+        .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
     );
 
     let mut base_config = make_base_config();

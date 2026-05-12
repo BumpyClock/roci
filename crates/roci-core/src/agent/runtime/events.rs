@@ -337,6 +337,7 @@ mod tests {
         ApprovalRequest {
             id: id.to_string(),
             kind: ApprovalKind::CommandExecution,
+            allow_session: true,
             reason: Some("needs command".to_string()),
             payload: serde_json::json!({ "tool_name": "shell" }),
             suggested_policy_change: None,

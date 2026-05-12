@@ -1,7 +1,74 @@
 use super::*;
 
 use crate::agent_loop::{ApprovalAction, ApprovalDecision, ApprovalMatcher, ApprovalRule};
-use crate::tools::ToolApprovalKind;
+use crate::tools::{ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary};
+
+fn read_only_safety_summary(kind: ToolSafetyKind) -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: true,
+        destructive_by_default: false,
+        concurrency_safe_by_default: true,
+        approval_kind: kind,
+    }
+}
+
+fn approval_required_safety_summary(kind: ToolSafetyKind) -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: false,
+        destructive_by_default: false,
+        concurrency_safe_by_default: false,
+        approval_kind: kind,
+    }
+}
+
+fn command_safety_from_args(args: &ToolArguments) -> ToolSafetyPlan {
+    let command = args.get_str("command").unwrap_or("");
+    ToolSafetyPlan::from_command_insight(crate::security::command::classify_shell_command(command))
+}
+
+fn tracked_safe_success_tool(
+    name: &str,
+    delay: Duration,
+    active_calls: Arc<AtomicUsize>,
+    max_active_calls: Arc<AtomicUsize>,
+) -> Arc<dyn Tool> {
+    let tool_name = name.to_string();
+    Arc::new(
+        AgentTool::new(
+            tool_name.clone(),
+            format!("{tool_name} tool"),
+            AgentToolParameters::empty(),
+            move |_args, _ctx: ToolExecutionContext| {
+                let tool_name = tool_name.clone();
+                let active_calls = active_calls.clone();
+                let max_active_calls = max_active_calls.clone();
+                async move {
+                    let active_now = active_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut observed_max = max_active_calls.load(Ordering::SeqCst);
+                    while active_now > observed_max {
+                        match max_active_calls.compare_exchange(
+                            observed_max,
+                            active_now,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => break,
+                            Err(next) => observed_max = next,
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    active_calls.fetch_sub(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({ "tool": tool_name }))
+                }
+            },
+        )
+        .with_static_safety(
+            ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+            read_only_safety_summary(ToolSafetyKind::Read),
+        ),
+    )
+}
+
 #[tokio::test]
 async fn tool_with_schema_rejects_bad_args_through_runner() {
     let (runner, _requests) = test_runner(ProviderScenario::SchemaToolBadArgs);
@@ -180,6 +247,69 @@ async fn pre_tool_use_hook_replace_args_are_used_by_tool() {
 }
 
 #[tokio::test]
+async fn invalid_finalized_tool_args_skip_approval_and_execution() {
+    let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+    let (sink, events) = capture_events();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let approval_requests = Arc::new(AtomicUsize::new(0));
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+    request.tools = vec![tracked_schema_path_tool(executions.clone())];
+    request.approval_policy = ApprovalPolicy::ask();
+    request.approval_handler = Some(Arc::new({
+        let approval_requests = approval_requests.clone();
+        move |_request| {
+            let approval_requests = approval_requests.clone();
+            Box::pin(async move {
+                approval_requests.fetch_add(1, Ordering::SeqCst);
+                ApprovalDecision::Accept
+            })
+        }
+    }));
+    request.event_sink = Some(sink);
+    request.hooks = RunHooks {
+        compaction: None,
+        pre_tool_use: Some(Arc::new(|_call, _cancel| {
+            Box::pin(async {
+                Ok(PreToolUseHookResult::ReplaceArgs {
+                    args: serde_json::json!({}),
+                })
+            })
+        })),
+        post_tool_use: None,
+    };
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run should complete without timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(approval_requests.load(Ordering::SeqCst), 0);
+
+    let events = events.lock().expect("event lock");
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.payload, RunEventPayload::ApprovalRequired { .. })),
+        "invalid finalized args must skip approval"
+    );
+    let tool_results = tool_results_from_events(&events);
+    assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+    let (call_id, result_json, is_error) = &tool_results[0];
+    assert_eq!(call_id, "schema-call-1");
+    assert!(*is_error, "validation failure must set is_error: true");
+    let error_msg = result_json["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("Argument validation failed"),
+        "expected validation error prefix, got: {error_msg}"
+    );
+    assert!(
+        error_msg.contains("missing required field 'path'"),
+        "expected missing field detail, got: {error_msg}"
+    );
+}
+
+#[tokio::test]
 async fn pre_tool_use_hook_replace_args_are_used_by_approval() {
     let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
     let (sink, events) = capture_events();
@@ -205,9 +335,10 @@ async fn pre_tool_use_hook_replace_args_are_used_by_approval() {
                 }
             },
         )
-        .with_approval(ToolApproval::requires_approval(
-            ToolApprovalKind::CommandExecution,
-        )),
+        .with_safety(
+            approval_required_safety_summary(ToolSafetyKind::CommandExecution),
+            command_safety_from_args,
+        ),
     )];
     request.approval_policy = ApprovalPolicy {
         default_action: ApprovalAction::Allow,
@@ -300,9 +431,10 @@ async fn pre_tool_use_hook_rewritten_args_can_fall_through_approval_default() {
                 }
             },
         )
-        .with_approval(ToolApproval::requires_approval(
-            ToolApprovalKind::CommandExecution,
-        )),
+        .with_safety(
+            approval_required_safety_summary(ToolSafetyKind::CommandExecution),
+            command_safety_from_args,
+        ),
     )];
     request.approval_policy = ApprovalPolicy {
         default_action: ApprovalAction::Allow,
@@ -404,13 +536,13 @@ async fn pre_tool_use_block_result_survives_parallel_flush_and_steering() {
     let max_active_calls = Arc::new(AtomicUsize::new(0));
     let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run tools")]);
     request.tools = vec![
-        tracked_success_tool(
+        tracked_safe_success_tool(
             "read",
             Duration::from_millis(10),
             active_calls.clone(),
             max_active_calls.clone(),
         ),
-        tracked_success_tool(
+        tracked_safe_success_tool(
             "ls",
             Duration::from_millis(10),
             active_calls,
@@ -513,6 +645,12 @@ async fn post_tool_use_hook_runs_for_skipped_synthetic_errors() {
         ),
         tracked_success_tool(
             "read",
+            Duration::from_millis(40),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ),
+        tracked_success_tool(
+            "ls",
             Duration::from_millis(40),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),

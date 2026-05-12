@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::error::RociError;
 
-use super::tool::{Tool, ToolApproval};
+use super::tool::{Tool, ToolSafetySummary};
 
 /// Origin for a tool exposed to an agent run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +108,7 @@ pub struct ToolDescriptor {
     pub label: String,
     pub description: String,
     pub origin: ToolOrigin,
-    pub approval: ToolApproval,
+    pub safety: ToolSafetySummary,
 }
 
 impl ToolDescriptor {
@@ -120,7 +120,7 @@ impl ToolDescriptor {
             label: tool.label().to_string(),
             description: tool.description().to_string(),
             origin,
-            approval: tool.approval(),
+            safety: tool.safety_summary(),
         }
     }
 }
@@ -283,9 +283,33 @@ pub fn count_by_origin(descriptors: &[ToolDescriptor]) -> HashMap<&'static str, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{AgentTool, AgentToolParameters, ToolApproval, ToolApprovalKind};
+    use crate::tools::{
+        AgentTool, AgentToolParameters, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
+    };
 
-    fn test_tool(name: &str, approval: ToolApproval) -> Arc<dyn Tool> {
+    fn safety_summary(
+        read_only_by_default: bool,
+        destructive_by_default: bool,
+        concurrency_safe_by_default: bool,
+        approval_kind: ToolSafetyKind,
+    ) -> ToolSafetySummary {
+        ToolSafetySummary {
+            read_only_by_default,
+            destructive_by_default,
+            concurrency_safe_by_default,
+            approval_kind,
+        }
+    }
+
+    fn read_only_summary() -> ToolSafetySummary {
+        safety_summary(true, false, true, ToolSafetyKind::Read)
+    }
+
+    fn approval_required_summary(kind: ToolSafetyKind) -> ToolSafetySummary {
+        safety_summary(false, false, false, kind)
+    }
+
+    fn test_tool(name: &str, plan: ToolSafetyPlan, summary: ToolSafetySummary) -> Arc<dyn Tool> {
         Arc::new(
             AgentTool::new(
                 name,
@@ -293,7 +317,7 @@ mod tests {
                 AgentToolParameters::empty(),
                 |_args, _ctx| async move { Ok(serde_json::json!({ "ok": true })) },
             )
-            .with_approval(approval),
+            .with_static_safety(plan, summary),
         )
     }
 
@@ -301,10 +325,15 @@ mod tests {
     fn policy_filters_allow_exclude_and_no_tools() {
         let catalog = ToolCatalog::from_tools(
             vec![
-                test_tool("read_file", ToolApproval::safe_read_only()),
+                test_tool(
+                    "read_file",
+                    ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+                    read_only_summary(),
+                ),
                 test_tool(
                     "write_file",
-                    ToolApproval::requires_approval(ToolApprovalKind::FileChange),
+                    ToolSafetyPlan::approval_required(ToolSafetyKind::FileChange),
+                    approval_required_summary(ToolSafetyKind::FileChange),
                 ),
             ],
             ToolOrigin::Builtin,
@@ -325,10 +354,15 @@ mod tests {
     fn duplicate_names_keep_first_by_default() {
         let catalog = ToolCatalog::from_tools(
             vec![
-                test_tool("read", ToolApproval::safe_read_only()),
                 test_tool(
                     "read",
-                    ToolApproval::requires_approval(ToolApprovalKind::Other),
+                    ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+                    read_only_summary(),
+                ),
+                test_tool(
+                    "read",
+                    ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
+                    approval_required_summary(ToolSafetyKind::Other),
                 ),
             ],
             ToolOrigin::Custom,
@@ -337,7 +371,10 @@ mod tests {
         let descriptors = catalog.descriptors();
 
         assert_eq!(descriptors.len(), 1);
-        assert_eq!(descriptors[0].approval, ToolApproval::safe_read_only());
+        assert_eq!(descriptors[0].safety.approval_kind, ToolSafetyKind::Read);
+        assert!(descriptors[0].safety.read_only_by_default);
+        assert!(!descriptors[0].safety.destructive_by_default);
+        assert!(descriptors[0].safety.concurrency_safe_by_default);
     }
 
     #[test]
@@ -345,7 +382,11 @@ mod tests {
         let mut catalog = ToolCatalog::new();
         catalog
             .insert(
-                test_tool("read", ToolApproval::safe_read_only()),
+                test_tool(
+                    "read",
+                    ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+                    read_only_summary(),
+                ),
                 ToolOrigin::Builtin,
             )
             .unwrap();
@@ -353,7 +394,8 @@ mod tests {
             .insert(
                 test_tool(
                     "write",
-                    ToolApproval::requires_approval(ToolApprovalKind::FileChange),
+                    ToolSafetyPlan::approval_required(ToolSafetyKind::FileChange),
+                    approval_required_summary(ToolSafetyKind::FileChange),
                 ),
                 ToolOrigin::Builtin,
             )
@@ -362,17 +404,18 @@ mod tests {
         catalog.insert_or_replace(
             test_tool(
                 "read",
-                ToolApproval::requires_approval(ToolApprovalKind::Other),
+                ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
+                approval_required_summary(ToolSafetyKind::Other),
             ),
             ToolOrigin::Dynamic,
         );
 
         let descriptors = catalog.descriptors();
         assert_eq!(descriptors[0].name, "read");
-        assert_eq!(
-            descriptors[0].approval,
-            ToolApproval::requires_approval(ToolApprovalKind::Other)
-        );
+        assert_eq!(descriptors[0].safety.approval_kind, ToolSafetyKind::Other);
+        assert!(!descriptors[0].safety.read_only_by_default);
+        assert!(!descriptors[0].safety.destructive_by_default);
+        assert!(!descriptors[0].safety.concurrency_safe_by_default);
         assert_eq!(descriptors[1].name, "write");
     }
 }

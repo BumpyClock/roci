@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use roci::error::RociError;
 use roci::tools::arguments::ToolArguments;
-use roci::tools::tool::{AgentTool, Tool, ToolApproval, ToolExecutionContext};
+use roci::tools::tool::{
+    AgentTool, Tool, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
+};
 use roci::tools::types::AgentToolParameters;
 use roci::tools::{
     AskUserChoice, AskUserFormField, AskUserFormInputKind, AskUserPrompt, UserInputRequest,
@@ -24,7 +26,16 @@ pub fn ask_user_tool() -> Arc<dyn Tool> {
             execute_ask_user(args, ctx).await
         },
     )
-    .with_approval(ToolApproval::safe_host_input()))
+    .with_static_safety(ToolSafetyPlan::host_input(), ask_user_safety_summary()))
+}
+
+fn ask_user_safety_summary() -> ToolSafetySummary {
+    ToolSafetySummary {
+        read_only_by_default: false,
+        destructive_by_default: false,
+        concurrency_safe_by_default: false,
+        approval_kind: ToolSafetyKind::Other,
+    }
 }
 
 fn ask_user_parameters() -> AgentToolParameters {

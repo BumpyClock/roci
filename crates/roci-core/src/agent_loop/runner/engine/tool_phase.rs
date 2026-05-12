@@ -6,14 +6,15 @@ use crate::types::{AgentToolCall, AgentToolResult, ModelMessage};
 use super::super::control::{
     approval_allows_execution, resolve_approval, AgentEventEmitter, RunEventEmitter,
 };
-use super::super::limits::{is_parallel_safe_tool, RunnerLimits};
+use super::super::limits::RunnerLimits;
 use super::super::message_events::assistant_message_snapshot;
 use super::super::message_events::emit_message_lifecycle;
 use super::super::tooling::{
     append_skipped_tool_call, append_tool_result, apply_post_tool_use_hook,
     apply_pre_tool_use_hook, canceled_tool_result, declined_tool_result, emit_tool_execution_end,
     emit_tool_execution_start, execute_parallel_tool_calls, execute_tool_call, resolve_tool_call,
-    ResolvedToolCall, ToolExecutionInputs, ToolExecutionOutcome,
+    safety_plan_for_finalized_call, validate_finalized_tool_call, ResolvedToolCall,
+    ToolExecutionInputs, ToolExecutionOutcome,
 };
 use super::super::{AgentEvent, ApprovalDecision, RunRequest};
 
@@ -191,10 +192,103 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                 continue;
             }
         };
-        let resolved_call = ResolvedToolCall {
+        let mut resolved_call = ResolvedToolCall {
             call: finalized_call,
-            tool: resolved_call.tool,
+            tool: resolved_call.tool.clone(),
+            safety_plan: Default::default(),
         };
+        if let Err(result) =
+            validate_finalized_tool_call(&resolved_call.call, resolved_call.tool.as_deref())
+        {
+            if !pending_parallel_calls.is_empty() {
+                for parallel_call in &pending_parallel_calls {
+                    emit_tool_execution_start(agent_emitter, &parallel_call.call);
+                }
+                let parallel_results = tokio::select! {
+                    _ = &mut *abort_rx => {
+                        run_cancel_token.cancel();
+                        for parallel_call in &pending_parallel_calls {
+                            let canceled_result = apply_post_tool_use_hook(
+                                &request.hooks,
+                                &parallel_call.call,
+                                canceled_tool_result(&parallel_call.call),
+                            )
+                            .await;
+                            emit_tool_execution_end(
+                                agent_emitter,
+                                &parallel_call.call,
+                                &canceled_result,
+                            );
+                        }
+                        return ToolPhaseOutcome::Canceled;
+                    }
+                    results = execute_parallel_tool_calls(
+                        &pending_parallel_calls,
+                        agent_emitter,
+                        run_cancel_token.child_token(),
+                        tool_inputs.clone(),
+                    ) => results,
+                };
+                pending_parallel_calls.clear();
+                for parallel_outcome in parallel_results {
+                    emit_tool_execution_end(
+                        agent_emitter,
+                        &parallel_outcome.call,
+                        &parallel_outcome.result,
+                    );
+                    let final_result = append_tool_result(
+                        &request.hooks,
+                        emitter,
+                        agent_emitter,
+                        &parallel_outcome.call,
+                        parallel_outcome.result,
+                        &mut iteration_failures,
+                        messages,
+                    )
+                    .await;
+                    turn_tool_results.push(final_result);
+                }
+            }
+
+            let final_result = append_tool_result(
+                &request.hooks,
+                emitter,
+                agent_emitter,
+                &resolved_call.call,
+                result,
+                &mut iteration_failures,
+                messages,
+            )
+            .await;
+            turn_tool_results.push(final_result);
+
+            if let Some(ref get_steering) = request.get_steering_messages {
+                let steering = get_steering().await;
+                if !steering.is_empty() {
+                    for remaining_call in &tool_calls[call_idx + 1..] {
+                        let skipped = append_skipped_tool_call(
+                            &request.hooks,
+                            emitter,
+                            agent_emitter,
+                            remaining_call,
+                            &mut iteration_failures,
+                            messages,
+                        )
+                        .await;
+                        turn_tool_results.push(skipped);
+                    }
+                    for msg in steering {
+                        emit_message_lifecycle(agent_emitter, &msg);
+                        messages.push(msg);
+                    }
+                    steering_interrupted = true;
+                    break;
+                }
+            }
+            continue;
+        }
+        resolved_call.safety_plan =
+            safety_plan_for_finalized_call(&resolved_call.call, resolved_call.tool.as_deref());
         let approval_tool = resolved_call.tool.clone();
         let decision = {
             let approval = resolve_approval(
@@ -206,6 +300,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                 &request.tool_permission_session_approvals,
                 &resolved_call.call,
                 approval_tool.as_deref(),
+                &resolved_call.safety_plan,
             );
             tokio::pin!(approval);
             tokio::select! {
@@ -223,7 +318,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         }
 
         let can_execute = approval_allows_execution(decision);
-        if can_execute && is_parallel_safe_tool(&resolved_call.call.name) {
+        if can_execute && resolved_call.safety_plan.concurrency_safe {
             pending_parallel_calls.push(resolved_call);
             continue;
         }

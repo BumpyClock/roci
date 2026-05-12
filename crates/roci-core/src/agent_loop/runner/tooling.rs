@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::session::{LogicalPath, SessionFs};
 use crate::tools::SandboxProvider;
-use crate::tools::{tool::Tool, ToolUpdateCallback};
+use crate::tools::{tool::Tool, ToolArguments, ToolSafetyPlan, ToolUpdateCallback};
 use crate::types::{AgentToolCall, AgentToolResult, ModelMessage};
 
 use super::super::events::{RunEventPayload, RunEventStream, ToolUpdatePayload};
@@ -39,6 +39,7 @@ pub(super) struct ToolExecutionOutcome {
 pub(super) struct ResolvedToolCall {
     pub(super) call: AgentToolCall,
     pub(super) tool: Option<Arc<dyn Tool>>,
+    pub(super) safety_plan: ToolSafetyPlan,
 }
 
 #[derive(Clone)]
@@ -73,7 +74,43 @@ pub(super) fn resolve_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -
     ResolvedToolCall {
         call: call.clone(),
         tool: tools.iter().find(|tool| tool.name() == call.name).cloned(),
+        safety_plan: ToolSafetyPlan::default(),
     }
+}
+
+pub(super) fn validation_error_result(
+    call: &AgentToolCall,
+    validation_error: impl std::fmt::Display,
+) -> AgentToolResult {
+    AgentToolResult {
+        tool_call_id: call.id.clone(),
+        result: serde_json::json!({
+            "error": format!("Argument validation failed: {validation_error}")
+        }),
+        is_error: true,
+    }
+}
+
+pub(super) fn validate_finalized_tool_call(
+    call: &AgentToolCall,
+    tool: Option<&dyn Tool>,
+) -> Result<(), AgentToolResult> {
+    let Some(tool) = tool else {
+        return Ok(());
+    };
+    crate::tools::validation::validate_arguments(&call.arguments, &tool.parameters().schema)
+        .map_err(|validation_error| validation_error_result(call, validation_error))
+}
+
+pub(super) fn safety_plan_for_finalized_call(
+    call: &AgentToolCall,
+    tool: Option<&dyn Tool>,
+) -> ToolSafetyPlan {
+    let Some(tool) = tool else {
+        return ToolSafetyPlan::default();
+    };
+    let safety_args = ToolArguments::new(call.arguments.clone());
+    tool.safety(&safety_args)
 }
 
 fn synthetic_hook_error_result(
@@ -171,23 +208,10 @@ pub(super) async fn execute_tool_call(
     cancel: CancellationToken,
     inputs: ToolExecutionInputs<'_>,
 ) -> ToolExecutionOutcome {
-    let ResolvedToolCall { call, tool } = resolved;
+    let ResolvedToolCall { call, tool, .. } = resolved;
     match tool {
         Some(tool) => {
-            let schema = &tool.parameters().schema;
-            if let Err(validation_error) =
-                crate::tools::validation::validate_arguments(&call.arguments, schema)
-            {
-                let result = AgentToolResult {
-                    tool_call_id: call.id.clone(),
-                    result: serde_json::json!({
-                        "error": format!("Argument validation failed: {}", validation_error)
-                    }),
-                    is_error: true,
-                };
-                return ToolExecutionOutcome { call, result };
-            }
-            let args = crate::tools::arguments::ToolArguments::new(call.arguments.clone());
+            let args = ToolArguments::new(call.arguments.clone());
             let ctx = crate::tools::tool::ToolExecutionContext {
                 metadata: serde_json::Value::Null,
                 tool_call_id: Some(call.id.clone()),

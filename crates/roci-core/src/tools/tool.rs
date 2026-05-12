@@ -1,6 +1,7 @@
 //! Tool trait and closure-based tool wrapper.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -106,51 +107,286 @@ impl std::fmt::Debug for ToolExecutionContext {
 pub type ToolUpdateCallback =
     Arc<dyn Fn(crate::agent_loop::events::ToolUpdatePayload) + Send + Sync>;
 
-/// Safety metadata used by the `ApprovalPolicy::ask()` preset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolSafety {
-    /// Reads local or remote state without intentional mutation.
-    ReadOnly,
-    /// Requests host/user input without modifying external state.
-    HostInput,
-}
-
-/// Tool-level approval category.
+/// Safety category used by approval and batching policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolApprovalKind {
+pub enum ToolSafetyKind {
+    /// Executes a local or remote command.
     CommandExecution,
+    /// Mutates filesystem state.
     FileChange,
+    /// Reads local or remote state.
     Read,
+    /// Invokes an MCP tool.
     Mcp,
+    /// Invokes a custom SDK tool.
     CustomTool,
+    /// Tool category is unknown or not yet classified.
     Other,
 }
 
-/// Approval behavior declared by a tool implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolApproval {
-    /// Safe to execute without prompting under the `ApprovalPolicy::ask()` preset.
-    AutoAccept { safety: ToolSafety },
-    /// Prompt before execution under the `ApprovalPolicy::ask()` preset.
-    RequiresApproval { kind: ToolApprovalKind },
+/// Minimum action an approval policy may take for a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActionFloor {
+    /// User approval is required.
+    Ask,
+    /// Tool call must be denied.
+    Deny,
 }
 
-impl ToolApproval {
-    pub const fn safe_read_only() -> Self {
-        Self::AutoAccept {
-            safety: ToolSafety::ReadOnly,
+/// Approval requirement declared by a tool safety plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolApprovalRequirement {
+    /// Approval category.
+    pub kind: ToolSafetyKind,
+    /// Whether `ApprovalPolicy::ask()` may accept this call without prompting.
+    pub auto_accept_under_ask: bool,
+    /// Optional policy floor for high-risk calls.
+    pub action_floor: Option<ToolActionFloor>,
+    /// Human-readable reason for approval handling.
+    pub reason: Option<String>,
+    /// Whether session-scoped approval may be offered.
+    pub allow_session: bool,
+}
+
+impl Default for ToolApprovalRequirement {
+    fn default() -> Self {
+        Self {
+            kind: ToolSafetyKind::Other,
+            auto_accept_under_ask: false,
+            action_floor: None,
+            reason: Some("tool requires approval by default".to_string()),
+            allow_session: true,
+        }
+    }
+}
+
+/// Filesystem operation a tool call intends to perform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFilesystemAccess {
+    /// Filesystem operation kind.
+    pub operation: crate::security::filesystem::PathOperation,
+    /// Target path.
+    pub path: PathBuf,
+}
+
+/// Resource access mode for scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResourceAccessMode {
+    /// Multiple readers can share this resource.
+    SharedRead,
+    /// Tool requires exclusive access to this resource.
+    Exclusive,
+}
+
+/// Named resource a tool call intends to access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResourceAccess {
+    /// Stable resource key.
+    pub key: String,
+    /// Requested access mode.
+    pub mode: ToolResourceAccessMode,
+}
+
+/// Static safety preview for catalogs and UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSafetySummary {
+    /// Tool is read-only unless args prove otherwise.
+    pub read_only_by_default: bool,
+    /// Tool is destructive unless args prove otherwise.
+    pub destructive_by_default: bool,
+    /// Tool may run concurrently unless args prove otherwise.
+    pub concurrency_safe_by_default: bool,
+    /// Default approval category.
+    pub approval_kind: ToolSafetyKind,
+}
+
+impl Default for ToolSafetySummary {
+    fn default() -> Self {
+        Self {
+            read_only_by_default: false,
+            destructive_by_default: false,
+            concurrency_safe_by_default: false,
+            approval_kind: ToolSafetyKind::Other,
+        }
+    }
+}
+
+/// Input-aware safety plan for a single tool call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSafetyPlan {
+    /// Tool call only reads state.
+    pub read_only: bool,
+    /// Tool call is irreversible or high impact.
+    pub destructive: bool,
+    /// Tool call can run concurrently with other safe calls.
+    pub concurrency_safe: bool,
+    /// Approval requirement for this call.
+    pub approval: ToolApprovalRequirement,
+    /// Command classifier output, when available.
+    pub command: Option<crate::security::command::CommandInsight>,
+    /// Filesystem access facts, when available.
+    pub filesystem: Vec<ToolFilesystemAccess>,
+    /// Resource access facts, when available.
+    pub resources: Vec<ToolResourceAccess>,
+}
+
+impl ToolSafetyPlan {
+    /// Build an approval-required plan for the given kind.
+    pub fn approval_required(kind: ToolSafetyKind) -> Self {
+        Self {
+            approval: ToolApprovalRequirement {
+                kind,
+                ..ToolApprovalRequirement::default()
+            },
+            ..Self::default()
         }
     }
 
-    pub const fn safe_host_input() -> Self {
-        Self::AutoAccept {
-            safety: ToolSafety::HostInput,
+    /// Build a read-only plan that can auto-accept under ask mode.
+    pub fn safe_read_only(kind: ToolSafetyKind) -> Self {
+        Self {
+            read_only: true,
+            destructive: false,
+            concurrency_safe: true,
+            approval: ToolApprovalRequirement {
+                kind,
+                auto_accept_under_ask: true,
+                action_floor: None,
+                reason: None,
+                allow_session: true,
+            },
+            ..Self::default()
         }
     }
 
-    pub const fn requires_approval(kind: ToolApprovalKind) -> Self {
-        Self::RequiresApproval { kind }
+    /// Build a plan for host/user-input-only tools.
+    pub fn host_input() -> Self {
+        Self {
+            read_only: false,
+            destructive: false,
+            concurrency_safe: false,
+            approval: ToolApprovalRequirement {
+                kind: ToolSafetyKind::Other,
+                auto_accept_under_ask: true,
+                action_floor: None,
+                reason: None,
+                allow_session: false,
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Build a plan with one filesystem access fact.
+    pub fn file_access(
+        kind: ToolSafetyKind,
+        operation: crate::security::filesystem::PathOperation,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        use crate::security::filesystem::PathOperation;
+
+        let read_only = matches!(
+            operation,
+            PathOperation::Read | PathOperation::List | PathOperation::Search
+        );
+        let mut plan = if read_only {
+            Self::safe_read_only(kind)
+        } else {
+            Self::approval_required(kind)
+        };
+        plan.read_only = read_only;
+        plan.concurrency_safe = read_only;
+        plan.destructive = matches!(operation, PathOperation::Delete);
+        plan.filesystem.push(ToolFilesystemAccess {
+            operation,
+            path: path.into(),
+        });
+        plan
+    }
+
+    /// Build a read-file plan.
+    pub fn file_read(path: impl Into<PathBuf>) -> Self {
+        Self::file_access(
+            ToolSafetyKind::Read,
+            crate::security::filesystem::PathOperation::Read,
+            path,
+        )
+    }
+
+    /// Build a list-directory plan.
+    pub fn file_list(path: impl Into<PathBuf>) -> Self {
+        Self::file_access(
+            ToolSafetyKind::Read,
+            crate::security::filesystem::PathOperation::List,
+            path,
+        )
+    }
+
+    /// Build a file-search plan.
+    pub fn file_search(path: impl Into<PathBuf>) -> Self {
+        Self::file_access(
+            ToolSafetyKind::Read,
+            crate::security::filesystem::PathOperation::Search,
+            path,
+        )
+    }
+
+    /// Build a write-file plan.
+    pub fn file_write(path: impl Into<PathBuf>) -> Self {
+        Self::file_access(
+            ToolSafetyKind::FileChange,
+            crate::security::filesystem::PathOperation::Write,
+            path,
+        )
+    }
+
+    /// Build a create-file plan.
+    pub fn file_create(path: impl Into<PathBuf>) -> Self {
+        Self::file_access(
+            ToolSafetyKind::FileChange,
+            crate::security::filesystem::PathOperation::Create,
+            path,
+        )
+    }
+
+    /// Build a delete-file plan.
+    pub fn file_delete(path: impl Into<PathBuf>) -> Self {
+        Self::file_access(
+            ToolSafetyKind::FileChange,
+            crate::security::filesystem::PathOperation::Delete,
+            path,
+        )
+    }
+
+    /// Build a plan from command-classifier output.
+    pub fn from_command_insight(insight: crate::security::command::CommandInsight) -> Self {
+        use crate::security::command::CommandCategory;
+
+        let read_only = !insight.categories.is_empty()
+            && insight
+                .categories
+                .iter()
+                .all(|category| matches!(category, CommandCategory::ReadOnly));
+        let destructive = insight
+            .categories
+            .contains(&CommandCategory::DestructiveDelete);
+
+        let mut plan = if read_only {
+            Self::safe_read_only(ToolSafetyKind::CommandExecution)
+        } else {
+            Self::approval_required(ToolSafetyKind::CommandExecution)
+        };
+        plan.read_only = read_only;
+        plan.concurrency_safe = read_only;
+        plan.destructive = destructive;
+        plan.command = Some(insight);
+        if destructive {
+            plan.approval.action_floor = Some(ToolActionFloor::Ask);
+            plan.approval.reason = Some("destructive command requires approval".to_string());
+        }
+        plan
     }
 }
 
@@ -175,11 +411,16 @@ pub trait Tool: Send + Sync {
     /// JSON Schema parameters.
     fn parameters(&self) -> &AgentToolParameters;
 
-    /// Approval metadata for the `ApprovalPolicy::ask()` preset.
+    /// Input-aware safety plan for this tool call.
     ///
-    /// Custom, dynamic, and unknown tools are approval-required by default.
-    fn approval(&self) -> ToolApproval {
-        ToolApproval::requires_approval(ToolApprovalKind::Other)
+    /// Custom, dynamic, and unknown tools fail closed by default.
+    fn safety(&self, _args: &ToolArguments) -> ToolSafetyPlan {
+        ToolSafetyPlan::default()
+    }
+
+    /// Static safety preview for catalogs and UI.
+    fn safety_summary(&self) -> ToolSafetySummary {
+        ToolSafetySummary::default()
     }
 
     /// Execute the tool with parsed arguments.
@@ -214,12 +455,16 @@ type ToolHandler = dyn Fn(
     + Send
     + Sync;
 
+/// Type alias for the tool safety handler function.
+type ToolSafetyHandler = dyn Fn(&ToolArguments) -> ToolSafetyPlan + Send + Sync;
+
 /// Closure-based tool for quick tool creation.
 pub struct AgentTool {
     name: String,
     description: String,
     parameters: AgentToolParameters,
-    approval: ToolApproval,
+    safety_summary: ToolSafetySummary,
+    safety_handler: Arc<ToolSafetyHandler>,
     handler: Arc<ToolHandler>,
 }
 
@@ -239,14 +484,27 @@ impl AgentTool {
             name: name.into(),
             description: description.into(),
             parameters,
-            approval: ToolApproval::requires_approval(ToolApprovalKind::Other),
+            safety_summary: ToolSafetySummary::default(),
+            safety_handler: Arc::new(|_args| ToolSafetyPlan::default()),
             handler: Arc::new(move |args, ctx| Box::pin(handler(args, ctx))),
         }
     }
 
-    /// Set approval metadata for the `ApprovalPolicy::ask()` preset.
-    pub fn with_approval(mut self, approval: ToolApproval) -> Self {
-        self.approval = approval;
+    /// Set a static safety plan.
+    pub fn with_static_safety(mut self, plan: ToolSafetyPlan, summary: ToolSafetySummary) -> Self {
+        let plan_for_handler = plan.clone();
+        self.safety_summary = summary;
+        self.safety_handler = Arc::new(move |_args| plan_for_handler.clone());
+        self
+    }
+
+    /// Set an input-aware safety handler.
+    pub fn with_safety<F>(mut self, summary: ToolSafetySummary, safety: F) -> Self
+    where
+        F: Fn(&ToolArguments) -> ToolSafetyPlan + Send + Sync + 'static,
+    {
+        self.safety_summary = summary;
+        self.safety_handler = Arc::new(safety);
         self
     }
 }
@@ -265,8 +523,12 @@ impl Tool for AgentTool {
         &self.parameters
     }
 
-    fn approval(&self) -> ToolApproval {
-        self.approval
+    fn safety(&self, args: &ToolArguments) -> ToolSafetyPlan {
+        (self.safety_handler)(args)
+    }
+
+    fn safety_summary(&self) -> ToolSafetySummary {
+        self.safety_summary
     }
 
     async fn execute(

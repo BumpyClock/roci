@@ -12,7 +12,7 @@ use crate::human_interaction::{HumanInteractionCoordinator, ToolPermissionDecisi
 use crate::models::LanguageModel;
 use crate::tools::arguments::ToolArguments;
 use crate::tools::catalog::ToolVisibilityPolicy;
-use crate::tools::tool::{AgentTool, ToolApproval, ToolExecutionContext, ToolUpdateCallback};
+use crate::tools::tool::{AgentTool, ToolExecutionContext, ToolUpdateCallback};
 use crate::tools::types::AgentToolParameters;
 use crate::types::{ContentPart, StreamEventType};
 

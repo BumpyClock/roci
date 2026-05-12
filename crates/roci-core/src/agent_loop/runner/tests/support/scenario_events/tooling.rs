@@ -99,6 +99,21 @@ pub(super) fn events_for_scenario(
                     }),
                     Ok(TextStreamDelta {
                         text: String::new(),
+                        event_type: StreamEventType::ToolCallDelta,
+                        tool_call: Some(AgentToolCall {
+                            id: "safe-ls-3".to_string(),
+                            name: "ls".to_string(),
+                            arguments: serde_json::json!({}),
+                            recipient: None,
+                        }),
+                        finish_reason: None,
+                        usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    }),
+                    Ok(TextStreamDelta {
+                        text: String::new(),
                         event_type: StreamEventType::Done,
                         tool_call: None,
                         finish_reason: None,

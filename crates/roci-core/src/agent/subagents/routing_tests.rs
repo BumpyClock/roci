@@ -21,7 +21,7 @@ use crate::models::LanguageModel;
 use crate::provider::{
     ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
 };
-use crate::tools::{Tool, ToolApproval, ToolArguments, ToolExecutionContext};
+use crate::tools::{Tool, ToolArguments, ToolExecutionContext, ToolSafetyPlan};
 use crate::types::{StreamEventType, TextStreamDelta, Usage};
 
 fn test_model() -> LanguageModel {
@@ -553,7 +553,10 @@ async fn subagent_routing_tools_delegate_subagent_tool_executes_foreground_and_r
     let tools = routing_tools(controller("tool foreground summary", true));
     let tool = routing_tool(&tools, "delegate_subagent");
 
-    assert_eq!(tool.approval(), ToolApproval::safe_host_input());
+    assert_eq!(
+        tool.safety(&ToolArguments::new(json!({}))),
+        ToolSafetyPlan::host_input()
+    );
     assert_eq!(
         tool.parameters().schema["required"],
         serde_json::Value::Array(vec![serde_json::Value::String("task".into())])
