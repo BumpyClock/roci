@@ -13,6 +13,7 @@ mod queue_and_continue;
 mod session;
 mod session_before_compact;
 mod session_before_tree;
+mod session_recovery;
 mod snapshot;
 mod state_lifecycle;
 mod subagent_events;

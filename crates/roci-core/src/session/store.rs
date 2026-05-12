@@ -15,6 +15,7 @@ use super::{
     SessionLease, SessionMetadata, SessionResourceManifest, SessionResourceNamespace,
     SessionResourceRef, SessionResult, SessionResumeState, SessionSnapshot,
 };
+use crate::session::recovery::{RecoveredSession, SessionRecoverySource};
 
 #[derive(Debug, Clone)]
 pub struct LocalSessionStore {
@@ -171,7 +172,32 @@ impl LocalSessionStore {
         Ok(state)
     }
 
-    async fn load_state(
+    /// Export a tolerant recovery artifact for a damaged local session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when source files cannot be read or diagnostics cannot be built.
+    pub async fn recover_export(
+        &self,
+        source: SessionRecoverySource,
+    ) -> SessionResult<RecoveredSession> {
+        super::recovery::recover_export_from_store(self, source).await
+    }
+
+    /// Import a validated recovery artifact into a new local session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact is not importable, target exists, or validation fails.
+    pub async fn recover_import(
+        &self,
+        recovered: RecoveredSession,
+        target_id: super::SessionId,
+    ) -> SessionResult<SessionResumeState> {
+        super::recovery::recover_import_into_store(self, recovered, target_id).await
+    }
+
+    pub(crate) async fn load_state(
         &self,
         config: SessionConfig,
         default_thread_id: ThreadId,
@@ -313,7 +339,7 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> SessionResu
     std::fs::rename(&tmp, path).map_err(|source| SessionError::io(path, source))
 }
 
-fn build_resource_manifest(
+pub(crate) fn build_resource_manifest(
     conventions: &PathConventions,
     runtime: &RuntimeSnapshot,
 ) -> SessionResourceManifest {
@@ -581,7 +607,7 @@ fn is_available(
         .any(|entry| entry.storage_path == storage_path && entry.available)
 }
 
-fn resource_events_from_manifest(
+pub(crate) fn resource_events_from_manifest(
     thread_id: ThreadId,
     start_seq: u64,
     manifest: &SessionResourceManifest,

@@ -1644,6 +1644,7 @@ dependencies = [
  "directories",
  "roci",
  "roci-tools",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

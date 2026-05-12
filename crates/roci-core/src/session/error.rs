@@ -14,6 +14,8 @@ pub enum SessionError {
     InvalidLogicalPath { path: String, reason: String },
     #[error("invalid session metadata at {path}: {message}")]
     InvalidMetadata { path: PathBuf, message: String },
+    #[error("invalid recovered session artifact: {message}")]
+    InvalidRecoveredSession { message: String },
     #[error("session already exists: {path}")]
     AlreadyExists { path: PathBuf },
     #[error("session is already open for writing: {path}")]
@@ -28,6 +30,8 @@ pub enum SessionError {
     NotFound { path: PathBuf },
     #[error("session path is not a directory: {path}")]
     NotDirectory { path: PathBuf },
+    #[error("session recovery artifact is not importable: {message}")]
+    NonImportableRecovery { message: String },
     #[error("session filesystem io error for {path}: {source}")]
     Io {
         path: PathBuf,

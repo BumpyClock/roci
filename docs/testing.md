@@ -178,6 +178,18 @@ test -f "$ROOT/export.json"
 test ! -e "$ROOT/smoke-import"
 ```
 
+Recovery smoke:
+
+```bash
+ROOT=/tmp/roci-session-recovery-smoke
+rm -rf "$ROOT"
+cargo run -q -p roci-cli -- session create --root "$ROOT" --id recover-smoke --title Recover --json
+printf 'not json\n' >> "$ROOT/recover-smoke/events.jsonl"
+cargo run -q -p roci-cli -- session recover-export recover-smoke --root "$ROOT" --output "$ROOT/recovered.json" --json
+rg -n '"artifact_type": "roci_recovered_session"|"warnings"' "$ROOT/recovered.json"
+cargo run -q -p roci-cli -- session recover-import --root "$ROOT" --input "$ROOT/recovered.json" --id recover-smoke-import --json
+```
+
 Provider-facing durable resume smoke should run in tmux and exercise chat with
 an explicit session root:
 
@@ -194,6 +206,34 @@ tmux new-session -d -s roci-session-resume \
    roci_status=$?; printf "\n[roci session smoke exit=%s]\n" "$roci_status"; \
    ls -la "$ROOT/live-resume"; exec zsh'
 echo "attach: tmux attach -t roci-session-resume"
+```
+
+Provider-facing durable recovery smoke should run in tmux and use framed OpenAI-compatible endpoint:
+
+```bash
+tmux new-session -d -s roci-session-recovery-live \
+  'cd /Users/adityasharma/Projects/roci && \
+   set -o pipefail; \
+   ROOT=/tmp/roci-session-recovery-live && \
+   rm -rf "$ROOT" && \
+   OPENAI_API_KEY=sk-local-dummy \
+   OPENAI_BASE_URL=http://framed:4001/v1 \
+   cargo run -q -p roci-cli -- chat --no-skills --no-tools --model "openai:gemma-4-e4b" \
+   --session-root "$ROOT" --session-id recovery-live \
+   "Seed durability context for recovery smoke."; \
+   seed_status=$?; printf "\n[seed chat recovery-live exit=%s]\n" "$seed_status"; \
+   cargo run -q -p roci-cli -- session recover-export recovery-live --root "$ROOT" --output "$ROOT/recovered.json" --json; \
+   recover_export_status=$?; printf "\n[session recover-export exit=%s]\n" "$recover_export_status"; \
+   rg -n '\"artifact_type\": \"roci_recovered_session\"|\"warnings\"' "$ROOT/recovered.json"; \
+   cargo run -q -p roci-cli -- session recover-import --root "$ROOT" --input "$ROOT/recovered.json" --id recovery-live-import --json; \
+   recover_import_status=$?; printf "\n[session recover-import exit=%s]\n" "$recover_import_status"; \
+   ls -la "$ROOT/recovery-live-import"; \
+   cargo run -q -p roci-cli -- chat --no-skills --no-tools --model "openai:gemma-4-e4b" \
+   --session-root "$ROOT" --session-id recovery-live-import \
+   "Reply exactly: roci session recovery live ok"; \
+   resume_status=$?; printf "\n[resume chat recovery-live-import exit=%s]\n" "$resume_status"; \
+   exec zsh'
+echo "attach: tmux attach -t roci-session-recovery-live"
 ```
 
 ## Subagent live verification

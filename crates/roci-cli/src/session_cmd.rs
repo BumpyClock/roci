@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use roci::session::{
-    CreateSessionOptions, ImportPolicy, LocalSessionStore, PathConventions, SessionId,
-    SessionMetadata, SessionSnapshot,
+    CreateSessionOptions, ImportPolicy, LocalSessionStore, PathConventions, RecoveredSession,
+    RecoveryReport, SessionId, SessionMetadata, SessionRecoverySource, SessionSnapshot,
+    RECOVERED_SESSION_ARTIFACT_TYPE,
 };
 
 use crate::cli::{
     SessionArgs, SessionCommands, SessionCreateArgs, SessionDeleteArgs, SessionExportArgs,
-    SessionImportArgs, SessionListArgs,
+    SessionImportArgs, SessionListArgs, SessionRecoverExportArgs, SessionRecoverImportArgs,
 };
 
 pub async fn handle_session(args: SessionArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -37,6 +38,14 @@ pub async fn handle_session(args: SessionArgs) -> Result<(), Box<dyn std::error:
         SessionCommands::Import(args) => {
             let summary = import_session(args).await?;
             print_import_summary(&summary)?;
+        }
+        SessionCommands::RecoverExport(args) => {
+            let summary = recover_export_session(args).await?;
+            print_recover_export_summary(&summary)?;
+        }
+        SessionCommands::RecoverImport(args) => {
+            let summary = recover_import_session(args).await?;
+            print_recover_import_summary(&summary)?;
         }
     }
     Ok(())
@@ -76,6 +85,34 @@ struct ExportSummary {
 struct ImportSummary {
     id: String,
     root: PathBuf,
+    json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct RecoverExportSummary {
+    id: String,
+    source: String,
+    output: PathBuf,
+    root: PathBuf,
+    importable_runtime_state: bool,
+    warning_count: usize,
+    recovered_events: usize,
+    recovered_provider_ledger_records: usize,
+    recovered_resources_records: usize,
+    report: RecoveryReport,
+    json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct RecoverImportSummary {
+    id: String,
+    root: PathBuf,
+    importable_runtime_state: bool,
+    warning_count: usize,
+    recovered_events: usize,
+    recovered_provider_ledger_records: usize,
+    recovered_resources_records: usize,
+    report: RecoveryReport,
     json: bool,
 }
 
@@ -181,7 +218,7 @@ async fn export_session(
     let id = SessionId::parse(args.id)?;
     let store = LocalSessionStore::new(root);
     let snapshot = store.export_snapshot(id.clone()).await?;
-    write_pretty_json(&args.output, &snapshot)?;
+    write_pretty_json_any(&args.output, &snapshot)?;
     Ok(ExportSummary {
         id: id.to_string(),
         output: args.output,
@@ -207,6 +244,97 @@ async fn import_session(
     })
 }
 
+async fn recover_export_session(
+    args: SessionRecoverExportArgs,
+) -> Result<RecoverExportSummary, Box<dyn std::error::Error>> {
+    let root = resolve_root(args.root)?;
+    let source = match (args.id, args.session_dir) {
+        (Some(id), None) => SessionRecoverySource::SessionId(SessionId::parse(id)?),
+        (None, Some(session_dir)) => SessionRecoverySource::SessionDir {
+            path: session_dir,
+            source_id: args.source_id.map(SessionId::parse).transpose()?,
+        },
+        (None, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session id or --session-dir required",
+            )
+            .into());
+        }
+        (Some(_), Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--session-dir cannot be used with positional session id",
+            )
+            .into());
+        }
+    };
+    let source = source.clone();
+    let source_label = match &source {
+        SessionRecoverySource::SessionId(id) => format!("session id {id}"),
+        SessionRecoverySource::SessionDir { path, source_id } => match source_id {
+            Some(id) => format!("session-dir {path:?} with source-id {id}"),
+            None => format!("session-dir {path:?}"),
+        },
+    };
+    let store = LocalSessionStore::new(root.clone());
+    let recovered = store.recover_export(source).await?;
+    let report = recovered.report.clone();
+    write_pretty_json_any(&args.output, &recovered)?;
+    Ok(RecoverExportSummary {
+        id: recovered.snapshot.metadata.id.to_string(),
+        source: source_label,
+        output: args.output,
+        root,
+        importable_runtime_state: report.importable_runtime_state,
+        warning_count: report.warnings.len(),
+        recovered_events: report.stats.events.records_recovered,
+        recovered_provider_ledger_records: report.stats.provider_ledger.records_recovered,
+        recovered_resources_records: report.stats.resources.records_recovered,
+        report: recovered.report,
+        json: args.json,
+    })
+}
+
+async fn recover_import_session(
+    args: SessionRecoverImportArgs,
+) -> Result<RecoverImportSummary, Box<dyn std::error::Error>> {
+    let root = resolve_root(args.root)?;
+    let target_id = SessionId::parse(args.id)?;
+    let bytes = fs::read(&args.input)?;
+    let recovered_value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let artifact_type = recovered_value
+        .get("artifact_type")
+        .and_then(|value| value.as_str());
+    if artifact_type != Some(RECOVERED_SESSION_ARTIFACT_TYPE) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input is not a recovered session artifact. Use `session import` for plain SessionSnapshot exports.",
+        )
+        .into());
+    }
+    let recovered: RecoveredSession = serde_json::from_value(recovered_value)?;
+    let report = recovered.report.clone();
+    let recovered_events = report.stats.events.records_recovered;
+    let recovered_provider_ledger_records = report.stats.provider_ledger.records_recovered;
+    let recovered_resources_records = report.stats.resources.records_recovered;
+    let warning_count = report.warnings.len();
+    let importable_runtime_state = report.importable_runtime_state;
+    let store = LocalSessionStore::new(root.clone());
+    let state = store.recover_import(recovered, target_id).await?;
+    Ok(RecoverImportSummary {
+        id: state.metadata.id.to_string(),
+        root,
+        importable_runtime_state,
+        warning_count,
+        recovered_events,
+        recovered_provider_ledger_records,
+        recovered_resources_records,
+        report,
+        json: args.json,
+    })
+}
+
 fn resolve_root(override_root: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(root) = override_root {
         return Ok(root);
@@ -221,9 +349,9 @@ fn resolve_root(override_root: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::
     Ok(dirs.data_dir().join("sessions"))
 }
 
-fn write_pretty_json(
+fn write_pretty_json_any<T: serde::Serialize>(
     path: &Path,
-    value: &SessionSnapshot,
+    value: &T,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -288,6 +416,49 @@ fn print_list(entries: &[SessionListEntry], json: bool) -> Result<(), Box<dyn st
                 .map_or_else(String::new, |path| path.display().to_string())
         );
     }
+    Ok(())
+}
+
+fn print_recover_export_summary(
+    summary: &RecoverExportSummary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if summary.json {
+        println!("{}", serde_json::to_string_pretty(summary)?);
+        return Ok(());
+    }
+    println!(
+        "Recovered session {} from {} to {}",
+        summary.id,
+        summary.source,
+        summary.output.display()
+    );
+    println!(
+        "Importable runtime state: {}",
+        summary.importable_runtime_state
+    );
+    println!(
+        "Warnings: {} | Recovered events: {} | Recovered provider ledger records: {} | Recovered resources: {}",
+        summary.warning_count,
+        summary.recovered_events,
+        summary.recovered_provider_ledger_records,
+        summary.recovered_resources_records
+    );
+    Ok(())
+}
+
+fn print_recover_import_summary(
+    summary: &RecoverImportSummary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if summary.json {
+        println!("{}", serde_json::to_string_pretty(summary)?);
+        return Ok(());
+    }
+    println!("Imported recovered session {}", summary.id);
+    println!("Root: {}", summary.root.display());
+    println!(
+        "Importable runtime state: {} | Warnings: {} | Recovered events: {}",
+        summary.importable_runtime_state, summary.warning_count, summary.recovered_events
+    );
     Ok(())
 }
 
@@ -530,5 +701,92 @@ mod tests {
         assert!(target_root.path().join("imported-session").is_dir());
         assert_ne!(generated.id, "source-session");
         assert!(target_root.path().join(generated.id).is_dir());
+    }
+
+    #[tokio::test]
+    async fn recover_export_and_import_session_round_trip() {
+        let root = tempdir().unwrap();
+        let output = root.path().join("recovered.json");
+        create_session(SessionCreateArgs {
+            root: root_args(root.path()),
+            id: Some("source-session".to_string()),
+            title: Some("Source session".to_string()),
+            json: false,
+        })
+        .await
+        .unwrap();
+
+        let conventions =
+            PathConventions::for_session(root.path(), &SessionId::parse("source-session").unwrap());
+        fs::write(conventions.events_file(), b"not json\n").unwrap();
+
+        let export_summary = recover_export_session(SessionRecoverExportArgs {
+            root: root_args(root.path()),
+            id: Some("source-session".to_string()),
+            session_dir: None,
+            source_id: None,
+            output: output.clone(),
+            json: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(export_summary.id, "source-session");
+        assert!(output.exists());
+        assert!(!export_summary.report.warnings.is_empty());
+
+        let import_summary = recover_import_session(SessionRecoverImportArgs {
+            root: root_args(root.path()),
+            input: output,
+            id: "imported-session".to_string(),
+            json: false,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(import_summary.id, "imported-session");
+        assert!(root
+            .path()
+            .join("imported-session")
+            .join("metadata.json")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn recover_import_plain_snapshot_reports_session_import_hint() {
+        let root = tempdir().unwrap();
+        let output = root.path().join("snapshot.json");
+        create_session(SessionCreateArgs {
+            root: root_args(root.path()),
+            id: Some("source-session".to_string()),
+            title: Some("Source".to_string()),
+            json: false,
+        })
+        .await
+        .unwrap();
+        export_session(SessionExportArgs {
+            root: root_args(root.path()),
+            id: "source-session".to_string(),
+            output: output.clone(),
+            json: false,
+        })
+        .await
+        .unwrap();
+
+        let err = recover_import_session(SessionRecoverImportArgs {
+            root: root_args(root.path()),
+            input: output,
+            id: "imported-session".to_string(),
+            json: false,
+        })
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("session import"));
+        assert!(
+            message.contains("SessionSnapshot") || message.contains("plain session snapshot"),
+            "{message}"
+        );
     }
 }

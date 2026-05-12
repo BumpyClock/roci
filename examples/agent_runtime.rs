@@ -102,6 +102,7 @@ async fn main() {
         session: None,
         sandbox_provider: None,
         chat: Default::default(),
+        subagents: None,
         human_interaction_coordinator: None,
     };
 

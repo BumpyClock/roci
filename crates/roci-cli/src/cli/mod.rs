@@ -376,6 +376,10 @@ pub enum SessionCommands {
     Export(SessionExportArgs),
     /// Import a durable session snapshot
     Import(SessionImportArgs),
+    /// Recover a durable session snapshot from local state
+    RecoverExport(SessionRecoverExportArgs),
+    /// Import a recovered durable session snapshot into local state
+    RecoverImport(SessionRecoverImportArgs),
 }
 
 /// Arguments for `roci-agent session create`.
@@ -454,6 +458,58 @@ pub struct SessionImportArgs {
     /// Imported session id. Defaults to a generated UUID.
     #[arg(long, value_name = "ID")]
     pub id: Option<String>,
+
+    /// Print a JSON summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `roci-agent session recover-export`.
+#[derive(Parser, Debug)]
+pub struct SessionRecoverExportArgs {
+    /// Session root directory. Defaults to the app data session directory.
+    #[arg(long, value_name = "PATH")]
+    pub root: Option<PathBuf>,
+
+    /// Session id to recover.
+    #[arg(
+        value_name = "ID",
+        conflicts_with = "session_dir",
+        required_unless_present = "session_dir"
+    )]
+    pub id: Option<String>,
+
+    /// Session directory to recover.
+    #[arg(long, value_name = "PATH", conflicts_with = "id")]
+    pub session_dir: Option<PathBuf>,
+
+    /// Source session id when recovering from --session-dir.
+    #[arg(long, value_name = "ID", requires = "session_dir")]
+    pub source_id: Option<String>,
+
+    /// Output recovered session JSON path.
+    #[arg(long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// Print a JSON summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `roci-agent session recover-import`.
+#[derive(Parser, Debug)]
+pub struct SessionRecoverImportArgs {
+    /// Session root directory. Defaults to the app data session directory.
+    #[arg(long, value_name = "PATH")]
+    pub root: Option<PathBuf>,
+
+    /// Input recovered session JSON path.
+    #[arg(long, value_name = "PATH")]
+    pub input: PathBuf,
+
+    /// Imported session id.
+    #[arg(long, value_name = "ID")]
+    pub id: String,
 
     /// Print a JSON summary.
     #[arg(long)]

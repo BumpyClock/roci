@@ -7,6 +7,8 @@ mod id;
 mod ledger;
 mod metadata;
 mod path;
+#[cfg(feature = "agent")]
+pub mod recovery;
 mod resources;
 mod snapshot;
 #[cfg(feature = "agent")]
@@ -29,3 +31,10 @@ pub use snapshot::{
 };
 #[cfg(feature = "agent")]
 pub use store::LocalSessionStore;
+
+#[cfg(feature = "agent")]
+pub use recovery::{
+    ProviderRecoveryReport, RecoveredSession, RecoveryReport, RecoverySeverity, RecoverySource,
+    RecoverySourceReport, RecoverySourceStats, RecoverySourceStatus, RecoveryStats,
+    RuntimeSnapshotCachePreview, SessionRecoverySource, RECOVERED_SESSION_ARTIFACT_TYPE,
+};
