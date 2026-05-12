@@ -8,7 +8,7 @@ roci notes:
 - Use parallel-subagents and agent-teams for all tasks.
 - keep roci-cli updated with the changes we make in roci so we can run live tests.
 - roci-cli is the example app. roci is the core agent sdk that makes it easy to develop agents. resposibility boundaries for features should be thought of accordingly.
-- We are in active development. no users of roci sdk, breaking changes ok and encouraged to get into the right shape. 
+- We are in active development. no users of roci sdk, breaking API changes ok and encouraged to get into the right shape. 
 
 # Core
 - use `tasque` for persistent task management

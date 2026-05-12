@@ -6,3 +6,4 @@ target/
 .env
 .tasque/
 docs/superpowers
+.idea/
