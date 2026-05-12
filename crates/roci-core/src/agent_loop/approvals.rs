@@ -676,6 +676,58 @@ mod tests {
     }
 
     #[test]
+    fn deny_shell_command_rule_beats_ask_and_allow_matches() {
+        let mut ctx = context();
+        ctx.command = Some(crate::security::command::CommandInsight {
+            normalized_command: "git status --short".to_string(),
+            primary_executable: Some("git".to_string()),
+            categories: vec![crate::security::command::CommandCategory::ReadOnly],
+            reasons: vec!["read-only command".to_string()],
+            confidence: crate::security::command::CommandConfidence::High,
+        });
+        let policy = ApprovalPolicy {
+            default_action: ApprovalAction::Allow,
+            rules: vec![
+                ApprovalRule::new(
+                    "allow-shell",
+                    ApprovalAction::Allow,
+                    ApprovalMatcher::ToolName {
+                        name: "shell".into(),
+                    },
+                ),
+                ApprovalRule::new(
+                    "ask-git-status",
+                    ApprovalAction::Ask,
+                    ApprovalMatcher::CommandPattern {
+                        pattern: "status".into(),
+                    },
+                ),
+                ApprovalRule::new(
+                    "deny-git",
+                    ApprovalAction::Deny,
+                    ApprovalMatcher::CommandExecutable {
+                        executable: "git".into(),
+                    },
+                ),
+            ],
+            additional_safety_floors: ApprovalSafetyFloors::default(),
+            session_grants: ApprovalGrantSet::default(),
+        };
+
+        let evaluation = policy.evaluate(&ctx);
+
+        assert_eq!(evaluation.action, ApprovalAction::Deny);
+        assert_eq!(
+            evaluation
+                .matched_rules
+                .iter()
+                .map(|rule| rule.rule_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deny-git", "ask-git-status", "allow-shell"]
+        );
+    }
+
+    #[test]
     fn exact_tool_match_beats_kind_match_for_same_action() {
         let policy = ApprovalPolicy {
             default_action: ApprovalAction::Allow,
@@ -718,6 +770,36 @@ mod tests {
         let evaluation = ApprovalPolicy::always().evaluate(&ctx);
         assert_eq!(evaluation.action, ApprovalAction::Ask);
         assert_eq!(evaluation.safety_floors[0].effect, ApprovalAction::Ask);
+    }
+
+    #[test]
+    fn destructive_command_safety_floor_beats_broad_shell_allow_rule() {
+        let mut ctx = context();
+        ctx.command = Some(crate::security::command::CommandInsight {
+            normalized_command: "rm -rf target".to_string(),
+            primary_executable: Some("rm".to_string()),
+            categories: vec![crate::security::command::CommandCategory::DestructiveDelete],
+            reasons: vec!["destructive delete".to_string()],
+            confidence: crate::security::command::CommandConfidence::High,
+        });
+        let policy = ApprovalPolicy {
+            default_action: ApprovalAction::Ask,
+            rules: vec![ApprovalRule::new(
+                "allow-shell",
+                ApprovalAction::Allow,
+                ApprovalMatcher::ToolName {
+                    name: "shell".into(),
+                },
+            )],
+            additional_safety_floors: ApprovalSafetyFloors::default(),
+            session_grants: ApprovalGrantSet::default(),
+        };
+
+        let evaluation = policy.evaluate(&ctx);
+
+        assert_eq!(evaluation.action, ApprovalAction::Ask);
+        assert_eq!(evaluation.matched_rules[0].rule_id, "allow-shell");
+        assert_eq!(evaluation.safety_floors[0].id, "destructive_command");
     }
 
     #[test]

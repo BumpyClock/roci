@@ -621,6 +621,15 @@ mod tests {
         Arc::new(tokio::sync::Mutex::new(HashSet::new()))
     }
 
+    fn tool_permission_request_count(events: &Arc<Mutex<Vec<AgentEvent>>>) -> usize {
+        events
+            .lock()
+            .expect("agent event lock")
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::HumanInteractionRequested { .. }))
+            .count()
+    }
+
     fn responding_permission_emitter(
         decision: ToolPermissionDecision,
     ) -> (
@@ -815,7 +824,15 @@ mod tests {
     #[tokio::test]
     async fn approval_payload_omits_nested_raw_arguments() {
         let (emitter, events) = emitter_with_events();
-        let agent_emitter = AgentEventEmitter::new(None);
+        let agent_events = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+        let sink_agent_events = agent_events.clone();
+        let agent_sink: AgentEventSink = Arc::new(move |event| {
+            sink_agent_events
+                .lock()
+                .expect("agent event lock")
+                .push(event);
+        });
+        let agent_emitter = AgentEventEmitter::new(Some(agent_sink));
         let shell = tool(
             "shell",
             ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
@@ -847,7 +864,21 @@ mod tests {
         };
         let payload = serde_json::to_string(&request.payload).expect("payload serializes");
         assert!(!payload.contains("sk-secret-leak-123"));
+        assert!(request.payload.get("arguments").is_none());
         assert!(request.payload.get("evaluation").is_some());
+
+        let agent_events = agent_events.lock().expect("agent event lock");
+        let agent_request = agent_events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Approval { request } => Some(request),
+                _ => None,
+            })
+            .expect("agent approval event");
+        let agent_payload =
+            serde_json::to_string(&agent_request.payload).expect("agent payload serializes");
+        assert!(!agent_payload.contains("sk-secret-leak-123"));
+        assert!(agent_request.payload.get("arguments").is_none());
     }
 
     #[tokio::test]
@@ -1072,7 +1103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_for_session_reuses_exact_permission_key_only() {
+    async fn legacy_session_grant_reuses_only_same_final_arguments() {
         let (emitter, _events) = emitter_with_events();
         let (agent_emitter, agent_events, coordinator) =
             responding_permission_emitter(ToolPermissionDecision::AllowForSession);
@@ -1100,28 +1131,47 @@ mod tests {
             recipient: None,
         };
 
-        for call in [&first_call, &second_call, &different_args] {
-            let decision = resolve_approval(
-                &emitter,
-                &agent_emitter,
-                &ApprovalPolicy::ask(),
-                None,
-                Some(&coordinator),
-                &approvals,
-                call,
-                Some(&shell),
-            )
-            .await;
-            assert_eq!(decision, ApprovalDecision::AcceptForSession);
-        }
+        let first_decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::ask(),
+            None,
+            Some(&coordinator),
+            &approvals,
+            &first_call,
+            Some(&shell),
+        )
+        .await;
+        assert_eq!(first_decision, ApprovalDecision::AcceptForSession);
+        assert_eq!(tool_permission_request_count(&agent_events), 1);
 
-        let request_count = agent_events
-            .lock()
-            .expect("agent event lock")
-            .iter()
-            .filter(|event| matches!(event, AgentEvent::HumanInteractionRequested { .. }))
-            .count();
-        assert_eq!(request_count, 2);
+        let second_decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::ask(),
+            None,
+            Some(&coordinator),
+            &approvals,
+            &second_call,
+            Some(&shell),
+        )
+        .await;
+        assert_eq!(second_decision, ApprovalDecision::AcceptForSession);
+        assert_eq!(tool_permission_request_count(&agent_events), 1);
+
+        let different_decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &ApprovalPolicy::ask(),
+            None,
+            Some(&coordinator),
+            &approvals,
+            &different_args,
+            Some(&shell),
+        )
+        .await;
+        assert_eq!(different_decision, ApprovalDecision::AcceptForSession);
+        assert_eq!(tool_permission_request_count(&agent_events), 2);
     }
 
     #[tokio::test]
@@ -1175,5 +1225,58 @@ mod tests {
             .filter(|event| matches!(event.payload, RunEventPayload::ApprovalRequired { .. }))
             .count();
         assert_eq!(request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_session_grant_does_not_override_explicit_deny_rule() {
+        let (emitter, events) = emitter_with_events();
+        let agent_emitter = AgentEventEmitter::new(None);
+        let approvals = session_approvals();
+        let call = AgentToolCall {
+            id: "shell-call".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": "echo cached" }),
+            recipient: None,
+        };
+        let shell = tool(
+            "shell",
+            ToolApproval::requires_approval(ToolApprovalKind::CommandExecution),
+        );
+        approvals
+            .lock()
+            .await
+            .insert(ToolPermissionSessionKey::for_tool_call(
+                ToolPermissionKind::Shell,
+                &call,
+            ));
+        let mut policy = ApprovalPolicy::always();
+        policy.rules.push(ApprovalRule::new(
+            "deny-shell",
+            ApprovalAction::Deny,
+            ApprovalMatcher::ToolName {
+                name: "shell".to_string(),
+            },
+        ));
+
+        let decision = resolve_approval(
+            &emitter,
+            &agent_emitter,
+            &policy,
+            None,
+            None,
+            &approvals,
+            &call,
+            Some(&shell),
+        )
+        .await;
+
+        assert_eq!(decision, ApprovalDecision::Decline);
+        let request_count = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter(|event| matches!(event.payload, RunEventPayload::ApprovalRequired { .. }))
+            .count();
+        assert_eq!(request_count, 0);
     }
 }

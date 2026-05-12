@@ -5,3 +5,4 @@ target/
 .ai_agents/
 .env
 .tasque/
+docs/superpowers

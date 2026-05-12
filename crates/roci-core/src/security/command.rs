@@ -152,7 +152,7 @@ const PERMISSION: &[&str] = &["chmod", "chown", "chgrp", "setfacl"];
 const PROCESS: &[&str] = &["kill", "pkill", "killall", "launchctl", "systemctl"];
 const NETWORK: &[&str] = &["curl", "wget", "ssh", "scp", "rsync", "nc"];
 const CODE_EXEC: &[&str] = &[
-    "sh", "bash", "zsh", "fish", "python", "ruby", "node", "perl",
+    "sh", "bash", "zsh", "fish", "python", "ruby", "node", "perl", "eval",
 ];
 const READ_ONLY: &[&str] = &[
     "cat", "ls", "pwd", "head", "tail", "less", "more", "grep", "rg", "find", "wc", "echo",
@@ -328,6 +328,11 @@ fn classify_executable(
         return;
     }
 
+    if executable == "eval" {
+        classify_eval(args, categories, reasons);
+        return;
+    }
+
     if DESTRUCTIVE.contains(&executable) {
         add_category(categories, CommandCategory::DestructiveDelete);
         add_reason(
@@ -370,6 +375,28 @@ fn classify_executable(
     } else {
         add_category(categories, CommandCategory::Unknown);
         add_reason(reasons, format!("unknown executable: {executable}"));
+    }
+}
+
+fn classify_eval(
+    args: &[String],
+    categories: &mut Vec<CommandCategory>,
+    reasons: &mut Vec<String>,
+) {
+    add_category(categories, CommandCategory::CodeExecution);
+    add_category(categories, CommandCategory::Unknown);
+    add_reason(reasons, "matched eval command execution".to_string());
+
+    let joined = args.join(" ");
+    let (segments, connectors) = split_segments(&joined);
+    for connector in connectors {
+        add_reason(reasons, format!("connector detected: {connector}"));
+    }
+    for segment in segments {
+        let tokens = tokenize_segment(&segment);
+        if !tokens.is_empty() {
+            let _ = classify_segment(&tokens, categories, reasons);
+        }
     }
 }
 
@@ -655,6 +682,219 @@ mod tests {
 
     fn has(report: &CommandInsight, category: CommandCategory) -> bool {
         report.categories.contains(&category)
+    }
+
+    struct CommandFixture {
+        command: &'static str,
+        expected_categories: &'static [CommandCategory],
+        expected_confidence: CommandConfidence,
+        expected_reasons: &'static [&'static str],
+    }
+
+    impl CommandFixture {
+        fn new(
+            command: &'static str,
+            expected_categories: &'static [CommandCategory],
+            expected_confidence: CommandConfidence,
+        ) -> Self {
+            Self {
+                command,
+                expected_categories,
+                expected_confidence,
+                expected_reasons: &[],
+            }
+        }
+
+        fn with_reasons(mut self, expected_reasons: &'static [&'static str]) -> Self {
+            self.expected_reasons = expected_reasons;
+            self
+        }
+
+        fn assert_matches(&self) {
+            let report = classify_shell_command(self.command);
+
+            assert_eq!(
+                report.categories.as_slice(),
+                self.expected_categories,
+                "categories mismatch for command `{}`; reasons: {:?}",
+                self.command,
+                report.reasons
+            );
+            assert_eq!(
+                &report.confidence, &self.expected_confidence,
+                "confidence mismatch for command `{}`; reasons: {:?}",
+                self.command, report.reasons
+            );
+            for expected_reason in self.expected_reasons {
+                assert!(
+                    report
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == expected_reason),
+                    "missing reason `{}` for command `{}`; got {:?}",
+                    expected_reason,
+                    self.command,
+                    report.reasons
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_classifier_fixture_corpus() {
+        use CommandCategory::{
+            CodeExecution, DestructiveDelete, NetworkLikely, PermissionChange, PrivilegeEscalation,
+            ProcessControl, ReadOnly, Unknown, WritesFilesystem,
+        };
+        use CommandConfidence::{High, Low};
+
+        let fixtures = [
+            CommandFixture::new("cat Cargo.toml", &[ReadOnly], High),
+            CommandFixture::new("ls crates", &[ReadOnly], High),
+            CommandFixture::new("grep roci Cargo.toml", &[ReadOnly], High),
+            CommandFixture::new("rg roci crates", &[ReadOnly], High),
+            CommandFixture::new("git status", &[ReadOnly], High)
+                .with_reasons(&["matched git read-only subcommand: status"]),
+            CommandFixture::new("git show HEAD", &[ReadOnly], High)
+                .with_reasons(&["matched git read-only subcommand: show"]),
+            CommandFixture::new("touch /tmp/roci-file", &[WritesFilesystem], High),
+            CommandFixture::new("mkdir /tmp/roci-dir", &[WritesFilesystem], High),
+            CommandFixture::new("cp Cargo.toml /tmp/roci-copy", &[WritesFilesystem], High),
+            CommandFixture::new("mv /tmp/roci-old /tmp/roci-new", &[WritesFilesystem], High),
+            CommandFixture::new("tee /tmp/roci-out", &[WritesFilesystem], High),
+            CommandFixture::new("rm -rf /tmp/roci-dir", &[DestructiveDelete], High)
+                .with_reasons(&["matched destructive delete executable: rm"]),
+            CommandFixture::new("rmdir /tmp/roci-dir", &[DestructiveDelete], High),
+            CommandFixture::new("shred /tmp/roci-secret", &[DestructiveDelete], High),
+            CommandFixture::new("find /tmp/roci-dir -delete", &[DestructiveDelete], High)
+                .with_reasons(&["matched find destructive predicate: -delete"]),
+            CommandFixture::new(
+                r"find /tmp/roci-dir -exec rm {} \;",
+                &[CodeExecution, Unknown, DestructiveDelete],
+                Low,
+            )
+            .with_reasons(&["matched find execution predicate: -exec"]),
+            CommandFixture::new("sudo ls /root", &[PrivilegeEscalation, ReadOnly], High)
+                .with_reasons(&["wrapper detected: sudo"]),
+            CommandFixture::new("doas ls /root", &[PrivilegeEscalation, ReadOnly], High)
+                .with_reasons(&["wrapper detected: doas"]),
+            CommandFixture::new(
+                "sudo -u root ls /root",
+                &[PrivilegeEscalation, ReadOnly],
+                High,
+            )
+            .with_reasons(&["wrapper detected: sudo"]),
+            CommandFixture::new("chmod 600 /tmp/roci-secret", &[PermissionChange], High),
+            CommandFixture::new(
+                "chown root:wheel /tmp/roci-secret",
+                &[PermissionChange],
+                High,
+            ),
+            CommandFixture::new("chgrp wheel /tmp/roci-secret", &[PermissionChange], High),
+            CommandFixture::new("kill 1234", &[ProcessControl], High),
+            CommandFixture::new("pkill roci", &[ProcessControl], High),
+            CommandFixture::new("systemctl restart roci.service", &[ProcessControl], High),
+            CommandFixture::new("launchctl kickstart system/roci", &[ProcessControl], High),
+            CommandFixture::new("curl https://example.com", &[NetworkLikely], High),
+            CommandFixture::new("wget https://example.com/file", &[NetworkLikely], High),
+            CommandFixture::new("ssh example.com", &[NetworkLikely], High),
+            CommandFixture::new("scp file example.com:/tmp/file", &[NetworkLikely], High),
+            CommandFixture::new(
+                "rsync -av src/ example.com:/tmp/src",
+                &[NetworkLikely],
+                High,
+            ),
+            CommandFixture::new("nc example.com 443", &[NetworkLikely], High),
+            CommandFixture::new("sh -c 'echo ok'", &[CodeExecution], High),
+            CommandFixture::new("bash -c 'echo ok'", &[CodeExecution], High),
+            CommandFixture::new("python -c 'print(1)'", &[CodeExecution], High),
+            CommandFixture::new("node -e 'console.log(1)'", &[CodeExecution], High),
+            CommandFixture::new(
+                "eval rm -rf /tmp/roci-dir",
+                &[CodeExecution, Unknown, DestructiveDelete],
+                Low,
+            )
+            .with_reasons(&["matched eval command execution"]),
+            CommandFixture::new(
+                "eval find /tmp/roci-dir -delete",
+                &[CodeExecution, Unknown, DestructiveDelete],
+                Low,
+            )
+            .with_reasons(&["matched find destructive predicate: -delete"]),
+            CommandFixture::new(
+                "eval git reset --hard",
+                &[CodeExecution, Unknown, WritesFilesystem],
+                Low,
+            )
+            .with_reasons(&["matched git write subcommand: reset"]),
+            CommandFixture::new(
+                "eval sudo ls /root",
+                &[CodeExecution, Unknown, PrivilegeEscalation, ReadOnly],
+                Low,
+            )
+            .with_reasons(&["matched eval command execution", "wrapper detected: sudo"]),
+            CommandFixture::new(
+                "eval 'rm -rf /tmp/roci-dir'",
+                &[CodeExecution, Unknown, DestructiveDelete],
+                Low,
+            )
+            .with_reasons(&["matched eval command execution"]),
+            CommandFixture::new(
+                "eval 'sudo rm -rf /tmp/roci-dir'",
+                &[
+                    CodeExecution,
+                    Unknown,
+                    PrivilegeEscalation,
+                    DestructiveDelete,
+                ],
+                Low,
+            )
+            .with_reasons(&["matched eval command execution", "wrapper detected: sudo"]),
+            CommandFixture::new(
+                "echo $(eval rm -rf /tmp/roci-dir)",
+                &[Unknown, ReadOnly, CodeExecution, DestructiveDelete],
+                Low,
+            )
+            .with_reasons(&["shell syntax detected: $()"]),
+            CommandFixture::new(
+                "echo `chmod 600 /tmp/roci-secret`",
+                &[Unknown, ReadOnly, PermissionChange],
+                Low,
+            )
+            .with_reasons(&["shell syntax detected: backticks"]),
+            CommandFixture::new("cat Cargo.toml | grep roci", &[Unknown, ReadOnly], Low)
+                .with_reasons(&["connector detected: |"]),
+            CommandFixture::new(
+                "cat Cargo.toml; rm -rf /tmp/roci-dir",
+                &[Unknown, ReadOnly, DestructiveDelete],
+                Low,
+            )
+            .with_reasons(&["connector detected: ;"]),
+            CommandFixture::new(
+                "cat Cargo.toml\nrm -rf /tmp/roci-dir",
+                &[Unknown, ReadOnly, DestructiveDelete],
+                Low,
+            )
+            .with_reasons(&["shell syntax detected: newline"]),
+            CommandFixture::new(
+                "cat Cargo.toml & rm -rf /tmp/roci-dir",
+                &[Unknown, ReadOnly, DestructiveDelete],
+                Low,
+            )
+            .with_reasons(&["connector detected: &"]),
+            CommandFixture::new("cat Cargo.toml > /tmp/roci-out", &[Unknown, ReadOnly], Low)
+                .with_reasons(&["shell syntax detected: redirect"]),
+            CommandFixture::new(
+                "tee /tmp/roci-out < Cargo.toml",
+                &[Unknown, WritesFilesystem],
+                Low,
+            )
+            .with_reasons(&["shell syntax detected: redirect"]),
+        ];
+
+        for fixture in fixtures {
+            fixture.assert_matches();
+        }
     }
 
     #[test]
