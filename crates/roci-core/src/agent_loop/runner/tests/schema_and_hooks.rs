@@ -1,4 +1,7 @@
 use super::*;
+
+use crate::agent_loop::{ApprovalAction, ApprovalDecision, ApprovalMatcher, ApprovalRule};
+use crate::tools::ToolApprovalKind;
 #[tokio::test]
 async fn tool_with_schema_rejects_bad_args_through_runner() {
     let (runner, _requests) = test_runner(ProviderScenario::SchemaToolBadArgs);
@@ -177,6 +180,183 @@ async fn pre_tool_use_hook_replace_args_are_used_by_tool() {
 }
 
 #[tokio::test]
+async fn pre_tool_use_hook_replace_args_are_used_by_approval() {
+    let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+    let (sink, events) = capture_events();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+    request.tools = vec![Arc::new(
+        AgentTool::new(
+            "schema_tool",
+            "tool with required command param",
+            AgentToolParameters::object()
+                .string("command", "shell command", true)
+                .build(),
+            {
+                let executions = executions.clone();
+                move |args, _ctx: ToolExecutionContext| {
+                    let executions = executions.clone();
+                    async move {
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        Ok(serde_json::json!({
+                            "command": args.get_str("command")?,
+                        }))
+                    }
+                }
+            },
+        )
+        .with_approval(ToolApproval::requires_approval(
+            ToolApprovalKind::CommandExecution,
+        )),
+    )];
+    request.approval_policy = ApprovalPolicy {
+        default_action: ApprovalAction::Allow,
+        rules: vec![ApprovalRule::new(
+            "rewritten-command",
+            ApprovalAction::Ask,
+            ApprovalMatcher::CommandPattern {
+                pattern: "approval-rewritten".to_string(),
+            },
+        )],
+        additional_safety_floors: Default::default(),
+        session_grants: Default::default(),
+    };
+    request.approval_handler = Some(Arc::new(|_request| {
+        Box::pin(async { ApprovalDecision::Accept })
+    }));
+    request.event_sink = Some(sink);
+    request.hooks = RunHooks {
+        compaction: None,
+        pre_tool_use: Some(Arc::new(|_call, _cancel| {
+            Box::pin(async {
+                Ok(PreToolUseHookResult::ReplaceArgs {
+                    args: serde_json::json!({ "command": "echo approval-rewritten" }),
+                })
+            })
+        })),
+        post_tool_use: None,
+    };
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run should complete without timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+    let events = events.lock().expect("event lock");
+    let approval_requests = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            RunEventPayload::ApprovalRequired { request } => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(approval_requests.len(), 1);
+    let payload = &approval_requests[0].payload;
+    assert_eq!(
+        payload.pointer("/evaluation/action"),
+        Some(&serde_json::json!("ask"))
+    );
+    assert_eq!(
+        payload.pointer("/evaluation/matched_rules/0/rule_id"),
+        Some(&serde_json::json!("rewritten-command"))
+    );
+    assert!(payload.get("arguments").is_none());
+
+    let tool_results = tool_results_from_events(&events);
+    assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+    let (_call_id, result_json, is_error) = &tool_results[0];
+    assert!(!is_error, "approved rewritten args should execute");
+    assert_eq!(
+        result_json["command"],
+        serde_json::json!("echo approval-rewritten")
+    );
+}
+
+#[tokio::test]
+async fn pre_tool_use_hook_rewritten_args_can_fall_through_approval_default() {
+    let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+    let (sink, events) = capture_events();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+    request.tools = vec![Arc::new(
+        AgentTool::new(
+            "schema_tool",
+            "tool with required command param",
+            AgentToolParameters::object()
+                .string("command", "shell command", true)
+                .build(),
+            {
+                let executions = executions.clone();
+                move |args, _ctx: ToolExecutionContext| {
+                    let executions = executions.clone();
+                    async move {
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        Ok(serde_json::json!({
+                            "command": args.get_str("command")?,
+                        }))
+                    }
+                }
+            },
+        )
+        .with_approval(ToolApproval::requires_approval(
+            ToolApprovalKind::CommandExecution,
+        )),
+    )];
+    request.approval_policy = ApprovalPolicy {
+        default_action: ApprovalAction::Allow,
+        rules: vec![ApprovalRule::new(
+            "rewritten-command",
+            ApprovalAction::Ask,
+            ApprovalMatcher::CommandPattern {
+                pattern: "approval-rewritten".to_string(),
+            },
+        )],
+        additional_safety_floors: Default::default(),
+        session_grants: Default::default(),
+    };
+    request.approval_handler = Some(Arc::new(|_request| {
+        Box::pin(async { ApprovalDecision::Decline })
+    }));
+    request.event_sink = Some(sink);
+    request.hooks = RunHooks {
+        compaction: None,
+        pre_tool_use: Some(Arc::new(|_call, _cancel| {
+            Box::pin(async {
+                Ok(PreToolUseHookResult::ReplaceArgs {
+                    args: serde_json::json!({ "command": "echo approval-not-matching" }),
+                })
+            })
+        })),
+        post_tool_use: None,
+    };
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run should complete without timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+    let events = events.lock().expect("event lock");
+    let approval_requests = events
+        .iter()
+        .filter(|event| matches!(event.payload, RunEventPayload::ApprovalRequired { .. }))
+        .count();
+    assert_eq!(approval_requests, 0);
+
+    let tool_results = tool_results_from_events(&events);
+    assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+    let (_call_id, result_json, is_error) = &tool_results[0];
+    assert!(!is_error, "default-allowed rewritten args should execute");
+    assert_eq!(
+        result_json["command"],
+        serde_json::json!("echo approval-not-matching")
+    );
+}
+
+#[tokio::test]
 async fn pre_tool_use_hook_error_returns_synthetic_tool_error() {
     let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
     let (sink, events) = capture_events();
@@ -214,6 +394,72 @@ async fn pre_tool_use_hook_error_returns_synthetic_tool_error() {
         .as_str()
         .unwrap_or_default()
         .contains("forced pre hook failure"));
+}
+
+#[tokio::test]
+async fn pre_tool_use_block_result_survives_parallel_flush_and_steering() {
+    let (runner, _requests) = test_runner(ProviderScenario::ParallelSafeBatchThenComplete);
+    let (sink, events) = capture_events();
+    let active_calls = Arc::new(AtomicUsize::new(0));
+    let max_active_calls = Arc::new(AtomicUsize::new(0));
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("run tools")]);
+    request.tools = vec![
+        tracked_success_tool(
+            "read",
+            Duration::from_millis(10),
+            active_calls.clone(),
+            max_active_calls.clone(),
+        ),
+        tracked_success_tool(
+            "ls",
+            Duration::from_millis(10),
+            active_calls,
+            max_active_calls,
+        ),
+    ];
+    request.approval_policy = ApprovalPolicy::always();
+    request.event_sink = Some(sink);
+    request.hooks = RunHooks {
+        compaction: None,
+        pre_tool_use: Some(Arc::new(|call, _cancel| {
+            Box::pin(async move {
+                if call.name == "ls" {
+                    Ok(PreToolUseHookResult::Block {
+                        reason: Some("blocked-before-steering".to_string()),
+                    })
+                } else {
+                    Ok(PreToolUseHookResult::Continue)
+                }
+            })
+        })),
+        post_tool_use: None,
+    };
+    request.get_steering_messages = Some(Arc::new(|| {
+        Box::pin(async { vec![ModelMessage::user("interrupt")] })
+    }));
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(4), handle.wait())
+        .await
+        .expect("run should complete without timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let events = events.lock().expect("event lock");
+    let tool_results = tool_results_from_events(&events);
+    assert_eq!(tool_results.len(), 2);
+    assert!(tool_results
+        .iter()
+        .any(|(call_id, _, is_error)| { call_id == "safe-read-1" && !is_error }));
+    let (_call_id, result_json, is_error) = tool_results
+        .iter()
+        .find(|(call_id, _, _)| call_id == "safe-ls-2")
+        .expect("pre-tool block result should be preserved for current call");
+    assert!(*is_error);
+    assert_eq!(result_json["source"], serde_json::json!("pre_tool_use"));
+    assert!(result_json["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("blocked-before-steering"));
 }
 
 #[tokio::test]

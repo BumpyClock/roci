@@ -10,10 +10,10 @@ use super::super::limits::{is_parallel_safe_tool, RunnerLimits};
 use super::super::message_events::assistant_message_snapshot;
 use super::super::message_events::emit_message_lifecycle;
 use super::super::tooling::{
-    append_skipped_tool_call, append_tool_result, apply_post_tool_use_hook, canceled_tool_result,
-    declined_tool_result, emit_tool_execution_end, emit_tool_execution_start,
-    execute_parallel_tool_calls, execute_tool_call, resolve_tool_call, ResolvedToolCall,
-    ToolExecutionInputs, ToolExecutionOutcome,
+    append_skipped_tool_call, append_tool_result, apply_post_tool_use_hook,
+    apply_pre_tool_use_hook, canceled_tool_result, declined_tool_result, emit_tool_execution_end,
+    emit_tool_execution_start, execute_parallel_tool_calls, execute_tool_call, resolve_tool_call,
+    ResolvedToolCall, ToolExecutionInputs, ToolExecutionOutcome,
 };
 use super::super::{AgentEvent, ApprovalDecision, RunRequest};
 
@@ -86,24 +86,135 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
 
     for (call_idx, call) in tool_calls.iter().enumerate() {
         let resolved_call = resolve_tool_call(&request.tools, call);
-        let approval_tool = resolved_call.tool.clone();
-        let approval = resolve_approval(
-            emitter,
-            agent_emitter,
-            &request.approval_policy,
-            request.approval_handler.as_ref(),
-            request.human_interaction_coordinator.as_ref(),
-            &request.tool_permission_session_approvals,
-            call,
-            approval_tool.as_deref(),
+        let pre_tool_use = apply_pre_tool_use_hook(
+            &request.hooks,
+            &resolved_call.call,
+            run_cancel_token.child_token(),
         );
-        tokio::pin!(approval);
-        let decision = tokio::select! {
+        tokio::pin!(pre_tool_use);
+        let pre_tool_use_result = tokio::select! {
             _ = &mut *abort_rx => {
                 run_cancel_token.cancel();
                 return ToolPhaseOutcome::Canceled;
             }
-            decision = &mut approval => decision,
+            result = &mut pre_tool_use => result,
+        };
+        let finalized_call = match pre_tool_use_result {
+            Ok(finalized_call) => finalized_call,
+            Err(result) => {
+                if !pending_parallel_calls.is_empty() {
+                    for parallel_call in &pending_parallel_calls {
+                        emit_tool_execution_start(agent_emitter, &parallel_call.call);
+                    }
+                    let parallel_results = tokio::select! {
+                        _ = &mut *abort_rx => {
+                            run_cancel_token.cancel();
+                            for parallel_call in &pending_parallel_calls {
+                                let canceled_result = apply_post_tool_use_hook(
+                                    &request.hooks,
+                                    &parallel_call.call,
+                                    canceled_tool_result(&parallel_call.call),
+                                )
+                                .await;
+                                emit_tool_execution_end(
+                                    agent_emitter,
+                                    &parallel_call.call,
+                                    &canceled_result,
+                                );
+                            }
+                            return ToolPhaseOutcome::Canceled;
+                        }
+                        results = execute_parallel_tool_calls(
+                            &pending_parallel_calls,
+                            agent_emitter,
+                            run_cancel_token.child_token(),
+                            tool_inputs.clone(),
+                        ) => results,
+                    };
+                    pending_parallel_calls.clear();
+                    for parallel_outcome in parallel_results {
+                        emit_tool_execution_end(
+                            agent_emitter,
+                            &parallel_outcome.call,
+                            &parallel_outcome.result,
+                        );
+                        let final_result = append_tool_result(
+                            &request.hooks,
+                            emitter,
+                            agent_emitter,
+                            &parallel_outcome.call,
+                            parallel_outcome.result,
+                            &mut iteration_failures,
+                            messages,
+                        )
+                        .await;
+                        turn_tool_results.push(final_result);
+                    }
+                }
+                emit_tool_execution_start(agent_emitter, &resolved_call.call);
+                emit_tool_execution_end(agent_emitter, &resolved_call.call, &result);
+                let final_result = append_tool_result(
+                    &request.hooks,
+                    emitter,
+                    agent_emitter,
+                    &resolved_call.call,
+                    result,
+                    &mut iteration_failures,
+                    messages,
+                )
+                .await;
+                turn_tool_results.push(final_result);
+
+                if let Some(ref get_steering) = request.get_steering_messages {
+                    let steering = get_steering().await;
+                    if !steering.is_empty() {
+                        for remaining_call in &tool_calls[call_idx + 1..] {
+                            let skipped = append_skipped_tool_call(
+                                &request.hooks,
+                                emitter,
+                                agent_emitter,
+                                remaining_call,
+                                &mut iteration_failures,
+                                messages,
+                            )
+                            .await;
+                            turn_tool_results.push(skipped);
+                        }
+                        for msg in steering {
+                            emit_message_lifecycle(agent_emitter, &msg);
+                            messages.push(msg);
+                        }
+                        steering_interrupted = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
+        let resolved_call = ResolvedToolCall {
+            call: finalized_call,
+            tool: resolved_call.tool,
+        };
+        let approval_tool = resolved_call.tool.clone();
+        let decision = {
+            let approval = resolve_approval(
+                emitter,
+                agent_emitter,
+                &request.approval_policy,
+                request.approval_handler.as_ref(),
+                request.human_interaction_coordinator.as_ref(),
+                &request.tool_permission_session_approvals,
+                &resolved_call.call,
+                approval_tool.as_deref(),
+            );
+            tokio::pin!(approval);
+            tokio::select! {
+                _ = &mut *abort_rx => {
+                    run_cancel_token.cancel();
+                    return ToolPhaseOutcome::Canceled;
+                }
+                decision = &mut approval => decision,
+            }
         };
 
         if matches!(decision, ApprovalDecision::Cancel) {
@@ -112,7 +223,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         }
 
         let can_execute = approval_allows_execution(decision);
-        if can_execute && is_parallel_safe_tool(&call.name) {
+        if can_execute && is_parallel_safe_tool(&resolved_call.call.name) {
             pending_parallel_calls.push(resolved_call);
             continue;
         }
@@ -140,7 +251,6 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     return ToolPhaseOutcome::Canceled;
                 }
                 results = execute_parallel_tool_calls(
-                    &request.hooks,
                     &pending_parallel_calls,
                     agent_emitter,
                     run_cancel_token.child_token(),
@@ -193,21 +303,21 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         }
 
         let outcome = if can_execute {
-            emit_tool_execution_start(agent_emitter, call);
+            let call_for_cancel = resolved_call.call.clone();
+            emit_tool_execution_start(agent_emitter, &call_for_cancel);
             tokio::select! {
                 _ = &mut *abort_rx => {
                     run_cancel_token.cancel();
                     let canceled_result = apply_post_tool_use_hook(
                         &request.hooks,
-                        call,
-                        canceled_tool_result(call),
+                        &call_for_cancel,
+                        canceled_tool_result(&call_for_cancel),
                     )
                     .await;
-                    emit_tool_execution_end(agent_emitter, call, &canceled_result);
+                    emit_tool_execution_end(agent_emitter, &call_for_cancel, &canceled_result);
                     return ToolPhaseOutcome::Canceled;
                 }
                 outcome = execute_tool_call(
-                    &request.hooks,
                     resolved_call,
                     agent_emitter,
                     run_cancel_token.child_token(),
@@ -216,8 +326,8 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
             }
         } else {
             ToolExecutionOutcome {
-                call: call.clone(),
-                result: declined_tool_result(call),
+                call: resolved_call.call.clone(),
+                result: declined_tool_result(&resolved_call.call),
             }
         };
         if can_execute {
@@ -290,7 +400,6 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                 return ToolPhaseOutcome::Canceled;
             }
             results = execute_parallel_tool_calls(
-                &request.hooks,
                 &pending_parallel_calls,
                 agent_emitter,
                 run_cancel_token.child_token(),

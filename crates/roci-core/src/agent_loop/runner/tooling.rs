@@ -96,7 +96,7 @@ fn pre_tool_use_block_result(call: &AgentToolCall, reason: Option<String>) -> Ag
     synthetic_hook_error_result(call, "pre_tool_use", error)
 }
 
-async fn apply_pre_tool_use_hook(
+pub(super) async fn apply_pre_tool_use_hook(
     hooks: &RunHooks,
     call: &AgentToolCall,
     cancel: CancellationToken,
@@ -166,22 +166,12 @@ pub(super) fn emit_tool_execution_end(
 }
 
 pub(super) async fn execute_tool_call(
-    hooks: &RunHooks,
     resolved: ResolvedToolCall,
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
     inputs: ToolExecutionInputs<'_>,
 ) -> ToolExecutionOutcome {
     let ResolvedToolCall { call, tool } = resolved;
-    let call = match apply_pre_tool_use_hook(hooks, &call, cancel.child_token()).await {
-        Ok(call) => call,
-        Err(result) => {
-            return ToolExecutionOutcome {
-                call: call.clone(),
-                result,
-            };
-        }
-    };
     match tool {
         Some(tool) => {
             let schema = &tool.parameters().schema;
@@ -247,7 +237,6 @@ pub(super) async fn execute_tool_call(
 }
 
 pub(super) async fn execute_parallel_tool_calls(
-    hooks: &RunHooks,
     calls: &[ResolvedToolCall],
     agent_emitter: &AgentEventEmitter,
     cancel: CancellationToken,
@@ -258,7 +247,6 @@ pub(super) async fn execute_parallel_tool_calls(
         .cloned()
         .map(|resolved| {
             execute_tool_call(
-                hooks,
                 resolved,
                 agent_emitter,
                 cancel.child_token(),
