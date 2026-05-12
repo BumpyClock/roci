@@ -154,6 +154,7 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments: serde_json::json!({}),
+                called_as: None,
                 recipient: None,
             })],
             name: None,

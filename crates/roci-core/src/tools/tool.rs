@@ -214,6 +214,37 @@ impl Default for ToolSafetySummary {
     }
 }
 
+/// Policy for bounding tool result payloads.
+///
+/// The default 64 KiB cap keeps provider payloads, session ledgers, and event
+/// streams from growing unexpectedly while leaving typical structured tool
+/// replies untouched. Tools that naturally return large payloads, such as file
+/// readers or bulk search/listing tools, should either self-summarize, stream
+/// partial progress, or set a custom `max_result_size_bytes` budget. `None`
+/// opts out for tools that already enforce their own bounded output contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolResultSizePolicy {
+    /// Maximum serialized result size in bytes. `None` means unbounded.
+    pub max_result_size_bytes: Option<usize>,
+}
+
+impl Default for ToolResultSizePolicy {
+    fn default() -> Self {
+        Self {
+            max_result_size_bytes: Some(64 * 1024),
+        }
+    }
+}
+
+/// Structured prompt metadata for model-facing tool guidance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPromptMetadata {
+    /// Tool-specific usage guidelines.
+    pub guidelines: Vec<String>,
+    /// Optional hint for tools that search or retrieve context.
+    pub search_hint: Option<String>,
+}
+
 /// Input-aware safety plan for a single tool call.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSafetyPlan {
@@ -408,6 +439,26 @@ pub trait Tool: Send + Sync {
     /// Human-readable description.
     fn description(&self) -> &str;
 
+    /// Canonical-name aliases accepted by future catalog/dispatch layers.
+    fn aliases(&self) -> &[String] {
+        &[]
+    }
+
+    /// Model-facing prompt text. Defaults to [`Self::description`].
+    fn prompt(&self) -> &str {
+        self.description()
+    }
+
+    /// Structured model-facing prompt metadata.
+    fn prompt_metadata(&self) -> ToolPromptMetadata {
+        ToolPromptMetadata::default()
+    }
+
+    /// Tool result size policy.
+    fn result_policy(&self) -> ToolResultSizePolicy {
+        ToolResultSizePolicy::default()
+    }
+
     /// JSON Schema parameters.
     fn parameters(&self) -> &AgentToolParameters;
 
@@ -462,6 +513,10 @@ type ToolSafetyHandler = dyn Fn(&ToolArguments) -> ToolSafetyPlan + Send + Sync;
 pub struct AgentTool {
     name: String,
     description: String,
+    aliases: Vec<String>,
+    prompt: Option<String>,
+    prompt_metadata: ToolPromptMetadata,
+    result_policy: ToolResultSizePolicy,
     parameters: AgentToolParameters,
     safety_summary: ToolSafetySummary,
     safety_handler: Arc<ToolSafetyHandler>,
@@ -483,11 +538,39 @@ impl AgentTool {
         Self {
             name: name.into(),
             description: description.into(),
+            aliases: Vec::new(),
+            prompt: None,
+            prompt_metadata: ToolPromptMetadata::default(),
+            result_policy: ToolResultSizePolicy::default(),
             parameters,
             safety_summary: ToolSafetySummary::default(),
             safety_handler: Arc::new(|_args| ToolSafetyPlan::default()),
             handler: Arc::new(move |args, ctx| Box::pin(handler(args, ctx))),
         }
+    }
+
+    /// Set aliases for the canonical tool name.
+    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.aliases = aliases.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set model-facing prompt text.
+    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = Some(prompt.into());
+        self
+    }
+
+    /// Set structured model-facing prompt metadata.
+    pub fn with_prompt_metadata(mut self, metadata: ToolPromptMetadata) -> Self {
+        self.prompt_metadata = metadata;
+        self
+    }
+
+    /// Set result size policy.
+    pub fn with_result_policy(mut self, policy: ToolResultSizePolicy) -> Self {
+        self.result_policy = policy;
+        self
     }
 
     /// Set a static safety plan.
@@ -517,6 +600,22 @@ impl Tool for AgentTool {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    fn prompt(&self) -> &str {
+        self.prompt.as_deref().unwrap_or(&self.description)
+    }
+
+    fn prompt_metadata(&self) -> ToolPromptMetadata {
+        self.prompt_metadata.clone()
+    }
+
+    fn result_policy(&self) -> ToolResultSizePolicy {
+        self.result_policy
     }
 
     fn parameters(&self) -> &AgentToolParameters {

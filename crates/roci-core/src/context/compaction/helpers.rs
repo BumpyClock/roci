@@ -126,6 +126,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: name.to_string(),
                 arguments,
+                called_as: None,
                 recipient: None,
             })],
             name: None,

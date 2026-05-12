@@ -2,7 +2,7 @@ use super::*;
 
 use crate::session::{LocalSessionFs, LogicalPath, SessionFs};
 use crate::tools::SandboxProvider;
-use crate::tools::{ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary};
+use crate::tools::{ToolResultSizePolicy, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary};
 
 #[derive(Debug, Default)]
 struct RecordingSandboxProvider {
@@ -61,6 +61,93 @@ fn tracked_safe_success_tool(
     )
 }
 
+fn aliased_success_tool(canonical_name: &str, alias: &str) -> Arc<dyn Tool> {
+    let tool_name = canonical_name.to_string();
+    Arc::new(
+        AgentTool::new(
+            tool_name.clone(),
+            format!("{tool_name} tool"),
+            AgentToolParameters::empty(),
+            move |_args, _ctx: ToolExecutionContext| {
+                let tool_name = tool_name.clone();
+                async move { Ok(serde_json::json!({ "tool": tool_name })) }
+            },
+        )
+        .with_aliases([alias]),
+    )
+}
+
+fn capped_result_tool(
+    result: serde_json::Value,
+    max_result_size_bytes: Option<usize>,
+) -> Arc<dyn Tool> {
+    Arc::new(
+        AgentTool::new(
+            "noop_tool",
+            "returns caller-provided result",
+            AgentToolParameters::empty(),
+            move |_args, _ctx: ToolExecutionContext| {
+                let result = result.clone();
+                async move { Ok(result) }
+            },
+        )
+        .with_result_policy(ToolResultSizePolicy {
+            max_result_size_bytes,
+        }),
+    )
+}
+
+fn first_tool_result_value(messages: &[ModelMessage]) -> serde_json::Value {
+    messages
+        .iter()
+        .find_map(|message| {
+            message.content.iter().find_map(|part| match part {
+                ContentPart::ToolResult(result) => Some(result.result.clone()),
+                _ => None,
+            })
+        })
+        .expect("expected tool result message")
+}
+
+fn first_tool_result_value_from_agent_events(events: &[AgentEvent]) -> serde_json::Value {
+    events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolExecutionEnd { result, .. } => Some(result.result.clone()),
+            _ => None,
+        })
+        .expect("expected ToolExecutionEnd")
+}
+
+fn first_turn_tool_result_value(events: &[AgentEvent]) -> serde_json::Value {
+    events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnEnd { tool_results, .. } => {
+                tool_results.first().map(|result| result.result.clone())
+            }
+            _ => None,
+        })
+        .expect("expected TurnEnd tool result")
+}
+
+fn first_tool_result_value_from_provider_request(
+    requests: &[crate::provider::ProviderRequest],
+) -> serde_json::Value {
+    requests
+        .get(1)
+        .expect("expected follow-up provider request")
+        .messages
+        .iter()
+        .find_map(|message| {
+            message.content.iter().find_map(|part| match part {
+                ContentPart::ToolResult(result) => Some(result.result.clone()),
+                _ => None,
+            })
+        })
+        .expect("expected follow-up tool result")
+}
+
 #[async_trait]
 impl SandboxProvider for RecordingSandboxProvider {
     async fn validate_shell_command(
@@ -74,6 +161,199 @@ impl SandboxProvider for RecordingSandboxProvider {
             .push((command.to_string(), cwd.clone()));
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn tool_result_size_policy_default_is_64_kib() {
+    assert_eq!(
+        ToolResultSizePolicy::default().max_result_size_bytes,
+        Some(64 * 1024)
+    );
+}
+
+#[tokio::test]
+async fn tool_result_size_caps_oversized_result_and_all_consumers_match() {
+    let (runner, requests) = test_runner(ProviderScenario::ToolCallWithUsageThenTextWithUsage);
+    let (sink, events) = capture_events();
+    let (agent_sink, agent_events) = capture_agent_events();
+    let oversized_text = format!("{}{}{}", "h".repeat(400), "middle", "t".repeat(400));
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("run capped tool")])
+        .with_tools(vec![capped_result_tool(
+            serde_json::json!({ "text": oversized_text }),
+            Some(360),
+        )])
+        .with_approval_policy(ApprovalPolicy::always())
+        .with_event_sink(sink)
+        .with_agent_event_sink(agent_sink);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let message_result = first_tool_result_value(&result.messages);
+    assert_eq!(message_result["truncated"], serde_json::json!(true));
+    assert_eq!(
+        message_result["reason"],
+        serde_json::json!("tool_result_size_limit_exceeded")
+    );
+    assert_eq!(
+        message_result["max_result_size_bytes"],
+        serde_json::json!(360)
+    );
+    assert!(
+        message_result["original_size_bytes"]
+            .as_u64()
+            .unwrap_or_default()
+            > 360,
+        "original serialized result should exceed cap"
+    );
+    let preview = message_result["preview"].as_str().expect("preview string");
+    assert!(preview.contains("...<truncated>..."));
+    assert!(
+        serde_json::to_string(&message_result)
+            .expect("serialize capped result")
+            .len()
+            <= 360,
+        "envelope should fit cap when possible"
+    );
+
+    let events = events.lock().expect("event lock");
+    let event_result = tool_results_from_events(&events)
+        .into_iter()
+        .next()
+        .expect("expected run event")
+        .1;
+    assert_eq!(event_result, message_result);
+
+    let agent_events = agent_events.lock().expect("agent event lock");
+    assert_eq!(
+        first_tool_result_value_from_agent_events(&agent_events),
+        message_result
+    );
+    assert_eq!(first_turn_tool_result_value(&agent_events), message_result);
+
+    let requests = requests.lock().expect("request lock");
+    assert_eq!(
+        first_tool_result_value_from_provider_request(&requests),
+        message_result
+    );
+}
+
+#[tokio::test]
+async fn tool_result_size_keeps_utf8_middle_preview_valid() {
+    let (runner, _requests) = test_runner(ProviderScenario::ToolCallWithUsageThenTextWithUsage);
+    let (sink, events) = capture_events();
+    let utf8_text = format!("{}{}{}", "😀".repeat(120), "中心", "é".repeat(120));
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("run capped tool")])
+        .with_tools(vec![capped_result_tool(
+            serde_json::json!({ "text": utf8_text }),
+            Some(360),
+        )])
+        .with_approval_policy(ApprovalPolicy::always())
+        .with_event_sink(sink);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let result_json = first_tool_result_value(&result.messages);
+    assert_eq!(result_json["truncated"], serde_json::json!(true));
+    assert_eq!(
+        result_json["reason"],
+        serde_json::json!("tool_result_size_limit_exceeded")
+    );
+    assert_eq!(result_json["max_result_size_bytes"], serde_json::json!(360));
+    assert!(
+        result_json["original_size_bytes"]
+            .as_u64()
+            .unwrap_or_default()
+            > 360,
+        "original serialized result should exceed cap"
+    );
+    let preview = result_json["preview"].as_str().expect("preview string");
+    assert!(preview.contains("...<truncated>..."));
+    assert!(preview.contains('😀'), "preview should include UTF-8 head");
+    assert!(preview.contains('é'), "preview should include UTF-8 tail");
+    assert!(
+        serde_json::to_string(&result_json)
+            .expect("serialize capped result")
+            .len()
+            <= 360,
+        "envelope should fit cap when possible"
+    );
+
+    let events = events.lock().expect("event lock");
+    let event_result = tool_results_from_events(&events)
+        .into_iter()
+        .next()
+        .expect("expected run event")
+        .1;
+    assert_eq!(event_result, result_json);
+}
+
+#[tokio::test]
+async fn tool_result_size_tiny_cap_uses_minimal_envelope() {
+    let (runner, _requests) = test_runner(ProviderScenario::ToolCallWithUsageThenTextWithUsage);
+    let (sink, events) = capture_events();
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("run capped tool")])
+        .with_tools(vec![capped_result_tool(
+            serde_json::json!({ "text": "x".repeat(400) }),
+            Some(1),
+        )])
+        .with_approval_policy(ApprovalPolicy::always())
+        .with_event_sink(sink);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let result_json = first_tool_result_value(&result.messages);
+    assert_eq!(result_json["truncated"], serde_json::json!(true));
+    assert_eq!(
+        result_json["reason"],
+        serde_json::json!("tool_result_size_limit_exceeded")
+    );
+    assert_eq!(result_json["max_result_size_bytes"], serde_json::json!(1));
+    assert_eq!(result_json["preview"], serde_json::json!(""));
+
+    let events = events.lock().expect("event lock");
+    let event_result = tool_results_from_events(&events)
+        .into_iter()
+        .next()
+        .expect("expected run event")
+        .1;
+    assert_eq!(event_result, result_json);
+}
+
+#[tokio::test]
+async fn tool_result_size_policy_none_leaves_oversized_result_intact() {
+    let (runner, _requests) = test_runner(ProviderScenario::ToolCallWithUsageThenTextWithUsage);
+    let large = "x".repeat(2_000);
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("run uncapped tool")])
+        .with_tools(vec![capped_result_tool(
+            serde_json::json!({ "text": large }),
+            None,
+        )])
+        .with_approval_policy(ApprovalPolicy::always());
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let result_json = first_tool_result_value(&result.messages);
+    assert_eq!(
+        result_json["text"].as_str().unwrap_or_default().len(),
+        2_000
+    );
+    assert!(result_json.get("truncated").is_none());
 }
 
 #[tokio::test]
@@ -218,6 +498,129 @@ async fn tool_visibility_policy_can_hide_all_provider_tools() {
     assert_eq!(result.status, RunStatus::Completed);
     let requests = requests.lock().expect("request lock");
     assert!(requests[0].tools.is_none());
+}
+
+#[tokio::test]
+async fn alias_tool_call_normalizes_to_canonical_before_execution_and_persistence() {
+    let (runner, requests) = test_runner(ProviderScenario::ToolCallWithUsageThenTextWithUsage);
+    let (sink, events) = capture_events();
+    let (agent_sink, agent_events) = capture_agent_events();
+    let request = RunRequest::new(test_model(), vec![ModelMessage::user("run alias tool")])
+        .with_tools(vec![aliased_success_tool("canonical_tool", "noop_tool")])
+        .with_approval_policy(ApprovalPolicy::always())
+        .with_event_sink(sink)
+        .with_agent_event_sink(agent_sink);
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let calls = assistant_tool_calls(&result.messages);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "canonical_tool");
+    assert_eq!(calls[0].called_as.as_deref(), Some("noop_tool"));
+
+    let events = events.lock().expect("event lock");
+    let started_call = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            RunEventPayload::ToolCallStarted { call } => Some(call),
+            _ => None,
+        })
+        .expect("tool call started event");
+    assert_eq!(started_call.name, "canonical_tool");
+    assert_eq!(started_call.called_as.as_deref(), Some("noop_tool"));
+
+    let completed_call = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            RunEventPayload::ToolCallCompleted { call } => Some(call),
+            _ => None,
+        })
+        .expect("tool call completed event");
+    assert_eq!(completed_call.name, "canonical_tool");
+    assert_eq!(completed_call.called_as.as_deref(), Some("noop_tool"));
+
+    let agent_events = agent_events.lock().expect("agent event lock");
+    let update_call = agent_events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::MessageUpdate {
+                message,
+                assistant_message_event,
+            } => message.tool_calls().first().map(|call| {
+                (
+                    call.name.as_str(),
+                    call.called_as.as_deref(),
+                    assistant_message_event
+                        .tool_call
+                        .as_ref()
+                        .map(|event_call| event_call.name.as_str()),
+                    assistant_message_event
+                        .tool_call
+                        .as_ref()
+                        .and_then(|event_call| event_call.called_as.as_deref()),
+                )
+            }),
+            _ => None,
+        })
+        .expect("message update with tool call");
+    assert_eq!(
+        update_call,
+        (
+            "canonical_tool",
+            Some("noop_tool"),
+            Some("canonical_tool"),
+            Some("noop_tool")
+        )
+    );
+    let end_call = agent_events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::MessageEnd { message } => message.tool_calls().first().cloned(),
+            _ => None,
+        })
+        .expect("message end with tool call");
+    assert_eq!(end_call.name, "canonical_tool");
+    assert_eq!(end_call.called_as.as_deref(), Some("noop_tool"));
+
+    let tool_names = agent_events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolExecutionStart { tool_name, .. }
+            | AgentEvent::ToolExecutionEnd { tool_name, .. } => Some(tool_name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_names, vec!["canonical_tool", "canonical_tool"]);
+    let turn_call = agent_events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnEnd {
+                assistant_message, ..
+            } => assistant_message.as_ref(),
+            _ => None,
+        })
+        .and_then(|message| message.tool_calls().into_iter().next())
+        .expect("turn assistant tool call");
+    assert_eq!(turn_call.name, "canonical_tool");
+    assert_eq!(turn_call.called_as.as_deref(), Some("noop_tool"));
+
+    let requests = requests.lock().expect("request lock");
+    let first_tools = requests[0].tools.as_ref().expect("provider tools");
+    assert_eq!(
+        first_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["canonical_tool"]
+    );
+    let followup_calls = assistant_tool_calls(&requests[1].messages);
+    assert_eq!(followup_calls[0].name, "canonical_tool");
+    assert_eq!(followup_calls[0].called_as.as_deref(), Some("noop_tool"));
 }
 
 fn tool_permission_responder(

@@ -8,11 +8,23 @@ use roci::tools::{ToolCatalog, ToolOrigin};
 #[must_use]
 pub fn tool_catalog() -> ToolCatalog {
     let mut catalog = ToolCatalog::new();
-    catalog.insert_first_wins(super::shell_tool(), ToolOrigin::Builtin);
-    catalog.insert_first_wins(super::read_file_tool(), ToolOrigin::Builtin);
-    catalog.insert_first_wins(super::write_file_tool(), ToolOrigin::Builtin);
-    catalog.insert_first_wins(super::list_directory_tool(), ToolOrigin::Builtin);
-    catalog.insert_first_wins(super::grep_tool(), ToolOrigin::Builtin);
-    catalog.insert_first_wins(super::ask_user_tool(), ToolOrigin::Builtin);
+    catalog
+        .insert_first_wins(super::shell_tool(), ToolOrigin::Builtin)
+        .expect("builtin shell tool catalog entry must be valid");
+    catalog
+        .insert_first_wins(super::read_file_tool(), ToolOrigin::Builtin)
+        .expect("builtin read_file tool catalog entry must be valid");
+    catalog
+        .insert_first_wins(super::write_file_tool(), ToolOrigin::Builtin)
+        .expect("builtin write_file tool catalog entry must be valid");
+    catalog
+        .insert_first_wins(super::list_directory_tool(), ToolOrigin::Builtin)
+        .expect("builtin list_directory tool catalog entry must be valid");
+    catalog
+        .insert_first_wins(super::grep_tool(), ToolOrigin::Builtin)
+        .expect("builtin grep tool catalog entry must be valid");
+    catalog
+        .insert_first_wins(super::ask_user_tool(), ToolOrigin::Builtin)
+        .expect("builtin ask_user tool catalog entry must be valid");
     catalog
 }

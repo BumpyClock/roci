@@ -115,19 +115,20 @@ impl AgentRuntime {
         let providers = self.dynamic_tool_providers.lock().await.clone();
         let mut catalog = Self::merge_static_and_dynamic_tools(static_tools, providers).await?;
         #[cfg(feature = "agent")]
-        self.inject_subagent_tools(&mut catalog);
+        self.inject_subagent_tools(&mut catalog)?;
         let policy = self.effective_tool_visibility_policy(&catalog)?;
         Ok(catalog.resolve(&policy))
     }
 
     #[cfg(feature = "agent")]
-    fn inject_subagent_tools(&self, catalog: &mut ToolCatalog) {
+    fn inject_subagent_tools(&self, catalog: &mut ToolCatalog) -> Result<(), RociError> {
         let Some(controller) = &self.subagent_controller else {
-            return;
+            return Ok(());
         };
         for tool in crate::agent::subagents::SubagentRoutingTools::new(controller.clone()).tools() {
-            catalog.insert_first_wins(tool, ToolOrigin::Custom);
+            catalog.insert_first_wins(tool, ToolOrigin::Custom)?;
         }
+        Ok(())
     }
 
     #[cfg(feature = "agent")]
@@ -187,14 +188,14 @@ impl AgentRuntime {
         static_tools: Vec<Arc<dyn Tool>>,
         providers: Vec<Arc<dyn DynamicToolProvider>>,
     ) -> Result<ToolCatalog, RociError> {
-        let mut catalog = ToolCatalog::from_tools(static_tools, ToolOrigin::Custom);
+        let mut catalog = ToolCatalog::from_tools(static_tools, ToolOrigin::Custom)?;
         for provider in providers {
             let discovered = provider.list_tools().await?;
             for tool in discovered {
                 catalog.insert_first_wins(
                     Arc::new(DynamicToolAdapter::new(Arc::clone(&provider), tool)),
                     ToolOrigin::Dynamic,
-                );
+                )?;
             }
         }
         Ok(catalog)

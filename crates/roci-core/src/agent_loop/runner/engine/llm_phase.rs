@@ -3,10 +3,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::super::control::{process_stream_delta, AgentEventEmitter, RunEventEmitter};
+use super::super::control::{
+    process_stream_delta, AgentEventEmitter, RunEventEmitter, StreamDeltaState,
+};
 use super::super::message_events::{
     assistant_message_snapshot, emit_message_end_if_open, emit_message_lifecycle,
 };
+use super::super::tooling::normalize_tool_call_alias;
 use super::super::{
     ConvertToLlmHookPayload, ConvertToLlmHookResult, RunEventPayload, RunEventStream, RunRequest,
     TransformContextHookPayload, TransformContextHookResult,
@@ -19,8 +22,12 @@ use crate::context::{
 };
 use crate::error::RociError;
 use crate::provider::{self, ProviderRequest, ToolDefinition};
-use crate::types::{AgentToolCall, GenerationSettings, ModelMessage, Usage};
+use crate::tools::Tool;
+use crate::types::Role;
+use crate::types::{AgentToolCall, ContentPart, GenerationSettings, ModelMessage, Usage};
 use crate::util::debug::roci_debug_enabled;
+use std::fmt::Write;
+use std::sync::Arc;
 
 /// Compute the effective usage for a single provider call, merging it into
 /// the run-local accumulator.
@@ -254,12 +261,12 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                         if let Some(max_retry_delay_ms) = request.max_retry_delay_ms {
                             if max_retry_delay_ms > 0 && retry_after_ms > max_retry_delay_ms {
                                 return LlmPhaseOutcome::Failed {
-                                reason: format!(
-                                    "rate limit retry delay {retry_after_ms}ms exceeds max_retry_delay_ms={max_retry_delay_ms}"
-                                ),
-                                assistant_message: None,
-                                failure_category: FailureCategory::RateLimit,
-                            };
+                                    reason: format!(
+                                        "rate limit retry delay {retry_after_ms}ms exceeds max_retry_delay_ms={max_retry_delay_ms}"
+                                    ),
+                                    assistant_message: None,
+                                    failure_category: FailureCategory::RateLimit,
+                                };
                             }
                         }
                     }
@@ -472,12 +479,12 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                         }
                                         Err(compaction_err) => {
                                             return LlmPhaseOutcome::Failed {
-                                            reason: format!(
-                                                "overflow recovery compaction failed: {compaction_err}"
-                                            ),
-                                            assistant_message: None,
-                                            failure_category: FailureCategory::Overflow,
-                                        };
+                                                reason: format!(
+                                                    "overflow recovery compaction failed: {compaction_err}"
+                                                ),
+                                                assistant_message: None,
+                                                failure_category: FailureCategory::Overflow,
+                                            };
                                         }
                                     }
                                 }
@@ -691,10 +698,13 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                     emitter,
                                     agent_emitter,
                                     delta,
-                                    &mut iteration_text,
-                                    &mut tool_calls,
-                                    &mut stream_done,
-                                    &mut message_open,
+                                    &request.tools,
+                                    StreamDeltaState {
+                                        iteration_text: &mut iteration_text,
+                                        tool_calls: &mut tool_calls,
+                                        stream_done: &mut stream_done,
+                                        message_open: &mut message_open,
+                                    },
                                 ) {
                                     emit_message_end_if_open(
                                         agent_emitter,
@@ -817,10 +827,13 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
                                     emitter,
                                     agent_emitter,
                                     delta,
-                                    &mut iteration_text,
-                                    &mut tool_calls,
-                                    &mut stream_done,
-                                    &mut message_open,
+                                    &request.tools,
+                                    StreamDeltaState {
+                                        iteration_text: &mut iteration_text,
+                                        tool_calls: &mut tool_calls,
+                                        stream_done: &mut stream_done,
+                                        message_open: &mut message_open,
+                                    },
                                 ) {
                                     emit_message_end_if_open(
                                         agent_emitter,
@@ -1030,6 +1043,8 @@ async fn build_provider_request(
         };
     }
 
+    insert_available_tools_metadata(&mut transformed, &request.tools);
+
     let llm_context = if let Some(ref convert) = request.convert_to_llm {
         let convert_cancel = run_cancel_token.child_token();
         let agent_messages: Vec<AgentMessage> = transformed
@@ -1085,6 +1100,7 @@ async fn build_provider_request(
         transformed
     };
 
+    let llm_context = normalize_tool_call_aliases_for_provider(&llm_context, &request.tools);
     let provider_messages =
         provider::sanitize_messages_for_provider(&llm_context, provider.provider_name());
     Ok(ProviderRequest {
@@ -1099,6 +1115,103 @@ async fn build_provider_request(
         session_id: request.session_id.clone(),
         transport: request.transport.clone(),
     })
+}
+
+fn normalize_tool_call_aliases_for_provider(
+    messages: &[ModelMessage],
+    tools: &[Arc<dyn Tool>],
+) -> Vec<ModelMessage> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            for part in &mut message.content {
+                if let ContentPart::ToolCall(call) = part {
+                    normalize_tool_call_alias(tools, call);
+                }
+            }
+            message
+        })
+        .collect()
+}
+
+fn insert_available_tools_metadata(messages: &mut Vec<ModelMessage>, tools: &[Arc<dyn Tool>]) {
+    let Some(metadata) = render_available_tools_metadata(tools) else {
+        return;
+    };
+    let insert_at = messages
+        .iter()
+        .take_while(|message| message.role == Role::System)
+        .count();
+    messages.insert(insert_at, ModelMessage::system(metadata));
+}
+
+fn render_available_tools_metadata(tools: &[Arc<dyn Tool>]) -> Option<String> {
+    let mut output = String::new();
+    let mut rendered = 0usize;
+
+    for tool in tools {
+        let metadata = tool.prompt_metadata();
+        let guidelines = metadata.guidelines;
+        if guidelines.is_empty() && tool.prompt() == tool.description() {
+            continue;
+        }
+
+        if rendered == 0 {
+            output.push_str("<available_tools>");
+        }
+        rendered += 1;
+
+        let _ = write!(
+            output,
+            "\n<tool name=\"{}\">\n<prompt>{}</prompt>",
+            escape_xml_attr(tool.name()),
+            escape_xml_text(tool.prompt())
+        );
+        if !guidelines.is_empty() {
+            output.push_str("\n<guidelines>");
+            for guideline in guidelines {
+                let _ = write!(output, "\n- {}", escape_xml_text(&guideline));
+            }
+            output.push_str("\n</guidelines>");
+        }
+        output.push_str("\n</tool>");
+    }
+
+    if rendered == 0 {
+        return None;
+    }
+
+    output.push_str("\n</available_tools>");
+    Some(output)
+}
+
+fn escape_xml_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn escape_xml_attr(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Emit policy-driven overflow recovery progress on the system stream.

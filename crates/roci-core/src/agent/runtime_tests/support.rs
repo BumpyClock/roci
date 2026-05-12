@@ -200,6 +200,7 @@ pub(super) fn assistant_tool_call(
             id: id.to_string(),
             name: name.to_string(),
             arguments,
+            called_as: None,
             recipient: None,
         })],
         name: None,

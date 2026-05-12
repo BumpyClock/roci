@@ -45,13 +45,15 @@ async fn set_tools_replaces_runtime_tool_registry() {
 #[tokio::test]
 async fn resolve_tools_for_run_merges_static_and_dynamic_tools() {
     let provider: Arc<dyn DynamicToolProvider> =
-        Arc::new(MockDynamicToolProvider::new(vec![DynamicTool {
-            name: "dynamic".into(),
-            description: "dynamic tool".into(),
-            parameters: AgentToolParameters::empty(),
-            safety: ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
-            safety_summary: ToolSafetySummary::default(),
-        }]));
+        Arc::new(MockDynamicToolProvider::new(vec![DynamicTool::new(
+            "dynamic",
+            "dynamic tool",
+            AgentToolParameters::empty(),
+        )
+        .with_safety(
+            ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
+            ToolSafetySummary::default(),
+        )]));
 
     let mut config = test_agent_config();
     config.tools = vec![dummy_tool("static")];
@@ -75,13 +77,15 @@ async fn resolve_tools_for_run_merges_static_and_dynamic_tools() {
 #[tokio::test]
 async fn resolve_tools_for_run_applies_visibility_policy_to_static_and_dynamic_tools() {
     let provider: Arc<dyn DynamicToolProvider> =
-        Arc::new(MockDynamicToolProvider::new(vec![DynamicTool {
-            name: "dynamic".into(),
-            description: "dynamic tool".into(),
-            parameters: AgentToolParameters::empty(),
-            safety: ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
-            safety_summary: ToolSafetySummary::default(),
-        }]));
+        Arc::new(MockDynamicToolProvider::new(vec![DynamicTool::new(
+            "dynamic",
+            "dynamic tool",
+            AgentToolParameters::empty(),
+        )
+        .with_safety(
+            ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
+            ToolSafetySummary::default(),
+        )]));
 
     let mut config = test_agent_config();
     config.tools = vec![dummy_tool("static")];

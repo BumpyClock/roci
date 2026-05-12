@@ -344,6 +344,7 @@ impl ModelProvider for BlockingAskUserProvider {
                             }
                         ]
                     }),
+                    called_as: None,
                     recipient: None,
                 }),
                 finish_reason: None,

@@ -89,6 +89,7 @@ impl ModelProvider for AskUserProvider {
                         id: "ask-user-call-1".to_string(),
                         name: "ask_user".to_string(),
                         arguments: serde_json::json!({}),
+                        called_as: None,
                         recipient: None,
                     }),
                     finish_reason: None,

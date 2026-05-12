@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::agent_loop::{ApprovalAction, ApprovalDecision, ApprovalMatcher, ApprovalRule};
-use crate::tools::{ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary};
+use crate::tools::{ToolResultSizePolicy, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary};
 
 fn read_only_safety_summary(kind: ToolSafetyKind) -> ToolSafetySummary {
     ToolSafetySummary {
@@ -629,6 +629,131 @@ async fn post_tool_use_hook_can_mutate_tool_result() {
     let (_call_id, result_json, is_error) = &tool_results[0];
     assert!(!is_error);
     assert_eq!(result_json["post_mutated"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn post_tool_use_hook_can_mutate_tool_result_size_is_capped() {
+    let (runner, _requests) = test_runner(ProviderScenario::SchemaToolValidArgs);
+    let (sink, events) = capture_events();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+    request.tools = vec![Arc::new(
+        AgentTool::new(
+            "schema_tool",
+            "tool with required path param",
+            AgentToolParameters::object()
+                .string("path", "file path", true)
+                .build(),
+            {
+                let executions = executions.clone();
+                move |args, _ctx: ToolExecutionContext| {
+                    let executions = executions.clone();
+                    async move {
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        Ok(serde_json::json!({
+                            "path": args.get_str("path")?,
+                        }))
+                    }
+                }
+            },
+        )
+        .with_result_policy(ToolResultSizePolicy {
+            max_result_size_bytes: Some(360),
+        }),
+    )];
+    request.approval_policy = ApprovalPolicy::always();
+    request.event_sink = Some(sink);
+    request.hooks = RunHooks {
+        compaction: None,
+        pre_tool_use: None,
+        post_tool_use: Some(Arc::new(|_call, mut result| {
+            Box::pin(async move {
+                if let Some(map) = result.result.as_object_mut() {
+                    map.insert("post_mutated".to_string(), serde_json::json!(true));
+                    map.insert("expanded".to_string(), serde_json::json!("z".repeat(600)));
+                }
+                Ok(result)
+            })
+        })),
+    };
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run should complete without timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+    let events = events.lock().expect("event lock");
+    let tool_results = tool_results_from_events(&events);
+    assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+    let (_call_id, result_json, is_error) = &tool_results[0];
+    assert!(!is_error);
+    assert_eq!(result_json["truncated"], serde_json::json!(true));
+    assert_eq!(
+        result_json["reason"],
+        serde_json::json!("tool_result_size_limit_exceeded")
+    );
+    let preview = result_json["preview"].as_str().unwrap_or_default();
+    assert!(
+        preview.contains("post_mutated") || preview.contains("expanded"),
+        "preview should come from post-hook-expanded result"
+    );
+}
+
+#[tokio::test]
+async fn tool_result_size_caps_validation_error_after_post_hook_growth() {
+    let (runner, _requests) = test_runner(ProviderScenario::SchemaToolBadArgs);
+    let (sink, events) = capture_events();
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("call schema_tool")]);
+    request.tools = vec![
+            Arc::new(
+                AgentTool::new(
+                    "schema_tool",
+                    "tool with required path param",
+                    AgentToolParameters::object()
+                        .string("path", "file path", true)
+                        .build(),
+                    |_args, _ctx: ToolExecutionContext| async move {
+                        Ok(serde_json::json!({ "ok": true }))
+                    },
+                )
+                .with_result_policy(ToolResultSizePolicy {
+                    max_result_size_bytes: Some(150),
+                }),
+            ),
+        ];
+    request.approval_policy = ApprovalPolicy::always();
+    request.event_sink = Some(sink);
+    request.hooks = RunHooks {
+        compaction: None,
+        pre_tool_use: None,
+        post_tool_use: Some(Arc::new(|_call, mut result| {
+            Box::pin(async move {
+                if let Some(map) = result.result.as_object_mut() {
+                    map.insert("expanded".to_string(), serde_json::json!("z".repeat(600)));
+                }
+                Ok(result)
+            })
+        })),
+    };
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("run should complete without timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let events = events.lock().expect("event lock");
+    let tool_results = tool_results_from_events(&events);
+    assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
+    let (_call_id, result_json, is_error) = &tool_results[0];
+    assert!(*is_error);
+    assert_eq!(result_json["truncated"], serde_json::json!(true));
+    assert_eq!(
+        result_json["reason"],
+        serde_json::json!("tool_result_size_limit_exceeded")
+    );
 }
 
 #[tokio::test]

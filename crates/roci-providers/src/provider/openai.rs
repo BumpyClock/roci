@@ -351,6 +351,12 @@ impl OpenAiProvider {
 
         body
     }
+
+    fn emit_payload_callback(&self, request: &ProviderRequest, body: &serde_json::Value) {
+        if let Some(callback) = request.payload_callback.as_ref() {
+            callback(body.clone());
+        }
+    }
 }
 
 #[async_trait]
@@ -372,6 +378,7 @@ impl ModelProvider for OpenAiProvider {
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, RociError> {
         let body = self.build_request_body(request, false);
+        self.emit_payload_callback(request, &body);
         let url = self.chat_url();
 
         debug!(model = self.model.as_str(), "OpenAI generate_text");
@@ -406,6 +413,7 @@ impl ModelProvider for OpenAiProvider {
                 name: tc.function.name,
                 arguments: serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(serde_json::Value::String(tc.function.arguments)),
+                called_as: None,
                 recipient: None,
             })
             .collect();
@@ -437,6 +445,7 @@ impl ModelProvider for OpenAiProvider {
         request: &ProviderRequest,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         let body = self.build_request_body(request, true);
+        self.emit_payload_callback(request, &body);
         let url = self.chat_url();
 
         debug!(model = self.model.as_str(), "OpenAI stream_text");
@@ -560,7 +569,7 @@ impl ModelProvider for OpenAiProvider {
                                                     yield Ok(TextStreamDelta {
                                                         text: String::new(),
                                                         event_type: StreamEventType::ToolCallDelta,
-                                                        tool_call: Some(AgentToolCall { id, name, arguments: args, recipient: None }),
+                                                        tool_call: Some(AgentToolCall { id, name, arguments: args, called_as: None, recipient: None }),
                                                         finish_reason: None,
                                                         usage: None,
                                                         reasoning: None,
@@ -936,6 +945,37 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("/tmp/"));
+    }
+
+    #[test]
+    fn payload_callback_receives_openai_chat_request_payload() {
+        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "test-key".to_string(), None, None);
+        let captured_model = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_model_for_hook = captured_model.clone();
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: Some(std::sync::Arc::new(move |payload| {
+                *captured_model_for_hook.lock().expect("capture lock") = payload
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            })),
+            session_id: None,
+            transport: None,
+        };
+        let body = provider.build_request_body(&request, false);
+        provider.emit_payload_callback(&request, &body);
+
+        assert_eq!(
+            captured_model.lock().expect("capture lock").as_deref(),
+            Some("gpt-4o")
+        );
     }
 
     #[test]

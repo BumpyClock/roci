@@ -5,7 +5,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::arguments::ToolArguments;
-use super::tool::{Tool, ToolExecutionContext, ToolSafetyPlan, ToolSafetySummary};
+use super::tool::{
+    Tool, ToolExecutionContext, ToolPromptMetadata, ToolResultSizePolicy, ToolSafetyPlan,
+    ToolSafetySummary,
+};
 use super::types::AgentToolParameters;
 use crate::error::RociError;
 
@@ -14,6 +17,10 @@ use crate::error::RociError;
 pub struct DynamicTool {
     pub name: String,
     pub description: String,
+    pub aliases: Vec<String>,
+    pub prompt: Option<String>,
+    pub prompt_metadata: ToolPromptMetadata,
+    pub result_policy: ToolResultSizePolicy,
     pub parameters: AgentToolParameters,
     pub safety: ToolSafetyPlan,
     pub safety_summary: ToolSafetySummary,
@@ -29,6 +36,10 @@ impl DynamicTool {
         Self {
             name: name.into(),
             description: description.into(),
+            aliases: Vec::new(),
+            prompt: None,
+            prompt_metadata: ToolPromptMetadata::default(),
+            result_policy: ToolResultSizePolicy::default(),
             parameters,
             safety: ToolSafetyPlan::default(),
             safety_summary: ToolSafetySummary::default(),
@@ -63,6 +74,10 @@ pub struct DynamicToolAdapter {
     provider: Arc<dyn DynamicToolProvider>,
     name: String,
     description: String,
+    aliases: Vec<String>,
+    prompt: Option<String>,
+    prompt_metadata: ToolPromptMetadata,
+    result_policy: ToolResultSizePolicy,
     parameters: AgentToolParameters,
     safety: ToolSafetyPlan,
     safety_summary: ToolSafetySummary,
@@ -75,6 +90,10 @@ impl DynamicToolAdapter {
             provider,
             name: tool.name,
             description: tool.description,
+            aliases: tool.aliases,
+            prompt: tool.prompt,
+            prompt_metadata: tool.prompt_metadata,
+            result_policy: tool.result_policy,
             parameters: tool.parameters,
             safety: tool.safety,
             safety_summary: tool.safety_summary,
@@ -90,6 +109,22 @@ impl Tool for DynamicToolAdapter {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    fn prompt(&self) -> &str {
+        self.prompt.as_deref().unwrap_or(&self.description)
+    }
+
+    fn prompt_metadata(&self) -> ToolPromptMetadata {
+        self.prompt_metadata.clone()
+    }
+
+    fn result_policy(&self) -> ToolResultSizePolicy {
+        self.result_policy
     }
 
     fn parameters(&self) -> &AgentToolParameters {
@@ -168,5 +203,21 @@ mod tests {
             plan
         );
         assert_eq!(adapter.safety_summary(), summary);
+    }
+
+    #[test]
+    fn prompt_metadata_dynamic_tool_adapter_uses_declared_metadata() {
+        let metadata = ToolPromptMetadata {
+            guidelines: vec!["Use dynamic context carefully.".to_string()],
+            search_hint: Some("future-search-only".to_string()),
+        };
+        let mut tool = DynamicTool::new("dynamic", "UI description", AgentToolParameters::empty());
+        tool.prompt = Some("Model prompt".to_string());
+        tool.prompt_metadata = metadata.clone();
+        let adapter = DynamicToolAdapter::new(Arc::new(NoopProvider), tool);
+
+        assert_eq!(adapter.description(), "UI description");
+        assert_eq!(adapter.prompt(), "Model prompt");
+        assert_eq!(adapter.prompt_metadata(), metadata);
     }
 }

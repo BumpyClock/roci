@@ -13,6 +13,9 @@ use super::control::{AgentEventEmitter, RunEventEmitter};
 use super::message_events::emit_message_lifecycle;
 use super::{AgentEvent, PreToolUseHookResult, RunHooks};
 
+const TOOL_RESULT_SIZE_LIMIT_REASON: &str = "tool_result_size_limit_exceeded";
+const TOOL_RESULT_PREVIEW_MARKER: &str = "...<truncated>...";
+
 pub(super) fn declined_tool_result(call: &AgentToolCall) -> AgentToolResult {
     AgentToolResult {
         tool_call_id: call.id.clone(),
@@ -29,9 +32,10 @@ pub(super) fn canceled_tool_result(call: &AgentToolCall) -> AgentToolResult {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct ToolExecutionOutcome {
     pub(super) call: AgentToolCall,
+    pub(super) tool: Option<Arc<dyn Tool>>,
     pub(super) result: AgentToolResult,
 }
 
@@ -71,11 +75,41 @@ impl<'a> ToolExecutionInputs<'a> {
 }
 
 pub(super) fn resolve_tool_call(tools: &[Arc<dyn Tool>], call: &AgentToolCall) -> ResolvedToolCall {
+    if let Some(tool) = tools.iter().find(|tool| tool.name() == call.name).cloned() {
+        return ResolvedToolCall {
+            call: call.clone(),
+            tool: Some(tool),
+            safety_plan: ToolSafetyPlan::default(),
+        };
+    }
+
+    let mut normalized = call.clone();
+    if let Some(tool) = normalize_tool_call_alias(tools, &mut normalized) {
+        return ResolvedToolCall {
+            call: normalized,
+            tool: Some(Arc::clone(tool)),
+            safety_plan: ToolSafetyPlan::default(),
+        };
+    }
+
     ResolvedToolCall {
         call: call.clone(),
-        tool: tools.iter().find(|tool| tool.name() == call.name).cloned(),
+        tool: None,
         safety_plan: ToolSafetyPlan::default(),
     }
+}
+
+pub(super) fn normalize_tool_call_alias<'a>(
+    tools: &'a [Arc<dyn Tool>],
+    call: &mut AgentToolCall,
+) -> Option<&'a Arc<dyn Tool>> {
+    let tool = tools.iter().find(|tool| {
+        call.name != tool.name() && tool.aliases().iter().any(|alias| alias == &call.name)
+    })?;
+    let called_as = call.name.clone();
+    call.called_as.get_or_insert(called_as);
+    call.name = tool.name().to_string();
+    Some(tool)
 }
 
 pub(super) fn validation_error_result(
@@ -181,6 +215,112 @@ pub(super) async fn apply_post_tool_use_hook(
     }
 }
 
+pub(super) fn apply_result_size_policy(
+    _call: &AgentToolCall,
+    tool: Option<&dyn Tool>,
+    result: AgentToolResult,
+) -> AgentToolResult {
+    let Some(max) = tool.and_then(|tool| tool.result_policy().max_result_size_bytes) else {
+        return result;
+    };
+    let Ok(serialized) = serde_json::to_string(&result.result) else {
+        return result;
+    };
+    if serialized.len() <= max {
+        return result;
+    }
+
+    AgentToolResult {
+        tool_call_id: result.tool_call_id,
+        result: tool_result_truncation_envelope(&serialized, max),
+        is_error: result.is_error,
+    }
+}
+
+pub(super) async fn finalize_tool_result(
+    hooks: &RunHooks,
+    call: &AgentToolCall,
+    tool: Option<&dyn Tool>,
+    result: AgentToolResult,
+) -> AgentToolResult {
+    let result = apply_post_tool_use_hook(hooks, call, result).await;
+    apply_result_size_policy(call, tool, result)
+}
+
+fn tool_result_truncation_envelope(serialized: &str, max: usize) -> serde_json::Value {
+    let original_size_bytes = serialized.len();
+    let minimal = tool_result_truncation_envelope_with_preview(original_size_bytes, max, "");
+    let Ok(minimal_serialized) = serde_json::to_string(&minimal) else {
+        return minimal;
+    };
+    if minimal_serialized.len() > max {
+        return minimal;
+    }
+
+    let mut low = 0usize;
+    let mut high = serialized.len();
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let preview = middle_preview(serialized, mid);
+        let candidate =
+            tool_result_truncation_envelope_with_preview(original_size_bytes, max, &preview);
+        let Ok(candidate_serialized) = serde_json::to_string(&candidate) else {
+            high = mid.saturating_sub(1);
+            continue;
+        };
+        if candidate_serialized.len() <= max {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    let preview = middle_preview(serialized, low);
+    tool_result_truncation_envelope_with_preview(original_size_bytes, max, &preview)
+}
+
+fn tool_result_truncation_envelope_with_preview(
+    original_size_bytes: usize,
+    max_result_size_bytes: usize,
+    preview: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "truncated": true,
+        "reason": TOOL_RESULT_SIZE_LIMIT_REASON,
+        "original_size_bytes": original_size_bytes,
+        "max_result_size_bytes": max_result_size_bytes,
+        "preview": preview,
+    })
+}
+
+fn middle_preview(source: &str, budget_bytes: usize) -> String {
+    if budget_bytes <= TOOL_RESULT_PREVIEW_MARKER.len() {
+        return String::new();
+    }
+    let content_budget = budget_bytes - TOOL_RESULT_PREVIEW_MARKER.len();
+    let head_budget = content_budget.div_ceil(2);
+    let tail_budget = content_budget / 2;
+    let head = utf8_prefix(source, head_budget);
+    let tail = utf8_suffix(source, tail_budget);
+    format!("{head}{TOOL_RESULT_PREVIEW_MARKER}{tail}")
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn utf8_suffix(value: &str, max_bytes: usize) -> &str {
+    let mut start = value.len().saturating_sub(max_bytes);
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
 pub(super) fn emit_tool_execution_start(agent_emitter: &AgentEventEmitter, call: &AgentToolCall) {
     agent_emitter.emit(AgentEvent::ToolExecutionStart {
         tool_call_id: call.id.clone(),
@@ -247,7 +387,11 @@ pub(super) async fn execute_tool_call(
                     is_error: true,
                 },
             };
-            ToolExecutionOutcome { call, result }
+            ToolExecutionOutcome {
+                call,
+                tool: Some(tool),
+                result,
+            }
         }
         None => ToolExecutionOutcome {
             result: AgentToolResult {
@@ -255,6 +399,7 @@ pub(super) async fn execute_tool_call(
                 result: serde_json::json!({ "error": format!("Tool '{}' not found", call.name) }),
                 is_error: true,
             },
+            tool: None,
             call,
         },
     }
@@ -281,8 +426,7 @@ pub(super) async fn execute_parallel_tool_calls(
     future::join_all(futures).await
 }
 
-pub(super) async fn append_tool_result(
-    hooks: &RunHooks,
+pub(super) fn append_tool_result(
     emitter: &RunEventEmitter,
     agent_emitter: &AgentEventEmitter,
     call: &AgentToolCall,
@@ -290,8 +434,24 @@ pub(super) async fn append_tool_result(
     iteration_failures: &mut usize,
     messages: &mut Vec<ModelMessage>,
 ) -> AgentToolResult {
-    let result = apply_post_tool_use_hook(hooks, call, result).await;
+    append_final_tool_result(
+        emitter,
+        agent_emitter,
+        call,
+        result,
+        iteration_failures,
+        messages,
+    )
+}
 
+fn append_final_tool_result(
+    emitter: &RunEventEmitter,
+    agent_emitter: &AgentEventEmitter,
+    call: &AgentToolCall,
+    result: AgentToolResult,
+    iteration_failures: &mut usize,
+    messages: &mut Vec<ModelMessage>,
+) -> AgentToolResult {
     if result.is_error {
         *iteration_failures = iteration_failures.saturating_add(1);
     }
@@ -322,6 +482,7 @@ pub(super) async fn append_skipped_tool_call(
     emitter: &RunEventEmitter,
     agent_emitter: &AgentEventEmitter,
     call: &AgentToolCall,
+    tool: Option<&dyn Tool>,
     iteration_failures: &mut usize,
     messages: &mut Vec<ModelMessage>,
 ) -> AgentToolResult {
@@ -331,9 +492,9 @@ pub(super) async fn append_skipped_tool_call(
         is_error: true,
     };
     emit_tool_execution_start(agent_emitter, call);
+    let skipped_result = finalize_tool_result(hooks, call, tool, skipped_result).await;
     emit_tool_execution_end(agent_emitter, call, &skipped_result);
-    append_tool_result(
-        hooks,
+    append_final_tool_result(
         emitter,
         agent_emitter,
         call,
@@ -341,5 +502,4 @@ pub(super) async fn append_skipped_tool_call(
         iteration_failures,
         messages,
     )
-    .await
 }

@@ -126,6 +126,7 @@ impl OpenAiResponsesProvider {
             name: name.to_string(),
             arguments: serde_json::from_str(args)
                 .unwrap_or(serde_json::Value::String(args.to_string())),
+            called_as: None,
             recipient: None,
         }
     }

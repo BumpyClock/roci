@@ -434,13 +434,7 @@ impl DynamicToolProvider for MCPToolAggregator {
         let tools = self.list_tools_with_origin().await?;
         Ok(tools
             .into_iter()
-            .map(|tool| DynamicTool {
-                name: tool.exposed_name,
-                description: tool.description,
-                parameters: tool.parameters,
-                safety: crate::tools::ToolSafetyPlan::default(),
-                safety_summary: crate::tools::ToolSafetySummary::default(),
-            })
+            .map(|tool| DynamicTool::new(tool.exposed_name, tool.description, tool.parameters))
             .collect())
     }
 

@@ -93,6 +93,7 @@ impl ModelProvider for ToolLoopProvider {
                             id: "call-1".to_string(),
                             name: "lookup".to_string(),
                             arguments: serde_json::json!({}),
+                            called_as: None,
                             recipient: None,
                         }),
                         finish_reason: None,

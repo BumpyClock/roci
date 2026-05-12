@@ -40,7 +40,7 @@ impl GoogleProvider {
     }
 
     fn build_request_body(&self, request: &ProviderRequest) -> serde_json::Value {
-        let mut system_instruction = None;
+        let mut system_instruction_parts = Vec::new();
         let mut contents = Vec::new();
         let mut tool_name_map = std::collections::HashMap::new();
 
@@ -55,9 +55,7 @@ impl GoogleProvider {
         for msg in &request.messages {
             match msg.role {
                 Role::System => {
-                    system_instruction = Some(serde_json::json!({
-                        "parts": [{"text": msg.text()}]
-                    }));
+                    system_instruction_parts.push(serde_json::json!({ "text": msg.text() }));
                 }
                 Role::User => {
                     let parts = build_gemini_parts(&msg.content);
@@ -135,8 +133,11 @@ impl GoogleProvider {
         let mut body = serde_json::json!({ "contents": contents });
         let obj = body.as_object_mut().unwrap();
 
-        if let Some(sys) = system_instruction {
-            obj.insert("systemInstruction".into(), sys);
+        if !system_instruction_parts.is_empty() {
+            obj.insert(
+                "systemInstruction".into(),
+                serde_json::json!({ "parts": system_instruction_parts }),
+            );
         }
 
         let max_tokens = request.settings.max_tokens.unwrap_or(2048);
@@ -300,6 +301,7 @@ impl ModelProvider for GoogleProvider {
                     arguments: fc
                         .args
                         .unwrap_or(serde_json::Value::Object(Default::default())),
+                    called_as: None,
                     recipient: thought_signature,
                 });
             }
@@ -392,7 +394,7 @@ impl ModelProvider for GoogleProvider {
                                         yield Ok(TextStreamDelta {
                                             text: String::new(),
                                             event_type: StreamEventType::ToolCallDelta,
-                                            tool_call: Some(AgentToolCall { id, name: call.name, arguments: args, recipient: thought_signature }),
+                                            tool_call: Some(AgentToolCall { id, name: call.name, arguments: args, called_as: None, recipient: thought_signature }),
                                             finish_reason: None,
                                             usage: None,
                                             reasoning: None,
@@ -554,6 +556,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "get_weather".to_string(),
             arguments: serde_json::json!({"city": "Paris"}),
+            called_as: None,
             recipient: Some("sig".to_string()),
         };
         let messages = vec![ModelMessage {
@@ -591,6 +594,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "get_weather".to_string(),
             arguments: serde_json::json!({"city": "Paris"}),
+            called_as: None,
             recipient: None,
         };
         let messages = vec![
@@ -625,6 +629,40 @@ mod tests {
             body["contents"][1]["parts"][0]["functionResponse"]["name"],
             "get_weather"
         );
+    }
+
+    #[test]
+    fn build_request_body_concatenates_system_messages_in_order() {
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![
+                ModelMessage::system("base system"),
+                ModelMessage::system("<available_tools>tool metadata</available_tools>"),
+                ModelMessage::user("hello"),
+            ],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request);
+        let parts = body["systemInstruction"]["parts"]
+            .as_array()
+            .expect("system instruction parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "base system");
+        assert_eq!(
+            parts[1]["text"],
+            "<available_tools>tool metadata</available_tools>"
+        );
+        assert_eq!(body["contents"][0]["role"], "user");
     }
 
     #[test]

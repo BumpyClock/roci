@@ -159,6 +159,22 @@ Use `curl http://127.0.0.1:1234/api/v0/models` to confirm at least one local mod
 
 Remote provider smoke tests must not print secrets. Pass credentials through the environment or existing auth store, print only whether a credential is configured, and keep the prompt/token budget small.
 
+Tool contract smoke (result cap, prompt metadata, alias normalization evidence):
+
+```bash
+tmux new-session -d -s roci-tool-contracts \
+  'cd /path/to/roci && \
+   set -o pipefail; \
+   OPENAI_API_KEY=sk-local-dummy \
+   cargo run -q -p roci-cli -- tool-contracts-smoke \
+     --model openai:gemma-4-e4b \
+     --endpoint http://framed:4001/v1 \
+     --case all; \
+   code=$?; printf "\n[tool contracts smoke exit=%s]\n" "$code"; \
+   exec zsh'
+echo "attach: tmux attach -t roci-tool-contracts"
+```
+
 ## Durable session verification
 
 Session storage must stay under the host-selected root. Do not treat the

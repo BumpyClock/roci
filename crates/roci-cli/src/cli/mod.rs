@@ -30,6 +30,38 @@ pub enum Commands {
     Session(SessionArgs),
     /// Manage installed skills
     Skills(SkillsArgs),
+    /// Exercise tool contract behavior against a live provider.
+    #[command(hide = true)]
+    ToolContractsSmoke(ToolContractsSmokeArgs),
+}
+
+/// Arguments for hidden `roci-agent tool-contracts-smoke`.
+#[derive(Parser, Debug)]
+pub struct ToolContractsSmokeArgs {
+    /// Model to use as provider:model.
+    #[arg(long, value_name = "PROVIDER:MODEL")]
+    pub model: String,
+
+    /// Provider endpoint/base URL override.
+    #[arg(long)]
+    pub endpoint: Option<String>,
+
+    /// Provider API key override.
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Smoke case to run.
+    #[arg(long, value_enum, default_value_t = ToolContractsSmokeCaseArg::All)]
+    pub case: ToolContractsSmokeCaseArg,
+}
+
+/// Hidden tool-contract smoke case selector.
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ToolContractsSmokeCaseArg {
+    All,
+    Result,
+    Prompt,
+    Alias,
 }
 
 /// Arguments for the `auth` subcommand group.
@@ -1385,6 +1417,54 @@ mod tests {
                 assert!(matches!(skills.command, SkillsCommands::List));
             }
             other => panic!("expected Skills, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_contracts_smoke_defaults_to_all_case() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "tool-contracts-smoke",
+            "--model",
+            "openai-compatible:gpt-4o-mini",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ToolContractsSmoke(args) => {
+                assert_eq!(args.model, "openai-compatible:gpt-4o-mini");
+                assert_eq!(args.case, ToolContractsSmokeCaseArg::All);
+                assert!(args.endpoint.is_none());
+                assert!(args.api_key.is_none());
+            }
+            other => panic!("expected ToolContractsSmoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_contracts_smoke_accepts_endpoint_api_key_and_case() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "tool-contracts-smoke",
+            "--model",
+            "openai-compatible:gpt-4o-mini",
+            "--endpoint",
+            "http://framed:4001/v1",
+            "--api-key",
+            "sk-local-dummy",
+            "--case",
+            "alias",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ToolContractsSmoke(args) => {
+                assert_eq!(args.model, "openai-compatible:gpt-4o-mini");
+                assert_eq!(args.endpoint.as_deref(), Some("http://framed:4001/v1"));
+                assert_eq!(args.api_key.as_deref(), Some("sk-local-dummy"));
+                assert_eq!(args.case, ToolContractsSmokeCaseArg::Alias);
+            }
+            other => panic!("expected ToolContractsSmoke, got {other:?}"),
         }
     }
 }

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::tools::ToolPromptMetadata;
+
 #[tokio::test]
 async fn no_panic_when_stream_optional_fields_missing() {
     let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
@@ -33,6 +35,314 @@ async fn no_panic_when_stream_optional_fields_missing() {
         }),
         "tool-less turns should persist assistant text into run messages"
     );
+}
+
+#[tokio::test]
+async fn prompt_metadata_schema_uses_prompt_and_renders_available_tools_transiently() {
+    let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+    let mut request = RunRequest::new(
+        test_model(),
+        vec![
+            ModelMessage::system("root system"),
+            ModelMessage::user("use tools"),
+        ],
+    );
+    request.tools = vec![
+            Arc::new(
+                AgentTool::new(
+                    "inspect",
+                    "UI catalog description",
+                    AgentToolParameters::empty(),
+                    |_args, _ctx: ToolExecutionContext| async move {
+                        Ok(serde_json::json!({ "ok": true }))
+                    },
+                )
+                .with_prompt("Model-facing inspect prompt")
+                .with_prompt_metadata(ToolPromptMetadata {
+                    guidelines: vec!["Use when exact inspection is needed.".to_string()],
+                    search_hint: Some("never-render-this-search-hint".to_string()),
+                }),
+            ),
+        ];
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let requests = requests.lock().expect("request lock");
+    let first = requests.first().expect("provider request");
+    let tools = first.tools.as_ref().expect("provider tools");
+    assert_eq!(tools[0].description, "Model-facing inspect prompt");
+
+    assert_eq!(first.messages[0].text(), "root system");
+    assert_eq!(first.messages[1].role, crate::types::Role::System);
+    let metadata = first.messages[1].text();
+    assert!(metadata.contains("<available_tools>"));
+    assert!(metadata.contains("<tool name=\"inspect\">"));
+    assert!(metadata.contains("<prompt>Model-facing inspect prompt</prompt>"));
+    assert!(metadata.contains("- Use when exact inspection is needed."));
+    assert!(!metadata.contains("never-render-this-search-hint"));
+    assert_eq!(first.messages[2].text(), "use tools");
+
+    assert!(
+        result
+            .messages
+            .iter()
+            .all(|message| !message.text().contains("<available_tools>")),
+        "tool metadata must not persist into run messages"
+    );
+}
+
+#[tokio::test]
+async fn prompt_metadata_is_deterministic_and_skips_default_schema_duplicates() {
+    let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("use tools")]);
+    request.tools = vec![
+        Arc::new(AgentTool::new(
+            "default_only",
+            "default description",
+            AgentToolParameters::empty(),
+            |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({})) },
+        )),
+        Arc::new(
+            AgentTool::new(
+                "first",
+                "first description",
+                AgentToolParameters::empty(),
+                |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({})) },
+            )
+            .with_prompt_metadata(ToolPromptMetadata {
+                guidelines: vec!["First guideline".to_string()],
+                search_hint: None,
+            }),
+        ),
+        Arc::new(
+            AgentTool::new(
+                "second",
+                "second description",
+                AgentToolParameters::empty(),
+                |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({})) },
+            )
+            .with_prompt("second prompt")
+            .with_prompt_metadata(ToolPromptMetadata {
+                guidelines: vec!["Second guideline".to_string()],
+                search_hint: Some("hidden-search-hint".to_string()),
+            }),
+        ),
+    ];
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let requests = requests.lock().expect("request lock");
+    let first = requests.first().expect("provider request");
+    let metadata = first
+        .messages
+        .iter()
+        .find(|message| message.text().contains("<available_tools>"))
+        .expect("available tools metadata")
+        .text();
+    assert_eq!(
+        metadata,
+        "<available_tools>\n\
+<tool name=\"first\">\n\
+<prompt>first description</prompt>\n\
+<guidelines>\n\
+- First guideline\n\
+</guidelines>\n\
+</tool>\n\
+<tool name=\"second\">\n\
+<prompt>second prompt</prompt>\n\
+<guidelines>\n\
+- Second guideline\n\
+</guidelines>\n\
+</tool>\n\
+</available_tools>"
+    );
+    assert!(!metadata.contains("default_only"));
+    assert!(!metadata.contains("hidden-search-hint"));
+}
+
+#[tokio::test]
+async fn prompt_metadata_renders_custom_prompt_without_guidelines() {
+    let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("use tools")]);
+    request.tools = vec![Arc::new(
+        AgentTool::new(
+            "summarize",
+            "UI summary",
+            AgentToolParameters::empty(),
+            |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({})) },
+        )
+        .with_prompt("Model summary prompt"),
+    )];
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let requests = requests.lock().expect("request lock");
+    let metadata = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.text().contains("<available_tools>"))
+        .expect("available tools metadata")
+        .text();
+    assert_eq!(
+        metadata,
+        "<available_tools>\n\
+<tool name=\"summarize\">\n\
+<prompt>Model summary prompt</prompt>\n\
+</tool>\n\
+</available_tools>"
+    );
+    assert!(!metadata.contains("<guidelines>"));
+}
+
+#[tokio::test]
+async fn prompt_metadata_search_hint_only_does_not_render_available_tools() {
+    let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+    let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("use tools")]);
+    request.tools = vec![Arc::new(
+        AgentTool::new(
+            "search",
+            "Search workspace",
+            AgentToolParameters::empty(),
+            |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({})) },
+        )
+        .with_prompt_metadata(ToolPromptMetadata {
+            guidelines: Vec::new(),
+            search_hint: Some("future-search-only".to_string()),
+        }),
+    )];
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+    assert_eq!(result.status, RunStatus::Completed);
+
+    let requests = requests.lock().expect("request lock");
+    let provider_request = requests.first().expect("provider request");
+    assert!(
+        provider_request
+            .messages
+            .iter()
+            .all(|message| !message.text().contains("<available_tools>")),
+        "search_hint alone should not render available_tools metadata"
+    );
+}
+
+#[tokio::test]
+async fn alias_historical_tool_calls_are_normalized_only_in_provider_payload() {
+    let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+    let historical_alias_call = AgentToolCall {
+        id: "historical-call-1".to_string(),
+        name: "old_read".to_string(),
+        arguments: serde_json::json!({ "path": "README.md" }),
+        called_as: None,
+        recipient: None,
+    };
+    let mut request = RunRequest::new(
+        test_model(),
+        vec![
+            ModelMessage::user("previous request"),
+            ModelMessage {
+                role: crate::types::Role::Assistant,
+                content: vec![ContentPart::ToolCall(historical_alias_call.clone())],
+                name: None,
+                timestamp: None,
+                metadata: None,
+            },
+        ],
+    );
+    request.tools = vec![Arc::new(
+        AgentTool::new(
+            "read_file",
+            "read file",
+            AgentToolParameters::empty(),
+            |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({})) },
+        )
+        .with_aliases(["old_read"]),
+    )];
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let requests = requests.lock().expect("request lock");
+    let provider_call = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_calls())
+        .next()
+        .expect("provider-facing tool call");
+    assert_eq!(provider_call.name, "read_file");
+    assert_eq!(provider_call.called_as.as_deref(), Some("old_read"));
+
+    let persisted_call = result
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_calls())
+        .next()
+        .expect("persisted historical tool call");
+    assert_eq!(persisted_call, &historical_alias_call);
+}
+
+#[tokio::test]
+async fn alias_historical_canonical_self_alias_does_not_set_called_as() {
+    let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+    let historical_canonical_call = AgentToolCall {
+        id: "historical-call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({ "path": "README.md" }),
+        called_as: None,
+        recipient: None,
+    };
+    let mut request = RunRequest::new(
+        test_model(),
+        vec![ModelMessage {
+            role: crate::types::Role::Assistant,
+            content: vec![ContentPart::ToolCall(historical_canonical_call.clone())],
+            name: None,
+            timestamp: None,
+            metadata: None,
+        }],
+    );
+    request.tools = vec![Arc::new(
+        AgentTool::new(
+            "read_file",
+            "read file",
+            AgentToolParameters::empty(),
+            |_args, _ctx: ToolExecutionContext| async move { Ok(serde_json::json!({})) },
+        )
+        .with_aliases(["read_file"]),
+    )];
+
+    let handle = runner.start(request).await.expect("start run");
+    let result = timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .expect("run wait timeout");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    let requests = requests.lock().expect("request lock");
+    let provider_call = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_calls())
+        .next()
+        .expect("provider-facing tool call");
+    assert_eq!(provider_call.name, "read_file");
+    assert_eq!(provider_call.called_as, None);
 }
 
 #[tokio::test]

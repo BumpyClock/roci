@@ -10,9 +10,9 @@ use super::super::limits::RunnerLimits;
 use super::super::message_events::assistant_message_snapshot;
 use super::super::message_events::emit_message_lifecycle;
 use super::super::tooling::{
-    append_skipped_tool_call, append_tool_result, apply_post_tool_use_hook,
-    apply_pre_tool_use_hook, canceled_tool_result, declined_tool_result, emit_tool_execution_end,
-    emit_tool_execution_start, execute_parallel_tool_calls, execute_tool_call, resolve_tool_call,
+    append_skipped_tool_call, append_tool_result, apply_pre_tool_use_hook, canceled_tool_result,
+    declined_tool_result, emit_tool_execution_end, emit_tool_execution_start,
+    execute_parallel_tool_calls, execute_tool_call, finalize_tool_result, resolve_tool_call,
     safety_plan_for_finalized_call, validate_finalized_tool_call, ResolvedToolCall,
     ToolExecutionInputs, ToolExecutionOutcome,
 };
@@ -54,16 +54,28 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         consecutive_failed_iterations,
     } = args;
 
-    let assistant_message = if iteration_text.is_empty() && tool_calls.is_empty() {
+    let resolved_tool_calls = tool_calls
+        .iter()
+        .map(|call| resolve_tool_call(&request.tools, call))
+        .collect::<Vec<_>>();
+    let normalized_tool_calls = resolved_tool_calls
+        .iter()
+        .map(|resolved| resolved.call.clone())
+        .collect::<Vec<_>>();
+
+    let assistant_message = if iteration_text.is_empty() && normalized_tool_calls.is_empty() {
         None
     } else {
-        Some(assistant_message_snapshot(&iteration_text, tool_calls))
+        Some(assistant_message_snapshot(
+            &iteration_text,
+            &normalized_tool_calls,
+        ))
     };
     if let Some(message) = assistant_message.as_ref() {
         messages.push(message.clone());
     }
 
-    if tool_calls.is_empty() {
+    if normalized_tool_calls.is_empty() {
         agent_emitter.emit(AgentEvent::TurnEnd {
             run_id: request.run_id,
             turn_index,
@@ -85,8 +97,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         request.user_input_callback.as_ref(),
     );
 
-    for (call_idx, call) in tool_calls.iter().enumerate() {
-        let resolved_call = resolve_tool_call(&request.tools, call);
+    for (call_idx, resolved_call) in resolved_tool_calls.iter().cloned().enumerate() {
         let pre_tool_use = apply_pre_tool_use_hook(
             &request.hooks,
             &resolved_call.call,
@@ -111,9 +122,10 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                         _ = &mut *abort_rx => {
                             run_cancel_token.cancel();
                             for parallel_call in &pending_parallel_calls {
-                                let canceled_result = apply_post_tool_use_hook(
+                                let canceled_result = finalize_tool_result(
                                     &request.hooks,
                                     &parallel_call.call,
+                                    parallel_call.tool.as_deref(),
                                     canceled_tool_result(&parallel_call.call),
                                 )
                                 .await;
@@ -134,47 +146,58 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     };
                     pending_parallel_calls.clear();
                     for parallel_outcome in parallel_results {
+                        let final_result = finalize_tool_result(
+                            &request.hooks,
+                            &parallel_outcome.call,
+                            parallel_outcome.tool.as_deref(),
+                            parallel_outcome.result,
+                        )
+                        .await;
                         emit_tool_execution_end(
                             agent_emitter,
                             &parallel_outcome.call,
-                            &parallel_outcome.result,
+                            &final_result,
                         );
                         let final_result = append_tool_result(
-                            &request.hooks,
                             emitter,
                             agent_emitter,
                             &parallel_outcome.call,
-                            parallel_outcome.result,
+                            final_result,
                             &mut iteration_failures,
                             messages,
-                        )
-                        .await;
+                        );
                         turn_tool_results.push(final_result);
                     }
                 }
                 emit_tool_execution_start(agent_emitter, &resolved_call.call);
-                emit_tool_execution_end(agent_emitter, &resolved_call.call, &result);
-                let final_result = append_tool_result(
+                let final_result = finalize_tool_result(
                     &request.hooks,
+                    &resolved_call.call,
+                    resolved_call.tool.as_deref(),
+                    result,
+                )
+                .await;
+                emit_tool_execution_end(agent_emitter, &resolved_call.call, &final_result);
+                let final_result = append_tool_result(
                     emitter,
                     agent_emitter,
                     &resolved_call.call,
-                    result,
+                    final_result,
                     &mut iteration_failures,
                     messages,
-                )
-                .await;
+                );
                 turn_tool_results.push(final_result);
 
                 if let Some(ref get_steering) = request.get_steering_messages {
                     let steering = get_steering().await;
                     if !steering.is_empty() {
-                        for remaining_call in &tool_calls[call_idx + 1..] {
+                        for remaining_call in &resolved_tool_calls[call_idx + 1..] {
                             let skipped = append_skipped_tool_call(
                                 &request.hooks,
                                 emitter,
                                 agent_emitter,
-                                remaining_call,
+                                &remaining_call.call,
+                                remaining_call.tool.as_deref(),
                                 &mut iteration_failures,
                                 messages,
                             )
@@ -208,9 +231,10 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                     _ = &mut *abort_rx => {
                         run_cancel_token.cancel();
                         for parallel_call in &pending_parallel_calls {
-                            let canceled_result = apply_post_tool_use_hook(
+                            let canceled_result = finalize_tool_result(
                                 &request.hooks,
                                 &parallel_call.call,
+                                parallel_call.tool.as_deref(),
                                 canceled_tool_result(&parallel_call.call),
                             )
                             .await;
@@ -231,46 +255,53 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                 };
                 pending_parallel_calls.clear();
                 for parallel_outcome in parallel_results {
-                    emit_tool_execution_end(
-                        agent_emitter,
-                        &parallel_outcome.call,
-                        &parallel_outcome.result,
-                    );
-                    let final_result = append_tool_result(
+                    let final_result = finalize_tool_result(
                         &request.hooks,
+                        &parallel_outcome.call,
+                        parallel_outcome.tool.as_deref(),
+                        parallel_outcome.result,
+                    )
+                    .await;
+                    emit_tool_execution_end(agent_emitter, &parallel_outcome.call, &final_result);
+                    let final_result = append_tool_result(
                         emitter,
                         agent_emitter,
                         &parallel_outcome.call,
-                        parallel_outcome.result,
+                        final_result,
                         &mut iteration_failures,
                         messages,
-                    )
-                    .await;
+                    );
                     turn_tool_results.push(final_result);
                 }
             }
 
-            let final_result = append_tool_result(
+            let final_result = finalize_tool_result(
                 &request.hooks,
+                &resolved_call.call,
+                resolved_call.tool.as_deref(),
+                result,
+            )
+            .await;
+            let final_result = append_tool_result(
                 emitter,
                 agent_emitter,
                 &resolved_call.call,
-                result,
+                final_result,
                 &mut iteration_failures,
                 messages,
-            )
-            .await;
+            );
             turn_tool_results.push(final_result);
 
             if let Some(ref get_steering) = request.get_steering_messages {
                 let steering = get_steering().await;
                 if !steering.is_empty() {
-                    for remaining_call in &tool_calls[call_idx + 1..] {
+                    for remaining_call in &resolved_tool_calls[call_idx + 1..] {
                         let skipped = append_skipped_tool_call(
                             &request.hooks,
                             emitter,
                             agent_emitter,
-                            remaining_call,
+                            &remaining_call.call,
+                            remaining_call.tool.as_deref(),
                             &mut iteration_failures,
                             messages,
                         )
@@ -331,9 +362,10 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
                 _ = &mut *abort_rx => {
                     run_cancel_token.cancel();
                     for parallel_call in &pending_parallel_calls {
-                        let canceled_result = apply_post_tool_use_hook(
+                        let canceled_result = finalize_tool_result(
                             &request.hooks,
                             &parallel_call.call,
+                            parallel_call.tool.as_deref(),
                             canceled_tool_result(&parallel_call.call),
                         )
                         .await;
@@ -354,33 +386,35 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
             };
             pending_parallel_calls.clear();
             for parallel_outcome in parallel_results {
-                emit_tool_execution_end(
-                    agent_emitter,
-                    &parallel_outcome.call,
-                    &parallel_outcome.result,
-                );
-                let final_result = append_tool_result(
+                let final_result = finalize_tool_result(
                     &request.hooks,
+                    &parallel_outcome.call,
+                    parallel_outcome.tool.as_deref(),
+                    parallel_outcome.result,
+                )
+                .await;
+                emit_tool_execution_end(agent_emitter, &parallel_outcome.call, &final_result);
+                let final_result = append_tool_result(
                     emitter,
                     agent_emitter,
                     &parallel_outcome.call,
-                    parallel_outcome.result,
+                    final_result,
                     &mut iteration_failures,
                     messages,
-                )
-                .await;
+                );
                 turn_tool_results.push(final_result);
             }
 
             if let Some(ref get_steering) = request.get_steering_messages {
                 let steering = get_steering().await;
                 if !steering.is_empty() {
-                    for remaining_call in &tool_calls[call_idx + 1..] {
+                    for remaining_call in &resolved_tool_calls[call_idx + 1..] {
                         let skipped = append_skipped_tool_call(
                             &request.hooks,
                             emitter,
                             agent_emitter,
-                            remaining_call,
+                            &remaining_call.call,
+                            remaining_call.tool.as_deref(),
                             &mut iteration_failures,
                             messages,
                         )
@@ -399,13 +433,15 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
 
         let outcome = if can_execute {
             let call_for_cancel = resolved_call.call.clone();
+            let tool_for_cancel = resolved_call.tool.clone();
             emit_tool_execution_start(agent_emitter, &call_for_cancel);
             tokio::select! {
                 _ = &mut *abort_rx => {
                     run_cancel_token.cancel();
-                    let canceled_result = apply_post_tool_use_hook(
+                    let canceled_result = finalize_tool_result(
                         &request.hooks,
                         &call_for_cancel,
+                        tool_for_cancel.as_deref(),
                         canceled_tool_result(&call_for_cancel),
                     )
                     .await;
@@ -422,34 +458,41 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         } else {
             ToolExecutionOutcome {
                 call: resolved_call.call.clone(),
+                tool: resolved_call.tool.clone(),
                 result: declined_tool_result(&resolved_call.call),
             }
         };
+        let final_result = finalize_tool_result(
+            &request.hooks,
+            &outcome.call,
+            outcome.tool.as_deref(),
+            outcome.result,
+        )
+        .await;
         if can_execute {
-            emit_tool_execution_end(agent_emitter, &outcome.call, &outcome.result);
+            emit_tool_execution_end(agent_emitter, &outcome.call, &final_result);
         }
 
         let final_result = append_tool_result(
-            &request.hooks,
             emitter,
             agent_emitter,
             &outcome.call,
-            outcome.result,
+            final_result,
             &mut iteration_failures,
             messages,
-        )
-        .await;
+        );
         turn_tool_results.push(final_result);
 
         if let Some(ref get_steering) = request.get_steering_messages {
             let steering = get_steering().await;
             if !steering.is_empty() {
-                for remaining_call in &tool_calls[call_idx + 1..] {
+                for remaining_call in &resolved_tool_calls[call_idx + 1..] {
                     let skipped = append_skipped_tool_call(
                         &request.hooks,
                         emitter,
                         agent_emitter,
-                        remaining_call,
+                        &remaining_call.call,
+                        remaining_call.tool.as_deref(),
                         &mut iteration_failures,
                         messages,
                     )
@@ -484,9 +527,10 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
             _ = &mut *abort_rx => {
                 run_cancel_token.cancel();
                 for parallel_call in &pending_parallel_calls {
-                    let canceled_result = apply_post_tool_use_hook(
+                    let canceled_result = finalize_tool_result(
                         &request.hooks,
                         &parallel_call.call,
+                        parallel_call.tool.as_deref(),
                         canceled_tool_result(&parallel_call.call),
                     )
                     .await;
@@ -503,21 +547,22 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         };
         pending_parallel_calls.clear();
         for parallel_outcome in parallel_results {
-            emit_tool_execution_end(
-                agent_emitter,
-                &parallel_outcome.call,
-                &parallel_outcome.result,
-            );
-            let final_result = append_tool_result(
+            let final_result = finalize_tool_result(
                 &request.hooks,
+                &parallel_outcome.call,
+                parallel_outcome.tool.as_deref(),
+                parallel_outcome.result,
+            )
+            .await;
+            emit_tool_execution_end(agent_emitter, &parallel_outcome.call, &final_result);
+            let final_result = append_tool_result(
                 emitter,
                 agent_emitter,
                 &parallel_outcome.call,
-                parallel_outcome.result,
+                final_result,
                 &mut iteration_failures,
                 messages,
-            )
-            .await;
+            );
             turn_tool_results.push(final_result);
         }
     }
@@ -529,7 +574,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
         tool_results: turn_tool_results,
     });
 
-    if iteration_failures == tool_calls.len() {
+    if iteration_failures == normalized_tool_calls.len() {
         *consecutive_failed_iterations = consecutive_failed_iterations.saturating_add(1);
     } else {
         *consecutive_failed_iterations = 0;

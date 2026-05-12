@@ -7,6 +7,7 @@ mod errors;
 mod models_cmd;
 mod session_cmd;
 mod skills_cmd;
+mod tool_contracts_smoke;
 
 use clap::Parser;
 
@@ -30,6 +31,9 @@ async fn main() {
         Commands::Models(models_args) => models_cmd::handle_models(models_args).await,
         Commands::Session(session_args) => session_cmd::handle_session(session_args).await,
         Commands::Skills(skills_args) => skills_cmd::handle_skills(skills_args).await,
+        Commands::ToolContractsSmoke(args) => {
+            tool_contracts_smoke::handle_tool_contracts_smoke(args).await
+        }
     };
 
     if let Err(error) = result {

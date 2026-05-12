@@ -355,6 +355,7 @@ impl ModelProvider for AnthropicProvider {
                             id: id.clone(),
                             name: name.clone(),
                             arguments: input.clone(),
+                            called_as: None,
                             recipient: None,
                         });
                     }
@@ -518,7 +519,7 @@ impl ModelProvider for AnthropicProvider {
                                             yield Ok(TextStreamDelta {
                                                 text: String::new(),
                                                 event_type: StreamEventType::ToolCallDelta,
-                                                tool_call: Some(AgentToolCall { id, name, arguments: args, recipient: None }),
+                                                tool_call: Some(AgentToolCall { id, name, arguments: args, called_as: None, recipient: None }),
                                                 finish_reason: None,
                                                 usage: None,
                                                 reasoning: None,

@@ -648,6 +648,7 @@ mod tests {
             id: "call_tc".to_string(),
             name: "read_file".to_string(),
             arguments: serde_json::json!({"path": "/tmp/a.txt"}),
+            called_as: None,
             recipient: None,
         });
         let msg = ModelMessage {

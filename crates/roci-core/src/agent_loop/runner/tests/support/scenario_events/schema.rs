@@ -22,6 +22,7 @@ pub(super) fn events_for_scenario(
                     id: "schema-call-1".to_string(),
                     name: "schema_tool".to_string(),
                     arguments: args,
+                    called_as: None,
                     recipient: None,
                 }),
                 finish_reason: None,

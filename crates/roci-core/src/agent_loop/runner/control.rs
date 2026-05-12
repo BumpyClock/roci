@@ -18,6 +18,14 @@ use crate::human_interaction::{
 use crate::tools::ToolFilesystemAccess;
 use crate::tools::{Tool, ToolActionFloor, ToolSafetyKind, ToolSafetyPlan};
 use crate::types::{AgentToolCall, ModelMessage, StreamEventType, TextStreamDelta};
+use std::sync::Arc;
+
+pub(super) struct StreamDeltaState<'a> {
+    pub(super) iteration_text: &'a mut String,
+    pub(super) tool_calls: &'a mut Vec<AgentToolCall>,
+    pub(super) stream_done: &'a mut bool,
+    pub(super) message_open: &'a mut bool,
+}
 
 pub(super) fn emit_failed_result(
     emitter: &RunEventEmitter,
@@ -39,13 +47,17 @@ pub(super) fn emit_failed_result(
 pub(super) fn process_stream_delta(
     emitter: &RunEventEmitter,
     agent_emitter: &AgentEventEmitter,
-    delta: TextStreamDelta,
-    iteration_text: &mut String,
-    tool_calls: &mut Vec<AgentToolCall>,
-    stream_done: &mut bool,
-    message_open: &mut bool,
+    mut delta: TextStreamDelta,
+    tools: &[Arc<dyn Tool>],
+    state: StreamDeltaState<'_>,
 ) -> Option<String> {
-    let assistant_event = delta.clone();
+    let StreamDeltaState {
+        iteration_text,
+        tool_calls,
+        stream_done,
+        message_open,
+    } = state;
+
     match delta.event_type {
         StreamEventType::ToolCallDelta => {
             if let Some(tc) = delta.tool_call {
@@ -58,6 +70,9 @@ pub(super) fn process_stream_delta(
                     );
                     return None;
                 }
+                let mut tc = tc;
+                super::tooling::normalize_tool_call_alias(tools, &mut tc);
+                delta.tool_call = Some(tc.clone());
 
                 emit_message_start_if_needed(
                     agent_emitter,
@@ -83,7 +98,7 @@ pub(super) fn process_stream_delta(
                 }
                 agent_emitter.emit(AgentEvent::MessageUpdate {
                     message: assistant_message_snapshot(iteration_text, tool_calls),
-                    assistant_message_event: assistant_event,
+                    assistant_message_event: delta,
                 });
             } else {
                 emitter.emit(
@@ -95,12 +110,13 @@ pub(super) fn process_stream_delta(
             }
         }
         StreamEventType::Reasoning => {
-            if let Some(reasoning) = delta.reasoning {
+            if let Some(reasoning) = delta.reasoning.as_ref() {
                 if !reasoning.is_empty() {
+                    let reasoning_text = reasoning.clone();
                     emitter.emit(
                         RunEventStream::Reasoning,
                         RunEventPayload::ReasoningDelta {
-                            text: reasoning.clone(),
+                            text: reasoning_text.clone(),
                         },
                     );
                     emit_message_start_if_needed(
@@ -111,9 +127,11 @@ pub(super) fn process_stream_delta(
                     );
                     agent_emitter.emit(AgentEvent::MessageUpdate {
                         message: assistant_message_snapshot(iteration_text, tool_calls),
-                        assistant_message_event: assistant_event,
+                        assistant_message_event: delta,
                     });
-                    agent_emitter.emit(AgentEvent::Reasoning { text: reasoning });
+                    agent_emitter.emit(AgentEvent::Reasoning {
+                        text: reasoning_text,
+                    });
                 }
             }
         }
@@ -134,7 +152,7 @@ pub(super) fn process_stream_delta(
                 );
                 agent_emitter.emit(AgentEvent::MessageUpdate {
                     message: assistant_message_snapshot(iteration_text, tool_calls),
-                    assistant_message_event: assistant_event,
+                    assistant_message_event: delta,
                 });
             }
         }
@@ -619,6 +637,7 @@ mod tests {
             id: format!("{name}-call"),
             name: name.to_string(),
             arguments: serde_json::json!({}),
+            called_as: None,
             recipient: None,
         }
     }
@@ -810,6 +829,7 @@ mod tests {
             id: "shell-call".to_string(),
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "rm -rf target" }),
+            called_as: None,
             recipient: None,
         };
 
@@ -900,6 +920,7 @@ mod tests {
             id: "shell-call".to_string(),
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "rm -rf sk-secret-leak-123" }),
+            called_as: None,
             recipient: None,
         };
 
@@ -961,6 +982,7 @@ mod tests {
             id: "grep-call".to_string(),
             name: "grep".to_string(),
             arguments: serde_json::json!({ "pattern": "needle" }),
+            called_as: None,
             recipient: None,
         };
         let mut policy = ApprovalPolicy::always();
@@ -1006,6 +1028,7 @@ mod tests {
             id: "read-call".to_string(),
             name: "read_file".to_string(),
             arguments: serde_json::json!({ "path": "../secret" }),
+            called_as: None,
             recipient: None,
         };
         let mut policy = ApprovalPolicy::always();
@@ -1259,18 +1282,21 @@ mod tests {
             id: "first".to_string(),
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "echo one" }),
+            called_as: None,
             recipient: None,
         };
         let second_call = AgentToolCall {
             id: "second".to_string(),
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "echo one" }),
+            called_as: None,
             recipient: None,
         };
         let different_args = AgentToolCall {
             id: "third".to_string(),
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "echo two" }),
+            called_as: None,
             recipient: None,
         };
 
@@ -1329,6 +1355,7 @@ mod tests {
             id: "shell-call".to_string(),
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "echo cached" }),
+            called_as: None,
             recipient: None,
         };
         let shell_plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);
@@ -1381,6 +1408,7 @@ mod tests {
             id: "shell-call".to_string(),
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "echo cached" }),
+            called_as: None,
             recipient: None,
         };
         let shell_plan = ToolSafetyPlan::approval_required(ToolSafetyKind::CommandExecution);

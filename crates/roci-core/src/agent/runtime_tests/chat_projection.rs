@@ -690,6 +690,7 @@ fn bootstrap_thread_projects_exact_history_as_completed_messages() {
                     id: "call-1".to_string(),
                     name: "search".to_string(),
                     arguments: serde_json::json!({ "query": "roci projector" }),
+                    called_as: None,
                     recipient: Some("web".to_string()),
                 }),
             ],

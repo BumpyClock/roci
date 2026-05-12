@@ -18,8 +18,9 @@ pub use dynamic::{DynamicTool, DynamicToolAdapter, DynamicToolProvider};
 pub use tool::ToolUpdateCallback;
 pub use tool::{
     AgentTool, SandboxProvider, Tool, ToolActionFloor, ToolApprovalRequirement,
-    ToolExecutionContext, ToolFilesystemAccess, ToolResourceAccess, ToolResourceAccessMode,
-    ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
+    ToolExecutionContext, ToolFilesystemAccess, ToolPromptMetadata, ToolResourceAccess,
+    ToolResourceAccessMode, ToolResultSizePolicy, ToolSafetyKind, ToolSafetyPlan,
+    ToolSafetySummary,
 };
 pub use types::AgentToolParameters;
 pub use user_input::{

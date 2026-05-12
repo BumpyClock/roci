@@ -167,6 +167,15 @@ pub struct AgentToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Alias or invocation label used for this call when it differed from the
+    /// canonical `name`.
+    ///
+    /// `None` means the model called the canonical tool name directly. For
+    /// example, a call emitted as `legacy_echo` and normalized to canonical
+    /// `canonical_echo` stores `name = "canonical_echo"` and
+    /// `called_as = Some("legacy_echo")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub called_as: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
 }
