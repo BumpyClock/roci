@@ -20,7 +20,7 @@ use tokio_tungstenite::{
 };
 
 use super::common::DynRoleClientTransport;
-use super::{MCPRunningService, MCPTransport};
+use super::{MCPRemoteReconnectPolicy, MCPRunningService, MCPTransport};
 use crate::error::RociError;
 use crate::mcp::elicitation::MCPClientHandler;
 
@@ -35,6 +35,7 @@ pub struct WebSocketTransportConfig {
     pub auth_header_provider: Option<WebSocketAuthHeaderProvider>,
     pub request_timeout_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
+    pub reconnect_policy: MCPRemoteReconnectPolicy,
 }
 
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -47,6 +48,7 @@ pub struct WebSocketTransport {
     custom_headers: HashMap<String, String>,
     request_timeout_ms: Option<u64>,
     connect_timeout_ms: Option<u64>,
+    reconnect_policy: MCPRemoteReconnectPolicy,
     inner: Option<Box<dyn DynRoleClientTransport>>,
     closed: bool,
 }
@@ -60,6 +62,7 @@ impl WebSocketTransport {
             custom_headers: HashMap::new(),
             request_timeout_ms: None,
             connect_timeout_ms: None,
+            reconnect_policy: MCPRemoteReconnectPolicy::default(),
             inner: None,
             closed: false,
         }
@@ -79,6 +82,7 @@ impl WebSocketTransport {
             custom_headers: config.headers,
             request_timeout_ms: config.request_timeout_ms,
             connect_timeout_ms: config.connect_timeout_ms,
+            reconnect_policy: config.reconnect_policy,
             inner: None,
             closed: false,
         }
@@ -165,6 +169,46 @@ impl WebSocketTransport {
     pub fn connect_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.connect_timeout_ms = Some(timeout_ms);
         self
+    }
+
+    pub fn reconnect_policy(mut self, policy: MCPRemoteReconnectPolicy) -> Self {
+        self.reconnect_policy = policy;
+        self
+    }
+
+    /// Total configured reconnect attempts, including the immediate first try.
+    pub fn retry_max_attempts(&self) -> Option<usize> {
+        Some(self.reconnect_policy.max_attempts)
+    }
+
+    /// First retry sleep in milliseconds after the immediate reconnect try fails.
+    pub fn retry_initial_delay_ms(&self) -> u64 {
+        self.reconnect_policy.initial_backoff_ms
+    }
+
+    /// Maximum retry sleep in milliseconds after multiplier and jitter apply.
+    pub fn retry_max_delay_ms(&self) -> u64 {
+        self.reconnect_policy.max_backoff_ms
+    }
+
+    /// Backoff multiplier between retry sleeps.
+    pub fn retry_multiplier(&self) -> f64 {
+        self.reconnect_policy.backoff_multiplier
+    }
+
+    /// Symmetric jitter ratio applied to retry sleeps.
+    pub fn retry_jitter_ratio(&self) -> f64 {
+        self.reconnect_policy.jitter_ratio
+    }
+
+    /// Idle milliseconds after which the next request reconnects first.
+    pub fn idle_timeout_ms_value(&self) -> Option<u64> {
+        self.reconnect_policy.idle_timeout_ms
+    }
+
+    /// Session-age milliseconds after which the next request reconnects first.
+    pub fn periodic_reconnect_ms_value(&self) -> Option<u64> {
+        self.reconnect_policy.periodic_reconnect_ms
     }
 
     fn build_request(
@@ -311,6 +355,10 @@ impl MCPTransport for WebSocketTransport {
             inner.close().await?;
         }
         Ok(())
+    }
+
+    fn remote_reconnect_policy(&self) -> Option<MCPRemoteReconnectPolicy> {
+        Some(self.reconnect_policy)
     }
 }
 
@@ -493,6 +541,29 @@ mod tests {
     }
 
     #[test]
+    fn websocket_constructor_sets_reconnect_policy_controls() {
+        let transport = WebSocketTransport::new("ws://localhost:3000/mcp").reconnect_policy(
+            MCPRemoteReconnectPolicy {
+                max_attempts: 4,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 500,
+                backoff_multiplier: 1.5,
+                jitter_ratio: 0.1,
+                idle_timeout_ms: Some(1_000),
+                periodic_reconnect_ms: Some(5_000),
+            },
+        );
+
+        assert_eq!(transport.retry_max_attempts(), Some(4));
+        assert_eq!(transport.retry_initial_delay_ms(), 50);
+        assert_eq!(transport.retry_max_delay_ms(), 500);
+        assert_eq!(transport.retry_multiplier(), 1.5);
+        assert_eq!(transport.retry_jitter_ratio(), 0.1);
+        assert_eq!(transport.idle_timeout_ms_value(), Some(1_000));
+        assert_eq!(transport.periodic_reconnect_ms_value(), Some(5_000));
+    }
+
+    #[test]
     fn websocket_from_config_applies_auth_hook_headers_and_timeouts() {
         let transport = WebSocketTransport::from_config(WebSocketTransportConfig {
             url: "ws://localhost:3000/mcp".into(),
@@ -501,6 +572,15 @@ mod tests {
             auth_header_provider: Some(Arc::new(|| Some("hook-token".into()))),
             request_timeout_ms: Some(250),
             connect_timeout_ms: Some(100),
+            reconnect_policy: MCPRemoteReconnectPolicy {
+                max_attempts: 2,
+                initial_backoff_ms: 25,
+                max_backoff_ms: 250,
+                backoff_multiplier: 2.0,
+                jitter_ratio: 0.0,
+                idle_timeout_ms: Some(500),
+                periodic_reconnect_ms: Some(1_000),
+            },
         });
 
         assert_eq!(transport.url(), "ws://localhost:3000/mcp");
@@ -509,6 +589,8 @@ mod tests {
             transport.custom_headers().get("x-api-key"),
             Some(&"abc123".to_string())
         );
+        assert_eq!(transport.retry_max_attempts(), Some(2));
+        assert_eq!(transport.idle_timeout_ms_value(), Some(500));
     }
 
     #[tokio::test]
@@ -715,6 +797,7 @@ mod tests {
             auth_header_provider: None,
             request_timeout_ms: Some(100),
             connect_timeout_ms: Some(100),
+            reconnect_policy: MCPRemoteReconnectPolicy::default(),
         });
 
         let _ = transport.receive().await;

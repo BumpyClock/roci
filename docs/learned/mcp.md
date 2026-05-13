@@ -57,3 +57,10 @@ let _search = aggregator
 - Set `GenerationSettings::openai_responses.instructions` to force a top-level instruction.
 - If unset, system messages are concatenated and used as fallback.
 - If there is no system content, provider defaults apply.
+
+## Remote reconnect policy
+
+- Remote transports expose `MCPRemoteReconnectPolicy`; stdio transports intentionally do not.
+- Defaults are bounded: immediate first reconnect attempt, exponential backoff with jitter for later attempts, and `MCPClient::last_reconnect_outcome()` records the last reconnect result as `Recovered`, `NeedsAuth`, or `Failed`.
+- `last_reconnect_outcome()` updates only when reconnect logic runs; it is not cleared on every normal request.
+- `idle_timeout_ms` and `periodic_reconnect_ms` are request-bound reconnect checks, not hidden background loops.

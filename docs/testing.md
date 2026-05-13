@@ -104,6 +104,23 @@ tmux new-session -d -s roci-live-provider \
 echo "attach: tmux attach -t roci-live-provider"
 ```
 
+```bash
+tmux new-session -d -s roci-context-management-live \
+  'cd /path/to/roci && \
+   LMSTUDIO_BASE_URL=http://127.0.0.1:1234 \
+   cargo run -q -p roci-cli --features roci/lmstudio -- \
+   chat --no-skills --model "lmstudio:<model-id>" \
+   --temperature 0 --max-tokens 32 \
+   --context-window-override 8192 \
+   --reserve-output-tokens 1024 \
+   --max-turn-input-tokens 5000 \
+   --max-session-output-tokens 2048 \
+   --compaction-model "lmstudio:<model-id>" \
+   "Reply exactly: roci-context-budget-ok"; \
+   roci_status=$?; printf "\n[roci context management smoke exit=%s]\n" "$roci_status"; exec zsh'
+echo "attach: tmux attach -t roci-context-management-live"
+```
+
 Attachment changes need end-to-end CLI check (not only unit tests):
 
 ```bash

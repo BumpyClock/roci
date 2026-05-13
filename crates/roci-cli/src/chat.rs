@@ -6,7 +6,9 @@ use roci::agent::{AgentConfig, AgentRuntime, HumanInteractionCoordinator, QueueD
 use roci::agent_loop::{ApprovalPolicy, PreToolUseHookResult, RetryMode, RunStatus};
 use roci::attachments::{Attachment, PromptInput};
 use roci::config::RociConfig;
+use roci::context::ContextBudget;
 use roci::mcp::{merge_mcp_instructions, MCPInstructionMergePolicy};
+use roci::resource::CompactionSettings;
 use roci::resource::SkillResourceOptions;
 use roci::session::{CreateSessionOptions, LocalSessionStore, SessionConfig, SessionId};
 use roci::skills::merge_system_prompt_with_skills;
@@ -44,6 +46,15 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         no_tools,
         tools: allowed_tools,
         exclude_tools,
+        context_window_override,
+        reserve_output_tokens,
+        max_turn_input_tokens,
+        max_session_input_tokens,
+        max_session_output_tokens,
+        no_auto_compaction,
+        compaction_reserve_tokens,
+        compaction_keep_recent_tokens,
+        compaction_model,
         max_tokens,
         approval,
         session_root,
@@ -128,6 +139,22 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(max) = max_tokens {
         settings.max_tokens = Some(max);
     }
+    let context_budget = build_context_budget(
+        context_window_override,
+        reserve_output_tokens,
+        max_turn_input_tokens,
+        max_session_input_tokens,
+        max_session_output_tokens,
+    );
+    let compaction = {
+        let default = CompactionSettings::default();
+        CompactionSettings {
+            enabled: !no_auto_compaction,
+            reserve_tokens: compaction_reserve_tokens.unwrap_or(default.reserve_tokens),
+            keep_recent_tokens: compaction_keep_recent_tokens.unwrap_or(default.keep_recent_tokens),
+            model: compaction_model,
+        }
+    };
 
     let coordinator = Arc::new(HumanInteractionCoordinator::new());
     let mut renderer = RuntimeEventRenderer::spawn(coordinator.clone());
@@ -177,7 +204,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         provider_metadata: HashMap::new(),
         provider_payload_callback: None,
         get_api_key: None,
-        compaction: Default::default(),
+        compaction,
         session_before_compact: None,
         session_before_tree: None,
         pre_tool_use: Some(Arc::new(|call, _cancel| {
@@ -189,7 +216,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             Box::pin(async move { Ok(result) })
         })),
         user_input_timeout_ms: None,
-        context_budget: None,
+        context_budget,
         chat: Default::default(),
         subagents: subagent_profiles.into_config(!no_subagents),
         human_interaction_coordinator: Some(coordinator.clone()),
@@ -236,6 +263,32 @@ fn build_prompt_input(prompt: String, attachment_paths: &[PathBuf]) -> PromptInp
         .with_attachments(attachment_paths.iter().cloned().map(Attachment::file))
 }
 
+fn build_context_budget(
+    context_window_override: Option<usize>,
+    reserve_output_tokens: Option<usize>,
+    max_turn_input_tokens: Option<usize>,
+    max_session_input_tokens: Option<usize>,
+    max_session_output_tokens: Option<usize>,
+) -> Option<ContextBudget> {
+    if context_window_override.is_none()
+        && reserve_output_tokens.is_none()
+        && max_turn_input_tokens.is_none()
+        && max_session_input_tokens.is_none()
+        && max_session_output_tokens.is_none()
+    {
+        return None;
+    }
+
+    let default = ContextBudget::default();
+    Some(ContextBudget {
+        context_window_override,
+        reserve_output_tokens: reserve_output_tokens.unwrap_or(default.reserve_output_tokens),
+        max_turn_input_tokens,
+        max_session_input_tokens,
+        max_session_output_tokens,
+    })
+}
+
 fn demo_pre_tool_use_hook(tool_name: &str, tool_call_id: &str) {
     eprintln!("[hook] preToolUse called (tool={tool_name}, id={tool_call_id})");
 }
@@ -271,7 +324,7 @@ mod tests {
     use roci::agent_loop::ApprovalAction;
     use roci::attachments::Attachment;
 
-    use super::{approval_policy_from_arg, build_prompt_input};
+    use super::{approval_policy_from_arg, build_context_budget, build_prompt_input};
     use crate::cli::ChatApprovalArg;
 
     #[test]
@@ -317,5 +370,21 @@ mod tests {
             approval_policy_from_arg(ChatApprovalArg::Never).default_action,
             ApprovalAction::Deny
         );
+    }
+
+    #[test]
+    fn build_context_budget_defaults_when_fields_omitted() {
+        assert!(build_context_budget(None, None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn build_context_budget_uses_core_defaults_for_unspecified_fields() {
+        let budget =
+            build_context_budget(Some(65_536), Some(2_048), None, Some(500_000), None).unwrap();
+        assert_eq!(budget.context_window_override, Some(65_536));
+        assert_eq!(budget.reserve_output_tokens, 2_048);
+        assert!(budget.max_turn_input_tokens.is_none());
+        assert_eq!(budget.max_session_input_tokens, Some(500_000));
+        assert!(budget.max_session_output_tokens.is_none());
     }
 }

@@ -2,6 +2,12 @@
 //!
 //! Provides named profiles, model fallback, context propagation,
 //! and parent-facing lifecycle management for child agent runtimes.
+//!
+//! Orchestration starts with [`SubagentSupervisor::spawn`] for explicit handle
+//! control. Parents can also use [`SubagentSupervisor::run_parallel`] for
+//! fan-out/fan-in, [`SubagentSupervisor::race`] for first-result-wins work, and
+//! [`SubagentSupervisor::watch_all`] / [`SubagentSupervisor::watch_any`] for
+//! snapshot streams over the currently active child set.
 
 pub mod config;
 pub mod context;

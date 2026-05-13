@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::service::{ClientInitializeError, ServiceExt};
 use rmcp::transport::{
-    common::client_side_sse::ExponentialBackoff,
+    common::client_side_sse::SseRetryPolicy,
     streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
 };
 
@@ -12,7 +12,7 @@ use super::common::{DynRoleClientTransport, ErasedRoleClientTransport};
 use crate::error::RociError;
 use crate::mcp::elicitation::MCPClientHandler;
 
-use super::{MCPRunningService, MCPTransport};
+use super::{MCPRemoteReconnectPolicy, MCPRunningService, MCPTransport};
 
 pub type StreamableHttpAuthHeaderProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
@@ -25,8 +25,7 @@ pub struct StreamableHttpTransportConfig {
     pub auth_header_provider: Option<StreamableHttpAuthHeaderProvider>,
     pub request_timeout_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
-    pub retry_max_attempts: Option<usize>,
-    pub retry_base_delay_ms: Option<u64>,
+    pub reconnect_policy: MCPRemoteReconnectPolicy,
 }
 
 /// Streamable HTTP MCP transport (for remote MCP servers).
@@ -36,8 +35,7 @@ pub struct StreamableHttpTransport {
     custom_headers: HashMap<String, String>,
     request_timeout_ms: Option<u64>,
     connect_timeout_ms: Option<u64>,
-    retry_max_attempts: Option<usize>,
-    retry_base_delay_ms: u64,
+    reconnect_policy: MCPRemoteReconnectPolicy,
     inner: Option<Box<dyn DynRoleClientTransport>>,
     closed: bool,
 }
@@ -51,8 +49,7 @@ impl StreamableHttpTransport {
             custom_headers: HashMap::new(),
             request_timeout_ms: None,
             connect_timeout_ms: None,
-            retry_max_attempts: None,
-            retry_base_delay_ms: 1_000,
+            reconnect_policy: MCPRemoteReconnectPolicy::default(),
             inner: None,
             closed: false,
         }
@@ -72,8 +69,7 @@ impl StreamableHttpTransport {
             custom_headers: config.headers,
             request_timeout_ms: config.request_timeout_ms,
             connect_timeout_ms: config.connect_timeout_ms,
-            retry_max_attempts: config.retry_max_attempts,
-            retry_base_delay_ms: config.retry_base_delay_ms.unwrap_or(1_000),
+            reconnect_policy: config.reconnect_policy,
             inner: None,
             closed: false,
         }
@@ -160,12 +156,39 @@ impl StreamableHttpTransport {
         self.connect_timeout_ms
     }
 
+    /// Total configured reconnect attempts, including the immediate first try.
     pub fn retry_max_attempts(&self) -> Option<usize> {
-        self.retry_max_attempts
+        Some(self.reconnect_policy.max_attempts)
     }
 
-    pub fn retry_base_delay_ms(&self) -> u64 {
-        self.retry_base_delay_ms
+    /// First retry sleep in milliseconds after the immediate reconnect try fails.
+    pub fn retry_initial_delay_ms(&self) -> u64 {
+        self.reconnect_policy.initial_backoff_ms
+    }
+
+    /// Maximum retry sleep in milliseconds after multiplier and jitter apply.
+    pub fn retry_max_delay_ms(&self) -> u64 {
+        self.reconnect_policy.max_backoff_ms
+    }
+
+    /// Backoff multiplier between retry sleeps.
+    pub fn retry_multiplier(&self) -> f64 {
+        self.reconnect_policy.backoff_multiplier
+    }
+
+    /// Symmetric jitter ratio applied to retry sleeps.
+    pub fn retry_jitter_ratio(&self) -> f64 {
+        self.reconnect_policy.jitter_ratio
+    }
+
+    /// Idle milliseconds after which the next request reconnects first.
+    pub fn idle_timeout_ms_value(&self) -> Option<u64> {
+        self.reconnect_policy.idle_timeout_ms
+    }
+
+    /// Session-age milliseconds after which the next request reconnects first.
+    pub fn periodic_reconnect_ms_value(&self) -> Option<u64> {
+        self.reconnect_policy.periodic_reconnect_ms
     }
 
     pub fn request_timeout_ms(mut self, timeout_ms: u64) -> Self {
@@ -179,8 +202,14 @@ impl StreamableHttpTransport {
     }
 
     pub fn retry_policy(mut self, max_attempts: Option<usize>, base_delay_ms: u64) -> Self {
-        self.retry_max_attempts = max_attempts;
-        self.retry_base_delay_ms = base_delay_ms;
+        self.reconnect_policy.max_attempts =
+            max_attempts.unwrap_or(MCPRemoteReconnectPolicy::DEFAULT_MAX_ATTEMPTS);
+        self.reconnect_policy.initial_backoff_ms = base_delay_ms;
+        self
+    }
+
+    pub fn reconnect_policy(mut self, policy: MCPRemoteReconnectPolicy) -> Self {
+        self.reconnect_policy = policy;
         self
     }
 
@@ -210,10 +239,7 @@ impl StreamableHttpTransport {
         if !parsed_headers.is_empty() {
             config = config.custom_headers(parsed_headers);
         }
-        config.retry_config = Arc::new(ExponentialBackoff {
-            max_times: self.retry_max_attempts,
-            base_duration: Duration::from_millis(self.retry_base_delay_ms),
-        });
+        config.retry_config = Arc::new(JitteredExponentialBackoff::new(self.reconnect_policy));
 
         Ok(config)
     }
@@ -237,6 +263,23 @@ impl StreamableHttpTransport {
             Some(inner) => Ok(inner.as_mut()),
             None => Err(RociError::Stream("MCP transport unavailable".into())),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JitteredExponentialBackoff {
+    policy: MCPRemoteReconnectPolicy,
+}
+
+impl JitteredExponentialBackoff {
+    fn new(policy: MCPRemoteReconnectPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl SseRetryPolicy for JitteredExponentialBackoff {
+    fn retry(&self, current_times: usize) -> Option<Duration> {
+        self.policy.backoff_delay(current_times)
     }
 }
 
@@ -309,6 +352,10 @@ impl MCPTransport for StreamableHttpTransport {
         }
         Ok(())
     }
+
+    fn remote_reconnect_policy(&self) -> Option<MCPRemoteReconnectPolicy> {
+        Some(self.reconnect_policy)
+    }
 }
 
 #[cfg(test)]
@@ -357,12 +404,25 @@ mod tests {
         let transport = StreamableHttpTransport::new("http://localhost:3000/mcp")
             .request_timeout_ms(5_000)
             .connect_timeout_ms(750)
-            .retry_policy(Some(3), 250);
+            .reconnect_policy(MCPRemoteReconnectPolicy {
+                max_attempts: 3,
+                initial_backoff_ms: 250,
+                max_backoff_ms: 2_000,
+                backoff_multiplier: 3.0,
+                jitter_ratio: 0.25,
+                idle_timeout_ms: Some(10_000),
+                periodic_reconnect_ms: Some(60_000),
+            });
 
         assert_eq!(transport.request_timeout_ms_value(), Some(5_000));
         assert_eq!(transport.connect_timeout_ms_value(), Some(750));
         assert_eq!(transport.retry_max_attempts(), Some(3));
-        assert_eq!(transport.retry_base_delay_ms(), 250);
+        assert_eq!(transport.retry_initial_delay_ms(), 250);
+        assert_eq!(transport.retry_max_delay_ms(), 2_000);
+        assert_eq!(transport.retry_multiplier(), 3.0);
+        assert_eq!(transport.retry_jitter_ratio(), 0.25);
+        assert_eq!(transport.idle_timeout_ms_value(), Some(10_000));
+        assert_eq!(transport.periodic_reconnect_ms_value(), Some(60_000));
     }
 
     #[test]
@@ -388,8 +448,17 @@ mod tests {
 
     #[test]
     fn streamable_http_build_config_applies_retry_policy_controls() {
-        let transport =
-            StreamableHttpTransport::new("http://localhost:3000/mcp").retry_policy(Some(2), 100);
+        let transport = StreamableHttpTransport::new("http://localhost:3000/mcp").reconnect_policy(
+            MCPRemoteReconnectPolicy {
+                max_attempts: 2,
+                initial_backoff_ms: 100,
+                max_backoff_ms: 500,
+                backoff_multiplier: 2.0,
+                jitter_ratio: 0.0,
+                idle_timeout_ms: None,
+                periodic_reconnect_ms: None,
+            },
+        );
         let config = transport.build_rmcp_config().expect("config should build");
 
         assert_eq!(
@@ -404,6 +473,36 @@ mod tests {
     }
 
     #[test]
+    fn streamable_http_backoff_jitter_stays_within_configured_bounds() {
+        let policy = MCPRemoteReconnectPolicy {
+            max_attempts: 12,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 500,
+            backoff_multiplier: 2.0,
+            jitter_ratio: 0.25,
+            idle_timeout_ms: None,
+            periodic_reconnect_ms: None,
+        };
+
+        let mut saw_variation = false;
+        let first = policy
+            .backoff_delay(2)
+            .expect("attempt should have delay")
+            .as_millis();
+
+        for _ in 0..24 {
+            let delay = policy
+                .backoff_delay(2)
+                .expect("attempt should have delay")
+                .as_millis();
+            assert!((300..=500).contains(&delay));
+            saw_variation |= delay != first;
+        }
+
+        assert!(saw_variation, "jitter should randomize retry delay");
+    }
+
+    #[test]
     fn streamable_http_from_config_applies_auth_hook_headers_and_timeouts() {
         let transport = StreamableHttpTransport::from_config(StreamableHttpTransportConfig {
             url: "http://localhost:3000/mcp".into(),
@@ -412,8 +511,15 @@ mod tests {
             auth_header_provider: Some(Arc::new(|| Some("hook-token".into()))),
             request_timeout_ms: Some(250),
             connect_timeout_ms: Some(100),
-            retry_max_attempts: Some(2),
-            retry_base_delay_ms: Some(10),
+            reconnect_policy: MCPRemoteReconnectPolicy {
+                max_attempts: 2,
+                initial_backoff_ms: 10,
+                max_backoff_ms: 100,
+                backoff_multiplier: 2.0,
+                jitter_ratio: 0.0,
+                idle_timeout_ms: Some(1_000),
+                periodic_reconnect_ms: Some(5_000),
+            },
         });
 
         assert_eq!(transport.url(), "http://localhost:3000/mcp");
@@ -425,7 +531,9 @@ mod tests {
         assert_eq!(transport.request_timeout_ms_value(), Some(250));
         assert_eq!(transport.connect_timeout_ms_value(), Some(100));
         assert_eq!(transport.retry_max_attempts(), Some(2));
-        assert_eq!(transport.retry_base_delay_ms(), 10);
+        assert_eq!(transport.retry_initial_delay_ms(), 10);
+        assert_eq!(transport.idle_timeout_ms_value(), Some(1_000));
+        assert_eq!(transport.periodic_reconnect_ms_value(), Some(5_000));
     }
 
     #[test]

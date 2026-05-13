@@ -328,14 +328,20 @@ No generic bus required -- `request_id` correlation handles multi-child routing.
 | Method | Behavior |
 |--------|----------|
 | `spawn(spec)` | Returns `SubagentHandle` immediately; child runs in background task |
+| `run_parallel(specs)` | Spawn a bounded group and return completions in spawn order |
+| `race(specs)` | Spawn a bounded group, return the first completion, abort/drain losers |
 | `wait(id)` | Block until a specific child completes |
 | `wait_any()` | Block until the next child completes (any child) |
 | `wait_all()` | Fan-out/fan-in: wait for all active children |
+| `watch_all()` | Stream snapshots for children active at call time until all are terminal |
+| `watch_any()` | Stream snapshots for children active at call time until one is terminal |
 | `shutdown()` | Abort all active children, then `wait_all()` |
 | `abort(id)` | Cancel a specific child |
 | `list_active()` | Snapshot of all Pending/Running children |
 
-Concurrency is bounded by a `Semaphore` (`max_concurrent`, default 4). An optional `max_active_children` hard cap rejects spawns beyond the limit.
+Concurrency is bounded by a `Semaphore` (`max_concurrent`, default 4). `max_concurrent = 0` is rejected at spawn time so children cannot hang behind a zero-permit semaphore. An optional `max_active_children` hard cap rejects spawns beyond the limit.
+
+`run_parallel()` and `race()` scope cleanup to the children they spawn. A spawn failure aborts and drains already-spawned children before returning the error. `race()` aborts and drains losing children before returning the winning completion.
 
 ### CancellationToken-based abort
 

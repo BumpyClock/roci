@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::subagents::types::{SubagentId, SubagentStatus};
+use crate::agent::subagents::types::{SubagentId, SubagentSnapshot, SubagentStatus};
 use crate::models::LanguageModel;
 
 /// Bookkeeping entry for a registered child sub-agent.
@@ -15,6 +15,7 @@ pub(super) struct ChildEntry {
     pub(super) profile: String,
     pub(super) model: Option<LanguageModel>,
     pub(super) status: Arc<Mutex<SubagentStatus>>,
+    pub(super) snapshot_rx: watch::Receiver<SubagentSnapshot>,
     pub(super) cancel_token: CancellationToken,
 }
 

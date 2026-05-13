@@ -2,9 +2,11 @@ use super::child_registry::{is_terminal, ChildEntry};
 use super::*;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::sync::{broadcast, watch, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -29,7 +31,8 @@ use crate::provider::{ModelProvider, ProviderRegistry, ProviderRequest, Provider
 use crate::tools::tool::Tool;
 use crate::tools::{AgentTool, AgentToolParameters};
 use crate::types::{
-    GenerationSettings, ModelMessage, ReasoningEffort, Role, TextStreamDelta, Usage,
+    GenerationSettings, ModelMessage, ReasoningEffort, Role, StreamEventType, TextStreamDelta,
+    Usage,
 };
 
 use async_trait::async_trait;
@@ -829,6 +832,198 @@ impl ModelProvider for BlockingStreamProvider {
     }
 }
 
+struct ActiveRun {
+    active: Arc<AtomicUsize>,
+}
+
+impl ActiveRun {
+    fn new(active: Arc<AtomicUsize>, max_active: Arc<AtomicUsize>) -> Self {
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        max_active.fetch_max(current, Ordering::SeqCst);
+        Self { active }
+    }
+}
+
+impl Drop for ActiveRun {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct DelayedProviderFactory {
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl ProviderFactory for DelayedProviderFactory {
+    fn provider_keys(&self) -> &[&str] {
+        &["test"]
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, TestRociError> {
+        Ok(Box::new(DelayedProvider {
+            provider_key: provider_key.to_string(),
+            model_id: model_id.to_string(),
+            active: self.active.clone(),
+            max_active: self.max_active.clone(),
+            capabilities: crate::models::capabilities::ModelCapabilities {
+                supports_streaming: true,
+                input: crate::models::capabilities::ModelInputCapabilities::default(),
+                ..Default::default()
+            },
+        }))
+    }
+}
+
+struct DelayedProvider {
+    provider_key: String,
+    model_id: String,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+    capabilities: crate::models::capabilities::ModelCapabilities,
+}
+
+impl DelayedProvider {
+    fn prompt_text(request: &ProviderRequest) -> String {
+        request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .map(ModelMessage::text)
+            .unwrap_or_default()
+    }
+
+    fn delay_for_prompt(prompt: &str) -> Duration {
+        if prompt.contains("slow") {
+            Duration::from_millis(120)
+        } else if prompt.contains("fast") {
+            Duration::from_millis(20)
+        } else {
+            Duration::from_millis(60)
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for DelayedProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &crate::models::capabilities::ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, TestRociError> {
+        let prompt = Self::prompt_text(request);
+        let _run = ActiveRun::new(self.active.clone(), self.max_active.clone());
+        tokio::time::sleep(Self::delay_for_prompt(&prompt)).await;
+        Ok(ProviderResponse {
+            text: format!("done: {prompt}"),
+            usage: Usage::default(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            thinking: Vec::new(),
+        })
+    }
+
+    async fn stream_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, TestRociError>>, TestRociError> {
+        let prompt = Self::prompt_text(request);
+        let delay = Self::delay_for_prompt(&prompt);
+        let active = self.active.clone();
+        let max_active = self.max_active.clone();
+        Ok(Box::pin(async_stream::stream! {
+            let _run = ActiveRun::new(active, max_active);
+            tokio::time::sleep(delay).await;
+            yield Ok(TextStreamDelta {
+                text: format!("done: {prompt}"),
+                event_type: StreamEventType::TextDelta,
+                tool_call: None,
+                finish_reason: None,
+                usage: None,
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            });
+            yield Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            });
+        }))
+    }
+}
+
+fn make_delayed_supervisor(
+    supervisor_config: SubagentSupervisorConfig,
+) -> (SubagentSupervisor, Arc<AtomicUsize>) {
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(DelayedProviderFactory {
+        active,
+        max_active: max_active.clone(),
+    }));
+
+    let supervisor = SubagentSupervisor::new(
+        Arc::new(registry),
+        test_roci_config(),
+        make_base_config(),
+        supervisor_config,
+        test_profile_registry(),
+    );
+    (supervisor, max_active)
+}
+
+fn delayed_spec(label: &str, task: &str) -> SubagentSpec {
+    SubagentSpec {
+        profile: "test:dev".into(),
+        label: Some(label.into()),
+        input: SubagentInput::Prompt { task: task.into() },
+        overrides: Default::default(),
+    }
+}
+
+fn test_snapshot_rx(id: SubagentId, status: SubagentStatus) -> watch::Receiver<SubagentSnapshot> {
+    let snapshot = SubagentSnapshot {
+        subagent_id: id,
+        profile: "test".into(),
+        label: None,
+        model: None,
+        status,
+        turn_index: 0,
+        message_count: 0,
+        is_streaming: false,
+        last_error: None,
+    };
+    let (_tx, rx) = watch::channel(snapshot);
+    rx
+}
+
+#[path = "orchestration_tests.rs"]
+mod orchestration_tests;
+
 // ---------------------------------------------------------------------------
 // Existing tests (lifecycle, abort, wait, etc.)
 // ---------------------------------------------------------------------------
@@ -908,6 +1103,7 @@ fn drop_cancels_tokens_when_abort_on_drop() {
             profile: "test".into(),
             model: None,
             status: Arc::new(Mutex::new(SubagentStatus::Running)),
+            snapshot_rx: test_snapshot_rx(Uuid::new_v4(), SubagentStatus::Running),
             cancel_token: token_clone,
         };
         // We need to insert without async; use try_lock since no contention
@@ -949,6 +1145,7 @@ fn drop_does_not_cancel_when_abort_on_drop_false() {
             profile: "test".into(),
             model: None,
             status: Arc::new(Mutex::new(SubagentStatus::Running)),
+            snapshot_rx: test_snapshot_rx(Uuid::new_v4(), SubagentStatus::Running),
             cancel_token: token_clone,
         };
         supervisor

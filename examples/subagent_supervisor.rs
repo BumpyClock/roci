@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt;
 use roci::agent::runtime::QueueDrainMode;
 use roci::agent::subagents::{
     SubagentInput, SubagentProfileRegistry, SubagentSpec, SubagentSupervisor,
@@ -148,11 +149,113 @@ async fn main() {
         }
     }
 
-    // -- 10. wait_all (returns immediately since nothing is running)
+    // -- 10. Run a fan-out/fan-in group scoped to these specs.
+    let parallel_specs = vec![
+        SubagentSpec {
+            profile: "builtin:developer".into(),
+            label: Some("parallel-a".into()),
+            input: SubagentInput::Prompt {
+                task: "Suggest one Rust test name.".into(),
+            },
+            overrides: Default::default(),
+        },
+        SubagentSpec {
+            profile: "builtin:planner".into(),
+            label: Some("parallel-b".into()),
+            input: SubagentInput::Prompt {
+                task: "Suggest one implementation step.".into(),
+            },
+            overrides: Default::default(),
+        },
+    ];
+    match supervisor.run_parallel(parallel_specs).await {
+        Ok(completions) => {
+            println!("\nrun_parallel returned {} completions.", completions.len());
+            for completion in completions {
+                println!("  {:?}: {:?}", completion.label, completion.result.status);
+            }
+        }
+        Err(e) => {
+            println!("\nrun_parallel failed (expected without API key): {e}");
+        }
+    }
+
+    // -- 11. Race two children and abort the loser automatically.
+    let race_specs = vec![
+        SubagentSpec {
+            profile: "builtin:developer".into(),
+            label: Some("race-a".into()),
+            input: SubagentInput::Prompt {
+                task: "Answer with one short sentence.".into(),
+            },
+            overrides: Default::default(),
+        },
+        SubagentSpec {
+            profile: "builtin:explorer".into(),
+            label: Some("race-b".into()),
+            input: SubagentInput::Prompt {
+                task: "Answer with one short sentence.".into(),
+            },
+            overrides: Default::default(),
+        },
+    ];
+    match supervisor.race(race_specs).await {
+        Ok(Some(completion)) => {
+            println!(
+                "race winner: {:?}, status={:?}",
+                completion.label, completion.result.status
+            );
+        }
+        Ok(None) => println!("race had no specs."),
+        Err(e) => println!("race failed (expected without API key): {e}"),
+    }
+
+    // -- 12. Watch snapshots for the active children at call time.
+    let watch_a = supervisor
+        .spawn(SubagentSpec {
+            profile: "builtin:developer".into(),
+            label: Some("watch-a".into()),
+            input: SubagentInput::Prompt {
+                task: "Return one short status line.".into(),
+            },
+            overrides: Default::default(),
+        })
+        .await;
+    let watch_b = supervisor
+        .spawn(SubagentSpec {
+            profile: "builtin:planner".into(),
+            label: Some("watch-b".into()),
+            input: SubagentInput::Prompt {
+                task: "Return one short status line.".into(),
+            },
+            overrides: Default::default(),
+        })
+        .await;
+
+    if watch_a.is_ok() && watch_b.is_ok() {
+        let mut snapshots = supervisor.watch_all().await;
+        let watcher = tokio::spawn(async move {
+            while let Some(snapshot) = snapshots.next().await {
+                println!("[snapshot] {:?}: {:?}", snapshot.label, snapshot.status);
+            }
+        });
+        let completions = supervisor.wait_all().await;
+        println!("watched {} children to terminal state.", completions.len());
+        let _ = watcher.await;
+    } else {
+        if let Err(e) = watch_a {
+            println!("watch-a spawn failed (expected without API key): {e}");
+        }
+        if let Err(e) = watch_b {
+            println!("watch-b spawn failed (expected without API key): {e}");
+        }
+    }
+
+    // -- 13. wait_all (returns immediately since nothing is running)
     let completions = supervisor.wait_all().await;
     println!("\nwait_all returned {} completions.", completions.len());
 
-    // -- 11. Shutdown
+    // -- 14. Shutdown
     println!("Shutting down supervisor...");
     supervisor.shutdown().await;
     println!("Supervisor shut down cleanly.");

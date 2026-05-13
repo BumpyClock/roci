@@ -6,6 +6,7 @@
 //! - [`wait`] — wait / drain / shutdown methods
 
 mod child_registry;
+mod orchestration;
 mod run_task;
 mod wait;
 
@@ -133,6 +134,12 @@ impl SubagentSupervisor {
         spec: SubagentSpec,
         context: SubagentContext,
     ) -> Result<SubagentHandle, RociError> {
+        if self.config.max_concurrent == 0 {
+            return Err(RociError::Configuration(
+                "max_concurrent must be greater than zero".into(),
+            ));
+        }
+
         // 1. Check max_active_children hard cap
         if let Some(max) = self.config.max_active_children {
             let children = self.children.lock().await;
@@ -232,6 +239,7 @@ impl SubagentSupervisor {
                 profile: spec.profile.clone(),
                 model: Some(model.clone()),
                 status: status.clone(),
+                snapshot_rx: snapshot_rx.clone(),
                 cancel_token: cancel_token.clone(),
             };
             self.children.lock().await.insert(id, entry);

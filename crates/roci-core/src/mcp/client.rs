@@ -1,6 +1,11 @@
 //! MCP client for connecting to MCP servers.
 
-use std::sync::Arc;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::error::RociError;
 use crate::human_interaction::HumanInteractionCoordinator;
@@ -15,7 +20,7 @@ use rmcp::{
 use super::elicitation::MCPClientHandler;
 use super::error::{map_client_initialize_error, map_service_error};
 use super::mapping::{coerce_tool_arguments, map_call_result, map_mcp_tool_schema};
-use super::transport::MCPTransport;
+use super::transport::{MCPRemoteReconnectPolicy, MCPTransport};
 
 pub type MCPRunningService = super::transport::MCPRunningService;
 
@@ -25,6 +30,16 @@ pub enum MCPConnectionState {
     Connected,
     Initialized,
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MCPRemoteReconnectOutcome {
+    /// Reconnect succeeded and a new session is active.
+    Recovered,
+    /// Reconnect stopped because credentials or authorization are required.
+    NeedsAuth,
+    /// Reconnect attempts were exhausted without recovering.
+    Failed,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +76,21 @@ impl MCPToolCallResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectReplayPolicy {
+    Replay,
+    DoNotReplayTimeouts,
+}
+
+impl ReconnectReplayPolicy {
+    fn should_replay(self, error: &ServiceError) -> bool {
+        match self {
+            Self::Replay => true,
+            Self::DoNotReplayTimeouts => !matches!(error, ServiceError::Timeout { .. }),
+        }
+    }
+}
+
 /// Client for a Model Context Protocol server.
 pub struct MCPClient {
     transport: Option<Box<dyn MCPTransport>>,
@@ -68,6 +98,9 @@ pub struct MCPClient {
     state: MCPConnectionState,
     server_id: String,
     human_interaction_coordinator: Option<Arc<HumanInteractionCoordinator>>,
+    session_started_at: Option<Instant>,
+    last_session_used_at: Option<Instant>,
+    last_reconnect_outcome: Option<MCPRemoteReconnectOutcome>,
 }
 
 impl MCPClient {
@@ -79,6 +112,9 @@ impl MCPClient {
             state: MCPConnectionState::Disconnected,
             server_id: "mcp".to_string(),
             human_interaction_coordinator: None,
+            session_started_at: None,
+            last_session_used_at: None,
+            last_reconnect_outcome: None,
         }
     }
 
@@ -92,6 +128,9 @@ impl MCPClient {
             state: MCPConnectionState::Connected,
             server_id: "mcp".to_string(),
             human_interaction_coordinator: None,
+            session_started_at: None,
+            last_session_used_at: None,
+            last_reconnect_outcome: None,
         }
     }
 
@@ -125,6 +164,7 @@ impl MCPClient {
     pub fn attach_running_service(&mut self, session: MCPRunningService) {
         self.session = Some(session);
         self.state = MCPConnectionState::Connected;
+        self.record_new_session();
     }
 
     pub fn connection_state(&self) -> MCPConnectionState {
@@ -133,6 +173,14 @@ impl MCPClient {
 
     pub fn is_initialized(&self) -> bool {
         self.state == MCPConnectionState::Initialized
+    }
+
+    /// Result of the most recent reconnect path, if one has run.
+    ///
+    /// The value is not reset on every request; it may describe an earlier
+    /// reconnect until another reconnect attempt updates it.
+    pub fn last_reconnect_outcome(&self) -> Option<MCPRemoteReconnectOutcome> {
+        self.last_reconnect_outcome
     }
 
     /// Return server-provided instructions when available.
@@ -157,6 +205,7 @@ impl MCPClient {
                 self.state = MCPConnectionState::Disconnected;
             } else {
                 self.state = MCPConnectionState::Initialized;
+                self.record_session_if_missing();
                 return Ok(());
             }
         }
@@ -164,6 +213,7 @@ impl MCPClient {
         if self.session.is_none() {
             let session = self.connect_with_protocol_fallback().await?;
             self.session = Some(session);
+            self.record_new_session();
         }
 
         self.state = MCPConnectionState::Initialized;
@@ -172,38 +222,26 @@ impl MCPClient {
 
     /// List available tools from the MCP server.
     pub async fn list_tools(&mut self) -> Result<Vec<super::schema::MCPToolSchema>, RociError> {
-        self.ensure_initialized()?;
-
-        let tools = match self.list_tools_from_active_session().await {
-            Ok(tools) => tools,
-            Err(error) if Self::should_reconnect_after_service_error(&error) => {
-                self.reset_for_reconnect()?;
-                self.initialize().await?;
-                self.list_tools_from_active_session()
-                    .await
-                    .map_err(|retry_error| map_service_error("list_tools", retry_error))?
-            }
-            Err(error) => return Err(map_service_error("list_tools", error)),
-        };
+        let tools = self
+            .with_reconnect(
+                "list_tools",
+                |client| Box::pin(async move { client.list_tools_from_active_session().await }),
+                ReconnectReplayPolicy::Replay,
+            )
+            .await?;
 
         Ok(tools.into_iter().map(map_mcp_tool_schema).collect())
     }
 
     /// List available resources from the MCP server.
     pub async fn list_resources(&mut self) -> Result<Vec<MCPResourceSchema>, RociError> {
-        self.ensure_initialized()?;
-
-        let resources = match self.list_resources_from_active_session().await {
-            Ok(resources) => resources,
-            Err(error) if Self::should_reconnect_after_service_error(&error) => {
-                self.reset_for_reconnect()?;
-                self.initialize().await?;
-                self.list_resources_from_active_session()
-                    .await
-                    .map_err(|retry_error| map_service_error("list_resources", retry_error))?
-            }
-            Err(error) => return Err(map_service_error("list_resources", error)),
-        };
+        let resources = self
+            .with_reconnect(
+                "list_resources",
+                |client| Box::pin(async move { client.list_resources_from_active_session().await }),
+                ReconnectReplayPolicy::Replay,
+            )
+            .await?;
 
         Ok(resources
             .into_iter()
@@ -220,19 +258,17 @@ impl MCPClient {
 
     /// Read one MCP resource by upstream URI.
     pub async fn read_resource(&mut self, uri: &str) -> Result<MCPReadResourceResult, RociError> {
-        self.ensure_initialized()?;
-
-        let result = match self.read_resource_from_active_session(uri).await {
-            Ok(result) => result,
-            Err(error) if Self::should_reconnect_after_service_error(&error) => {
-                self.reset_for_reconnect()?;
-                self.initialize().await?;
-                self.read_resource_from_active_session(uri)
-                    .await
-                    .map_err(|retry_error| map_service_error("read_resource", retry_error))?
-            }
-            Err(error) => return Err(map_service_error("read_resource", error)),
-        };
+        let uri = uri.to_owned();
+        let result = self
+            .with_reconnect(
+                "read_resource",
+                move |client| {
+                    let uri = uri.clone();
+                    Box::pin(async move { client.read_resource_from_active_session(&uri).await })
+                },
+                ReconnectReplayPolicy::Replay,
+            )
+            .await?;
 
         Ok(MCPReadResourceResult {
             contents: result
@@ -249,25 +285,86 @@ impl MCPClient {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<MCPToolCallResult, RociError> {
-        self.ensure_initialized()?;
         let arguments = coerce_tool_arguments(arguments)?;
-
-        let result = match self
-            .call_tool_from_active_session(name, arguments.clone())
-            .await
-        {
-            Ok(result) => result,
-            Err(error) if Self::should_reconnect_after_service_error(&error) => {
-                self.reset_for_reconnect()?;
-                self.initialize().await?;
-                self.call_tool_from_active_session(name, arguments)
-                    .await
-                    .map_err(|retry_error| map_service_error("call_tool", retry_error))?
-            }
-            Err(error) => return Err(map_service_error("call_tool", error)),
-        };
+        let tool_name = name.to_owned();
+        let result = self
+            .with_reconnect(
+                "call_tool",
+                move |client| {
+                    let arguments = arguments.clone();
+                    let tool_name = tool_name.clone();
+                    Box::pin(async move {
+                        client
+                            .call_tool_from_active_session(&tool_name, arguments)
+                            .await
+                    })
+                },
+                ReconnectReplayPolicy::DoNotReplayTimeouts,
+            )
+            .await?;
 
         map_call_result(name, result)
+    }
+
+    async fn with_reconnect<T, Op>(
+        &mut self,
+        context: &'static str,
+        mut operation: Op,
+        replay_policy: ReconnectReplayPolicy,
+    ) -> Result<T, RociError>
+    where
+        Op: for<'a> FnMut(
+            &'a mut MCPClient,
+        )
+            -> Pin<Box<dyn Future<Output = Result<T, ServiceError>> + Send + 'a>>,
+    {
+        self.prepare_for_request().await?;
+        let max_recoveries = self
+            .remote_reconnect_policy()
+            .map(|policy| policy.max_attempts)
+            .unwrap_or(1);
+        let mut recoveries = 0;
+
+        loop {
+            match operation(self).await {
+                Ok(value) => {
+                    self.record_session_used();
+                    return Ok(value);
+                }
+                Err(error)
+                    if Self::should_reconnect_after_service_error(&error)
+                        && recoveries < max_recoveries =>
+                {
+                    recoveries += 1;
+                    self.recover_after_service_error(context, &error).await?;
+                    if !replay_policy.should_replay(&error) {
+                        return Err(map_service_error(context, error));
+                    }
+                }
+                Err(error) => {
+                    if Self::is_auth_service_error(&error) {
+                        self.last_reconnect_outcome = Some(MCPRemoteReconnectOutcome::NeedsAuth);
+                        return Err(RociError::Authentication(format!(
+                            "{context}: MCP auth required: {error}"
+                        )));
+                    }
+                    if Self::should_reconnect_after_service_error(&error) {
+                        self.last_reconnect_outcome = Some(MCPRemoteReconnectOutcome::Failed);
+                    }
+                    return Err(map_service_error(context, error));
+                }
+            }
+        }
+    }
+
+    async fn prepare_for_request(&mut self) -> Result<(), RociError> {
+        self.ensure_initialized()?;
+
+        if self.should_reconnect_for_idle_timeout() || self.should_reconnect_for_periodic_policy() {
+            self.reconnect_with_policy().await?;
+        }
+
+        Ok(())
     }
 
     fn ensure_initialized(&self) -> Result<(), RociError> {
@@ -306,6 +403,61 @@ impl MCPClient {
             transport.connect(fallback_client_handler).await
         }
         .map_err(map_client_initialize_error)
+    }
+
+    async fn recover_after_service_error(
+        &mut self,
+        context: &str,
+        error: &ServiceError,
+    ) -> Result<(), RociError> {
+        if Self::is_auth_service_error(error) {
+            self.last_reconnect_outcome = Some(MCPRemoteReconnectOutcome::NeedsAuth);
+            return Err(RociError::Authentication(format!(
+                "{context}: MCP auth required: {error}"
+            )));
+        }
+
+        self.reconnect_with_policy().await
+    }
+
+    async fn reconnect_with_policy(&mut self) -> Result<(), RociError> {
+        let Some(policy) = self.remote_reconnect_policy() else {
+            self.reset_for_reconnect()?;
+            self.initialize().await?;
+            self.last_reconnect_outcome = Some(MCPRemoteReconnectOutcome::Recovered);
+            return Ok(());
+        };
+
+        self.reset_for_reconnect()?;
+        let mut last_error = None;
+
+        for attempt in 0..policy.max_attempts {
+            if attempt > 0 {
+                let delay = policy
+                    .backoff_delay(attempt - 1)
+                    .unwrap_or_else(|| Duration::from_millis(policy.max_backoff_ms));
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.initialize().await {
+                Ok(()) => {
+                    self.last_reconnect_outcome = Some(MCPRemoteReconnectOutcome::Recovered);
+                    return Ok(());
+                }
+                Err(error) if Self::is_auth_roci_error(&error) => {
+                    self.last_reconnect_outcome = Some(MCPRemoteReconnectOutcome::NeedsAuth);
+                    return Err(error);
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        self.last_reconnect_outcome = Some(MCPRemoteReconnectOutcome::Failed);
+        Err(last_error.unwrap_or_else(|| {
+            RociError::Stream("MCP reconnect failed: retry policy allows no attempts".into())
+        }))
     }
 
     fn client_handler(&self, protocol_version: ProtocolVersion) -> MCPClientHandler {
@@ -384,16 +536,22 @@ impl MCPClient {
 
         self.session = None;
         self.state = MCPConnectionState::Disconnected;
+        self.session_started_at = None;
+        self.last_session_used_at = None;
         Ok(())
     }
 
     fn should_reconnect_after_service_error(error: &ServiceError) -> bool {
+        if Self::is_auth_service_error(error) {
+            return false;
+        }
         matches!(
             error,
             ServiceError::TransportClosed
                 | ServiceError::TransportSend(_)
                 | ServiceError::Cancelled { .. }
-        )
+                | ServiceError::Timeout { .. }
+        ) || Self::is_session_expired_service_error(error)
     }
 
     fn should_retry_protocol_fallback(error: &ClientInitializeError) -> bool {
@@ -405,375 +563,103 @@ impl MCPClient {
             _ => false,
         }
     }
+
+    fn remote_reconnect_policy(&self) -> Option<MCPRemoteReconnectPolicy> {
+        self.transport
+            .as_ref()
+            .and_then(|transport| transport.remote_reconnect_policy())
+    }
+
+    fn record_new_session(&mut self) {
+        let now = Instant::now();
+        self.session_started_at = Some(now);
+        self.last_session_used_at = Some(now);
+    }
+
+    fn record_session_if_missing(&mut self) {
+        if self.session_started_at.is_none() || self.last_session_used_at.is_none() {
+            self.record_new_session();
+        }
+    }
+
+    fn record_session_used(&mut self) {
+        self.last_session_used_at = Some(Instant::now());
+    }
+
+    fn should_reconnect_for_idle_timeout(&self) -> bool {
+        let Some(policy) = self.remote_reconnect_policy() else {
+            return false;
+        };
+        let Some(timeout_ms) = policy.idle_timeout_ms else {
+            return false;
+        };
+        let Some(last_used) = self.last_session_used_at else {
+            return false;
+        };
+
+        last_used.elapsed() >= Duration::from_millis(timeout_ms)
+    }
+
+    fn should_reconnect_for_periodic_policy(&self) -> bool {
+        let Some(policy) = self.remote_reconnect_policy() else {
+            return false;
+        };
+        let Some(period_ms) = policy.periodic_reconnect_ms else {
+            return false;
+        };
+        let Some(started_at) = self.session_started_at else {
+            return false;
+        };
+
+        started_at.elapsed() >= Duration::from_millis(period_ms)
+    }
+
+    fn is_auth_service_error(error: &ServiceError) -> bool {
+        match error {
+            ServiceError::McpError(error) => Self::is_auth_error_text(&error.message),
+            _ => false,
+        }
+    }
+
+    fn is_session_expired_service_error(error: &ServiceError) -> bool {
+        match error {
+            ServiceError::McpError(error) => {
+                let message = error.message.to_ascii_lowercase();
+                message.contains("session")
+                    && (message.contains("expired")
+                        || message.contains("invalid")
+                        || message.contains("not found")
+                        || message.contains("closed"))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_auth_roci_error(error: &RociError) -> bool {
+        match error {
+            RociError::Authentication(_) | RociError::MissingCredential { .. } => true,
+            RociError::Api { status, .. } => matches!(status, 401 | 403),
+            RociError::Provider { message, .. }
+            | RociError::Stream(message)
+            | RociError::Configuration(message) => Self::is_auth_error_text(message),
+            _ => false,
+        }
+    }
+
+    fn is_auth_error_text(message: &str) -> bool {
+        let message = message.to_ascii_lowercase();
+        message.contains("401")
+            || message.contains("403")
+            || message.contains("unauthorized")
+            || message.contains("forbidden")
+            || message.contains("authentication")
+            || message.contains("authorization")
+            || message.contains("auth")
+            || message.contains("credential")
+            || message.contains("token")
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use rmcp::{
-        model::ServerJsonRpcMessage,
-        service::{serve_directly, RoleClient, RxJsonRpcMessage, ServiceExt, TxJsonRpcMessage},
-        transport::Transport as RmcpTransport,
-    };
-    use serde_json::json;
-    use std::{
-        collections::VecDeque,
-        io,
-        sync::{Arc, Mutex},
-    };
-    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-    use crate::mcp::transport::{MCPRunningService, MCPTransport};
-
-    enum MockSessionBehavior {
-        DisconnectOnListTools,
-        DisconnectOnCallTool,
-        ListTools { tool_name: String },
-        CallTool,
-    }
-
-    struct ChannelRmcpTransport {
-        outbound: UnboundedSender<TxJsonRpcMessage<RoleClient>>,
-        inbound: UnboundedReceiver<RxJsonRpcMessage<RoleClient>>,
-    }
-
-    impl ChannelRmcpTransport {
-        fn new(
-            outbound: UnboundedSender<TxJsonRpcMessage<RoleClient>>,
-            inbound: UnboundedReceiver<RxJsonRpcMessage<RoleClient>>,
-        ) -> Self {
-            Self { outbound, inbound }
-        }
-    }
-
-    impl RmcpTransport<RoleClient> for ChannelRmcpTransport {
-        type Error = io::Error;
-
-        fn send(
-            &mut self,
-            item: TxJsonRpcMessage<RoleClient>,
-        ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
-            let tx = self.outbound.clone();
-            async move {
-                tx.send(item).map_err(|_| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "mock rmcp channel closed")
-                })
-            }
-        }
-
-        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
-            self.inbound.recv().await
-        }
-
-        fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-            self.inbound.close();
-            std::future::ready(Ok(()))
-        }
-    }
-
-    fn scripted_running_service(behavior: MockSessionBehavior) -> MCPRunningService {
-        let (outbound_tx, mut outbound_rx) = unbounded_channel::<TxJsonRpcMessage<RoleClient>>();
-        let (inbound_tx, inbound_rx) = unbounded_channel::<RxJsonRpcMessage<RoleClient>>();
-        let transport = ChannelRmcpTransport::new(outbound_tx, inbound_rx);
-
-        tokio::spawn(async move {
-            while let Some(message) = outbound_rx.recv().await {
-                let value = match serde_json::to_value(message) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-
-                let Some(method) = value.get("method").and_then(|m| m.as_str()) else {
-                    continue;
-                };
-
-                match (&behavior, method) {
-                    (MockSessionBehavior::DisconnectOnListTools, "tools/list")
-                    | (MockSessionBehavior::DisconnectOnCallTool, "tools/call") => {
-                        return;
-                    }
-                    (MockSessionBehavior::ListTools { tool_name }, "tools/list") => {
-                        let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                        let response: ServerJsonRpcMessage = serde_json::from_value(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "tools": [
-                                    {
-                                        "name": tool_name,
-                                        "description": "mock tool",
-                                        "inputSchema": { "type": "object", "properties": {} }
-                                    }
-                                ],
-                                "nextCursor": null
-                            }
-                        }))
-                        .expect("mock tools/list response should deserialize");
-                        let _ = inbound_tx.send(response);
-                    }
-                    (MockSessionBehavior::CallTool, "tools/call") => {
-                        let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                        let response: ServerJsonRpcMessage = serde_json::from_value(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [
-                                    { "type": "text", "text": "tool ok" }
-                                ],
-                                "structuredContent": { "ok": true },
-                                "isError": false
-                            }
-                        }))
-                        .expect("mock tools/call response should deserialize");
-                        let _ = inbound_tx.send(response);
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        serve_directly(().into_dyn(), transport, None)
-    }
-
-    struct MockBootstrapTransport {
-        connect_results: VecDeque<Result<MCPRunningService, ClientInitializeError>>,
-        attempted_protocols: Arc<Mutex<Vec<ProtocolVersion>>>,
-    }
-
-    impl MockBootstrapTransport {
-        fn new(connect_results: Vec<Result<MCPRunningService, ClientInitializeError>>) -> Self {
-            Self {
-                connect_results: connect_results.into(),
-                attempted_protocols: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn attempted_protocols(&self) -> Arc<Mutex<Vec<ProtocolVersion>>> {
-            Arc::clone(&self.attempted_protocols)
-        }
-    }
-
-    #[async_trait]
-    impl MCPTransport for MockBootstrapTransport {
-        #[allow(clippy::result_large_err)]
-        async fn connect(
-            &mut self,
-            client_handler: MCPClientHandler,
-        ) -> Result<MCPRunningService, ClientInitializeError> {
-            self.attempted_protocols
-                .lock()
-                .expect("protocol mutex should lock")
-                .push(client_handler.client_info().protocol_version.clone());
-
-            self.connect_results.pop_front().unwrap_or_else(|| {
-                Err(ClientInitializeError::ConnectionClosed(
-                    "missing mock connect result".into(),
-                ))
-            })
-        }
-
-        async fn send(&mut self, _message: serde_json::Value) -> Result<(), RociError> {
-            Ok(())
-        }
-
-        async fn receive(&mut self) -> Result<serde_json::Value, RociError> {
-            Ok(serde_json::Value::Null)
-        }
-
-        async fn close(&mut self) -> Result<(), RociError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn initialize_bootstraps_session_from_transport() {
-        let transport = MockBootstrapTransport::new(vec![Ok(scripted_running_service(
-            MockSessionBehavior::ListTools {
-                tool_name: "weather".into(),
-            },
-        ))]);
-        let attempted = transport.attempted_protocols();
-        let mut client = MCPClient::new(Box::new(transport));
-
-        client
-            .initialize()
-            .await
-            .expect("initialize should bootstrap from transport");
-
-        assert!(client.is_initialized());
-        let attempted = attempted.lock().expect("protocol mutex should lock");
-        assert_eq!(attempted.as_slice(), &[ProtocolVersion::LATEST]);
-    }
-
-    #[tokio::test]
-    async fn initialize_with_attached_running_service_sets_initialized_state() {
-        let session = scripted_running_service(MockSessionBehavior::ListTools {
-            tool_name: "weather".into(),
-        });
-        let mut client = MCPClient::from_running_service(session);
-
-        client
-            .initialize()
-            .await
-            .expect("initialize should accept attached running service");
-        assert!(client.is_initialized());
-    }
-
-    #[tokio::test]
-    async fn initialize_falls_back_to_legacy_protocol_version() {
-        let transport = MockBootstrapTransport::new(vec![
-            Err(ClientInitializeError::JsonRpcError(
-                rmcp::model::ErrorData::invalid_request("unsupported protocol version", None),
-            )),
-            Ok(scripted_running_service(MockSessionBehavior::ListTools {
-                tool_name: "weather".into(),
-            })),
-        ]);
-        let attempted = transport.attempted_protocols();
-        let mut client = MCPClient::new(Box::new(transport));
-
-        client
-            .initialize()
-            .await
-            .expect("initialize should retry with fallback protocol");
-
-        let attempted = attempted.lock().expect("protocol mutex should lock");
-        assert_eq!(attempted.len(), 2);
-        assert_eq!(attempted[0], ProtocolVersion::LATEST);
-        assert_eq!(attempted[1], ProtocolVersion::V_2024_11_05);
-    }
-
-    #[tokio::test]
-    async fn list_tools_works_after_transport_bootstrap() {
-        let transport = MockBootstrapTransport::new(vec![Ok(scripted_running_service(
-            MockSessionBehavior::ListTools {
-                tool_name: "weather".into(),
-            },
-        ))]);
-        let mut client = MCPClient::new(Box::new(transport));
-
-        client
-            .initialize()
-            .await
-            .expect("initialize should succeed");
-        let tools = client
-            .list_tools()
-            .await
-            .expect("list_tools should succeed after initialize");
-
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "weather");
-    }
-
-    #[tokio::test]
-    async fn call_tool_works_after_transport_bootstrap() {
-        let transport = MockBootstrapTransport::new(vec![Ok(scripted_running_service(
-            MockSessionBehavior::CallTool,
-        ))]);
-        let mut client = MCPClient::new(Box::new(transport));
-
-        client
-            .initialize()
-            .await
-            .expect("initialize should succeed");
-        let result = client
-            .call_tool("echo", json!({"message": "hello"}))
-            .await
-            .expect("call_tool should succeed after initialize");
-
-        assert_eq!(result.structured_content, Some(json!({"ok": true})));
-        assert_eq!(result.text_content.as_deref(), Some("tool ok"));
-    }
-
-    #[tokio::test]
-    async fn list_tools_reconnects_when_session_disconnects() {
-        let transport = MockBootstrapTransport::new(vec![
-            Ok(scripted_running_service(
-                MockSessionBehavior::DisconnectOnListTools,
-            )),
-            Ok(scripted_running_service(MockSessionBehavior::ListTools {
-                tool_name: "weather".into(),
-            })),
-        ]);
-        let attempted = transport.attempted_protocols();
-        let mut client = MCPClient::new(Box::new(transport));
-
-        client
-            .initialize()
-            .await
-            .expect("initialize should succeed");
-        let tools = client
-            .list_tools()
-            .await
-            .expect("list_tools should reconnect and retry");
-
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "weather");
-
-        let attempted = attempted.lock().expect("protocol mutex should lock");
-        assert_eq!(attempted.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn call_tool_reconnects_when_session_disconnects() {
-        let transport = MockBootstrapTransport::new(vec![
-            Ok(scripted_running_service(
-                MockSessionBehavior::DisconnectOnCallTool,
-            )),
-            Ok(scripted_running_service(MockSessionBehavior::CallTool)),
-        ]);
-        let attempted = transport.attempted_protocols();
-        let mut client = MCPClient::new(Box::new(transport));
-
-        client
-            .initialize()
-            .await
-            .expect("initialize should succeed");
-        let result = client
-            .call_tool("echo", json!({"message": "hello"}))
-            .await
-            .expect("call_tool should reconnect and retry");
-
-        assert_eq!(result.structured_content, Some(json!({"ok": true})));
-
-        let attempted = attempted.lock().expect("protocol mutex should lock");
-        assert_eq!(attempted.len(), 2);
-    }
-
-    #[test]
-    fn reconnect_predicate_treats_cancelled_as_transient() {
-        let cancelled = ServiceError::Cancelled {
-            reason: Some("transport dropped".into()),
-        };
-        assert!(MCPClient::should_reconnect_after_service_error(&cancelled));
-    }
-
-    #[tokio::test]
-    async fn list_tools_requires_initialize() {
-        let mut client = MCPClient::new(Box::new(MockBootstrapTransport::new(Vec::new())));
-        let err = client
-            .list_tools()
-            .await
-            .expect_err("listing tools should require initialize");
-        assert!(matches!(err, RociError::UnsupportedOperation(_)));
-    }
-
-    #[test]
-    fn from_running_service_result_maps_jsonrpc_initialize_error() {
-        let init_error = ClientInitializeError::JsonRpcError(
-            rmcp::model::ErrorData::invalid_request("bad initialize payload", None),
-        );
-        let err = match MCPClient::from_running_service_result(Err(init_error)) {
-            Ok(_) => panic!("initialize error should be mapped"),
-            Err(err) => err,
-        };
-        assert!(matches!(
-            err,
-            RociError::Provider { provider, message }
-            if provider == "mcp"
-                && message.contains("JSON-RPC error")
-                && message.contains("bad initialize payload")
-        ));
-    }
-}
+#[path = "client_tests.rs"]
+mod tests;

@@ -17,7 +17,7 @@ pub use aggregate::{
     MCPAggregationConfig, MCPCollisionPolicy, MCPToolAggregator, MCPToolRoute,
 };
 pub use bridge::MCPToolAdapter;
-pub use client::MCPClient;
+pub use client::{MCPClient, MCPRemoteReconnectOutcome};
 pub use instructions::{
     merge_mcp_instructions, MCPInstructionMergePolicy, MCPInstructionSource, MCPResourceIdentity,
     MCPServerKind, MCPServerMetadata,
@@ -26,3 +26,4 @@ pub use server::{
     McpCallToolResult, McpServerCore, McpServerListedTool, McpServerToolIdentity, McpToolIdentity,
     McpToolSchema,
 };
+pub use transport::MCPRemoteReconnectPolicy;

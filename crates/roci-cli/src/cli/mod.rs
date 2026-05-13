@@ -196,6 +196,17 @@ fn parse_max_retry_attempts(value: &str) -> Result<u32, String> {
     }
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "must be >= 1".to_string())?;
+    if parsed >= 1 {
+        Ok(parsed)
+    } else {
+        Err("must be >= 1".to_string())
+    }
+}
+
 /// Arguments for the `chat` subcommand.
 #[derive(Parser, Debug)]
 pub struct ChatArgs {
@@ -262,6 +273,58 @@ pub struct ChatArgs {
     /// Max tokens
     #[arg(long)]
     pub max_tokens: Option<u32>,
+
+    /// Override provider context window (input+output token limit)
+    #[arg(long, value_name = "TOKENS", value_parser = parse_positive_usize)]
+    pub context_window_override: Option<usize>,
+
+    /// Reserve tokens for model output during budget checks
+    #[arg(long = "reserve-output-tokens", value_name = "TOKENS", value_parser = parse_positive_usize)]
+    pub reserve_output_tokens: Option<usize>,
+
+    /// Max input tokens allowed for the current turn
+    #[arg(long = "max-turn-input-tokens", value_name = "TOKENS", value_parser = parse_positive_usize)]
+    pub max_turn_input_tokens: Option<usize>,
+
+    /// Max cumulative input tokens for this session
+    #[arg(
+        long = "max-session-input-tokens",
+        value_name = "TOKENS",
+        value_parser = parse_positive_usize
+    )]
+    pub max_session_input_tokens: Option<usize>,
+
+    /// Max cumulative output tokens for this session
+    #[arg(
+        long = "max-session-output-tokens",
+        value_name = "TOKENS",
+        value_parser = parse_positive_usize
+    )]
+    pub max_session_output_tokens: Option<usize>,
+
+    /// Disable auto compaction summary+pruning
+    #[arg(long = "no-auto-compaction")]
+    pub no_auto_compaction: bool,
+
+    /// Compaction reserve token target
+    #[arg(
+        long = "compaction-reserve-tokens",
+        value_name = "TOKENS",
+        value_parser = parse_positive_usize
+    )]
+    pub compaction_reserve_tokens: Option<usize>,
+
+    /// Compaction keep-recent token floor
+    #[arg(
+        long = "compaction-keep-recent-tokens",
+        value_name = "TOKENS",
+        value_parser = parse_positive_usize
+    )]
+    pub compaction_keep_recent_tokens: Option<usize>,
+
+    /// Compaction model override
+    #[arg(long = "compaction-model", value_name = "PROVIDER:MODEL")]
+    pub compaction_model: Option<String>,
 
     /// Tool approval behavior
     #[arg(long, value_enum, default_value_t = ChatApprovalArg::Ask)]
@@ -661,7 +724,16 @@ mod tests {
                 assert!(!args.no_tools);
                 assert!(args.tools.is_empty());
                 assert!(args.exclude_tools.is_empty());
-                assert!(args.max_tokens.is_none());
+                assert_eq!(args.max_tokens, None);
+                assert!(args.context_window_override.is_none());
+                assert!(args.reserve_output_tokens.is_none());
+                assert!(args.max_turn_input_tokens.is_none());
+                assert!(args.max_session_input_tokens.is_none());
+                assert!(args.max_session_output_tokens.is_none());
+                assert!(!args.no_auto_compaction);
+                assert!(args.compaction_reserve_tokens.is_none());
+                assert!(args.compaction_keep_recent_tokens.is_none());
+                assert!(args.compaction_model.is_none());
                 assert_eq!(args.approval, ChatApprovalArg::Ask);
                 assert!(args.session_root.is_none());
                 assert!(args.session_id.is_none());
@@ -921,6 +993,15 @@ mod tests {
                 assert!(args.tools.is_empty());
                 assert!(args.exclude_tools.is_empty());
                 assert_eq!(args.max_tokens, Some(1024));
+                assert!(args.context_window_override.is_none());
+                assert!(args.reserve_output_tokens.is_none());
+                assert!(args.max_turn_input_tokens.is_none());
+                assert!(args.max_session_input_tokens.is_none());
+                assert!(args.max_session_output_tokens.is_none());
+                assert!(!args.no_auto_compaction);
+                assert!(args.compaction_reserve_tokens.is_none());
+                assert!(args.compaction_keep_recent_tokens.is_none());
+                assert!(args.compaction_model.is_none());
                 assert_eq!(args.approval, ChatApprovalArg::Always);
                 assert!(args.session_root.is_none());
                 assert!(args.session_id.is_none());
@@ -928,6 +1009,49 @@ mod tests {
                 assert!(args.mcp_streamable_http.is_empty());
                 assert!(args.mcp_websocket.is_empty());
                 assert_eq!(args.prompt.as_deref(), Some("Hello world"));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_with_context_budget_and_compaction_flags() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--context-window-override",
+            "65536",
+            "--reserve-output-tokens",
+            "2048",
+            "--max-turn-input-tokens",
+            "4096",
+            "--max-session-input-tokens",
+            "262144",
+            "--max-session-output-tokens",
+            "16384",
+            "--no-auto-compaction",
+            "--compaction-reserve-tokens",
+            "8192",
+            "--compaction-keep-recent-tokens",
+            "12000",
+            "--compaction-model",
+            "openai:gpt-4.1",
+            "budget-check",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.context_window_override, Some(65_536));
+                assert_eq!(args.reserve_output_tokens, Some(2_048));
+                assert_eq!(args.max_turn_input_tokens, Some(4_096));
+                assert_eq!(args.max_session_input_tokens, Some(262_144));
+                assert_eq!(args.max_session_output_tokens, Some(16_384));
+                assert!(args.no_auto_compaction);
+                assert_eq!(args.compaction_reserve_tokens, Some(8_192));
+                assert_eq!(args.compaction_keep_recent_tokens, Some(12_000));
+                assert_eq!(args.compaction_model.as_deref(), Some("openai:gpt-4.1"));
+                assert_eq!(args.prompt.as_deref(), Some("budget-check"));
             }
             other => panic!("expected Chat, got {other:?}"),
         }
