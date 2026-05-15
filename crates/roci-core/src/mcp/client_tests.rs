@@ -21,8 +21,17 @@ enum MockSessionBehavior {
     DisconnectOnCallTool,
     SessionExpiredOnListTools,
     AuthOnListTools,
-    ListTools { tool_name: String },
-    ListResources { resource_name: String },
+    ListTools {
+        tool_name: String,
+    },
+    ListResources {
+        resource_name: String,
+    },
+    ReadResourceBlob {
+        uri: String,
+        mime_type: String,
+        blob_base64: String,
+    },
     CallTool,
 }
 
@@ -148,6 +157,31 @@ fn scripted_running_service(behavior: MockSessionBehavior) -> MCPRunningService 
                         }
                     }))
                     .expect("mock resources/list response should deserialize");
+                    let _ = inbound_tx.send(response);
+                }
+                (
+                    MockSessionBehavior::ReadResourceBlob {
+                        uri,
+                        mime_type,
+                        blob_base64,
+                    },
+                    "resources/read",
+                ) => {
+                    let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                    let response: ServerJsonRpcMessage = serde_json::from_value(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "contents": [
+                                {
+                                    "uri": uri,
+                                    "mimeType": mime_type,
+                                    "blob": blob_base64
+                                }
+                            ]
+                        }
+                    }))
+                    .expect("mock resources/read blob response should deserialize");
                     let _ = inbound_tx.send(response);
                 }
                 (MockSessionBehavior::CallTool, "tools/call") => {
@@ -313,6 +347,46 @@ async fn list_tools_works_after_transport_bootstrap() {
 
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "weather");
+}
+
+#[tokio::test]
+async fn read_resource_preserves_binary_blob_payload() {
+    let uri = "file:///image.png".to_string();
+    let mime_type = "image/png".to_string();
+    // Representative base64 blob data; the client must pass it through unchanged.
+    let blob_base64 = "iVBORw0=".to_string();
+
+    let transport = MockBootstrapTransport::new(vec![Ok(scripted_running_service(
+        MockSessionBehavior::ReadResourceBlob {
+            uri: uri.clone(),
+            mime_type: mime_type.clone(),
+            blob_base64: blob_base64.clone(),
+        },
+    ))]);
+    let mut client = MCPClient::new(Box::new(transport));
+
+    client
+        .initialize()
+        .await
+        .expect("initialize should succeed");
+    let result = client
+        .read_resource(&uri)
+        .await
+        .expect("read_resource should succeed for blob payload");
+
+    assert_eq!(result.contents.len(), 1);
+    match &result.contents[0] {
+        crate::mcp::client::MCPResourceContent::Blob {
+            uri: got_uri,
+            mime_type: got_mime,
+            blob_base64: got_blob,
+        } => {
+            assert_eq!(got_uri, &uri);
+            assert_eq!(got_mime.as_deref(), Some(mime_type.as_str()));
+            assert_eq!(got_blob, &blob_base64);
+        }
+        other => panic!("blob resource must surface typed Blob variant, got: {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -419,7 +419,51 @@ impl ToolSafetyPlan {
         }
         plan
     }
+
+    /// Validate invariants for a manually constructed plan.
+    ///
+    /// Builders on [`ToolSafetyPlan`] already encode these invariants, but
+    /// values built by hand (e.g. by external SDK consumers or by dynamic
+    /// tool providers) can drift. This method is not enforced implicitly;
+    /// consumers should call [`validate`](Self::validate) where externally
+    /// supplied plans enter the system, such as during tool registration or
+    /// before executing/using a plan. The agent-loop runtime calls this at the
+    /// tool execution boundary and fails closed to the default plan when a tool
+    /// returns invalid safety metadata.
+    pub fn validate(&self) -> Result<(), ToolSafetyPlanInvariant> {
+        if self.destructive && self.read_only {
+            return Err(ToolSafetyPlanInvariant::DestructiveReadOnly);
+        }
+        if self.read_only && !self.concurrency_safe {
+            return Err(ToolSafetyPlanInvariant::ReadOnlyNotConcurrencySafe);
+        }
+        Ok(())
+    }
 }
+
+/// Invariant violations detected by [`ToolSafetyPlan::validate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolSafetyPlanInvariant {
+    /// Plan is marked both `destructive` and `read_only`.
+    DestructiveReadOnly,
+    /// Plan is `read_only` but not `concurrency_safe`.
+    ReadOnlyNotConcurrencySafe,
+}
+
+impl std::fmt::Display for ToolSafetyPlanInvariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DestructiveReadOnly => {
+                f.write_str("tool safety plan is both destructive and read_only")
+            }
+            Self::ReadOnlyNotConcurrencySafe => {
+                f.write_str("tool safety plan is read_only but not concurrency_safe")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ToolSafetyPlanInvariant {}
 
 /// Core tool trait -- implement to create custom tools.
 ///
@@ -645,5 +689,73 @@ impl std::fmt::Debug for AgentTool {
             .field("name", &self.name)
             .field("description", &self.description)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_builder_outputs() {
+        ToolSafetyPlan::default().validate().unwrap();
+        ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read)
+            .validate()
+            .unwrap();
+        ToolSafetyPlan::approval_required(ToolSafetyKind::FileChange)
+            .validate()
+            .unwrap();
+        ToolSafetyPlan::host_input().validate().unwrap();
+        ToolSafetyPlan::file_delete("/tmp/x").validate().unwrap();
+
+        let command_insight = crate::security::command::classify_shell_command("ls -la");
+        ToolSafetyPlan::from_command_insight(command_insight)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_destructive_read_only() {
+        let mut plan = ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read);
+        plan.destructive = true;
+        assert_eq!(
+            plan.validate(),
+            Err(ToolSafetyPlanInvariant::DestructiveReadOnly)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_read_only_without_concurrency_safety() {
+        let mut plan = ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read);
+        plan.concurrency_safe = false;
+        assert_eq!(
+            plan.validate(),
+            Err(ToolSafetyPlanInvariant::ReadOnlyNotConcurrencySafe)
+        );
+    }
+
+    #[test]
+    fn validate_destructive_read_only_takes_precedence() {
+        let plan = ToolSafetyPlan {
+            read_only: true,
+            destructive: true,
+            concurrency_safe: false,
+            ..ToolSafetyPlan::default()
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(ToolSafetyPlanInvariant::DestructiveReadOnly)
+        );
+    }
+
+    #[test]
+    fn validate_allows_non_read_only_non_concurrent_plans() {
+        let plan = ToolSafetyPlan {
+            read_only: false,
+            destructive: false,
+            concurrency_safe: false,
+            ..ToolSafetyPlan::default()
+        };
+        plan.validate().unwrap();
     }
 }

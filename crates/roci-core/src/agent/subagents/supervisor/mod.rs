@@ -1,9 +1,21 @@
 //! Sub-agent supervisor: lifecycle management, concurrency, and event forwarding.
 //!
+//! [`SubagentSupervisor`] is the public entry point. It owns:
+//! - profile resolution and model-candidate fallback (launch-time, not mid-run)
+//! - concurrency via `Semaphore` (`max_concurrent`, default 4)
+//! - event forwarding from children to parent via `broadcast::channel`
+//! - abort, wait, and shutdown orchestration
+//! - shared [`crate::agent::runtime::HumanInteractionCoordinator`] across all children
+//!
+//! See `docs/ARCHITECTURE.md` §"Sub-Agent Supervisor" for design rationale,
+//! named-profile registry, model fallback rules, input modes, and the
+//! deferred peer-bus seam.
+//!
 //! Internal structure:
-//! - [`child_registry`] — child entry bookkeeping and status helpers
-//! - [`run_task`] — background task that drives a child to completion
-//! - [`wait`] — wait / drain / shutdown methods
+//! - `child_registry` — child entry bookkeeping and status helpers
+//! - `orchestration` — high-level `run_parallel`, `race`, and watch helpers
+//! - `run_task` — background task that drives a child to completion
+//! - `wait` — wait / drain / shutdown methods
 
 mod child_registry;
 mod orchestration;

@@ -144,7 +144,49 @@ pub(super) fn safety_plan_for_finalized_call(
         return ToolSafetyPlan::default();
     };
     let safety_args = ToolArguments::new(call.arguments.clone());
-    tool.safety(&safety_args)
+    let plan = tool.safety(&safety_args);
+    match plan.validate() {
+        Ok(()) => plan,
+        Err(error) => {
+            tracing::warn!(
+                tool_name = tool.name(),
+                call_id = call.id.as_str(),
+                %error,
+                "tool produced invalid safety plan; failing closed to default"
+            );
+            ToolSafetyPlan::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{AgentTool, AgentToolParameters, ToolSafetyKind};
+
+    #[test]
+    fn invalid_tool_safety_plan_fails_closed_at_runtime_boundary() {
+        let mut invalid_plan = ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read);
+        invalid_plan.concurrency_safe = false;
+        let tool = AgentTool::new(
+            "unsafe",
+            "invalid safety plan fixture",
+            AgentToolParameters::empty(),
+            |_args, _ctx| async { Ok(serde_json::json!({"ok": true})) },
+        )
+        .with_static_safety(invalid_plan, Default::default());
+        let call = AgentToolCall {
+            id: "call-1".to_string(),
+            name: "unsafe".to_string(),
+            arguments: serde_json::json!({}),
+            called_as: None,
+            recipient: None,
+        };
+
+        let plan = safety_plan_for_finalized_call(&call, Some(&tool));
+
+        assert_eq!(plan, ToolSafetyPlan::default());
+    }
 }
 
 fn synthetic_hook_error_result(

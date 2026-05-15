@@ -458,7 +458,9 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use crate::mcp::client::{MCPReadResourceResult, MCPResourceSchema, MCPToolCallResult};
+    use crate::mcp::client::{
+        MCPReadResourceResult, MCPResourceContent, MCPResourceSchema, MCPToolCallResult,
+    };
     use crate::mcp::schema::MCPToolSchema;
 
     struct MockClientOps {
@@ -1028,11 +1030,11 @@ mod tests {
             HashMap::from([(
                 "file:///same.md".to_string(),
                 MCPReadResourceResult {
-                    contents: vec![json!({
-                        "uri": "file:///same.md",
-                        "mimeType": "text/plain",
-                        "text": "alpha"
-                    })],
+                    contents: vec![MCPResourceContent::Text {
+                        uri: "file:///same.md".into(),
+                        mime_type: Some("text/plain".into()),
+                        text: "alpha".into(),
+                    }],
                 },
             )]),
         );
@@ -1053,7 +1055,14 @@ mod tests {
             .await
             .expect("resource should read");
 
-        assert_eq!(result.contents[0]["text"], "alpha");
+        assert_eq!(result.contents.len(), 1);
+        match &result.contents[0] {
+            MCPResourceContent::Text { uri, text, .. } => {
+                assert_eq!(uri, "file:///same.md");
+                assert_eq!(text, "alpha");
+            }
+            other => panic!("expected Text variant, got {other:?}"),
+        }
         assert_eq!(
             resource_reads
                 .lock()

@@ -20,7 +20,7 @@ pub use tool::{
     AgentTool, SandboxProvider, Tool, ToolActionFloor, ToolApprovalRequirement,
     ToolExecutionContext, ToolFilesystemAccess, ToolPromptMetadata, ToolResourceAccess,
     ToolResourceAccessMode, ToolResultSizePolicy, ToolSafetyKind, ToolSafetyPlan,
-    ToolSafetySummary,
+    ToolSafetyPlanInvariant, ToolSafetySummary,
 };
 pub use types::AgentToolParameters;
 pub use user_input::{

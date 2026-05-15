@@ -12,7 +12,7 @@ use crate::human_interaction::HumanInteractionCoordinator;
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, JsonObject, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResult, Resource,
+        ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
     },
     service::{ClientInitializeError, ServiceError},
 };
@@ -59,9 +59,69 @@ pub struct MCPResourceSchema {
     pub size: Option<u32>,
 }
 
+/// Typed payload returned by an MCP server for a single resource entry.
+///
+/// Mirrors the spec's `TextResourceContents` / `BlobResourceContents` variants so
+/// callers do not have to inspect raw JSON to distinguish text from binary blobs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MCPResourceContent {
+    Text {
+        uri: String,
+        mime_type: Option<String>,
+        text: String,
+    },
+    Blob {
+        uri: String,
+        mime_type: Option<String>,
+        blob_base64: String,
+    },
+}
+
+impl MCPResourceContent {
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::Text { uri, .. } | Self::Blob { uri, .. } => uri,
+        }
+    }
+
+    pub fn mime_type(&self) -> Option<&str> {
+        match self {
+            Self::Text { mime_type, .. } | Self::Blob { mime_type, .. } => mime_type.as_deref(),
+        }
+    }
+
+    fn from_rmcp(contents: ResourceContents) -> Self {
+        // TextResourceContents and BlobResourceContents may grow extra spec fields.
+        // Keep this SDK type focused on the stable read payload contract: uri,
+        // optional MIME type, and text/blob body.
+        match contents {
+            ResourceContents::TextResourceContents {
+                uri,
+                mime_type,
+                text,
+                ..
+            } => Self::Text {
+                uri,
+                mime_type,
+                text,
+            },
+            ResourceContents::BlobResourceContents {
+                uri,
+                mime_type,
+                blob,
+                ..
+            } => Self::Blob {
+                uri,
+                mime_type,
+                blob_base64: blob,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MCPReadResourceResult {
-    pub contents: Vec<serde_json::Value>,
+    pub contents: Vec<MCPResourceContent>,
 }
 
 impl MCPToolCallResult {
@@ -274,8 +334,8 @@ impl MCPClient {
             contents: result
                 .contents
                 .into_iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(MCPResourceContent::from_rmcp)
+                .collect(),
         })
     }
 

@@ -768,7 +768,14 @@ mod tests {
             Some(serde_json::json!({"ok": true}))
         );
         assert_eq!(resources[0].uri, "file:///fixture.txt");
-        assert_eq!(resource.contents[0]["text"], "fixture content");
+        assert_eq!(resource.contents.len(), 1);
+        match &resource.contents[0] {
+            crate::mcp::client::MCPResourceContent::Text { text, uri, .. } => {
+                assert_eq!(uri, "file:///fixture.txt");
+                assert_eq!(text, "fixture content");
+            }
+            other => panic!("expected Text resource content, got {other:?}"),
+        }
     }
 
     #[tokio::test]
