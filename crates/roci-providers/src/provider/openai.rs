@@ -524,7 +524,34 @@ impl ModelProvider for OpenAiProvider {
                     if let Some(data) = roci_core::provider::http::parse_sse_data(&line) {
                         if let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk>(data) {
                             if let Some(choice) = chunk.choices.into_iter().next() {
-                                if let Some(deltas) = choice.delta.tool_calls {
+                                let OpenAiStreamChoice {
+                                    delta,
+                                    finish_reason,
+                                } = choice;
+                                let OpenAiStreamDelta {
+                                    content,
+                                    reasoning_content,
+                                    reasoning,
+                                    reasoning_text,
+                                    tool_calls: tool_call_deltas,
+                                } = delta;
+                                let reasoning = [reasoning_content, reasoning, reasoning_text]
+                                    .into_iter()
+                                    .flatten()
+                                    .find(|value| !value.is_empty());
+                                if let Some(reasoning) = reasoning {
+                                    yield Ok(TextStreamDelta {
+                                        text: String::new(),
+                                        event_type: StreamEventType::Reasoning,
+                                        tool_call: None,
+                                        finish_reason: None,
+                                        usage: None,
+                                        reasoning: Some(reasoning),
+                                        reasoning_signature: None,
+                                        reasoning_type: None,
+                                    });
+                                }
+                                if let Some(deltas) = tool_call_deltas {
                                     for delta in deltas {
                                         let entry = tool_calls.entry(delta.index).or_insert_with(|| ToolCallBuilder {
                                             id: None,
@@ -544,7 +571,7 @@ impl ModelProvider for OpenAiProvider {
                                         }
                                     }
                                 }
-                                if let Some(text) = choice.delta.content {
+                                if let Some(text) = content {
                                     yield Ok(TextStreamDelta {
                                         text,
                                         event_type: StreamEventType::TextDelta,
@@ -556,7 +583,7 @@ impl ModelProvider for OpenAiProvider {
                                         reasoning_type: None,
                                     });
                                 }
-                                let finish = choice.finish_reason.as_deref().and_then(parse_finish_reason);
+                                let finish = finish_reason.as_deref().and_then(parse_finish_reason);
                                 if let Some(reason) = finish {
                                     if reason == FinishReason::ToolCalls {
                                         let mut indices = tool_calls.keys().copied().collect::<Vec<_>>();
@@ -753,6 +780,9 @@ struct OpenAiStreamChoice {
 #[derive(Deserialize)]
 struct OpenAiStreamDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_text: Option<String>,
     tool_calls: Option<Vec<OpenAiStreamToolCallDelta>>,
 }
 
@@ -772,6 +802,8 @@ struct OpenAiStreamFunctionDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn settings(
         max_tokens: Option<u32>,
@@ -817,6 +849,61 @@ mod tests {
             session_id: None,
             transport: None,
         }
+    }
+
+    #[tokio::test]
+    async fn stream_emits_reasoning_fields_separately_from_assistant_text() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"more \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_text\":\"detail\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" first\",\"reasoning\":\" duplicate\",\"reasoning_text\":\" duplicate\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(
+            OpenAiModel::Custom("reasoning-model".to_string()),
+            "test-key".to_string(),
+            Some(server.uri()),
+            None,
+        );
+        let request = request_with_headers(None, HeaderMap::new());
+        let deltas = provider
+            .stream_text(&request)
+            .await
+            .expect("stream response")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream deltas");
+
+        assert_eq!(deltas.len(), 7);
+        assert_eq!(deltas[0].event_type, StreamEventType::Reasoning);
+        assert_eq!(deltas[0].reasoning.as_deref(), Some("think "));
+        assert_eq!(deltas[1].event_type, StreamEventType::Reasoning);
+        assert_eq!(deltas[1].reasoning.as_deref(), Some("more "));
+        assert_eq!(deltas[2].event_type, StreamEventType::Reasoning);
+        assert_eq!(deltas[2].reasoning.as_deref(), Some("detail"));
+        assert_eq!(deltas[3].event_type, StreamEventType::Reasoning);
+        assert_eq!(deltas[3].reasoning.as_deref(), Some(" first"));
+        assert_eq!(deltas[4].event_type, StreamEventType::TextDelta);
+        assert_eq!(deltas[4].text, "answer");
+        assert_eq!(deltas[5].event_type, StreamEventType::Done);
+        assert_eq!(deltas[5].finish_reason, Some(FinishReason::Stop));
+        assert_eq!(deltas[6].event_type, StreamEventType::Done);
     }
 
     #[test]
