@@ -277,11 +277,11 @@ pub fn estimate_message_tokens(message: &ModelMessage) -> usize {
 pub fn estimate_context_usage(messages: &[ModelMessage], context_window: usize) -> ContextUsage {
     let used_tokens: usize = HeuristicTokenCounter.count_messages(messages).tokens;
     let remaining_tokens = context_window.saturating_sub(used_tokens);
-    let usage_percent = if context_window == 0 {
-        100
-    } else {
-        ((used_tokens.saturating_mul(100)) / context_window).min(100) as u8
-    };
+    let usage_percent = used_tokens
+        .saturating_mul(100)
+        .checked_div(context_window)
+        .unwrap_or(100)
+        .min(100) as u8;
 
     ContextUsage {
         used_tokens,
