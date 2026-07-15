@@ -163,9 +163,20 @@ impl AgentRuntime {
             return;
         }
 
+        let system_prompt = self.system_prompt.lock().await.clone();
         let snapshot = {
             let messages = self.messages.lock().await;
             let mut snapshot = messages.clone();
+            if snapshot.is_empty()
+                && !queued
+                    .messages
+                    .iter()
+                    .any(|message| message.role == Role::System)
+            {
+                if let Some(system_prompt) = system_prompt {
+                    snapshot.push(ModelMessage::system(system_prompt));
+                }
+            }
             snapshot.extend(queued.messages);
             snapshot
         };

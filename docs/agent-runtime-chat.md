@@ -43,6 +43,9 @@ runtime state.
   - Returns a stable `TurnId` after semantic queue projection and before provider
     execution starts.
   - Runtime serializes queued turns so only one provider run is active at a time.
+  - The first queued turn prepends the configured system prompt to provider
+    context when runtime history is empty. Later turns reuse that persisted
+    system message without duplicating it.
 - `set_generation_settings(settings: GenerationSettings) -> Result<(), RociError>` (async)
   - Idle-only default update for later turns.
 - `set_approval_policy(policy: ApprovalPolicy) -> Result<(), RociError>` (async)

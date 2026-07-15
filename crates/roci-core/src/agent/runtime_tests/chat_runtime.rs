@@ -838,6 +838,84 @@ async fn queued_turns_run_fifo() {
 }
 
 #[tokio::test]
+async fn queued_turns_prepend_configured_system_prompt_once() {
+    let (registry, requests) = registry_with_request_recording_provider("stub", "ok");
+    let mut config = test_agent_config();
+    config.candidates = vec!["stub:system-prompt"
+        .parse()
+        .expect("stub model should parse")];
+    config.system_prompt = Some("system instructions".to_string());
+    let agent = AgentRuntime::new(registry, test_config(), config);
+
+    let first = agent
+        .enqueue_turn(EnqueueTurnRequest {
+            messages: vec![ModelMessage::user("first")],
+            generation_settings: None,
+            approval_policy: None,
+            collaboration_mode: None,
+        })
+        .await
+        .expect("first turn queues");
+    wait_for_turn_status(&agent, first, TurnStatus::Completed).await;
+
+    let second = agent
+        .enqueue_turn(EnqueueTurnRequest {
+            messages: vec![ModelMessage::user("second")],
+            generation_settings: None,
+            approval_policy: None,
+            collaboration_mode: None,
+        })
+        .await
+        .expect("second turn queues");
+    wait_for_turn_status(&agent, second, TurnStatus::Completed).await;
+
+    let recorded = requests.lock().expect("requests lock").clone();
+    assert_eq!(
+        recorded[0],
+        vec!["system instructions".to_string(), "first".to_string()]
+    );
+    assert_eq!(
+        recorded[1]
+            .iter()
+            .filter(|text| text.as_str() == "system instructions")
+            .count(),
+        1
+    );
+    assert_eq!(recorded[1].last().map(String::as_str), Some("second"));
+}
+
+#[tokio::test]
+async fn queued_turn_respects_explicit_system_message() {
+    let (registry, requests) = registry_with_request_recording_provider("stub", "ok");
+    let mut config = test_agent_config();
+    config.candidates = vec!["stub:explicit-system"
+        .parse()
+        .expect("stub model should parse")];
+    config.system_prompt = Some("configured system".to_string());
+    let agent = AgentRuntime::new(registry, test_config(), config);
+
+    let turn = agent
+        .enqueue_turn(EnqueueTurnRequest {
+            messages: vec![
+                ModelMessage::system("explicit system"),
+                ModelMessage::user("hello"),
+            ],
+            generation_settings: None,
+            approval_policy: None,
+            collaboration_mode: None,
+        })
+        .await
+        .expect("turn queues");
+    wait_for_turn_status(&agent, turn, TurnStatus::Completed).await;
+
+    let recorded = requests.lock().expect("requests lock").clone();
+    assert_eq!(
+        recorded[0],
+        vec!["explicit system".to_string(), "hello".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn pre_start_cancel_does_not_commit_canceled_prompt_to_provider_ledger() {
     let (registry, requests) = registry_with_request_recording_provider("stub", "ok");
     let entered = Arc::new(Notify::new());
