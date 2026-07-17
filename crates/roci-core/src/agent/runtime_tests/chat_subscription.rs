@@ -71,6 +71,8 @@ fn payload_name(payload: &AgentRuntimeEventPayload) -> &'static str {
         }
         AgentRuntimeEventPayload::SubagentMessage { .. } => "subagent_message",
         AgentRuntimeEventPayload::SubagentNeedsInput { .. } => "subagent_needs_input",
+        AgentRuntimeEventPayload::SubagentInputResolved { .. } => "subagent_input_resolved",
+        AgentRuntimeEventPayload::SubagentInputCanceled { .. } => "subagent_input_canceled",
         AgentRuntimeEventPayload::SubagentCompleted { .. } => "subagent_completed",
         AgentRuntimeEventPayload::SubagentFailed { .. } => "subagent_failed",
         AgentRuntimeEventPayload::SubagentCancelled { .. } => "subagent_cancelled",

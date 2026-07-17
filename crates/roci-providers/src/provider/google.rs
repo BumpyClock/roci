@@ -39,6 +39,26 @@ impl GoogleProvider {
         }
     }
 
+    fn validate_settings(&self, settings: &GenerationSettings) -> Result<(), RociError> {
+        let has_google_thinking_config = settings
+            .google
+            .as_ref()
+            .and_then(|options| options.thinking_config.as_ref())
+            .is_some();
+        if !has_google_thinking_config {
+            if let Some(effort) = settings.reasoning_effort {
+                if !self.capabilities.supports_reasoning_effort(effort) {
+                    return Err(RociError::InvalidArgument(format!(
+                        "reasoning effort '{effort}' is not supported for model {}",
+                        self.model.as_str()
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn build_request_body(&self, request: &ProviderRequest) -> serde_json::Value {
         let mut system_instruction_parts = Vec::new();
         let mut contents = Vec::new();
@@ -166,22 +186,30 @@ impl GoogleProvider {
             }
         }
 
-        // Google thinking config (inside generationConfig)
-        if let Some(ref google_opts) = request.settings.google {
-            if let Some(ref thinking) = google_opts.thinking_config {
-                let mut tc = serde_json::Map::new();
-                if let Some(budget) = thinking.budget_tokens {
-                    tc.insert("thinkingBudget".into(), budget.into());
-                }
-                if let Some(include) = thinking.include_thoughts {
-                    tc.insert("includeThoughts".into(), include.into());
-                }
-                if let Some(ref level) = thinking.thinking_level {
-                    tc.insert("thinkingLevel".into(), serde_json::json!(level.to_string()));
-                }
-                if !tc.is_empty() {
-                    gen_config.insert("thinkingConfig".into(), serde_json::Value::Object(tc));
-                }
+        // Explicit Google options take precedence over the generic host picker setting.
+        let generic_thinking = request
+            .settings
+            .reasoning_effort
+            .and_then(|effort| self.model.thinking_config_for_effort(effort));
+        let thinking = request
+            .settings
+            .google
+            .as_ref()
+            .and_then(|options| options.thinking_config.as_ref())
+            .or(generic_thinking.as_ref());
+        if let Some(thinking) = thinking {
+            let mut tc = serde_json::Map::new();
+            if let Some(budget) = thinking.budget_tokens {
+                tc.insert("thinkingBudget".into(), budget.into());
+            }
+            if let Some(include) = thinking.include_thoughts {
+                tc.insert("includeThoughts".into(), include.into());
+            }
+            if let Some(ref level) = thinking.thinking_level {
+                tc.insert("thinkingLevel".into(), serde_json::json!(level.to_string()));
+            }
+            if !tc.is_empty() {
+                gen_config.insert("thinkingConfig".into(), serde_json::Value::Object(tc));
             }
         }
 
@@ -253,6 +281,7 @@ impl ModelProvider for GoogleProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, RociError> {
+        self.validate_settings(&request.settings)?;
         let body = self.build_request_body(request);
         let url = format!(
             "{}/models/{}:generateContent?key={}",
@@ -337,6 +366,7 @@ impl ModelProvider for GoogleProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        self.validate_settings(&request.settings)?;
         let body = self.build_request_body(request);
         let url = format!(
             "{}/models/{}:streamGenerateContent?alt=sse&key={}",
@@ -764,6 +794,7 @@ mod tests {
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
+                reasoning_effort: Some(ReasoningEffort::None),
                 google: Some(GoogleOptions {
                     thinking_config: Some(GoogleThinkingConfig {
                         budget_tokens: Some(5000),
@@ -783,6 +814,7 @@ mod tests {
             session_id: None,
             transport: None,
         };
+        assert!(provider.validate_settings(&request.settings).is_ok());
         let body = provider.build_request_body(&request);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
@@ -825,6 +857,92 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
         );
+    }
+
+    #[test]
+    fn build_request_body_maps_generic_reasoning_effort_to_gemini_thinking_level() {
+        let provider = GoogleProvider::new(GoogleModel::Gemini3Flash, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                reasoning_effort: Some(ReasoningEffort::Minimal),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request);
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "MINIMAL"
+        );
+    }
+
+    #[test]
+    fn build_request_body_maps_gemini_2_5_flash_none_to_zero_thinking_budget() {
+        let provider = GoogleProvider::new(GoogleModel::Gemini25Flash, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                reasoning_effort: Some(ReasoningEffort::None),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let body = provider.build_request_body(&request);
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_and_streaming_reject_unsupported_gemini_2_5_pro_none_effort() {
+        let provider = GoogleProvider::new(GoogleModel::Gemini25Pro, "test-key".to_string());
+        let request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                reasoning_effort: Some(ReasoningEffort::None),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: reqwest::header::HeaderMap::new(),
+            metadata: std::collections::HashMap::new(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+
+        let generate_error = provider
+            .generate_text(&request)
+            .await
+            .expect_err("unsupported effort must fail before the network request");
+        let stream_error = match provider.stream_text(&request).await {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported effort must fail before the network request"),
+        };
+
+        assert!(matches!(generate_error, RociError::InvalidArgument(_)));
+        assert!(matches!(stream_error, RociError::InvalidArgument(_)));
     }
 
     #[test]

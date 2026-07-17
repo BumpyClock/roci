@@ -2,6 +2,7 @@
 name = "roci-tools"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 roci = { path = "../.." }
@@ -14,5 +15,6 @@ default = []
 agent = ["roci/agent"]
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

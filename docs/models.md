@@ -37,6 +37,41 @@ Catalog strategy:
 Provider model enums (`OpenAiModel`, `AnthropicModel`, `GoogleModel`, etc.) live in
 `roci-providers` and feed static catalogs.
 
+## Reasoning effort capabilities
+
+`ModelInfo.capabilities.reasoning_effort` is the canonical host contract for
+reasoning-effort pickers:
+
+- `supported` is the ordered list of values the exact model accepts.
+- `default` is the provider value when a host leaves effort unset.
+- `ModelCapabilities::reasoning_effort_options`,
+  `supports_reasoning_effort`, and `default_reasoning_effort` let hosts consume
+  the contract without provider-specific rules.
+
+An empty `supported` list means Roci cannot expose a portable effort picker for
+that model. It does not mean the provider lacks every provider-specific thinking
+control. `ReasoningEffortCapabilities::new` rejects a default that is not in the
+supported list. Catalog JSON includes the capability data under each model's
+`capabilities` object.
+
+The Codex provider has a separate catalog from the public OpenAI provider. Its
+current local presets are synchronized from
+`../codex/codex-rs/models-manager/models.json`; they use the existing Codex
+Responses transport and do not claim public OpenAI API availability.
+
+The public OpenAI and Codex catalogs may expose the same model ID with distinct
+capabilities. For example, public `gpt-5.4` defaults to `none`, while Codex's
+local `gpt-5.4` preset defaults to `medium`. Provider construction selects the
+matching capability profile, and rejects an explicitly unsupported effort before
+sending a request.
+
+| Codex model | Context | Default effort | Supported efforts |
+| --- | ---: | --- | --- |
+| `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5` | 272,000 | `medium` | `low`, `medium`, `high`, `xhigh` |
+| `gpt-5.6-sol` | 372,000 | `low` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| `gpt-5.6-terra` | 372,000 | `medium` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| `gpt-5.6-luna` | 372,000 | `medium` | `low`, `medium`, `high`, `xhigh`, `max` |
+
 ## Runtime candidates
 
 Agent runtime model selection is expressed as ordered

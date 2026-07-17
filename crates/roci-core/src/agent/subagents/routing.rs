@@ -1,9 +1,9 @@
 //! Session-scoped routing controller for sub-agent delegation.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::agent::runtime::chat::ThreadId;
 use crate::agent::runtime::AgentConfig;
@@ -14,14 +14,15 @@ use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
 use crate::types::{ModelMessage, Role};
 
+use super::events::{emit_subagent_event, CriticalSubagentEventSink};
 use super::handle::SubagentHandle;
 use super::profiles::SubagentProfileRegistry;
 use super::supervisor::SubagentSupervisor;
 use super::types::{
     DelegateSubagentRequest, DelegateSubagentResult, SendSubagentMessageResult, SubagentCaller,
     SubagentCancelResult, SubagentEvent, SubagentId, SubagentInput, SubagentKnownChild,
-    SubagentProfileRef, SubagentProfileSummary, SubagentRoutingMetadata, SubagentRunResult,
-    SubagentSpec, SubagentStatus, SubagentSupervisorConfig,
+    SubagentProfile, SubagentProfileRef, SubagentProfileSummary, SubagentRoutingMetadata,
+    SubagentRunResult, SubagentSpec, SubagentStatus, SubagentSupervisorConfig,
 };
 
 /// Session-scoped controller for sub-agent management operations.
@@ -30,11 +31,14 @@ pub struct SubagentRoutingController {
     profiles: SubagentProfileRegistry,
     state: Arc<Mutex<RoutingState>>,
     event_tx: broadcast::Sender<SubagentEvent>,
+    critical_event_sink: Option<CriticalSubagentEventSink>,
+    event_order: Arc<StdMutex<()>>,
     max_depth: u32,
 }
 
 #[derive(Default)]
 struct RoutingState {
+    selected_profile: Option<SubagentProfileRef>,
     children: HashMap<SubagentId, ChildRoutingRecord>,
 }
 
@@ -59,35 +63,90 @@ impl SubagentRoutingController {
         base_config: AgentConfig,
         supervisor_config: SubagentSupervisorConfig,
         profiles: SubagentProfileRegistry,
+        selected_profile: Option<SubagentProfileRef>,
     ) -> Self {
-        let supervisor = Arc::new(SubagentSupervisor::new(
+        Self::new_inner(
+            registry,
+            roci_config,
+            base_config,
+            supervisor_config,
+            profiles,
+            selected_profile,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_critical_events(
+        registry: Arc<ProviderRegistry>,
+        roci_config: RociConfig,
+        base_config: AgentConfig,
+        supervisor_config: SubagentSupervisorConfig,
+        profiles: SubagentProfileRegistry,
+        selected_profile: Option<SubagentProfileRef>,
+    ) -> (Self, mpsc::UnboundedReceiver<SubagentEvent>) {
+        // ponytail: queue can grow to process memory ceiling while persistence stalls;
+        // switch to bounded backpressure when AgentEventSink supports async delivery.
+        let (critical_event_tx, critical_event_rx) = mpsc::unbounded_channel();
+        let critical_event_sink: CriticalSubagentEventSink = Arc::new(move |event| {
+            let _ = critical_event_tx.send(event);
+        });
+        (
+            Self::new_inner(
+                registry,
+                roci_config,
+                base_config,
+                supervisor_config,
+                profiles,
+                selected_profile,
+                Some(critical_event_sink),
+            ),
+            critical_event_rx,
+        )
+    }
+
+    fn new_inner(
+        registry: Arc<ProviderRegistry>,
+        roci_config: RociConfig,
+        base_config: AgentConfig,
+        supervisor_config: SubagentSupervisorConfig,
+        profiles: SubagentProfileRegistry,
+        selected_profile: Option<SubagentProfileRef>,
+        critical_event_sink: Option<CriticalSubagentEventSink>,
+    ) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
+        let event_order = Arc::new(StdMutex::new(()));
+        let forwarded_events = event_tx.clone();
+        let forwarded_critical_events = critical_event_sink.clone();
+        let forwarded_event_order = event_order.clone();
+        let supervisor_event_sink: CriticalSubagentEventSink = Arc::new(move |event| {
+            if !matches!(event, SubagentEvent::Spawned { .. }) {
+                emit_ordered_subagent_event(
+                    &forwarded_event_order,
+                    &forwarded_events,
+                    forwarded_critical_events.as_ref(),
+                    event,
+                );
+            }
+        });
+        let supervisor = Arc::new(SubagentSupervisor::new_with_critical_event_sink(
             registry,
             roci_config,
             base_config,
             supervisor_config,
             profiles.clone(),
+            Some(supervisor_event_sink),
         ));
-        let (event_tx, _) = broadcast::channel(256);
-        let mut supervisor_events = supervisor.subscribe();
-        let forwarded_events = event_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match supervisor_events.recv().await {
-                    Ok(SubagentEvent::Spawned { .. }) => {}
-                    Ok(event) => {
-                        let _ = forwarded_events.send(event);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
 
         Self {
             supervisor,
             profiles,
-            state: Arc::new(Mutex::new(RoutingState::default())),
+            state: Arc::new(Mutex::new(RoutingState {
+                selected_profile,
+                ..RoutingState::default()
+            })),
             event_tx,
+            critical_event_sink,
+            event_order,
             max_depth: 0,
         }
     }
@@ -129,6 +188,54 @@ impl SubagentRoutingController {
         self.profiles.profile_summaries()
     }
 
+    /// Return the selected main/default-agent profile override.
+    pub async fn current_profile(
+        &self,
+        caller: &SubagentCaller,
+    ) -> Result<Option<SubagentProfileSummary>, RociError> {
+        authorize_main_agent(caller)?;
+        let selected = self.state.lock().await.selected_profile.clone();
+        selected
+            .map(|profile_ref| {
+                self.profiles
+                    .resolve(&profile_ref)
+                    .map(|profile| SubagentProfileSummary::from(&profile))
+            })
+            .transpose()
+    }
+
+    /// Select the profile applied to the main/default agent on future runs.
+    pub async fn select_profile(
+        &self,
+        profile_ref: &str,
+        caller: &SubagentCaller,
+    ) -> Result<SubagentProfileSummary, RociError> {
+        authorize_main_agent(caller)?;
+        let profile_ref = self.resolve_profile_ref(Some(profile_ref))?;
+        let profile = self.profiles.resolve(&profile_ref)?;
+        self.state.lock().await.selected_profile = Some(profile_ref);
+        Ok(SubagentProfileSummary::from(&profile))
+    }
+
+    /// Clear the selected override. Registry default resolution remains active.
+    pub async fn deselect_profile(&self, caller: &SubagentCaller) -> Result<(), RociError> {
+        authorize_main_agent(caller)?;
+        self.state.lock().await.selected_profile = None;
+        Ok(())
+    }
+
+    pub(crate) async fn effective_main_profile(
+        &self,
+        caller: &SubagentCaller,
+    ) -> Result<Option<SubagentProfile>, RociError> {
+        authorize_main_agent(caller)?;
+        let selected = self.state.lock().await.selected_profile.clone();
+        selected
+            .or_else(|| self.profiles.default_profile_ref())
+            .map(|profile_ref| self.profiles.resolve(&profile_ref))
+            .transpose()
+    }
+
     /// Delegate a task to a sub-agent.
     pub async fn delegate(
         &self,
@@ -153,7 +260,8 @@ impl SubagentRoutingController {
             input: SubagentInput::Prompt { task: request.task },
             overrides: Default::default(),
         };
-        let handle = Arc::new(self.supervisor.spawn(spec).await?);
+        let (handle, start_tx) = self.supervisor.spawn_paused(spec).await?;
+        let handle = Arc::new(handle);
         let id = handle.id();
         let model = handle.model().cloned();
         let label = handle.label().map(str::to_string);
@@ -177,12 +285,18 @@ impl SubagentRoutingController {
                 },
             );
         }
-        let _ = self.event_tx.send(SubagentEvent::Spawned {
-            subagent_id: id,
-            label: label.clone(),
-            profile: profile.clone(),
-            model: model.clone(),
-        });
+        emit_ordered_subagent_event(
+            &self.event_order,
+            &self.event_tx,
+            self.critical_event_sink.as_ref(),
+            SubagentEvent::Spawned {
+                subagent_id: id,
+                label: label.clone(),
+                profile: profile.clone(),
+                model: model.clone(),
+            },
+        );
+        let _ = start_tx.send(());
 
         if request.run_in_background {
             return Ok(running_result(id, profile, child_thread_id));
@@ -400,6 +514,18 @@ impl SubagentRoutingController {
             record.cached_result = Some(result);
         }
     }
+}
+
+fn emit_ordered_subagent_event(
+    event_order: &StdMutex<()>,
+    event_tx: &broadcast::Sender<SubagentEvent>,
+    critical_event_sink: Option<&CriticalSubagentEventSink>,
+    event: SubagentEvent,
+) {
+    let _guard = event_order
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    emit_subagent_event(event_tx, critical_event_sink, event);
 }
 
 fn authorize_main_agent(caller: &SubagentCaller) -> Result<(), RociError> {

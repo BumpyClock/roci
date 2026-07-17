@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::error::RociError;
 use crate::tools::arguments::ToolArguments;
 use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
-use crate::tools::tool::ToolExecutionContext;
+use crate::tools::tool::{ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary};
 use crate::tools::types::AgentToolParameters;
 
 use super::client::MCPClient;
@@ -36,6 +36,42 @@ pub enum MCPAggregateInitPolicy {
     /// Stop immediately on first initialize/list failure.
     #[default]
     StrictFailFast,
+    /// Continue after per-server initialize/list failures and report them.
+    BestEffort,
+}
+
+/// MCP server operation that failed during aggregate discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MCPServerFailureStage {
+    Initialize,
+    ListTools,
+}
+
+/// Redacted failure category safe to expose in diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MCPServerFailureCategory {
+    Configuration,
+    Authentication,
+    Timeout,
+    Transport,
+    Provider,
+    Protocol,
+    Unknown,
+}
+
+/// Per-server aggregate failure without the potentially sensitive source message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MCPServerFailure {
+    pub server_id: String,
+    pub stage: MCPServerFailureStage,
+    pub category: MCPServerFailureCategory,
+}
+
+/// Tool discovery output plus redacted failures from best-effort aggregation.
+#[derive(Debug, Clone)]
+pub struct MCPAggregateToolList {
+    pub tools: Vec<MCPAggregatedTool>,
+    pub failures: Vec<MCPServerFailure>,
 }
 
 /// Aggregation behavior controls.
@@ -141,11 +177,18 @@ struct MCPServerEntry {
     client: Mutex<Box<dyn MCPClientOps>>,
 }
 
+#[derive(Clone, Default)]
+struct MCPToolCache {
+    tools_by_server: HashMap<String, Vec<MCPAggregatedTool>>,
+    routes_by_server: HashMap<String, HashMap<String, MCPToolRoute>>,
+}
+
 /// Aggregates multiple MCP servers behind deterministic tool routing.
 pub struct MCPToolAggregator {
     servers: Vec<MCPServerEntry>,
     server_index_by_id: HashMap<String, usize>,
-    routes: Mutex<HashMap<String, MCPToolRoute>>,
+    refresh_lock: Mutex<()>,
+    cache: Mutex<MCPToolCache>,
     config: MCPAggregationConfig,
 }
 
@@ -184,25 +227,83 @@ impl MCPToolAggregator {
         Ok(Self {
             servers: entries,
             server_index_by_id: index,
-            routes: Mutex::new(HashMap::new()),
+            refresh_lock: Mutex::new(()),
+            cache: Mutex::new(MCPToolCache::default()),
             config,
         })
     }
 
     pub async fn list_tools_with_origin(&self) -> Result<Vec<MCPAggregatedTool>, RociError> {
+        Ok(self.list_tools_with_report().await?.tools)
+    }
+
+    /// Discover tools from every registered server and retain typed failures.
+    pub async fn list_tools_with_report(&self) -> Result<MCPAggregateToolList, RociError> {
+        self.list_tools_with_report_for_servers(&[]).await
+    }
+
+    /// Discover tools from selected servers while preserving other server routes.
+    pub async fn list_tools_with_origin_for_servers(
+        &self,
+        server_ids: &[String],
+    ) -> Result<Vec<MCPAggregatedTool>, RociError> {
+        Ok(self
+            .list_tools_with_report_for_servers(server_ids)
+            .await?
+            .tools)
+    }
+
+    /// Scoped discovery output plus redacted per-server failures.
+    pub async fn list_tools_with_report_for_servers(
+        &self,
+        server_ids: &[String],
+    ) -> Result<MCPAggregateToolList, RociError> {
+        let _refresh_guard = self.refresh_lock.lock().await;
         struct PendingTool {
             exposed_name: String,
             route: MCPToolRoute,
             tool: MCPAggregatedTool,
         }
 
-        let mut pending_tools = Vec::new();
+        let selected_indices = self.selected_server_indices(server_ids)?;
+        let selected_server_ids = selected_indices
+            .iter()
+            .map(|index| self.servers[*index].metadata.id.clone())
+            .collect::<HashSet<_>>();
+        let mut refreshed_tools = HashMap::with_capacity(selected_indices.len());
+        let mut refreshed_server_ids = HashSet::with_capacity(selected_indices.len());
+        let mut failures = Vec::new();
 
-        for server in &self.servers {
+        for server_idx in selected_indices {
+            let server = &self.servers[server_idx];
             let mut client = server.client.lock().await;
-            self.initialize_client(&mut **client).await?;
-            let tools = client.list_tools().await?;
+            if let Err(error) = client.initialize().await {
+                if self.config.init_policy == MCPAggregateInitPolicy::StrictFailFast {
+                    return Err(error);
+                }
+                failures.push(Self::server_failure(
+                    &server.metadata.id,
+                    MCPServerFailureStage::Initialize,
+                    &error,
+                ));
+                continue;
+            }
+            let tools = match client.list_tools().await {
+                Ok(tools) => tools,
+                Err(error) => {
+                    if self.config.init_policy == MCPAggregateInitPolicy::StrictFailFast {
+                        return Err(error);
+                    }
+                    failures.push(Self::server_failure(
+                        &server.metadata.id,
+                        MCPServerFailureStage::ListTools,
+                        &error,
+                    ));
+                    continue;
+                }
+            };
 
+            let mut server_tools = Vec::with_capacity(tools.len());
             for tool in tools {
                 let upstream_tool_name = tool.name;
                 let exposed_name =
@@ -210,12 +311,6 @@ impl MCPToolAggregator {
                 let identity = McpToolIdentity::Mcp {
                     server_id: server.metadata.id.clone(),
                     tool_name: upstream_tool_name.clone(),
-                };
-                let route = MCPToolRoute {
-                    server_id: server.metadata.id.clone(),
-                    server_label: server.metadata.label.clone(),
-                    upstream_tool_name: upstream_tool_name.clone(),
-                    identity: identity.clone(),
                 };
                 let tool = MCPAggregatedTool {
                     exposed_name: exposed_name.clone(),
@@ -226,17 +321,61 @@ impl MCPToolAggregator {
                     description: tool.description.unwrap_or_default(),
                     parameters: AgentToolParameters::from_schema(tool.input_schema),
                 };
+                server_tools.push(tool);
+            }
+            refreshed_server_ids.insert(server.metadata.id.clone());
+            refreshed_tools.insert(server.metadata.id.clone(), server_tools);
+        }
+
+        let mut cache = self.cache.lock().await;
+        let mut candidate_tools_by_server = cache.tools_by_server.clone();
+        for server_id in &selected_server_ids {
+            candidate_tools_by_server.remove(server_id);
+        }
+        candidate_tools_by_server.extend(refreshed_tools);
+        let cached_tool_count = selected_server_ids
+            .iter()
+            .filter_map(|server_id| candidate_tools_by_server.get(server_id))
+            .map(Vec::len)
+            .sum();
+        let mut pending_tools = Vec::with_capacity(cached_tool_count);
+        for server in &self.servers {
+            if !selected_server_ids.contains(&server.metadata.id) {
+                continue;
+            }
+            let Some(tools) = candidate_tools_by_server.get(&server.metadata.id) else {
+                continue;
+            };
+            for tool in tools {
+                let identity = tool.identity.clone();
+                let route = MCPToolRoute {
+                    server_id: tool.server_id.clone(),
+                    server_label: tool.server_label.clone(),
+                    upstream_tool_name: tool.upstream_tool_name.clone(),
+                    identity,
+                };
                 pending_tools.push(PendingTool {
-                    exposed_name,
+                    exposed_name: Self::base_exposed_name(
+                        &tool.server_id,
+                        &tool.upstream_tool_name,
+                    ),
                     route,
-                    tool,
+                    tool: tool.clone(),
                 });
             }
         }
 
         let mut merged_tools = Vec::with_capacity(pending_tools.len());
-        let mut routing_map = HashMap::with_capacity(pending_tools.len());
-        let mut used_names = std::collections::HashSet::with_capacity(pending_tools.len());
+        let mut routes_by_server = cache
+            .routes_by_server
+            .iter()
+            .filter(|(server_id, _)| !selected_server_ids.contains(*server_id))
+            .map(|(server_id, routes)| (server_id.clone(), routes.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut used_names = routes_by_server
+            .values()
+            .flat_map(|routes| routes.keys().cloned())
+            .collect::<HashSet<_>>();
         for mut pending in pending_tools {
             if used_names.contains(&pending.exposed_name) {
                 pending.exposed_name = self.resolve_collision_name(
@@ -246,7 +385,6 @@ impl MCPToolAggregator {
                 )?;
                 pending.tool.exposed_name = pending.exposed_name.clone();
             }
-
             if !used_names.insert(pending.exposed_name.clone()) {
                 return Err(RociError::InvalidState(format!(
                     "Duplicate aggregated MCP tool name '{}'",
@@ -254,7 +392,9 @@ impl MCPToolAggregator {
                 )));
             }
 
-            if routing_map
+            if routes_by_server
+                .entry(pending.route.server_id.clone())
+                .or_default()
                 .insert(pending.exposed_name.clone(), pending.route)
                 .is_some()
             {
@@ -266,10 +406,16 @@ impl MCPToolAggregator {
             merged_tools.push(pending.tool);
         }
 
-        let mut routes = self.routes.lock().await;
-        *routes = routing_map;
+        cache.tools_by_server = candidate_tools_by_server;
+        cache.routes_by_server = routes_by_server;
+        drop(cache);
         merged_tools.sort_by(|left, right| left.exposed_name.cmp(&right.exposed_name));
-        Ok(merged_tools)
+        merged_tools.retain(|tool| refreshed_server_ids.contains(&tool.server_id));
+        failures.sort_by(|left, right| left.server_id.cmp(&right.server_id));
+        Ok(MCPAggregateToolList {
+            tools: merged_tools,
+            failures,
+        })
     }
 
     pub async fn execute_routed_tool(
@@ -278,9 +424,24 @@ impl MCPToolAggregator {
         args: &ToolArguments,
         _ctx: &ToolExecutionContext,
     ) -> Result<serde_json::Value, RociError> {
+        self.execute_routed_tool_for_servers(&[], exposed_tool_name, args)
+            .await
+    }
+
+    async fn execute_routed_tool_for_servers(
+        &self,
+        server_ids: &[String],
+        exposed_tool_name: &str,
+        args: &ToolArguments,
+    ) -> Result<serde_json::Value, RociError> {
         let route = self.route_for(exposed_tool_name).await.ok_or_else(|| {
             RociError::InvalidArgument(format!("Unknown aggregated MCP tool '{exposed_tool_name}'"))
         })?;
+        if !server_ids.is_empty() && !server_ids.contains(&route.server_id) {
+            return Err(RociError::InvalidArgument(format!(
+                "MCP tool '{exposed_tool_name}' is outside the selected server scope"
+            )));
+        }
 
         let server_idx = self
             .server_index_by_id
@@ -333,7 +494,12 @@ impl MCPToolAggregator {
     }
 
     pub async fn route_for(&self, exposed_tool_name: &str) -> Option<MCPToolRoute> {
-        self.routes.lock().await.get(exposed_tool_name).cloned()
+        self.cache
+            .lock()
+            .await
+            .routes_by_server
+            .values()
+            .find_map(|routes| routes.get(exposed_tool_name).cloned())
     }
 
     pub async fn list_resources(&self) -> Result<Vec<MCPAggregatedResource>, RociError> {
@@ -390,6 +556,66 @@ impl MCPToolAggregator {
         format!("mcp__{server_id}__{tool_name}")
     }
 
+    fn selected_server_indices(&self, server_ids: &[String]) -> Result<Vec<usize>, RociError> {
+        if server_ids.is_empty() {
+            return Ok((0..self.servers.len()).collect());
+        }
+        for server_id in server_ids {
+            if !self.server_index_by_id.contains_key(server_id) {
+                return Err(RociError::InvalidArgument(format!(
+                    "Unknown MCP server '{server_id}'"
+                )));
+            }
+        }
+        let requested = server_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        Ok(self
+            .servers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, server)| {
+                requested
+                    .contains(server.metadata.id.as_str())
+                    .then_some(index)
+            })
+            .collect())
+    }
+
+    fn server_failure(
+        server_id: &str,
+        stage: MCPServerFailureStage,
+        error: &RociError,
+    ) -> MCPServerFailure {
+        let category = match error {
+            RociError::Configuration(_) | RociError::MissingConfiguration { .. } => {
+                MCPServerFailureCategory::Configuration
+            }
+            RociError::Authentication(_) | RociError::MissingCredential { .. } => {
+                MCPServerFailureCategory::Authentication
+            }
+            RociError::Timeout(_) => MCPServerFailureCategory::Timeout,
+            RociError::Network(_) | RociError::Io(_) | RociError::Stream(_) => {
+                MCPServerFailureCategory::Transport
+            }
+            RociError::Api { .. }
+            | RociError::Provider { .. }
+            | RociError::ModelNotFound(_)
+            | RociError::UnsupportedOperation(_)
+            | RociError::RateLimited { .. } => MCPServerFailureCategory::Provider,
+            RociError::Serialization(_)
+            | RociError::InvalidArgument(_)
+            | RociError::InvalidState(_) => MCPServerFailureCategory::Protocol,
+            RociError::ToolExecution { .. } => MCPServerFailureCategory::Unknown,
+        };
+        MCPServerFailure {
+            server_id: server_id.to_owned(),
+            stage,
+            category,
+        }
+    }
+
     fn resolve_collision_name(
         &self,
         base_name: &str,
@@ -423,18 +649,54 @@ impl MCPToolAggregator {
 
     async fn initialize_client(&self, client: &mut dyn MCPClientOps) -> Result<(), RociError> {
         match self.config.init_policy {
-            MCPAggregateInitPolicy::StrictFailFast => client.initialize().await,
+            MCPAggregateInitPolicy::StrictFailFast | MCPAggregateInitPolicy::BestEffort => {
+                client.initialize().await
+            }
         }
     }
 }
 
 #[async_trait]
 impl DynamicToolProvider for MCPToolAggregator {
+    fn server_ids(&self) -> Vec<String> {
+        self.list_server_metadata()
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
     async fn list_tools(&self) -> Result<Vec<DynamicTool>, RociError> {
         let tools = self.list_tools_with_origin().await?;
         Ok(tools
             .into_iter()
-            .map(|tool| DynamicTool::new(tool.exposed_name, tool.description, tool.parameters))
+            .map(|tool| {
+                DynamicTool::new(tool.exposed_name, tool.description, tool.parameters).with_safety(
+                    ToolSafetyPlan::approval_required(ToolSafetyKind::Mcp),
+                    ToolSafetySummary {
+                        approval_kind: ToolSafetyKind::Mcp,
+                        ..ToolSafetySummary::default()
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn list_tools_for_servers(
+        &self,
+        server_ids: &[String],
+    ) -> Result<Vec<DynamicTool>, RociError> {
+        let tools = self.list_tools_with_origin_for_servers(server_ids).await?;
+        Ok(tools
+            .into_iter()
+            .map(|tool| {
+                DynamicTool::new(tool.exposed_name, tool.description, tool.parameters).with_safety(
+                    ToolSafetyPlan::approval_required(ToolSafetyKind::Mcp),
+                    ToolSafetySummary {
+                        approval_kind: ToolSafetyKind::Mcp,
+                        ..ToolSafetySummary::default()
+                    },
+                )
+            })
             .collect())
     }
 
@@ -445,6 +707,18 @@ impl DynamicToolProvider for MCPToolAggregator {
         ctx: &ToolExecutionContext,
     ) -> Result<serde_json::Value, RociError> {
         self.execute_routed_tool(name, args, ctx).await
+    }
+
+    async fn execute_tool_for_servers(
+        &self,
+        server_ids: &[String],
+        name: &str,
+        args: &ToolArguments,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<serde_json::Value, RociError> {
+        self.selected_server_indices(server_ids)?;
+        self.execute_routed_tool_for_servers(server_ids, name, args)
+            .await
     }
 }
 
@@ -462,6 +736,7 @@ mod tests {
         MCPReadResourceResult, MCPResourceContent, MCPResourceSchema, MCPToolCallResult,
     };
     use crate::mcp::schema::MCPToolSchema;
+    use crate::tools::ScopedDynamicToolProvider;
 
     struct MockClientOps {
         initialize_error: Option<String>,
@@ -674,6 +949,200 @@ mod tests {
                 && tool.server_id == "beta"
                 && tool.upstream_tool_name == "search"
         }));
+    }
+
+    #[tokio::test]
+    async fn scoped_list_refreshes_only_selected_server_and_preserves_other_routes() {
+        let (alpha_client, _alpha_calls, alpha_list_calls, _alpha_resource_reads) =
+            MockClientOps::new(
+                vec![Ok(vec![test_tool("search")]), Ok(vec![test_tool("lookup")])],
+                HashMap::new(),
+            );
+        let (beta_client, _beta_calls, beta_list_calls, _beta_resource_reads) =
+            MockClientOps::new(vec![Ok(vec![test_tool("stats")])], HashMap::new());
+        let aggregator = MCPToolAggregator::new(vec![
+            MCPAggregateServer::from_client_ops("alpha", Box::new(alpha_client)),
+            MCPAggregateServer::from_client_ops("beta", Box::new(beta_client)),
+        ])
+        .expect("aggregator should construct");
+
+        aggregator
+            .list_tools_with_origin()
+            .await
+            .expect("initial list should work");
+        let scoped = aggregator
+            .list_tools_for_servers(&["alpha".to_string()])
+            .await
+            .expect("scoped refresh should work");
+
+        assert_eq!(aggregator.server_ids(), vec!["alpha", "beta"]);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].name, "mcp__alpha__lookup");
+        assert_eq!(alpha_list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(beta_list_calls.load(Ordering::SeqCst), 1);
+        assert!(aggregator.route_for("mcp__beta__stats").await.is_some());
+        assert!(aggregator.route_for("mcp__alpha__search").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn best_effort_returns_typed_redacted_failures_and_healthy_tools() {
+        let (mut failed_client, _failed_calls, _failed_list_calls, _failed_resource_reads) =
+            MockClientOps::new(vec![Ok(Vec::new())], HashMap::new());
+        failed_client.initialize_error = Some("internal-failure-marker".into());
+        let (healthy_client, _healthy_calls, _healthy_list_calls, _healthy_resource_reads) =
+            MockClientOps::new(vec![Ok(vec![test_tool("search")])], HashMap::new());
+        let aggregator = MCPToolAggregator::with_config(
+            vec![
+                MCPAggregateServer::from_client_ops("failed", Box::new(failed_client)),
+                MCPAggregateServer::from_client_ops("healthy", Box::new(healthy_client)),
+            ],
+            MCPAggregationConfig {
+                collision_policy: MCPCollisionPolicy::DenyOnCollision,
+                init_policy: MCPAggregateInitPolicy::BestEffort,
+            },
+        )
+        .expect("aggregator should construct");
+
+        let report = aggregator
+            .list_tools_with_report()
+            .await
+            .expect("best-effort listing should succeed");
+
+        assert_eq!(report.tools.len(), 1);
+        assert_eq!(report.tools[0].server_id, "healthy");
+        assert_eq!(
+            report.failures,
+            vec![MCPServerFailure {
+                server_id: "failed".into(),
+                stage: MCPServerFailureStage::Initialize,
+                category: MCPServerFailureCategory::Provider,
+            }]
+        );
+        let debug = format!("{:?}", report.failures);
+        assert!(!debug.contains("internal-failure-marker"));
+    }
+
+    #[tokio::test]
+    async fn best_effort_excludes_stale_tools_from_failed_selected_server() {
+        let (alpha_client, _alpha_calls, _alpha_list_calls, _alpha_resource_reads) =
+            MockClientOps::new(
+                vec![
+                    Ok(vec![test_tool("beta__search")]),
+                    Err("refresh failed".to_string()),
+                ],
+                HashMap::new(),
+            );
+        let (beta_client, _beta_calls, _beta_list_calls, _beta_resource_reads) = MockClientOps::new(
+            vec![Ok(Vec::new()), Ok(vec![test_tool("search")])],
+            HashMap::new(),
+        );
+        let aggregator = MCPToolAggregator::with_config(
+            vec![
+                MCPAggregateServer::from_client_ops("alpha", Box::new(alpha_client)),
+                MCPAggregateServer::from_client_ops("alpha__beta", Box::new(beta_client)),
+            ],
+            MCPAggregationConfig {
+                collision_policy: MCPCollisionPolicy::DenyOnCollision,
+                init_policy: MCPAggregateInitPolicy::BestEffort,
+            },
+        )
+        .expect("aggregator should construct");
+
+        aggregator
+            .list_tools_with_report()
+            .await
+            .expect("initial discovery should cache alpha");
+        let report = aggregator
+            .list_tools_with_report()
+            .await
+            .expect("failed alpha refresh must not collide with healthy beta");
+
+        assert_eq!(report.tools.len(), 1);
+        assert_eq!(report.tools[0].server_id, "alpha__beta");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].server_id, "alpha");
+    }
+
+    #[tokio::test]
+    async fn scoped_provider_rejects_execution_routed_to_hidden_server() {
+        let (alpha_client, _alpha_calls, _alpha_list_calls, _alpha_resource_reads) =
+            MockClientOps::new(vec![Ok(vec![test_tool("search")])], HashMap::new());
+        let (beta_client, _beta_calls, _beta_list_calls, _beta_resource_reads) = MockClientOps::new(
+            vec![Ok(vec![test_tool("stats")])],
+            HashMap::from([(String::from("stats"), json!({"server": "beta"}))]),
+        );
+        let aggregator = Arc::new(
+            MCPToolAggregator::new(vec![
+                MCPAggregateServer::from_client_ops("alpha", Box::new(alpha_client)),
+                MCPAggregateServer::from_client_ops("beta", Box::new(beta_client)),
+            ])
+            .expect("aggregator should construct"),
+        );
+        aggregator
+            .list_tools_with_origin()
+            .await
+            .expect("discovery should succeed");
+        let scoped = ScopedDynamicToolProvider::new(aggregator, vec!["alpha".to_string()]);
+
+        let error = scoped
+            .execute_tool(
+                "mcp__beta__stats",
+                &ToolArguments::new(json!({})),
+                &ToolExecutionContext::default(),
+            )
+            .await
+            .expect_err("hidden server route must be rejected at execution");
+
+        assert!(error
+            .to_string()
+            .contains("outside the selected server scope"));
+    }
+
+    #[tokio::test]
+    async fn scoped_refresh_preserves_unselected_collision_route() {
+        let (alpha_client, _alpha_calls, _alpha_list_calls, _alpha_resource_reads) =
+            MockClientOps::new(
+                vec![Ok(vec![test_tool("beta__search")]), Ok(Vec::new())],
+                HashMap::new(),
+            );
+        let (beta_client, _beta_calls, _beta_list_calls, _beta_resource_reads) =
+            MockClientOps::new(vec![Ok(vec![test_tool("search")])], HashMap::new());
+        let aggregator = MCPToolAggregator::with_config(
+            vec![
+                MCPAggregateServer::from_client_ops("alpha", Box::new(alpha_client)),
+                MCPAggregateServer::from_client_ops("alpha__beta", Box::new(beta_client)),
+            ],
+            MCPAggregationConfig {
+                collision_policy: MCPCollisionPolicy::SuffixOnCollision { hash_len: 8 },
+                init_policy: MCPAggregateInitPolicy::StrictFailFast,
+            },
+        )
+        .expect("aggregator should construct");
+        let initial = aggregator
+            .list_tools_with_origin()
+            .await
+            .expect("initial discovery should succeed");
+        let beta_name = initial
+            .iter()
+            .find(|tool| tool.server_id == "alpha__beta")
+            .expect("beta tool")
+            .exposed_name
+            .clone();
+
+        aggregator
+            .list_tools_with_origin_for_servers(&["alpha".to_string()])
+            .await
+            .expect("scoped refresh should succeed");
+
+        let route = aggregator
+            .route_for(&beta_name)
+            .await
+            .expect("unselected route must remain stable");
+        assert_eq!(route.server_id, "alpha__beta");
+        assert!(aggregator
+            .route_for("mcp__alpha__beta__search")
+            .await
+            .is_none());
     }
 
     #[tokio::test]

@@ -64,3 +64,11 @@ let _search = aggregator
 - Defaults are bounded: immediate first reconnect attempt, exponential backoff with jitter for later attempts, and `MCPClient::last_reconnect_outcome()` records the last reconnect result as `Recovered`, `NeedsAuth`, or `Failed`.
 - `last_reconnect_outcome()` updates only when reconnect logic runs; it is not cleared on every normal request.
 - `idle_timeout_ms` and `periodic_reconnect_ms` are request-bound reconnect checks, not hidden background loops.
+
+## Host discovery and stdio configuration
+
+- `DynamicToolProvider::server_ids` and `list_tools_for_servers` let hosts project only selected MCP servers. Wrap a provider in `ScopedDynamicToolProvider` when one agent/profile must see a fixed server subset.
+- `MCPToolAggregator` keeps tool routes per server. A scoped refresh replaces selected-server routes while preserving cached routes for unselected servers.
+- Aggregate discovery defaults to `StrictFailFast`. `BestEffort` returns healthy tools plus typed `MCPServerFailure` entries; failure values omit source error messages to avoid leaking credentials or command output.
+- MCP-discovered tools use approval-required `ToolSafetyKind::Mcp` metadata unless a future trusted classifier supplies narrower safety facts.
+- `StdioTransportConfig` carries command, args, env, and cwd. Its `Debug` output redacts args and env values while retaining env keys.

@@ -13,7 +13,9 @@ pub use catalog::{
     catalog_from_groups, count_by_origin, ToolCatalog, ToolDescriptor, ToolOrigin,
     ToolVisibilityPolicy,
 };
-pub use dynamic::{DynamicTool, DynamicToolAdapter, DynamicToolProvider};
+pub use dynamic::{
+    DynamicTool, DynamicToolAdapter, DynamicToolProvider, ScopedDynamicToolProvider,
+};
 #[cfg(feature = "agent")]
 pub use tool::ToolUpdateCallback;
 pub use tool::{

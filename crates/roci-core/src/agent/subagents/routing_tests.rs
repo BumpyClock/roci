@@ -8,8 +8,8 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::agent::runtime::AgentConfig;
 use crate::agent::subagents::types::{
     DelegateSubagentRequest, DelegateSubagentResult, SendSubagentMessageResult, SubagentCaller,
-    SubagentCancelResult, SubagentId, SubagentKnownChild, SubagentProfile, SubagentStatus,
-    SubagentSupervisorConfig,
+    SubagentCancelResult, SubagentEvent, SubagentId, SubagentKnownChild, SubagentProfile,
+    SubagentStatus, SubagentSupervisorConfig,
 };
 use crate::agent::subagents::{
     ModelCandidate, SubagentProfileRegistry, SubagentRoutingController, SubagentRoutingTools,
@@ -23,6 +23,8 @@ use crate::provider::{
 };
 use crate::tools::{Tool, ToolArguments, ToolExecutionContext, ToolSafetyPlan};
 use crate::types::{StreamEventType, TextStreamDelta, Usage};
+
+use super::{emit_ordered_subagent_event, CriticalSubagentEventSink};
 
 fn test_model() -> LanguageModel {
     LanguageModel::Known {
@@ -85,6 +87,24 @@ fn controller(response_text: &str, completes: bool) -> SubagentRoutingController
         test_base_config(),
         SubagentSupervisorConfig::default(),
         profile_registry(Some("test:alpha")),
+        None,
+    )
+}
+
+fn controller_with_critical_events(
+    response_text: &str,
+    completes: bool,
+) -> (
+    SubagentRoutingController,
+    tokio::sync::mpsc::UnboundedReceiver<SubagentEvent>,
+) {
+    SubagentRoutingController::new_with_critical_events(
+        provider_registry(response_text, completes),
+        RociConfig::default(),
+        test_base_config(),
+        SubagentSupervisorConfig::default(),
+        profile_registry(Some("test:alpha")),
+        None,
     )
 }
 
@@ -245,6 +265,139 @@ async fn subagent_routing_delegate_without_profile_uses_default_profile() {
 }
 
 #[tokio::test]
+async fn subagent_routing_emits_one_metadata_ready_spawned_to_critical_and_observer_paths() {
+    let (controller, mut critical_events) = controller_with_critical_events("done", true);
+    let mut observer_events = controller.subscribe();
+
+    let result = controller
+        .delegate(delegate_request(None, false), &main_caller())
+        .await
+        .expect("delegate should complete");
+
+    let critical = std::iter::from_fn(|| critical_events.try_recv().ok()).collect::<Vec<_>>();
+    let observer = std::iter::from_fn(|| observer_events.try_recv().ok()).collect::<Vec<_>>();
+    for events in [&critical, &observer] {
+        assert!(matches!(
+            events.first(),
+            Some(SubagentEvent::Spawned { .. })
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SubagentEvent::Spawned { subagent_id, .. } if *subagent_id == result.subagent_id))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        critical
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>(),
+        observer
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>()
+    );
+
+    let metadata = controller
+        .metadata(result.subagent_id)
+        .await
+        .expect("spawned event should follow metadata insertion");
+    assert_eq!(metadata.profile_id, "test:alpha");
+    assert!(metadata.child_thread_id.is_some());
+}
+
+#[test]
+fn ordered_fanout_keeps_critical_and_observer_order_under_concurrent_emitters() {
+    use std::sync::{mpsc as std_mpsc, Mutex as StdMutex, TryLockError};
+
+    let (event_tx, mut observer_rx) = tokio::sync::broadcast::channel(8);
+    let event_order = Arc::new(StdMutex::new(()));
+    let critical_ids = Arc::new(StdMutex::new(Vec::new()));
+    let (first_entered_tx, first_entered_rx) = std_mpsc::channel();
+    let (release_first_tx, release_first_rx) = std_mpsc::channel();
+    let release_first_rx = Arc::new(StdMutex::new(release_first_rx));
+    let first_id = SubagentId::new_v4();
+    let second_id = SubagentId::new_v4();
+    let event_id = |event: &SubagentEvent| match event {
+        SubagentEvent::Spawned { subagent_id, .. }
+        | SubagentEvent::StatusChanged { subagent_id, .. }
+        | SubagentEvent::AgentEvent { subagent_id, .. }
+        | SubagentEvent::Completed { subagent_id, .. }
+        | SubagentEvent::Failed { subagent_id, .. }
+        | SubagentEvent::Aborted { subagent_id } => *subagent_id,
+    };
+    let sink: CriticalSubagentEventSink = {
+        let critical_ids = critical_ids.clone();
+        let release_first_rx = release_first_rx.clone();
+        Arc::new(move |event| {
+            let id = event_id(&event);
+            critical_ids.lock().unwrap().push(id);
+            if id == first_id {
+                first_entered_tx.send(()).unwrap();
+                release_first_rx.lock().unwrap().recv().unwrap();
+            }
+        })
+    };
+
+    let first = {
+        let event_order = event_order.clone();
+        let event_tx = event_tx.clone();
+        let sink = sink.clone();
+        std::thread::spawn(move || {
+            emit_ordered_subagent_event(
+                &event_order,
+                &event_tx,
+                Some(&sink),
+                SubagentEvent::Aborted {
+                    subagent_id: first_id,
+                },
+            );
+        })
+    };
+    first_entered_rx.recv().unwrap();
+
+    let (second_attempted_tx, second_attempted_rx) = std_mpsc::channel();
+    let second = {
+        let event_order = event_order.clone();
+        let event_tx = event_tx.clone();
+        let sink = sink.clone();
+        std::thread::spawn(move || {
+            second_attempted_tx.send(()).unwrap();
+            emit_ordered_subagent_event(
+                &event_order,
+                &event_tx,
+                Some(&sink),
+                SubagentEvent::Aborted {
+                    subagent_id: second_id,
+                },
+            );
+        })
+    };
+    second_attempted_rx.recv().unwrap();
+    assert!(matches!(
+        event_order.try_lock(),
+        Err(TryLockError::WouldBlock)
+    ));
+    assert!(matches!(
+        observer_rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    release_first_tx.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+
+    let critical = critical_ids.lock().unwrap().clone();
+    let observer = std::iter::from_fn(|| observer_rx.try_recv().ok())
+        .map(|event| event_id(&event))
+        .collect::<Vec<_>>();
+    assert_eq!(critical, vec![first_id, second_id]);
+    assert_eq!(observer, critical);
+}
+
+#[tokio::test]
 async fn subagent_routing_delegate_without_default_profile_returns_clear_error() {
     let controller = SubagentRoutingController::new(
         provider_registry("unused", true),
@@ -252,6 +405,7 @@ async fn subagent_routing_delegate_without_default_profile_returns_clear_error()
         test_base_config(),
         SubagentSupervisorConfig::default(),
         profile_registry(None),
+        None,
     );
 
     let error = controller
@@ -290,6 +444,70 @@ async fn subagent_routing_list_profiles_returns_sorted_profile_summaries() {
         .map(|summary| summary.name)
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["test:alpha", "test:beta"]);
+}
+
+#[tokio::test]
+async fn subagent_routing_select_and_deselect_profile_updates_selected_override() {
+    let controller = controller("default profile summary", true);
+
+    assert!(controller
+        .current_profile(&main_caller())
+        .await
+        .unwrap()
+        .is_none());
+
+    let selected = controller
+        .select_profile("test:beta", &main_caller())
+        .await
+        .unwrap();
+    assert_eq!(selected.name, "test:beta");
+    assert_eq!(
+        controller
+            .current_profile(&main_caller())
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "test:beta"
+    );
+
+    controller.deselect_profile(&main_caller()).await.unwrap();
+    assert!(controller
+        .current_profile(&main_caller())
+        .await
+        .unwrap()
+        .is_none());
+
+    let delegated = controller
+        .delegate(delegate_request(None, false), &main_caller())
+        .await
+        .unwrap();
+    assert_eq!(delegated.profile_id, "test:alpha");
+}
+
+#[tokio::test]
+async fn subagent_routing_select_unknown_profile_preserves_current_selection() {
+    let controller = controller("unused", true);
+    controller
+        .select_profile("test:alpha", &main_caller())
+        .await
+        .unwrap();
+
+    let error = controller
+        .select_profile("test:missing", &main_caller())
+        .await
+        .unwrap_err();
+
+    assert_config_error_contains(error, "unknown subagent profile 'test:missing'");
+    assert_eq!(
+        controller
+            .current_profile(&main_caller())
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "test:alpha"
+    );
 }
 
 #[tokio::test]
@@ -462,6 +680,27 @@ async fn subagent_routing_management_methods_reject_child_callers() {
     );
     assert_config_error_contains(
         controller
+            .current_profile(&caller)
+            .await
+            .expect_err("child current profile should fail"),
+        "only available to the main agent",
+    );
+    assert_config_error_contains(
+        controller
+            .select_profile("test:alpha", &caller)
+            .await
+            .expect_err("child select profile should fail"),
+        "only available to the main agent",
+    );
+    assert_config_error_contains(
+        controller
+            .deselect_profile(&caller)
+            .await
+            .expect_err("child deselect profile should fail"),
+        "only available to the main agent",
+    );
+    assert_config_error_contains(
+        controller
             .delegate(delegate_request(None, false), &caller)
             .await
             .expect_err("child delegate should fail"),
@@ -560,6 +799,10 @@ async fn subagent_routing_tools_delegate_subagent_tool_executes_foreground_and_r
     assert_eq!(
         tool.parameters().schema["required"],
         serde_json::Value::Array(vec![serde_json::Value::String("task".into())])
+    );
+    assert_eq!(
+        tool.parameters().schema["properties"]["profile"]["enum"],
+        json!(["test:alpha", "test:beta"])
     );
 
     let value = execute_tool(

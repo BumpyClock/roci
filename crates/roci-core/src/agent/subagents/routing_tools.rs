@@ -51,6 +51,25 @@ impl SubagentRoutingTools {
     }
 
     fn delegate_subagent_tool(&self) -> Arc<dyn Tool> {
+        let profile_names = self
+            .controller
+            .list_profiles(&SubagentCaller::main_agent())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>();
+        let profile_schema = if profile_names.is_empty() {
+            json!({
+                "type": "string",
+                "description": "Optional sub-agent profile; omit to use the configured default"
+            })
+        } else {
+            json!({
+                "type": "string",
+                "description": "Optional sub-agent profile; omit to use the configured default",
+                "enum": profile_names
+            })
+        };
         let controller = self.controller.clone();
         Arc::new(
             AgentTool::new(
@@ -59,7 +78,7 @@ impl SubagentRoutingTools {
                 AgentToolParameters::from_schema(json!({
                     "type": "object",
                     "properties": {
-                        "profile": { "type": "string" },
+                        "profile": profile_schema,
                         "task": { "type": "string" },
                         "label": { "type": "string" },
                         "run_in_background": { "type": "boolean" }

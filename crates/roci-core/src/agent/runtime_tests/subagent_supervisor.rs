@@ -75,6 +75,7 @@ fn make_base_config() -> AgentConfig {
         approval_handler: None,
         session_id: None,
         session: None,
+        workspace_root: None,
         sandbox_provider: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,

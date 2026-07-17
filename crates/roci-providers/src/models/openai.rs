@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
-use roci_core::models::{ModelCapabilities, ModelInputCapabilities};
+use roci_core::models::{ModelCapabilities, ModelInputCapabilities, ReasoningEffortCapabilities};
 use roci_core::types::ReasoningEffort;
 
 /// OpenAI models.
@@ -43,6 +43,18 @@ pub enum OpenAiModel {
     Gpt51,
     #[strum(serialize = "gpt-5.2")]
     Gpt52,
+    #[strum(serialize = "gpt-5.4")]
+    Gpt54,
+    #[strum(serialize = "gpt-5.4-mini")]
+    Gpt54Mini,
+    #[strum(serialize = "gpt-5.5")]
+    Gpt55,
+    #[strum(serialize = "gpt-5.6-sol")]
+    Gpt56Sol,
+    #[strum(serialize = "gpt-5.6-terra")]
+    Gpt56Terra,
+    #[strum(serialize = "gpt-5.6-luna")]
+    Gpt56Luna,
     #[strum(serialize = "gpt-5-pro")]
     Gpt5Pro,
     #[strum(serialize = "gpt-5-mini")]
@@ -85,6 +97,12 @@ impl OpenAiModel {
             Self::Gpt5 => "gpt-5",
             Self::Gpt51 => "gpt-5.1",
             Self::Gpt52 => "gpt-5.2",
+            Self::Gpt54 => "gpt-5.4",
+            Self::Gpt54Mini => "gpt-5.4-mini",
+            Self::Gpt55 => "gpt-5.5",
+            Self::Gpt56Sol => "gpt-5.6-sol",
+            Self::Gpt56Terra => "gpt-5.6-terra",
+            Self::Gpt56Luna => "gpt-5.6-luna",
             Self::Gpt5Pro => "gpt-5-pro",
             Self::Gpt5Mini => "gpt-5-mini",
             Self::Gpt5Nano => "gpt-5-nano",
@@ -106,6 +124,12 @@ impl OpenAiModel {
             | Self::Gpt5
             | Self::Gpt51
             | Self::Gpt52
+            | Self::Gpt54
+            | Self::Gpt54Mini
+            | Self::Gpt55
+            | Self::Gpt56Sol
+            | Self::Gpt56Terra
+            | Self::Gpt56Luna
             | Self::Gpt5Pro
             | Self::Gpt5Mini
             | Self::Gpt5Nano
@@ -135,9 +159,17 @@ impl OpenAiModel {
     /// Whether the model accepts sampling parameters in the Responses API.
     pub fn supports_sampling_params(&self, reasoning_effort: Option<ReasoningEffort>) -> bool {
         match self {
-            Self::Gpt52 => matches!(reasoning_effort, Some(ReasoningEffort::None)),
+            Self::Gpt51
+            | Self::Gpt52
+            | Self::Gpt54
+            | Self::Gpt54Mini
+            | Self::Gpt55
+            | Self::Gpt56Sol
+            | Self::Gpt56Terra
+            | Self::Gpt56Luna => {
+                matches!(reasoning_effort, Some(ReasoningEffort::None))
+            }
             Self::Gpt5
-            | Self::Gpt51
             | Self::Gpt5Pro
             | Self::Gpt5Mini
             | Self::Gpt5Nano
@@ -156,13 +188,18 @@ impl OpenAiModel {
             Self::Gpt5
                 | Self::Gpt51
                 | Self::Gpt52
+                | Self::Gpt54
+                | Self::Gpt54Mini
+                | Self::Gpt55
+                | Self::Gpt56Sol
+                | Self::Gpt56Terra
+                | Self::Gpt56Luna
                 | Self::Gpt5Pro
                 | Self::Gpt5Mini
                 | Self::Gpt5Nano
                 | Self::Gpt5Thinking
                 | Self::Gpt5ThinkingMini
                 | Self::Gpt5ThinkingNano
-                | Self::Gpt5ChatLatest
         )
     }
 
@@ -173,13 +210,18 @@ impl OpenAiModel {
             Self::Gpt5
                 | Self::Gpt51
                 | Self::Gpt52
+                | Self::Gpt54
+                | Self::Gpt54Mini
+                | Self::Gpt55
+                | Self::Gpt56Sol
+                | Self::Gpt56Terra
+                | Self::Gpt56Luna
                 | Self::Gpt5Pro
                 | Self::Gpt5Mini
                 | Self::Gpt5Nano
                 | Self::Gpt5Thinking
                 | Self::Gpt5ThinkingMini
                 | Self::Gpt5ThinkingNano
-                | Self::Gpt5ChatLatest
         )
     }
 
@@ -192,6 +234,14 @@ impl OpenAiModel {
     }
 
     pub fn capabilities(&self) -> ModelCapabilities {
+        self.capabilities_for(false)
+    }
+
+    pub(crate) fn codex_capabilities(&self) -> ModelCapabilities {
+        self.capabilities_for(true)
+    }
+
+    fn capabilities_for(&self, codex: bool) -> ModelCapabilities {
         let (ctx, vision, tools, reasoning, json_schema) = match self {
             Self::Gpt4o | Self::Gpt4oMini => (128_000, true, true, false, true),
             Self::Gpt4Turbo => (128_000, true, true, false, true),
@@ -201,6 +251,27 @@ impl OpenAiModel {
             Self::O1Mini => (128_000, false, false, true, false),
             Self::O3 | Self::O3Mini | Self::O4Mini => (200_000, true, true, true, true),
             Self::Gpt41 | Self::Gpt41Mini | Self::Gpt41Nano => (1_000_000, true, true, false, true),
+            Self::Gpt54 | Self::Gpt54Mini | Self::Gpt55 => (
+                if codex {
+                    272_000
+                } else if matches!(self, Self::Gpt54 | Self::Gpt55) {
+                    1_050_000
+                } else {
+                    400_000
+                },
+                true,
+                true,
+                true,
+                true,
+            ),
+            Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna => (
+                if codex { 372_000 } else { 1_050_000 },
+                true,
+                true,
+                true,
+                true,
+            ),
+            Self::Gpt5ChatLatest => (128_000, true, true, false, true),
             Self::Gpt5
             | Self::Gpt51
             | Self::Gpt52
@@ -209,8 +280,7 @@ impl OpenAiModel {
             | Self::Gpt5Nano
             | Self::Gpt5Thinking
             | Self::Gpt5ThinkingMini
-            | Self::Gpt5ThinkingNano
-            | Self::Gpt5ChatLatest => (400_000, true, true, true, true),
+            | Self::Gpt5ThinkingNano => (400_000, true, true, true, true),
             Self::Gpt4oRealtimePreview => (128_000, true, true, false, true),
             Self::Custom(_) => (128_000, false, true, false, true),
         };
@@ -221,33 +291,190 @@ impl OpenAiModel {
             supports_json_mode: true,
             supports_json_schema: json_schema,
             supports_reasoning: reasoning,
+            reasoning_effort: self.reasoning_effort_capabilities(codex),
             supports_system_messages: !self.is_reasoning()
                 || matches!(self, Self::O3 | Self::O3Mini | Self::O4Mini),
             context_length: ctx,
-            max_output_tokens: Some(match self {
-                Self::O1 | Self::O1Mini | Self::O1Pro | Self::O3 | Self::O3Mini | Self::O4Mini => {
-                    100_000
-                }
-                Self::Gpt5
-                | Self::Gpt51
-                | Self::Gpt52
-                | Self::Gpt5Pro
-                | Self::Gpt5Mini
-                | Self::Gpt5Nano
-                | Self::Gpt5Thinking
-                | Self::Gpt5ThinkingMini
-                | Self::Gpt5ThinkingNano
-                | Self::Gpt5ChatLatest => 128_000,
-                _ => 16_384,
-            }),
+            max_output_tokens: if codex
+                && matches!(
+                    self,
+                    Self::Gpt54
+                        | Self::Gpt54Mini
+                        | Self::Gpt55
+                        | Self::Gpt56Sol
+                        | Self::Gpt56Terra
+                        | Self::Gpt56Luna
+                ) {
+                None
+            } else {
+                Some(match self {
+                    Self::O1
+                    | Self::O1Mini
+                    | Self::O1Pro
+                    | Self::O3
+                    | Self::O3Mini
+                    | Self::O4Mini => 100_000,
+                    Self::Gpt5
+                    | Self::Gpt51
+                    | Self::Gpt52
+                    | Self::Gpt54
+                    | Self::Gpt54Mini
+                    | Self::Gpt55
+                    | Self::Gpt56Sol
+                    | Self::Gpt56Terra
+                    | Self::Gpt56Luna
+                    | Self::Gpt5Pro
+                    | Self::Gpt5Mini
+                    | Self::Gpt5Nano
+                    | Self::Gpt5Thinking
+                    | Self::Gpt5ThinkingMini
+                    | Self::Gpt5ThinkingNano => 128_000,
+                    Self::Gpt5ChatLatest => 16_384,
+                    _ => 16_384,
+                })
+            },
             input: ModelInputCapabilities::from_vision_support(vision),
         }
     }
+
+    fn reasoning_effort_capabilities(&self, codex: bool) -> ReasoningEffortCapabilities {
+        match self {
+            Self::Gpt5Pro => {
+                reasoning_efforts(&[ReasoningEffort::High], Some(ReasoningEffort::High))
+            }
+            Self::Gpt51 => reasoning_efforts(
+                &[
+                    ReasoningEffort::None,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ],
+                Some(ReasoningEffort::None),
+            ),
+            Self::Gpt52 => reasoning_efforts(
+                &[
+                    ReasoningEffort::None,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                ],
+                Some(ReasoningEffort::None),
+            ),
+            Self::Gpt54 | Self::Gpt54Mini if codex => reasoning_efforts(
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                ],
+                Some(ReasoningEffort::Medium),
+            ),
+            Self::Gpt54 | Self::Gpt54Mini => reasoning_efforts(
+                &[
+                    ReasoningEffort::None,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                ],
+                Some(ReasoningEffort::None),
+            ),
+            Self::Gpt55 if codex => reasoning_efforts(
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                ],
+                Some(ReasoningEffort::Medium),
+            ),
+            Self::Gpt55 => reasoning_efforts(
+                &[
+                    ReasoningEffort::None,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                ],
+                Some(ReasoningEffort::Medium),
+            ),
+            Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna if !codex => reasoning_efforts(
+                &[
+                    ReasoningEffort::None,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                    ReasoningEffort::Max,
+                ],
+                None,
+            ),
+            Self::Gpt56Sol | Self::Gpt56Terra => reasoning_efforts(
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                    ReasoningEffort::Max,
+                    ReasoningEffort::Ultra,
+                ],
+                Some(if matches!(self, Self::Gpt56Sol) {
+                    ReasoningEffort::Low
+                } else {
+                    ReasoningEffort::Medium
+                }),
+            ),
+            Self::Gpt56Luna => reasoning_efforts(
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                    ReasoningEffort::Max,
+                ],
+                Some(ReasoningEffort::Medium),
+            ),
+            Self::Gpt5
+            | Self::Gpt5Mini
+            | Self::Gpt5Nano
+            | Self::Gpt5Thinking
+            | Self::Gpt5ThinkingMini
+            | Self::Gpt5ThinkingNano => reasoning_efforts(
+                &[
+                    ReasoningEffort::Minimal,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ],
+                Some(ReasoningEffort::Medium),
+            ),
+            Self::O1Pro => reasoning_efforts(&[ReasoningEffort::High], Some(ReasoningEffort::High)),
+            Self::O1 | Self::O1Mini | Self::O3 | Self::O3Mini | Self::O4Mini => reasoning_efforts(
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ],
+                Some(ReasoningEffort::Medium),
+            ),
+            _ => ReasoningEffortCapabilities::default(),
+        }
+    }
+}
+
+fn reasoning_efforts(
+    supported: &[ReasoningEffort],
+    default: Option<ReasoningEffort>,
+) -> ReasoningEffortCapabilities {
+    ReasoningEffortCapabilities::new(supported.iter().copied(), default)
+        .expect("static model reasoning effort metadata is valid")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roci_core::types::ReasoningEffort;
 
     #[test]
     fn gpt4o_has_vision_input_capabilities() {
@@ -274,5 +501,76 @@ mod tests {
         assert!(!caps.supports_vision);
         assert!(caps.input.image.is_none());
         assert_eq!(caps.supports_vision, caps.input.image.is_some());
+    }
+
+    #[test]
+    fn reasoning_models_expose_model_specific_effort_options() {
+        let gpt5 = OpenAiModel::Gpt5.capabilities();
+        let gpt51 = OpenAiModel::Gpt51.capabilities();
+        let gpt52 = OpenAiModel::Gpt52.capabilities();
+        let gpt5_pro = OpenAiModel::Gpt5Pro.capabilities();
+        let o1_pro = OpenAiModel::O1Pro.capabilities();
+        let gpt56_sol = OpenAiModel::Gpt56Sol.capabilities();
+        let codex_gpt56_sol = OpenAiModel::Gpt56Sol.codex_capabilities();
+
+        assert!(gpt5.supports_reasoning_effort(ReasoningEffort::Minimal));
+        assert_eq!(
+            gpt5.default_reasoning_effort(),
+            Some(ReasoningEffort::Medium)
+        );
+        assert!(gpt51.supports_reasoning_effort(ReasoningEffort::None));
+        assert_eq!(
+            gpt51.default_reasoning_effort(),
+            Some(ReasoningEffort::None)
+        );
+        assert_eq!(
+            gpt52.default_reasoning_effort(),
+            Some(ReasoningEffort::None)
+        );
+        assert_eq!(
+            gpt5_pro.reasoning_effort_options(),
+            &[ReasoningEffort::High]
+        );
+        assert_eq!(o1_pro.reasoning_effort_options(), &[ReasoningEffort::High]);
+        assert_eq!(
+            o1_pro.default_reasoning_effort(),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(gpt56_sol.context_length, 1_050_000);
+        assert_eq!(gpt56_sol.default_reasoning_effort(), None);
+        assert!(gpt56_sol.supports_reasoning_effort(ReasoningEffort::None));
+        assert!(!gpt56_sol.supports_reasoning_effort(ReasoningEffort::Ultra));
+        assert_eq!(codex_gpt56_sol.context_length, 372_000);
+        assert_eq!(
+            codex_gpt56_sol.default_reasoning_effort(),
+            Some(ReasoningEffort::Low)
+        );
+        assert!(codex_gpt56_sol.supports_reasoning_effort(ReasoningEffort::Ultra));
+    }
+
+    #[test]
+    fn same_id_models_use_provider_specific_reasoning_defaults() {
+        let public = OpenAiModel::Gpt54.capabilities();
+        let codex = OpenAiModel::Gpt54.codex_capabilities();
+        let codex_gpt55 = OpenAiModel::Gpt55.codex_capabilities();
+        let gpt5_chat = OpenAiModel::Gpt5ChatLatest.capabilities();
+
+        assert_eq!(public.context_length, 1_050_000);
+        assert_eq!(
+            public.default_reasoning_effort(),
+            Some(ReasoningEffort::None)
+        );
+        assert!(public.supports_reasoning_effort(ReasoningEffort::None));
+        assert_eq!(codex.context_length, 272_000);
+        assert_eq!(
+            codex.default_reasoning_effort(),
+            Some(ReasoningEffort::Medium)
+        );
+        assert!(!codex.supports_reasoning_effort(ReasoningEffort::None));
+        assert!(!codex_gpt55.supports_reasoning_effort(ReasoningEffort::None));
+        assert!(!gpt5_chat.supports_reasoning);
+        assert!(gpt5_chat.reasoning_effort_options().is_empty());
+        assert_eq!(gpt5_chat.context_length, 128_000);
+        assert_eq!(gpt5_chat.max_output_tokens, Some(16_384));
     }
 }

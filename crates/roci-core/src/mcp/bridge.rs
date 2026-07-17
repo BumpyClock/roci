@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use crate::error::RociError;
 use crate::tools::arguments::ToolArguments;
 use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
-use crate::tools::tool::ToolExecutionContext;
+use crate::tools::tool::{ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary};
 use crate::tools::types::AgentToolParameters;
 
 use super::client::MCPClient;
@@ -60,6 +60,13 @@ fn map_mcp_tool_to_dynamic(tool: MCPToolSchema) -> DynamicTool {
         tool.name,
         tool.description.unwrap_or_default(),
         AgentToolParameters::from_schema(tool.input_schema),
+    )
+    .with_safety(
+        ToolSafetyPlan::approval_required(ToolSafetyKind::Mcp),
+        ToolSafetySummary {
+            approval_kind: ToolSafetyKind::Mcp,
+            ..ToolSafetySummary::default()
+        },
     )
 }
 
@@ -166,10 +173,18 @@ mod tests {
         assert_eq!(dynamic.name, "search");
         assert_eq!(dynamic.description, "query index");
         assert_eq!(dynamic.parameters.schema["type"], "object");
-        assert_eq!(dynamic.safety, crate::tools::ToolSafetyPlan::default());
         assert_eq!(
-            dynamic.safety_summary,
-            crate::tools::ToolSafetySummary::default()
+            dynamic.safety,
+            crate::tools::ToolSafetyPlan::approval_required(crate::tools::ToolSafetyKind::Mcp)
+        );
+        assert_eq!(
+            dynamic.safety.approval.kind,
+            crate::tools::ToolSafetyKind::Mcp
+        );
+        assert!(!dynamic.safety.approval.auto_accept_under_ask);
+        assert_eq!(
+            dynamic.safety_summary.approval_kind,
+            crate::tools::ToolSafetyKind::Mcp
         );
     }
 

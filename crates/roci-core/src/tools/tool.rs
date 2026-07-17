@@ -1,6 +1,7 @@
 //! Tool trait and closure-based tool wrapper.
 
 use std::future::Future;
+use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,6 +22,16 @@ pub trait SandboxProvider: Send + Sync {
         command: &str,
         cwd: &LogicalPath,
     ) -> Result<(), RociError>;
+
+    /// Validate a command that will run from a trusted host workspace.
+    async fn validate_workspace_shell_command(
+        &self,
+        command: &str,
+        _workspace_root: &Path,
+    ) -> Result<(), RociError> {
+        self.validate_shell_command(command, &LogicalPath::root())
+            .await
+    }
 }
 
 /// Context available during tool execution.
@@ -36,6 +47,10 @@ pub struct ToolExecutionContext {
     pub session_fs: Option<Arc<dyn SessionFs + Send + Sync>>,
     /// Logical current working directory inside the session filesystem.
     pub session_cwd: Option<LogicalPath>,
+    /// Canonical trusted host workspace for coding tools.
+    ///
+    /// This root does not make command execution a filesystem sandbox.
+    pub workspace_root: Option<PathBuf>,
     /// Optional sandbox validator for command-capable tools.
     pub sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     /// Callback to request user input. None if not configured.
@@ -51,6 +66,7 @@ impl Default for ToolExecutionContext {
             tool_name: None,
             session_fs: None,
             session_cwd: None,
+            workspace_root: None,
             sandbox_provider: None,
             #[cfg(feature = "agent")]
             request_user_input: None,
@@ -70,6 +86,7 @@ impl std::fmt::Debug for ToolExecutionContext {
                 &self.session_fs.as_ref().map(|_| "<session_fs>"),
             )
             .field("session_cwd", &self.session_cwd)
+            .field("workspace_root", &self.workspace_root)
             .field(
                 "sandbox_provider",
                 &self.sandbox_provider.as_ref().map(|_| "<sandbox_provider>"),
@@ -94,6 +111,7 @@ impl std::fmt::Debug for ToolExecutionContext {
                 &self.session_fs.as_ref().map(|_| "<session_fs>"),
             )
             .field("session_cwd", &self.session_cwd)
+            .field("workspace_root", &self.workspace_root)
             .field(
                 "sandbox_provider",
                 &self.sandbox_provider.as_ref().map(|_| "<sandbox_provider>"),

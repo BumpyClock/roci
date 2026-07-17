@@ -13,8 +13,9 @@ pub mod server;
 pub mod transport;
 
 pub use aggregate::{
-    MCPAggregateInitPolicy, MCPAggregateServer, MCPAggregatedResource, MCPAggregatedTool,
-    MCPAggregationConfig, MCPCollisionPolicy, MCPToolAggregator, MCPToolRoute,
+    MCPAggregateInitPolicy, MCPAggregateServer, MCPAggregateToolList, MCPAggregatedResource,
+    MCPAggregatedTool, MCPAggregationConfig, MCPCollisionPolicy, MCPServerFailure,
+    MCPServerFailureCategory, MCPServerFailureStage, MCPToolAggregator, MCPToolRoute,
 };
 pub use bridge::MCPToolAdapter;
 pub use client::{

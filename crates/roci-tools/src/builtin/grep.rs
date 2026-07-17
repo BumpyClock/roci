@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use roci::error::RociError;
 use roci::prelude::{LogicalPath, SessionFileKind, SessionFs};
+use roci::security::filesystem::PathOperation;
 use roci::tools::arguments::ToolArguments;
 use roci::tools::tool::{
     AgentTool, Tool, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
 };
 use roci::tools::types::AgentToolParameters;
 
-use super::common::{resolve_session_path, truncate_utf8, GREP_OUTPUT_MAX_BYTES};
+use super::common::{
+    resolve_session_path, resolve_workspace_path, truncate_utf8, GREP_OUTPUT_MAX_BYTES,
+};
 
 /// Create the `grep` tool — searches for a pattern in files.
 ///
@@ -30,6 +33,11 @@ pub fn grep_tool() -> Arc<dyn Tool> {
             let pattern = args_val.get_str("pattern")?;
             let path = args_val.get_str_opt("path").unwrap_or(".");
 
+            if let Some(workspace_path) = resolve_workspace_path(&ctx, path, PathOperation::Search)?
+            {
+                return host_grep(pattern, &workspace_path).await;
+            }
+
             if let (Some(session_fs), Some(logical_path)) =
                 (ctx.session_fs.as_ref(), resolve_session_path(&ctx, path)?)
             {
@@ -50,37 +58,42 @@ pub fn grep_tool() -> Arc<dyn Tool> {
                 }));
             }
 
-            let output = tokio::process::Command::new("grep")
-                .args(["-rn", "--", pattern, path])
-                .output()
-                .await
-                .map_err(|e| RociError::ToolExecution {
-                    tool_name: "grep".into(),
-                    message: e.to_string(),
-                })?;
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            let mut result = stdout.into_owned();
-            if !stderr.is_empty() {
-                result.push_str(&stderr);
-            }
-
-            let truncated = result.len() > GREP_OUTPUT_MAX_BYTES;
-            if truncated {
-                result = truncate_utf8(&result, GREP_OUTPUT_MAX_BYTES);
-                result.push_str("\n... (truncated)");
-            }
-
-            Ok(serde_json::json!({
-                "exit_code": output.status.code(),
-                "output": result,
-                "truncated": truncated,
-            }))
+            host_grep(pattern, std::path::Path::new(path)).await
         },
     );
     Arc::new(tool.with_safety(grep_safety_summary(), grep_safety))
+}
+
+async fn host_grep(pattern: &str, path: &std::path::Path) -> Result<serde_json::Value, RociError> {
+    let output = tokio::process::Command::new("grep")
+        .args(["-rn", "--", pattern])
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| RociError::ToolExecution {
+            tool_name: "grep".into(),
+            message: e.to_string(),
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut result = stdout.into_owned();
+    if !stderr.is_empty() {
+        result.push_str(&stderr);
+    }
+
+    let truncated = result.len() > GREP_OUTPUT_MAX_BYTES;
+    if truncated {
+        result = truncate_utf8(&result, GREP_OUTPUT_MAX_BYTES);
+        result.push_str("\n... (truncated)");
+    }
+
+    Ok(serde_json::json!({
+        "exit_code": output.status.code(),
+        "output": result,
+        "truncated": truncated,
+    }))
 }
 
 fn grep_safety(args: &ToolArguments) -> ToolSafetyPlan {

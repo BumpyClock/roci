@@ -807,8 +807,10 @@ mod tests {
         let host_cwd = temp.path().join("host");
         let metadata = SessionMetadata::new(id, Some(host_cwd.clone()), None);
 
+        fs::create_dir(conventions.root()).expect("session dir should be created");
+
         metadata
-            .write_to_path(conventions.metadata_file())
+            .write_new_to_path(conventions.metadata_file())
             .expect("metadata should be written");
         let read = SessionMetadata::read_from_path(conventions.metadata_file())
             .expect("metadata should be read");

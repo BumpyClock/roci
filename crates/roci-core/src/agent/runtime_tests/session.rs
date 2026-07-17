@@ -10,7 +10,7 @@ use super::support::*;
 use super::*;
 use crate::session::{
     CreateSessionOptions, ImportPolicy, LocalProviderLedger, LocalSessionResources,
-    LocalSessionStore, LogicalPath, SessionConfig, SessionId,
+    LocalSessionStore, LogicalPath, SessionCatalogQuery, SessionConfig, SessionId,
 };
 
 static CWD_LOCK: StdMutex<()> = StdMutex::new(());
@@ -90,6 +90,7 @@ async fn local_session_store_create_writes_metadata_once_and_open_preserves_it()
             title: Some("Store test".to_string()),
             host_cwd: Some(PathBuf::from("/tmp/project")),
             import_source: None,
+            model_preferences: Default::default(),
             default_thread_id: None,
         })
         .await
@@ -112,6 +113,60 @@ async fn local_session_store_create_writes_metadata_once_and_open_preserves_it()
             .provider_ledger_file()
             .is_file()
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resume_session_accepts_a_session_root_symlink_alias() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().expect("temporary root should be created");
+    let canonical_root = temp.path().join("canonical-sessions");
+    fs::create_dir(&canonical_root).expect("canonical root should be created");
+    let alias_root = temp.path().join("alias-sessions");
+    symlink(&canonical_root, &alias_root).expect("direct root alias should be created");
+
+    let id = session_id("root-alias");
+    let store = LocalSessionStore::new(&alias_root);
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..CreateSessionOptions::default()
+        })
+        .await
+        .expect("session should create through root alias");
+    assert_eq!(
+        state.session_config.root,
+        fs::canonicalize(&canonical_root).expect("canonical root should resolve")
+    );
+    assert_eq!(
+        store
+            .list(&SessionCatalogQuery::default())
+            .expect("catalog should list through direct root alias")
+            .len(),
+        1
+    );
+
+    let mut config = test_agent_config();
+    config.session = Some(SessionConfig::new(id.clone(), &alias_root));
+    let runtime = AgentRuntime::resume_session(test_registry(), test_config(), config, state)
+        .await
+        .expect("session should resume through root alias");
+    drop(runtime);
+
+    let state = store.open(id).await.expect("session should reopen");
+    let mut config = test_agent_config();
+    let mut aliased_config = SessionConfig::new(state.session_config.id.clone(), &alias_root);
+    aliased_config.cwd = LogicalPath::parse("other").expect("logical cwd should parse");
+    config.session = Some(aliased_config);
+    let err =
+        match AgentRuntime::resume_session(test_registry(), test_config(), config, state).await {
+            Ok(_) => panic!("session cwd mismatch should remain rejected"),
+            Err(err) => err,
+        };
+    assert!(err
+        .to_string()
+        .contains("resume session config does not match"));
 }
 
 #[tokio::test]

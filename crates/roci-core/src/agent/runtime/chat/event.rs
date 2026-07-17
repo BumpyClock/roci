@@ -10,6 +10,9 @@ use crate::agent::subagents::types::{
     DelegateSubagentResult, SubagentId, SubagentProfileRef, SubagentStatus,
 };
 use crate::agent_loop::RetryEvent;
+use crate::human_interaction::{
+    HumanInteractionRequest, HumanInteractionRequestId, HumanInteractionResponse,
+};
 use crate::models::LanguageModel;
 use crate::types::{AgentToolResult, Role};
 
@@ -200,8 +203,16 @@ pub enum AgentRuntimeEventPayload {
     },
     SubagentNeedsInput {
         subagent: SubagentRuntimeSnapshot,
-        question: String,
-        context: Option<String>,
+        request: HumanInteractionRequest,
+    },
+    SubagentInputResolved {
+        subagent: SubagentRuntimeSnapshot,
+        response: HumanInteractionResponse,
+    },
+    SubagentInputCanceled {
+        subagent: SubagentRuntimeSnapshot,
+        request_id: HumanInteractionRequestId,
+        reason: Option<String>,
     },
     SubagentCompleted {
         subagent: SubagentRuntimeSnapshot,
@@ -383,6 +394,16 @@ impl AgentRuntimeEventPayload {
     }
 
     #[must_use]
+    pub const fn subagent_input_resolved_name() -> &'static str {
+        "subagent_input_resolved"
+    }
+
+    #[must_use]
+    pub const fn subagent_input_canceled_name() -> &'static str {
+        "subagent_input_canceled"
+    }
+
+    #[must_use]
     pub const fn subagent_completed_name() -> &'static str {
         "subagent_completed"
     }
@@ -407,6 +428,8 @@ impl AgentRuntimeEventPayload {
                 | Self::SubagentToolCallCompleted { .. }
                 | Self::SubagentMessage { .. }
                 | Self::SubagentNeedsInput { .. }
+                | Self::SubagentInputResolved { .. }
+                | Self::SubagentInputCanceled { .. }
                 | Self::SubagentCompleted { .. }
                 | Self::SubagentFailed { .. }
                 | Self::SubagentCancelled { .. }
@@ -435,8 +458,34 @@ mod tests {
     use crate::agent::subagents::types::{
         DelegateSubagentResult, SubagentArtifact, SubagentId, SubagentStatus,
     };
+    use crate::human_interaction::{HumanInteractionRequest, HumanInteractionResponse};
     use crate::models::LanguageModel;
+    use crate::tools::{AskUserPrompt, UserInputRequest, UserInputResponse, UserInputResult};
     use crate::types::{AgentToolResult, Role};
+
+    fn test_human_interaction_request() -> HumanInteractionRequest {
+        HumanInteractionRequest::from_user_input(UserInputRequest {
+            request_id: uuid::Uuid::new_v4(),
+            tool_call_id: "child-tool-call".to_string(),
+            prompt: AskUserPrompt::Question {
+                id: "architecture-choice".to_string(),
+                question: "Pick one?".to_string(),
+                placeholder: Some("A or B".to_string()),
+                default: Some("A".to_string()),
+                multiline: true,
+            },
+            timeout_ms: Some(12_345),
+        })
+    }
+
+    fn test_human_interaction_response() -> HumanInteractionResponse {
+        HumanInteractionResponse::from_user_input(UserInputResponse {
+            request_id: uuid::Uuid::new_v4(),
+            result: UserInputResult::Question {
+                answer: "B".to_string(),
+            },
+        })
+    }
 
     fn test_model() -> LanguageModel {
         LanguageModel::Known {
@@ -522,8 +571,16 @@ mod tests {
             },
             AgentRuntimeEventPayload::SubagentNeedsInput {
                 subagent: subagent.clone(),
-                question: "Pick one?".to_string(),
-                context: Some("Need design choice".to_string()),
+                request: test_human_interaction_request(),
+            },
+            AgentRuntimeEventPayload::SubagentInputResolved {
+                subagent: subagent.clone(),
+                response: test_human_interaction_response(),
+            },
+            AgentRuntimeEventPayload::SubagentInputCanceled {
+                subagent: subagent.clone(),
+                request_id: uuid::Uuid::new_v4(),
+                reason: Some("timed out".to_string()),
             },
             AgentRuntimeEventPayload::SubagentCompleted {
                 subagent: subagent.clone(),

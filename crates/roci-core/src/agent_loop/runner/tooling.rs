@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::future;
@@ -50,6 +51,7 @@ pub(super) struct ResolvedToolCall {
 pub(super) struct ToolExecutionInputs<'a> {
     session_fs: Option<Arc<dyn SessionFs + Send + Sync>>,
     session_cwd: Option<LogicalPath>,
+    workspace_root: Option<PathBuf>,
     sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     #[cfg(feature = "agent")]
     user_input_callback: Option<&'a crate::tools::user_input::RequestUserInputFn>,
@@ -59,6 +61,7 @@ impl<'a> ToolExecutionInputs<'a> {
     pub(super) fn new(
         session_fs: Option<Arc<dyn SessionFs + Send + Sync>>,
         session_cwd: Option<LogicalPath>,
+        workspace_root: Option<PathBuf>,
         sandbox_provider: Option<Arc<dyn SandboxProvider>>,
         #[cfg(feature = "agent")] user_input_callback: Option<
             &'a crate::tools::user_input::RequestUserInputFn,
@@ -67,6 +70,7 @@ impl<'a> ToolExecutionInputs<'a> {
         Self {
             session_fs,
             session_cwd,
+            workspace_root,
             sandbox_provider,
             #[cfg(feature = "agent")]
             user_input_callback,
@@ -370,6 +374,7 @@ pub(super) async fn execute_tool_call(
                 tool_name: Some(call.name.clone()),
                 session_fs: inputs.session_fs,
                 session_cwd: inputs.session_cwd,
+                workspace_root: inputs.workspace_root,
                 sandbox_provider: inputs.sandbox_provider,
                 #[cfg(feature = "agent")]
                 request_user_input: inputs.user_input_callback.cloned(),

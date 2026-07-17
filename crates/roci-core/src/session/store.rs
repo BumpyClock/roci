@@ -10,6 +10,10 @@ use crate::agent::runtime::chat::{
 };
 
 use super::{
+    locks::{
+        create_session_directory, ensure_store_root, validate_session_directory, SessionFileLock,
+        SessionLockKind,
+    },
     CreateSessionOptions, ImportPolicy, LocalProviderLedger, LocalSessionFs, LocalSessionResources,
     PathConventions, ProviderLedgerSummary, RuntimeSnapshotCache, SessionConfig, SessionError,
     SessionLease, SessionMetadata, SessionResourceManifest, SessionResourceNamespace,
@@ -19,7 +23,7 @@ use crate::session::recovery::{RecoveredSession, SessionRecoverySource};
 
 #[derive(Debug, Clone)]
 pub struct LocalSessionStore {
-    root: PathBuf,
+    pub(super) root: PathBuf,
 }
 
 impl LocalSessionStore {
@@ -40,27 +44,25 @@ impl LocalSessionStore {
     /// Returns an error if the session already exists or files cannot be written.
     pub async fn create(&self, options: CreateSessionOptions) -> SessionResult<SessionResumeState> {
         let id = options.id.unwrap_or_else(super::SessionId::new_v4);
-        let config = SessionConfig::new(id.clone(), &self.root);
+        let root = ensure_store_root(&self.root)?;
+        let lease = SessionLease::acquire(&root, &id)?;
+        let metadata_lock = SessionFileLock::acquire(&root, &id, SessionLockKind::Metadata).await?;
+        create_session_directory(&root, &id)?;
+        let config = SessionConfig::new(id.clone(), root);
         let conventions = config.conventions();
-        std::fs::create_dir_all(&self.root)
-            .map_err(|source| SessionError::io(&self.root, source))?;
-        let lease = SessionLease::acquire(conventions.root().to_path_buf())?;
-        if conventions.root().exists() {
-            return Err(SessionError::AlreadyExists {
-                path: conventions.root().to_path_buf(),
-            });
-        }
 
         LocalSessionFs::with_conventions(conventions.clone())?;
         LocalSessionResources::with_conventions(conventions.clone())?;
 
         let mut metadata = SessionMetadata::new(id, options.host_cwd, options.import_source);
         metadata.title = options.title;
-        metadata.write_to_path(conventions.metadata_file())?;
+        metadata.set_model_preferences(options.model_preferences);
+        metadata.write_new_to_path(conventions.metadata_file())?;
         write_empty_file(&conventions.events_file())?;
         write_empty_file(&conventions.provider_ledger_file())?;
 
         let default_thread_id = options.default_thread_id.unwrap_or_default();
+        drop(metadata_lock);
         self.load_state(config, default_thread_id, lease).await
     }
 
@@ -70,8 +72,10 @@ impl LocalSessionStore {
     ///
     /// Returns an error if metadata/log replay fails or another writer is open.
     pub async fn open(&self, id: super::SessionId) -> SessionResult<SessionResumeState> {
-        let config = SessionConfig::new(id, &self.root);
-        let lease = SessionLease::acquire(config.conventions().root().to_path_buf())?;
+        let root = ensure_store_root(&self.root)?;
+        let config = SessionConfig::new(id.clone(), root);
+        validate_session_directory(&config.root, &id)?;
+        let lease = SessionLease::acquire(&config.root, &id)?;
         let default_thread_id = default_thread_id_from_cache_or_events(&config).await?;
         self.load_state(config, default_thread_id, lease).await
     }
@@ -120,6 +124,11 @@ impl LocalSessionStore {
                 title: snapshot.metadata.title.clone(),
                 host_cwd: snapshot.metadata.host_cwd.clone(),
                 import_source: snapshot.metadata.import_source.clone(),
+                model_preferences: super::SessionModelPreferences {
+                    selected_model: snapshot.metadata.selected_model.clone(),
+                    reasoning_effort: snapshot.metadata.reasoning_effort,
+                    agent_profile: snapshot.metadata.agent_profile.clone(),
+                },
                 default_thread_id: Some(snapshot.default_thread_id),
             })
             .await?;

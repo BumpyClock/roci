@@ -21,16 +21,19 @@ pub use crate::resource::{
     PromptTemplate, PromptTemplateLoader, ResourceBundle, ResourceDiagnostic, ResourceDirectories,
     ResourceLoader, ResourceSettings, ResourceSettingsLoader,
 };
-#[cfg(feature = "agent")]
-pub use crate::session::LocalSessionStore;
 pub use crate::session::{
     AgentRuntimeEvent, CreateSessionOptions, ImportPolicy, LocalProviderLedger, LocalSessionFs,
     LocalSessionResources, LogicalPath, PathConventions, PathNamespace, ProviderLedgerRecord,
     ProviderLedgerSnapshot, ProviderLedgerState, ProviderLedgerSummary, RuntimeCursor,
     RuntimeSnapshot, RuntimeSnapshotCache, SessionConfig, SessionDirEntry, SessionError,
     SessionFileKind, SessionFileMetadata, SessionFs, SessionId, SessionLease, SessionMetadata,
-    SessionResourceManifest, SessionResourceMetadata, SessionResourceNamespace, SessionResourceRef,
-    SessionResult, SessionResumeState, SessionSnapshot, ThreadId,
+    SessionModelPreferences, SessionResourceManifest, SessionResourceMetadata,
+    SessionResourceNamespace, SessionResourceRef, SessionResult, SessionResumeState,
+    SessionSnapshot, ThreadId,
+};
+#[cfg(feature = "agent")]
+pub use crate::session::{
+    LocalSessionStore, SessionArchiveFilter, SessionCatalogEntry, SessionCatalogQuery,
 };
 pub use crate::tools::{AgentTool, AgentToolParameters, Tool, ToolArguments};
 pub use crate::types::{

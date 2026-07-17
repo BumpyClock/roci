@@ -214,6 +214,19 @@ impl SubagentProfileRegistry {
         config: &RociConfig,
         base_config: &AgentConfig,
     ) -> Result<ResolvedSubagentCandidates, RociError> {
+        if profile.models.is_empty() {
+            if base_config.candidates.is_empty() {
+                return Err(RociError::Configuration(
+                    "subagent profile has no model candidates and parent has none to inherit"
+                        .into(),
+                ));
+            }
+            return Ok(ResolvedSubagentCandidates {
+                candidates: base_config.candidates.clone(),
+                reasoning_effort: None,
+            });
+        }
+
         let candidates = profile
             .models
             .iter()

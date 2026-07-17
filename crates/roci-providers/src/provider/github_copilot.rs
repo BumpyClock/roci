@@ -214,6 +214,14 @@ mod tests {
             catalog.models()[0].source,
             ModelCatalogSource::Dynamic { .. }
         ));
+        let gpt5 = catalog
+            .models()
+            .iter()
+            .find(|model| model.model_id == "gpt-5")
+            .expect("gpt-5 present");
+        assert!(gpt5
+            .capabilities
+            .supports_reasoning_effort(roci_core::types::ReasoningEffort::Minimal));
     }
 
     #[test]

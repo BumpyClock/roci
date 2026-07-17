@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::runtime::AgentRuntime;
+use crate::agent::subagents::events::{emit_subagent_event, CriticalSubagentEventSink};
 use crate::agent::subagents::types::{
     SubagentEvent, SubagentId, SubagentRunResult, SubagentSnapshot, SubagentStatus,
 };
@@ -18,13 +19,15 @@ use crate::models::LanguageModel;
 
 /// Run a child agent inside a background task.
 ///
-/// Acquires a semaphore permit, transitions status to `Running`, executes the
-/// child runtime (racing against cancellation), maps the outcome, emits
-/// terminal events, and sends the result through the oneshot channel.
+/// Waits for the routing start signal, acquires a semaphore permit, transitions
+/// status to `Running`, executes the child runtime (racing against
+/// cancellation), maps the outcome, emits terminal events, and sends the
+/// result through the oneshot channel.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_child_task(
     semaphore: Arc<Semaphore>,
     event_tx: broadcast::Sender<SubagentEvent>,
+    critical_event_sink: Option<CriticalSubagentEventSink>,
     status: Arc<Mutex<SubagentStatus>>,
     snapshot_tx: watch::Sender<SubagentSnapshot>,
     child_id: SubagentId,
@@ -44,10 +47,14 @@ pub(super) async fn run_child_task(
         let mut s = status.lock().await;
         *s = SubagentStatus::Running;
     }
-    let _ = event_tx.send(SubagentEvent::StatusChanged {
-        subagent_id: child_id,
-        status: SubagentStatus::Running,
-    });
+    emit_subagent_event(
+        &event_tx,
+        critical_event_sink.as_ref(),
+        SubagentEvent::StatusChanged {
+            subagent_id: child_id,
+            status: SubagentStatus::Running,
+        },
+    );
     let _ = snapshot_tx.send(SubagentSnapshot {
         subagent_id: child_id,
         profile: profile_name.clone(),
@@ -130,24 +137,36 @@ pub(super) async fn run_child_task(
     // Emit terminal event
     match final_status {
         SubagentStatus::Completed => {
-            let _ = event_tx.send(SubagentEvent::Completed {
-                subagent_id: child_id,
-                result: subagent_result.clone(),
-            });
+            emit_subagent_event(
+                &event_tx,
+                critical_event_sink.as_ref(),
+                SubagentEvent::Completed {
+                    subagent_id: child_id,
+                    result: subagent_result.clone(),
+                },
+            );
         }
         SubagentStatus::Failed => {
-            let _ = event_tx.send(SubagentEvent::Failed {
-                subagent_id: child_id,
-                error: subagent_result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "unknown".into()),
-            });
+            emit_subagent_event(
+                &event_tx,
+                critical_event_sink.as_ref(),
+                SubagentEvent::Failed {
+                    subagent_id: child_id,
+                    error: subagent_result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "unknown".into()),
+                },
+            );
         }
         SubagentStatus::Aborted => {
-            let _ = event_tx.send(SubagentEvent::Aborted {
-                subagent_id: child_id,
-            });
+            emit_subagent_event(
+                &event_tx,
+                critical_event_sink.as_ref(),
+                SubagentEvent::Aborted {
+                    subagent_id: child_id,
+                },
+            );
         }
         _ => {}
     }

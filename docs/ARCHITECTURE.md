@@ -128,6 +128,17 @@ use logical paths under `files/`.
 
 - `AgentRuntime` is the high-level stateful API (prompt/continue/follow-up/steer/reset/abort, snapshots/watchers).
 - See [Agent runtime chat semantics](agent-runtime-chat.md) for projected snapshots/events, cursor replay, and cancellation contracts.
+- Runtime event ownership is categorical at host boundaries: a foreground turn
+  stream is filtered to one `turn_id`; a session-scoped child stream carries
+  subagent lifecycle/progress/tool/input/terminal events, including events after
+  the parent turn is terminal. Child payloads are not duplicated into the turn
+  stream.
+- Session cursors crossing a host boundary are opaque durable positions;
+  `RuntimeCursor` is Roci's typed `(thread_id, seq)` implementation.
+  `RuntimeSubscription` registers its live receiver before reading retained
+  events, then suppresses replay/live overlap; replay followed by live therefore
+  has no subscription gap. A stale live subscription requires resubscription
+  from the last acknowledged cursor.
 - Runtime module layout:
   - `crates/roci-core/src/agent/runtime.rs` is the runtime module root/wiring layer.
   - `crates/roci-core/src/agent/runtime/{chat,types,config,state,lifecycle,mutations,run_loop,events,summary}.rs` contains runtime internals by concern.
@@ -159,6 +170,17 @@ use logical paths under `files/`.
   - `ToolVisibilityPolicy` supports hiding all tools, allow-only names, and excluded names after static + dynamic tool discovery and before provider tool definitions are built.
   - Policy precedence is `no_tools` first, then exclusions, then allow-only.
   - Built-in tools expose catalog metadata from `roci-tools`; CLI chat maps `--no-tools`, `--tool`, and `--exclude-tool` onto the same policy.
+- Coding tools receive an optional canonical `workspace_root` through
+  `AgentConfig`/`RunRequest` and `ToolExecutionContext`. Both runtime entry
+  points reject missing roots and non-directories before starting a run.
+- Built-in file tools accept workspace-relative paths only. They reject
+  absolute paths, `..`, and symlink resolutions outside the workspace. This is
+  best-effort path confinement: a same-OS-user process can still race the
+  check and reopen by swapping a symlink. Strong confinement requires
+  handle-relative platform APIs or an external sandbox.
+- The built-in `shell` tool uses the canonical workspace as its current
+  directory but does not claim filesystem confinement. Hosts that run
+  untrusted commands must provide a `SandboxProvider` or OS sandbox.
 - Core run lifecycle hooks are surfaced through `AgentConfig`:
   - `before_agent_start` supports continue/cancel/replace-initial-messages before runner startup
   - `transform_context` runs before `convert_to_llm`, with typed payload and continue/cancel/replace semantics
@@ -308,7 +330,20 @@ Context is always read-only. Children cannot mutate parent conversation state.
 
 ### Event forwarding
 
-Child `AgentEvent`s are wrapped in `SubagentEvent::AgentEvent { subagent_id, label, event }` and forwarded through the supervisor's `broadcast::channel`. The supervisor also emits lifecycle events: `Spawned`, `StatusChanged`, `Completed`, `Failed`, `Aborted`.
+Child `AgentEvent`s are wrapped in `SubagentEvent::AgentEvent { subagent_id, label, event }`. The supervisor also emits lifecycle events: `Spawned`, `StatusChanged`, `Completed`, `Failed`, `Aborted`. Every event is sent first to a persistence-critical FIFO channel and then to the supervisor's best-effort `broadcast::channel` for public observers.
+
+`AgentRuntime` runs a session bridge independently of any parent turn
+subscription. The bridge pins each child to its first observed parent `TurnId`,
+projects against that turn while mutable, and falls back to thread scope after
+the parent becomes terminal. The event snapshot keeps the original parent pin;
+only the runtime event envelope loses its `turn_id` on fallback. This lets
+background children continue after foreground turn completion.
+
+The runtime bridge consumes the persistence-critical FIFO directly, so public
+broadcast lag cannot create holes in durable session replay. The FIFO is
+currently unbounded because child event sinks are synchronous; an indefinitely
+stalled persistence bridge can therefore grow it to the process memory ceiling.
+Use bounded async backpressure once `AgentEventSink` supports async delivery.
 
 Parent subscribes via `supervisor.subscribe()`. Handle provides `watch_snapshot()` for per-child progress observation.
 
@@ -322,6 +357,11 @@ The supervisor shares a `HumanInteractionCoordinator` (from `AgentConfig` or a f
 4. Coordinator routes the response by `request_id` to the correct child
 
 No generic bus required -- `request_id` correlation handles multi-child routing. Current `ask_user` requests use the `AskUser` payload inside the human interaction envelope.
+The semantic runtime preserves the complete request in `SubagentNeedsInput` and
+emits `SubagentInputResolved` or `SubagentInputCanceled` so hosts can retire the
+matching prompt without guessing from child status. Hosts must branch on
+`HumanInteractionPayload`; `UiElicitation` and tool permission are not
+`ask_user` responses.
 
 ### Orchestration
 
@@ -423,6 +463,26 @@ Default features (via `roci`): `openai`, `anthropic`, `google`.
 - `session::LocalSessionStore` owns session filesystem lifecycle. Host apps
   choose the session root and call async store APIs before constructing or
   resuming an `AgentRuntime`.
+- Hosts use `LocalSessionStore::list`, `update_title`, `archive`, `unarchive`,
+  and `delete` for durable conversation catalogs. Catalog entries are filtered
+  by session ID, recorded host cwd, title, or free-text search; active and
+  archived sessions remain in the same host-selected root.
+- `SessionMetadata` also persists the host's selected `LanguageModel` and
+  `ReasoningEffort`. Hosts update both together through
+  `LocalSessionStore::update_model_preferences` before applying them to the
+  next runtime turn.
+- Roci coordinates cooperative host processes with private lock files at
+  `<session-root>/.locks/<session-id>.runtime.lock` and
+  `<session-root>/.locks/<session-id>.metadata.lock`. Runtime create/open owns
+  the runtime lock for the resume lifetime; metadata edits own only the
+  metadata lock, so an active runtime can still be renamed, archived, or have
+  its model preference changed. Delete acquires metadata first, then a
+  nonblocking runtime lock through removal.
+- On Unix, Roci tightens an app-owned session root, session directory, and
+  lock directory to `0700`, and metadata and lock files to `0600`. This blocks
+  lower-privileged users from swapping session paths. The portable filesystem
+  API cannot defend against an uncooperative process running as the same OS
+  user; handle-relative OS APIs would be required for that threat model.
 - `AgentRuntime::{new,try_new}` consume prepared session configuration only.
   They do not write session metadata or create session directories.
 

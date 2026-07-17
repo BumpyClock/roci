@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -77,6 +78,28 @@ pub type SteeringMessagesFn = MessageBatchFn;
 
 /// Callback to retrieve follow-up messages after the inner loop completes.
 pub type FollowUpMessagesFn = MessageBatchFn;
+
+pub(crate) fn canonical_workspace_root(root: &Path) -> Result<PathBuf, RociError> {
+    let canonical = root.canonicalize().map_err(|error| {
+        RociError::Configuration(format!(
+            "failed to canonicalize workspace root {}: {error}",
+            root.display()
+        ))
+    })?;
+    let metadata = canonical.metadata().map_err(|error| {
+        RociError::Configuration(format!(
+            "failed to inspect workspace root {}: {error}",
+            canonical.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(RociError::Configuration(format!(
+            "workspace root is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
 
 /// Payload for the `before_agent_start` lifecycle hook.
 #[derive(Debug, Clone)]
@@ -223,6 +246,8 @@ pub struct RunRequest {
     pub session_fs: Option<Arc<dyn SessionFs + Send + Sync>>,
     /// Optional logical current directory inside the durable session filesystem.
     pub session_cwd: Option<LogicalPath>,
+    /// Canonical trusted host workspace exposed to coding tools.
+    pub workspace_root: Option<PathBuf>,
     /// Optional sandbox provider exposed to command-capable tools.
     pub sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     /// Policy deciding which tools are visible to provider/tool resolution.
@@ -312,6 +337,7 @@ impl RunRequest {
             tools: Vec::new(),
             session_fs: None,
             session_cwd: None,
+            workspace_root: None,
             sandbox_provider: None,
             tool_visibility_policy: ToolVisibilityPolicy::default(),
             approval_policy: ApprovalPolicy::ask(),
@@ -390,6 +416,12 @@ impl RunRequest {
     ) -> Self {
         self.session_fs = Some(session_fs);
         self.session_cwd = Some(session_cwd);
+        self
+    }
+
+    #[must_use]
+    pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        self.workspace_root = Some(workspace_root);
         self
     }
 

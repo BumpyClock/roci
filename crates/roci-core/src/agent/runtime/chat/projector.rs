@@ -929,6 +929,8 @@ impl ThreadState {
             | AgentRuntimeEventPayload::SubagentToolCallCompleted { .. }
             | AgentRuntimeEventPayload::SubagentMessage { .. }
             | AgentRuntimeEventPayload::SubagentNeedsInput { .. }
+            | AgentRuntimeEventPayload::SubagentInputResolved { .. }
+            | AgentRuntimeEventPayload::SubagentInputCanceled { .. }
             | AgentRuntimeEventPayload::SubagentCompleted { .. }
             | AgentRuntimeEventPayload::SubagentFailed { .. }
             | AgentRuntimeEventPayload::SubagentCancelled { .. } => {}

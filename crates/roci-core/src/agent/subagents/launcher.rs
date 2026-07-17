@@ -13,6 +13,7 @@ use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
+use crate::tools::dynamic::{DynamicToolProvider, ScopedDynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::types::{ModelMessage, ReasoningEffort};
 
@@ -64,7 +65,8 @@ impl SubagentLauncher for InProcessLauncher {
         initial_messages: Vec<ModelMessage>,
         config: AgentConfig,
     ) -> Result<LaunchedChild, RociError> {
-        let runtime = AgentRuntime::new(self.registry.clone(), self.roci_config.clone(), config);
+        let runtime =
+            AgentRuntime::try_new(self.registry.clone(), self.roci_config.clone(), config)?;
 
         // Seed the child runtime with the fully-composed message list.
         // The system prompt is the first message; the config has no system
@@ -90,7 +92,9 @@ impl SubagentLauncher for InProcessLauncher {
 ///   `before_agent_start`, session hooks, tool hooks, provider payload callback).
 /// - approval policy/handler: clone parent ruleset and inherit handler.
 /// - session fields: reset. Child persistence needs child-specific session resources.
-/// - provider fields: inherit transport, retry, API key, headers, metadata, key fn.
+/// - workspace/sandbox: inherit parent host boundaries.
+/// - provider fields: inherit dynamic providers, transport, retry, API key, headers,
+///   metadata, and key fn.
 /// - tools: replace with profile-selected child tools.
 /// - user input coordinator: replace with supervisor coordinator.
 /// - compaction: inherit. Chat config: reset to avoid sharing parent event store.
@@ -122,13 +126,14 @@ pub(super) fn build_child_config(
         approval_handler: parent.approval_handler.clone(),
         #[cfg(feature = "agent")]
         human_interaction_coordinator: Some(coordinator),
-        dynamic_tool_providers: Vec::new(),
+        dynamic_tool_providers: parent.dynamic_tool_providers.clone(),
         settings,
         transform_context: None,
         convert_to_llm: None,
         before_agent_start: None,
         session_id: None,
         session: None,
+        workspace_root: parent.workspace_root.clone(),
         sandbox_provider: parent.sandbox_provider.clone(),
         steering_mode: parent.steering_mode,
         follow_up_mode: parent.follow_up_mode,
@@ -185,6 +190,48 @@ pub(super) fn select_child_tools(
     }
 }
 
+pub(super) fn select_child_dynamic_tool_providers(
+    parent_providers: &[Arc<dyn DynamicToolProvider>],
+    requested_server_ids: &[String],
+) -> Result<Vec<Arc<dyn DynamicToolProvider>>, RociError> {
+    if requested_server_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut matched_server_ids = std::collections::HashSet::new();
+    let mut selected = Vec::<Arc<dyn DynamicToolProvider>>::new();
+    for provider in parent_providers {
+        let provider_server_ids = provider.server_ids();
+        let intersection = requested_server_ids
+            .iter()
+            .filter(|server_id| provider_server_ids.contains(server_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if intersection.is_empty() {
+            continue;
+        }
+        matched_server_ids.extend(intersection.iter().cloned());
+        selected.push(Arc::new(ScopedDynamicToolProvider::new(
+            provider.clone(),
+            intersection,
+        )));
+    }
+
+    let unknown = requested_server_ids
+        .iter()
+        .filter(|server_id| !matched_server_ids.contains(*server_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(RociError::Configuration(format!(
+            "subagent MCP server ids are not available from parent dynamic providers: {}",
+            unknown.join(", ")
+        )));
+    }
+
+    Ok(selected)
+}
+
 fn find_parent_tool(
     parent_tools: &[Arc<dyn Tool>],
     name: &str,
@@ -206,8 +253,81 @@ mod tests {
     };
     use crate::agent_loop::ApprovalPolicy;
     use crate::agent_loop::RetryMode;
-    use crate::tools::{AgentTool, AgentToolParameters};
+    use crate::session::LogicalPath;
+    use crate::tools::arguments::ToolArguments;
+    use crate::tools::dynamic::DynamicTool;
+    use crate::tools::tool::ToolExecutionContext;
+    use crate::tools::{AgentTool, AgentToolParameters, SandboxProvider};
     use crate::types::GenerationSettings;
+
+    struct TestDynamicToolProvider {
+        server_ids: Vec<String>,
+    }
+
+    struct TestSandboxProvider;
+
+    #[tokio::test]
+    async fn launch_returns_error_when_inherited_workspace_disappears() {
+        let workspace = tempfile::tempdir().expect("workspace temp dir");
+        let workspace_root = workspace.path().to_path_buf();
+        drop(workspace);
+        let launcher = InProcessLauncher {
+            registry: Arc::new(ProviderRegistry::new()),
+            roci_config: RociConfig::new(),
+        };
+        let config = AgentConfig {
+            candidates: vec![LanguageModel::Known {
+                provider_key: "test".to_string(),
+                model_id: "test-model".to_string(),
+            }],
+            workspace_root: Some(workspace_root),
+            ..AgentConfig::default()
+        };
+
+        let error = match launcher
+            .launch(SubagentId::new_v4(), Vec::new(), config)
+            .await
+        {
+            Ok(_) => panic!("missing inherited workspace must fail child launch"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RociError::Configuration(_)));
+        assert!(error
+            .to_string()
+            .contains("failed to canonicalize workspace root"));
+    }
+
+    #[async_trait]
+    impl SandboxProvider for TestSandboxProvider {
+        async fn validate_shell_command(
+            &self,
+            _command: &str,
+            _cwd: &LogicalPath,
+        ) -> Result<(), RociError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl DynamicToolProvider for TestDynamicToolProvider {
+        fn server_ids(&self) -> Vec<String> {
+            self.server_ids.clone()
+        }
+
+        async fn list_tools(&self) -> Result<Vec<DynamicTool>, RociError> {
+            Ok(Vec::new())
+        }
+
+        async fn execute_tool(
+            &self,
+            _name: &str,
+            _args: &ToolArguments,
+            _ctx: &ToolExecutionContext,
+        ) -> Result<serde_json::Value, RociError> {
+            Ok(serde_json::Value::Null)
+        }
+    }
 
     #[test]
     fn build_child_config_has_no_system_prompt() {
@@ -266,6 +386,11 @@ mod tests {
     fn build_child_config_applies_explicit_inheritance_matrix() {
         let mut provider_headers = reqwest::header::HeaderMap::new();
         provider_headers.insert("x-parent", "1".parse().unwrap());
+        let dynamic_provider: Arc<dyn DynamicToolProvider> = Arc::new(TestDynamicToolProvider {
+            server_ids: vec!["github".to_string()],
+        });
+        let sandbox_provider: Arc<dyn SandboxProvider> = Arc::new(TestSandboxProvider);
+        let workspace_root = std::env::temp_dir().join("roci-parent-workspace");
         let parent = AgentConfig {
             system_prompt: Some("parent prompt".into()),
             event_sink: Some(Arc::new(|_| {})),
@@ -284,12 +409,15 @@ mod tests {
                 crate::session::SessionId::parse("parent-durable-session").unwrap(),
                 std::env::temp_dir(),
             )),
+            workspace_root: Some(workspace_root.clone()),
+            sandbox_provider: Some(sandbox_provider.clone()),
             transport: Some("proxy".into()),
             max_retry_delay_ms: Some(123),
             retry_mode: Some(RetryMode::Persistent),
             api_key_override: Some("parent-key".into()),
             provider_headers,
             provider_metadata: HashMap::from([("tenant".into(), "parent".into())]),
+            dynamic_tool_providers: vec![dynamic_provider.clone()],
             user_input_timeout_ms: Some(456),
             settings: GenerationSettings {
                 temperature: Some(0.2),
@@ -318,6 +446,11 @@ mod tests {
         assert_eq!(cfg.approval_policy, ApprovalPolicy::never());
         assert_eq!(cfg.session_id, None, "session_id resets");
         assert_eq!(cfg.session, None, "durable session config resets");
+        assert_eq!(cfg.workspace_root, Some(workspace_root));
+        assert!(Arc::ptr_eq(
+            cfg.sandbox_provider.as_ref().unwrap(),
+            &sandbox_provider
+        ));
         assert_eq!(cfg.transport.as_deref(), Some("proxy"));
         assert_eq!(cfg.max_retry_delay_ms, Some(123));
         assert_eq!(cfg.retry_mode, Some(RetryMode::Persistent));
@@ -328,7 +461,11 @@ mod tests {
         assert_eq!(cfg.user_input_timeout_ms, Some(456));
         assert_eq!(cfg.settings.temperature, Some(0.2));
         assert_eq!(cfg.settings.reasoning_effort, Some(ReasoningEffort::Medium));
-        assert!(cfg.dynamic_tool_providers.is_empty());
+        assert_eq!(cfg.dynamic_tool_providers.len(), 1);
+        assert!(Arc::ptr_eq(
+            &cfg.dynamic_tool_providers[0],
+            &dynamic_provider
+        ));
         assert!(cfg.transform_context.is_none());
         assert!(cfg.convert_to_llm.is_none());
         assert!(cfg.before_agent_start.is_none());
@@ -337,6 +474,54 @@ mod tests {
         assert!(cfg.pre_tool_use.is_none());
         assert!(cfg.post_tool_use.is_none());
         assert_eq!(cfg.chat, Default::default(), "chat config resets");
+    }
+
+    #[test]
+    fn select_child_dynamic_providers_scopes_explicit_mcp_servers() {
+        let multi_server: Arc<dyn DynamicToolProvider> = Arc::new(TestDynamicToolProvider {
+            server_ids: vec!["github".into(), "linear".into()],
+        });
+        let unrelated: Arc<dyn DynamicToolProvider> = Arc::new(TestDynamicToolProvider {
+            server_ids: vec!["figma".into()],
+        });
+
+        let selected = select_child_dynamic_tool_providers(
+            &[multi_server, unrelated],
+            &["linear".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].server_ids(), vec!["linear"]);
+    }
+
+    #[test]
+    fn select_child_dynamic_providers_empty_allow_list_selects_none() {
+        let provider: Arc<dyn DynamicToolProvider> = Arc::new(TestDynamicToolProvider {
+            server_ids: vec!["github".into()],
+        });
+
+        let selected = select_child_dynamic_tool_providers(&[provider], &[]).unwrap();
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn select_child_dynamic_providers_rejects_unknown_mcp_servers() {
+        let provider: Arc<dyn DynamicToolProvider> = Arc::new(TestDynamicToolProvider {
+            server_ids: vec!["github".into()],
+        });
+
+        let result = select_child_dynamic_tool_providers(
+            &[provider],
+            &["github".to_string(), "missing".to_string()],
+        );
+        let error = match result {
+            Ok(_) => panic!("expected unknown MCP server id to fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("missing"));
     }
 
     #[test]

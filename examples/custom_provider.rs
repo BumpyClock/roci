@@ -50,6 +50,7 @@ impl ModelProvider for EchoProvider {
             supports_json_mode: false,
             supports_json_schema: false,
             supports_reasoning: false,
+            reasoning_effort: Default::default(),
             supports_system_messages: true,
             context_length: 4096,
             max_output_tokens: None,

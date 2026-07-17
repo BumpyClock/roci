@@ -11,6 +11,7 @@ use crate::types::{StreamEventType, TextStreamDelta};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 pub(super) fn test_registry() -> Arc<ProviderRegistry> {
     Arc::new(ProviderRegistry::new())
@@ -126,6 +127,7 @@ pub(super) fn test_agent_config() -> AgentConfig {
         approval_handler: None,
         session_id: None,
         session: None,
+        workspace_root: None,
         sandbox_provider: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,
@@ -255,6 +257,11 @@ struct StreamingTextFactory {
     output_tokens: u32,
 }
 
+struct GatedStreamingFactory {
+    provider_key: &'static str,
+    gate: Arc<Notify>,
+}
+
 struct StreamingChunksFactory {
     provider_key: &'static str,
     chunk_count: usize,
@@ -296,6 +303,33 @@ struct StreamingTextProvider {
     capabilities: ModelCapabilities,
     input_tokens: u32,
     output_tokens: u32,
+}
+
+struct GatedStreamingProvider {
+    provider_key: String,
+    model_id: String,
+    capabilities: ModelCapabilities,
+    gate: Arc<Notify>,
+}
+
+impl ProviderFactory for GatedStreamingFactory {
+    fn provider_keys(&self) -> &[&str] {
+        std::slice::from_ref(&self.provider_key)
+    }
+
+    fn create(
+        &self,
+        _config: &RociConfig,
+        _provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(GatedStreamingProvider {
+            provider_key: self.provider_key.to_string(),
+            model_id: model_id.to_string(),
+            capabilities: ModelCapabilities::default(),
+            gate: self.gate.clone(),
+        }))
+    }
 }
 
 struct StreamingChunksProvider {
@@ -435,6 +469,50 @@ impl ModelProvider for StreamingTextProvider {
             }),
         ];
         Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[async_trait]
+impl ModelProvider for GatedStreamingProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_key
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn capabilities(&self) -> &ModelCapabilities {
+        &self.capabilities
+    }
+
+    async fn generate_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        Err(RociError::UnsupportedOperation(
+            "stream-only gated test provider".to_string(),
+        ))
+    }
+
+    async fn stream_text(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        let gate = self.gate.clone();
+        Ok(Box::pin(futures::stream::once(async move {
+            gate.notified().await;
+            Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(crate::types::Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            })
+        })))
     }
 }
 
@@ -640,6 +718,15 @@ pub(super) fn registry_with_streaming_provider(
         input_tokens,
         output_tokens,
     }));
+    Arc::new(registry)
+}
+
+pub(super) fn registry_with_gated_streaming_provider(
+    provider_key: &'static str,
+    gate: Arc<Notify>,
+) -> Arc<ProviderRegistry> {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(GatedStreamingFactory { provider_key, gate }));
     Arc::new(registry)
 }
 

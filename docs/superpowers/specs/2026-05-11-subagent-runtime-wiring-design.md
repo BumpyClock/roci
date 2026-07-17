@@ -53,7 +53,7 @@ Add semantic runtime payload variants to `AgentRuntimeEventPayload`:
 - `SubagentToolCallStarted { subagent: SubagentRuntimeSnapshot, tool: SubagentToolCallSnapshot }`
 - `SubagentToolCallCompleted { subagent: SubagentRuntimeSnapshot, tool: SubagentToolCallSnapshot }`
 - `SubagentMessage { subagent: SubagentRuntimeSnapshot, message: SubagentMessageSnapshot }`
-- `SubagentNeedsInput { subagent: SubagentRuntimeSnapshot, question: String, context: Option<String> }`
+- `SubagentNeedsInput { subagent: SubagentRuntimeSnapshot, request: HumanInteractionRequest }`
 - `SubagentCompleted { subagent: SubagentRuntimeSnapshot, result: DelegateSubagentResult }`
 - `SubagentFailed { subagent: SubagentRuntimeSnapshot, error: String }`
 - `SubagentCancelled { subagent: SubagentRuntimeSnapshot }`
@@ -112,7 +112,8 @@ Semantic events:
 
 - Translate child lifecycle events to `SubagentStarted`, `SubagentCompleted`, `SubagentFailed`, `SubagentCancelled`.
 - Translate child message/tool events to semantic subagent message/tool variants.
-- Translate child human input request events to `SubagentNeedsInput`.
+- Translate child human input request events to `SubagentNeedsInput`, preserving
+  the full request envelope, source, typed payload, timeout, and correlation id.
 - Do not project `SubagentEvent::AgentEvent` or raw child `AgentEvent` directly into `AgentRuntimeEventPayload`.
 - Publish semantic events through the same runtime event store/broadcast path as other chat runtime events.
 - `SubagentRoutingController` exposes `subscribe()` to allow runtime-owned bridge subscription without exposing supervisor internals.

@@ -10,7 +10,10 @@ use roci::context::ContextBudget;
 use roci::mcp::{merge_mcp_instructions, MCPInstructionMergePolicy};
 use roci::resource::CompactionSettings;
 use roci::resource::SkillResourceOptions;
-use roci::session::{CreateSessionOptions, LocalSessionStore, SessionConfig, SessionId};
+use roci::session::{
+    CreateSessionOptions, LocalSessionStore, SessionConfig, SessionId, SessionModelPreferences,
+    SessionResumeState,
+};
 use roci::skills::merge_system_prompt_with_skills;
 use roci::tools::ToolVisibilityPolicy;
 
@@ -27,7 +30,7 @@ use resource_prompt::{
     build_resource_system_prompt, expand_chat_prompt, print_resource_diagnostics,
 };
 use runtime_events::RuntimeEventRenderer;
-use subagents::{load_cli_subagent_profiles, print_agent_profiles};
+use subagents::{load_cli_subagent_profiles, print_agent_profiles, select_session_agent_profile};
 
 pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ChatArgs {
@@ -67,8 +70,8 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     } = args;
 
     let cwd = std::env::current_dir()?;
-    let subagent_profiles = load_cli_subagent_profiles(&cwd, agent)?;
     if list_agents {
+        let subagent_profiles = load_cli_subagent_profiles(&cwd, agent)?;
         let mut stdout = std::io::stdout();
         print_agent_profiles(&subagent_profiles.registry, &mut stdout)?;
         return Ok(());
@@ -175,6 +178,47 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             Ok::<_, roci::session::SessionError>(SessionConfig::new(id, root))
         })
         .transpose()?;
+    let mut session_state = None;
+    let persisted_agent_profile = if let Some(session_config) = session.as_ref() {
+        if session_config.conventions().metadata_file().is_file() {
+            let store = LocalSessionStore::new(session_config.root.clone());
+            let state = store.open(session_config.id.clone()).await?;
+            let persisted = state.metadata.agent_profile.clone();
+            session_state = Some(state);
+            persisted
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let selected_agent_profile =
+        select_session_agent_profile(agent.as_deref(), persisted_agent_profile.as_deref());
+    let subagent_profiles = load_cli_subagent_profiles(&cwd, selected_agent_profile.clone())?;
+    if let Some(state) = session_state.as_mut() {
+        let store = LocalSessionStore::new(state.session_config.root.clone());
+        persist_explicit_agent_profile(&store, state, agent.as_deref())?;
+    }
+    if let Some(session_config) = session.as_ref() {
+        if session_state.is_none() {
+            let store = LocalSessionStore::new(session_config.root.clone());
+            session_state = Some(
+                store
+                    .create(CreateSessionOptions {
+                        id: Some(session_config.id.clone()),
+                        title: None,
+                        host_cwd: Some(cwd.clone()),
+                        import_source: None,
+                        default_thread_id: None,
+                        model_preferences: SessionModelPreferences {
+                            agent_profile: selected_agent_profile,
+                            ..SessionModelPreferences::default()
+                        },
+                    })
+                    .await?,
+            );
+        }
+    }
     let tools = roci_tools::builtin::tool_catalog().resolve(&tool_visibility_policy);
     let agent_config = AgentConfig {
         candidates,
@@ -191,6 +235,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         approval_handler,
         session_id: None,
         session,
+        workspace_root: Some(cwd.clone()),
         sandbox_provider: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,
@@ -221,21 +266,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         subagents: subagent_profiles.into_config(!no_subagents),
         human_interaction_coordinator: Some(coordinator.clone()),
     };
-    let agent = if let Some(session_config) = agent_config.session.clone() {
-        let store = LocalSessionStore::new(session_config.root.clone());
-        let state = if session_config.conventions().metadata_file().is_file() {
-            store.open(session_config.id.clone()).await?
-        } else {
-            store
-                .create(CreateSessionOptions {
-                    id: Some(session_config.id.clone()),
-                    title: None,
-                    host_cwd: Some(cwd.clone()),
-                    import_source: None,
-                    default_thread_id: agent_config.chat.default_thread_id,
-                })
-                .await?
-        };
+    let agent = if let Some(state) = session_state {
         Arc::new(AgentRuntime::resume_session(registry, config, agent_config, state).await?)
     } else {
         Arc::new(AgentRuntime::try_new(registry, config, agent_config)?)
@@ -255,6 +286,19 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         }
     }
 
+    Ok(())
+}
+
+fn persist_explicit_agent_profile(
+    store: &LocalSessionStore,
+    state: &mut SessionResumeState,
+    explicit_profile: Option<&str>,
+) -> Result<(), roci::session::SessionError> {
+    let Some(agent_profile) = explicit_profile else {
+        return Ok(());
+    };
+    let id = state.metadata.id.clone();
+    state.metadata = store.update_agent_profile(&id, Some(agent_profile.to_string()))?;
     Ok(())
 }
 
@@ -323,8 +367,17 @@ mod tests {
 
     use roci::agent_loop::ApprovalAction;
     use roci::attachments::Attachment;
+    use roci::models::LanguageModel;
+    use roci::session::{
+        CreateSessionOptions, LocalSessionStore, SessionId, SessionModelPreferences,
+    };
+    use roci::types::ReasoningEffort;
+    use tempfile::tempdir;
 
-    use super::{approval_policy_from_arg, build_context_budget, build_prompt_input};
+    use super::{
+        approval_policy_from_arg, build_context_budget, build_prompt_input,
+        persist_explicit_agent_profile,
+    };
     use crate::cli::ChatApprovalArg;
 
     #[test]
@@ -386,5 +439,61 @@ mod tests {
         assert!(budget.max_turn_input_tokens.is_none());
         assert_eq!(budget.max_session_input_tokens, Some(500_000));
         assert!(budget.max_session_output_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_agent_override_persists_without_changing_model_preferences() {
+        let root = tempdir().unwrap();
+        let store = LocalSessionStore::new(root.path());
+        let id = SessionId::parse("agent-override").unwrap();
+        let preferences = SessionModelPreferences {
+            selected_model: Some(LanguageModel::Known {
+                provider_key: "openai".into(),
+                model_id: "gpt-5".into(),
+            }),
+            reasoning_effort: Some(ReasoningEffort::High),
+            agent_profile: Some("builtin:developer".into()),
+        };
+        let mut state = store
+            .create(CreateSessionOptions {
+                id: Some(id.clone()),
+                model_preferences: preferences.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_model_preferences(
+                &id,
+                SessionModelPreferences {
+                    selected_model: Some(LanguageModel::Known {
+                        provider_key: "google".into(),
+                        model_id: "gemini-2.5-pro".into(),
+                    }),
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    agent_profile: Some("builtin:planner".into()),
+                },
+            )
+            .unwrap();
+        persist_explicit_agent_profile(&store, &mut state, Some("builtin:developer")).unwrap();
+        drop(state);
+
+        let reopened = store.open(id).await.unwrap();
+        assert_eq!(
+            reopened.metadata.selected_model,
+            Some(LanguageModel::Known {
+                provider_key: "google".into(),
+                model_id: "gemini-2.5-pro".into(),
+            })
+        );
+        assert_eq!(
+            reopened.metadata.reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            reopened.metadata.agent_profile.as_deref(),
+            Some("builtin:developer")
+        );
     }
 }

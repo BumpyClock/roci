@@ -53,6 +53,12 @@ pub fn openai_catalog(provider_key: &str) -> ModelCatalog {
         OpenAiModel::Gpt5,
         OpenAiModel::Gpt51,
         OpenAiModel::Gpt52,
+        OpenAiModel::Gpt54,
+        OpenAiModel::Gpt54Mini,
+        OpenAiModel::Gpt55,
+        OpenAiModel::Gpt56Sol,
+        OpenAiModel::Gpt56Terra,
+        OpenAiModel::Gpt56Luna,
         OpenAiModel::Gpt5Pro,
         OpenAiModel::Gpt5Mini,
         OpenAiModel::Gpt5Nano,
@@ -77,9 +83,29 @@ pub fn openai_catalog(provider_key: &str) -> ModelCatalog {
 
 #[cfg(feature = "openai")]
 pub fn codex_catalog(provider_key: &str) -> ModelCatalog {
+    use crate::models::openai::OpenAiModel;
+
     let mut catalog = openai_catalog(provider_key);
+    for model in [
+        OpenAiModel::Gpt54,
+        OpenAiModel::Gpt54Mini,
+        OpenAiModel::Gpt55,
+        OpenAiModel::Gpt56Sol,
+        OpenAiModel::Gpt56Terra,
+        OpenAiModel::Gpt56Luna,
+    ] {
+        let id = model.as_str().to_string();
+        catalog.insert(model_info(
+            provider_key,
+            &id,
+            model.codex_capabilities(),
+            true,
+            false,
+            id == "gpt-5.6-terra",
+        ));
+    }
     catalog.update_models(|model| {
-        model.policy.default_for_provider = model.model_id == "gpt-5";
+        model.policy.default_for_provider = model.model_id == "gpt-5.6-terra";
     });
     catalog
 }
@@ -276,6 +302,46 @@ mod tests {
 
         assert!(gemini.capabilities.supports_vision);
         assert_eq!(gemini.provider_key, "google");
+    }
+
+    #[cfg(feature = "openai")]
+    #[test]
+    fn codex_catalog_uses_current_codex_model_presets() {
+        let catalog = codex_catalog("codex");
+        let terra = catalog
+            .models()
+            .iter()
+            .find(|model| model.model_id == "gpt-5.6-terra")
+            .expect("GPT-5.6 Terra present");
+        let luna = catalog
+            .models()
+            .iter()
+            .find(|model| model.model_id == "gpt-5.6-luna")
+            .expect("GPT-5.6 Luna present");
+
+        assert_eq!(terra.capabilities.context_length, 372_000);
+        assert_eq!(
+            terra.capabilities.default_reasoning_effort(),
+            Some(roci_core::types::ReasoningEffort::Medium)
+        );
+        assert!(terra
+            .capabilities
+            .supports_reasoning_effort(roci_core::types::ReasoningEffort::Ultra));
+        assert!(!luna
+            .capabilities
+            .supports_reasoning_effort(roci_core::types::ReasoningEffort::Ultra));
+        assert!(terra.policy.default_for_provider);
+        let public_catalog = openai_catalog("openai");
+        let public_terra = public_catalog
+            .models()
+            .iter()
+            .find(|model| model.model_id == "gpt-5.6-terra")
+            .expect("public GPT-5.6 Terra present");
+        assert_eq!(public_terra.capabilities.context_length, 1_050_000);
+        assert!(public_terra
+            .capabilities
+            .supports_reasoning_effort(roci_core::types::ReasoningEffort::None));
+        assert_eq!(public_terra.capabilities.default_reasoning_effort(), None);
     }
 
     #[cfg(feature = "ollama")]

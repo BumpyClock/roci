@@ -40,9 +40,11 @@ use crate::error::RociError;
 use crate::provider::ProviderRegistry;
 
 use super::context::build_child_initial_messages;
+use super::events::{emit_subagent_event, CriticalSubagentEventSink};
 use super::handle::SubagentHandle;
 use super::launcher::{
-    build_child_config, select_child_tools, InProcessLauncher, SubagentLauncher,
+    build_child_config, select_child_dynamic_tool_providers, select_child_tools, InProcessLauncher,
+    SubagentLauncher,
 };
 use super::profiles::SubagentProfileRegistry;
 use super::prompt::SubagentPromptPolicy;
@@ -75,6 +77,7 @@ pub struct SubagentSupervisor {
     #[cfg(feature = "agent")]
     coordinator: Arc<HumanInteractionCoordinator>,
     event_tx: broadcast::Sender<SubagentEvent>,
+    critical_event_sink: Option<CriticalSubagentEventSink>,
     children: Arc<Mutex<HashMap<SubagentId, ChildEntry>>>,
     concurrency_semaphore: Arc<Semaphore>,
 }
@@ -90,6 +93,24 @@ impl SubagentSupervisor {
         base_config: AgentConfig,
         supervisor_config: SubagentSupervisorConfig,
         profile_registry: SubagentProfileRegistry,
+    ) -> Self {
+        Self::new_with_critical_event_sink(
+            registry,
+            roci_config,
+            base_config,
+            supervisor_config,
+            profile_registry,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_critical_event_sink(
+        registry: Arc<ProviderRegistry>,
+        roci_config: RociConfig,
+        base_config: AgentConfig,
+        supervisor_config: SubagentSupervisorConfig,
+        profile_registry: SubagentProfileRegistry,
+        critical_event_sink: Option<CriticalSubagentEventSink>,
     ) -> Self {
         #[cfg(feature = "agent")]
         let coordinator = base_config
@@ -116,6 +137,7 @@ impl SubagentSupervisor {
             #[cfg(feature = "agent")]
             coordinator,
             event_tx,
+            critical_event_sink,
             children: Arc::new(Mutex::new(HashMap::new())),
             concurrency_semaphore: semaphore,
         }
@@ -146,6 +168,24 @@ impl SubagentSupervisor {
         spec: SubagentSpec,
         context: SubagentContext,
     ) -> Result<SubagentHandle, RociError> {
+        let (handle, start_tx) = self.spawn_with_context_paused(spec, context).await?;
+        let _ = start_tx.send(());
+        Ok(handle)
+    }
+
+    pub(super) async fn spawn_paused(
+        &self,
+        spec: SubagentSpec,
+    ) -> Result<(SubagentHandle, oneshot::Sender<()>), RociError> {
+        self.spawn_with_context_paused(spec, SubagentContext::default())
+            .await
+    }
+
+    async fn spawn_with_context_paused(
+        &self,
+        spec: SubagentSpec,
+        context: SubagentContext,
+    ) -> Result<(SubagentHandle, oneshot::Sender<()>), RociError> {
         if self.config.max_concurrent == 0 {
             return Err(RociError::Configuration(
                 "max_concurrent must be greater than zero".into(),
@@ -201,11 +241,19 @@ impl SubagentSupervisor {
         let id: SubagentId = Uuid::new_v4();
 
         // 5. Build child event sink wrapping events as SubagentEvent::AgentEvent
-        let child_event_sink =
-            super::events::build_child_event_sink(id, spec.label.clone(), self.event_tx.clone());
+        let child_event_sink = super::events::build_child_event_sink_with_critical_sink(
+            id,
+            spec.label.clone(),
+            self.event_tx.clone(),
+            self.critical_event_sink.clone(),
+        );
 
         let child_tools = select_child_tools(&self.base_config.tools, &profile.tools)?;
-        let child_config = build_child_config(
+        let child_dynamic_tool_providers = select_child_dynamic_tool_providers(
+            &self.base_config.dynamic_tool_providers,
+            &profile.mcp_servers,
+        )?;
+        let mut child_config = build_child_config(
             &self.base_config,
             resolved_model.candidates.clone(),
             child_tools,
@@ -214,6 +262,7 @@ impl SubagentSupervisor {
             #[cfg(feature = "agent")]
             self.coordinator.clone(),
         )?;
+        child_config.dynamic_tool_providers = child_dynamic_tool_providers;
 
         // 6. Launch child runtime seeded with the full initial messages.
         //    System prompt is in the messages, not in the runtime config.
@@ -258,31 +307,73 @@ impl SubagentSupervisor {
         }
 
         // 11. Emit spawned event
-        let _ = self.event_tx.send(SubagentEvent::Spawned {
-            subagent_id: id,
-            label: spec.label.clone(),
-            profile: spec.profile.clone(),
-            model: Some(model.clone()),
-        });
+        emit_subagent_event(
+            &self.event_tx,
+            self.critical_event_sink.as_ref(),
+            SubagentEvent::Spawned {
+                subagent_id: id,
+                label: spec.label.clone(),
+                profile: spec.profile.clone(),
+                model: Some(model.clone()),
+            },
+        );
 
         // 12. Channels for handle <-> task communication
         let (completion_tx, completion_rx) = oneshot::channel::<SubagentRunResult>();
+        let (start_tx, start_rx) = oneshot::channel();
 
-        // 13. Spawn background task
-        tokio::spawn(run_task::run_child_task(
-            self.concurrency_semaphore.clone(),
-            self.event_tx.clone(),
-            status.clone(),
-            snapshot_tx,
-            id,
-            spec.profile.clone(),
-            spec.label.clone(),
-            model.clone(),
-            launched.runtime,
-            cancel_token.clone(),
-            profile.default_timeout_ms,
-            completion_tx,
-        ));
+        // 13. Spawn the child behind a routing-controlled start gate.
+        let task_status = status.clone();
+        let task_profile = spec.profile.clone();
+        let task_label = spec.label.clone();
+        let task_model = model.clone();
+        let task_cancel_token = cancel_token.clone();
+        let task_semaphore = self.concurrency_semaphore.clone();
+        let task_event_tx = self.event_tx.clone();
+        let task_critical_event_sink = self.critical_event_sink.clone();
+        tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                // Routing never published its canonical Spawned event. Resolve
+                // the handle without emitting a later out-of-order event.
+                let result = SubagentRunResult {
+                    subagent_id: id,
+                    status: SubagentStatus::Aborted,
+                    messages: Vec::new(),
+                    error: Some("subagent start canceled".into()),
+                };
+                *task_status.lock().await = SubagentStatus::Aborted;
+                let _ = snapshot_tx.send(SubagentSnapshot {
+                    subagent_id: id,
+                    profile: task_profile,
+                    label: task_label,
+                    model: Some(task_model),
+                    status: SubagentStatus::Aborted,
+                    turn_index: 0,
+                    message_count: 0,
+                    is_streaming: false,
+                    last_error: result.error.clone(),
+                });
+                let _ = completion_tx.send(result);
+                return;
+            }
+
+            run_task::run_child_task(
+                task_semaphore,
+                task_event_tx,
+                task_critical_event_sink,
+                task_status,
+                snapshot_tx,
+                id,
+                task_profile,
+                task_label,
+                task_model,
+                launched.runtime,
+                task_cancel_token,
+                profile.default_timeout_ms,
+                completion_tx,
+            )
+            .await;
+        });
 
         // 14. Build and return handle
         let handle = SubagentHandle::new(
@@ -297,7 +388,7 @@ impl SubagentSupervisor {
             completion_rx,
         );
 
-        Ok(handle)
+        Ok((handle, start_tx))
     }
 
     /// Abort a specific child by ID.

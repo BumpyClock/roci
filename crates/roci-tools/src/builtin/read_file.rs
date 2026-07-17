@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
+use roci::security::filesystem::PathOperation;
 use roci::tools::arguments::ToolArguments;
 use roci::tools::tool::{
     AgentTool, Tool, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
 };
 use roci::tools::types::AgentToolParameters;
 
-use super::common::{resolve_session_path, truncate_utf8, READ_FILE_MAX_BYTES};
+use super::common::{
+    resolve_session_path, resolve_workspace_path, truncate_utf8, READ_FILE_MAX_BYTES,
+};
 
 /// Create the `read_file` tool — reads a file as UTF-8 text.
 ///
@@ -23,7 +26,16 @@ pub fn read_file_tool() -> Arc<dyn Tool> {
         |args_val, ctx: ToolExecutionContext| async move {
             let path = args_val.get_str("path")?;
 
-            let content = if let (Some(session_fs), Some(path)) =
+            let content = if let Some(workspace_path) =
+                resolve_workspace_path(&ctx, path, PathOperation::Read)?
+            {
+                tokio::fs::read_to_string(&workspace_path)
+                    .await
+                    .map_err(|e| RociError::ToolExecution {
+                        tool_name: "read_file".into(),
+                        message: format!("{}: {e}", workspace_path.display()),
+                    })?
+            } else if let (Some(session_fs), Some(path)) =
                 (ctx.session_fs.as_ref(), resolve_session_path(&ctx, path)?)
             {
                 let bytes = session_fs

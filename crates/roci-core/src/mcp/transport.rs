@@ -117,7 +117,7 @@ mod stdio;
 mod streamable_http;
 mod websocket;
 
-pub use stdio::StdioTransport;
+pub use stdio::{StdioTransport, StdioTransportConfig};
 pub use streamable_http::{
     StreamableHttpAuthHeaderProvider, StreamableHttpTransport, StreamableHttpTransportConfig,
 };

@@ -10,7 +10,7 @@ pub mod selector;
 pub use candidates::ModelCandidates;
 pub use capabilities::{
     FileInputCapabilities, ImageInputCapabilities, ModelCapabilities, ModelInputCapabilities,
-    TextInputCapabilities,
+    ReasoningEffortCapabilities, ReasoningEffortCapabilitiesError, TextInputCapabilities,
 };
 pub use catalog::{ModelCatalog, ModelCatalogSource, ModelInfo, ModelListOptions, ModelPolicy};
 pub use health::{

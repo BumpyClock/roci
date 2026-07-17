@@ -28,7 +28,10 @@ use crate::error::RociError as TestRociError;
 use crate::models::LanguageModel;
 use crate::provider::factory::ProviderFactory;
 use crate::provider::{ModelProvider, ProviderRegistry, ProviderRequest, ProviderResponse};
+use crate::tools::arguments::ToolArguments;
+use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
 use crate::tools::tool::Tool;
+use crate::tools::tool::ToolExecutionContext;
 use crate::tools::{AgentTool, AgentToolParameters};
 use crate::types::{
     GenerationSettings, ModelMessage, ReasoningEffort, Role, StreamEventType, TextStreamDelta,
@@ -78,6 +81,30 @@ struct CredentialFlagFactory {
     requires_credentials: bool,
 }
 
+struct ServerScopedDynamicProvider {
+    server_ids: Vec<String>,
+}
+
+#[async_trait]
+impl DynamicToolProvider for ServerScopedDynamicProvider {
+    fn server_ids(&self) -> Vec<String> {
+        self.server_ids.clone()
+    }
+
+    async fn list_tools(&self) -> Result<Vec<DynamicTool>, TestRociError> {
+        Ok(Vec::new())
+    }
+
+    async fn execute_tool(
+        &self,
+        _name: &str,
+        _args: &ToolArguments,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<serde_json::Value, TestRociError> {
+        Ok(serde_json::Value::Null)
+    }
+}
+
 impl ProviderFactory for CredentialFlagFactory {
     fn provider_keys(&self) -> &[&str] {
         self.keys
@@ -122,6 +149,7 @@ fn make_base_config() -> AgentConfig {
         approval_handler: None,
         session_id: None,
         session: None,
+        workspace_root: None,
         sandbox_provider: None,
         steering_mode: QueueDrainMode::All,
         follow_up_mode: QueueDrainMode::All,
@@ -273,6 +301,7 @@ fn make_supervisor_with_mock_config_and_registry(
         #[cfg(feature = "agent")]
         coordinator,
         event_tx,
+        critical_event_sink: None,
         children: Arc::new(Mutex::new(HashMap::new())),
         concurrency_semaphore: semaphore,
     };
@@ -424,6 +453,88 @@ async fn spawn_applies_tool_policy_and_reasoning_effort() {
     assert_eq!(cfg.settings.reasoning_effort, Some(ReasoningEffort::High));
 
     handle.abort().await;
+}
+
+#[tokio::test]
+async fn spawn_inherits_parent_candidates_when_profile_candidates_are_empty() {
+    let mut base_config = make_base_config();
+    base_config.candidates = vec![
+        LanguageModel::Known {
+            provider_key: "test".into(),
+            model_id: "parent-primary".into(),
+        },
+        LanguageModel::Known {
+            provider_key: "local".into(),
+            model_id: "parent-fallback".into(),
+        },
+    ];
+    let (supervisor, _, captured_config) = make_supervisor_with_mock_config(
+        base_config.clone(),
+        SubagentProfileRegistry::with_builtins(),
+    );
+
+    let handle = supervisor
+        .spawn_with_context(
+            SubagentSpec {
+                profile: "builtin:developer".into(),
+                label: None,
+                input: SubagentInput::Prompt {
+                    task: "inherit parent models".into(),
+                },
+                overrides: Default::default(),
+            },
+            SubagentContext::default(),
+        )
+        .await
+        .unwrap();
+
+    let cfg = captured_config.lock().await.clone().unwrap();
+    assert_eq!(cfg.candidates, base_config.candidates);
+
+    handle.abort().await;
+}
+
+#[tokio::test]
+async fn spawn_rejects_profile_mcp_server_missing_from_parent_providers() {
+    let mut base_config = make_base_config();
+    base_config.dynamic_tool_providers = vec![Arc::new(ServerScopedDynamicProvider {
+        server_ids: vec!["github".into()],
+    })];
+    let mut profiles = test_profile_registry();
+    profiles
+        .register(SubagentProfile {
+            name: "test:missing-mcp".into(),
+            system_prompt: Some("Missing MCP test".into()),
+            mcp_servers: vec!["missing".into()],
+            models: vec![ModelCandidate {
+                provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    let (supervisor, _, _) = make_supervisor_with_mock_config(base_config, profiles);
+
+    let result = supervisor
+        .spawn_with_context(
+            SubagentSpec {
+                profile: "test:missing-mcp".into(),
+                label: None,
+                input: SubagentInput::Prompt {
+                    task: "must not broaden MCP access".into(),
+                },
+                overrides: Default::default(),
+            },
+            SubagentContext::default(),
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("expected missing MCP server to fail launch"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("missing"));
 }
 
 #[tokio::test]
@@ -663,6 +774,46 @@ async fn spawn_without_context_uses_default() {
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[1].text(), "test default context");
 
+    handle.abort().await;
+}
+
+#[tokio::test]
+async fn paused_spawn_emits_no_child_events_until_started() {
+    let (supervisor, _, _) = make_supervisor_with_mock();
+    let mut events = supervisor.subscribe();
+    let spec = SubagentSpec {
+        profile: "test:dev".into(),
+        label: None,
+        input: SubagentInput::Prompt {
+            task: "wait for routing metadata".into(),
+        },
+        overrides: Default::default(),
+    };
+
+    let (handle, start_tx) = supervisor.spawn_paused(spec).await.unwrap();
+
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        SubagentEvent::Spawned { .. }
+    ));
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(handle.status().await, SubagentStatus::Pending);
+
+    start_tx.send(()).unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        SubagentEvent::StatusChanged {
+            status: SubagentStatus::Running,
+            ..
+        }
+    ));
     handle.abort().await;
 }
 

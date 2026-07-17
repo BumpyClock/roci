@@ -7,6 +7,7 @@ use crate::provider::{self, ToolDefinition};
 use crate::tools::{ToolCatalog, ToolOrigin};
 use crate::types::{ModelMessage, Usage};
 
+use super::canonical_workspace_root;
 use super::control::{
     emit_failed_result, resolve_iteration_limit_approval, AgentEventEmitter,
     IterationLimitApprovalContext, RunEventEmitter,
@@ -254,6 +255,11 @@ fn now_ms() -> u64 {
 impl Runner for LoopRunner {
     async fn start(&self, mut request: RunRequest) -> Result<RunHandle, crate::error::RociError> {
         validate_retry_mode(request.retry_mode)?;
+        request.workspace_root = request
+            .workspace_root
+            .as_deref()
+            .map(canonical_workspace_root)
+            .transpose()?;
         request.tools = ToolCatalog::from_tools(request.tools, ToolOrigin::Custom)?
             .resolve(&request.tool_visibility_policy);
         let (handle, mut abort_rx, result_tx, mut input_rx) = RunHandle::new(request.run_id);

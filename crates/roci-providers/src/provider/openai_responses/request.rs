@@ -16,11 +16,25 @@ const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Roci, a helpful assistant.";
 const RESPONSES_PROXY_BASE_URL_ENV: &str = "ROCI_OPENAI_RESPONSES_PROXY_BASE_URL";
 
 impl OpenAiResponsesProvider {
+    fn effective_reasoning_effort(&self, settings: &GenerationSettings) -> Option<ReasoningEffort> {
+        settings
+            .reasoning_effort
+            .or_else(|| self.capabilities.default_reasoning_effort())
+    }
+
     pub(crate) fn validate_settings(&self, settings: &GenerationSettings) -> Result<(), RociError> {
+        if let Some(effort) = settings.reasoning_effort {
+            if !self.capabilities.supports_reasoning_effort(effort) {
+                return Err(RociError::InvalidArgument(format!(
+                    "reasoning effort {effort} not supported for model {}",
+                    self.model.as_str()
+                )));
+            }
+        }
         if (settings.temperature.is_some() || settings.top_p.is_some())
             && !self
                 .model
-                .supports_sampling_params(settings.reasoning_effort)
+                .supports_sampling_params(self.effective_reasoning_effort(settings))
         {
             return Err(RociError::InvalidArgument(format!(
                 "temperature/top_p not supported for model {}",
@@ -206,17 +220,15 @@ impl OpenAiResponsesProvider {
 
         let needs_reasoning = self.model.is_reasoning() || self.model.is_gpt5_family();
         if needs_reasoning {
-            let effort = request
-                .settings
-                .reasoning_effort
-                .unwrap_or(ReasoningEffort::Medium);
-            obj.insert(
-                "reasoning".into(),
-                serde_json::json!({
-                    "effort": effort.to_string(),
-                    "summary": "auto",
-                }),
-            );
+            if let Some(effort) = self.effective_reasoning_effort(&request.settings) {
+                obj.insert(
+                    "reasoning".into(),
+                    serde_json::json!({
+                        "effort": effort.to_string(),
+                        "summary": "auto",
+                    }),
+                );
+            }
         }
     }
 

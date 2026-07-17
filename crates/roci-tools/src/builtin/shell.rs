@@ -16,6 +16,10 @@ use super::common::{
 ///
 /// Captures stdout and stderr, applies a 30-second timeout, and truncates
 /// output beyond 32 KB to prevent context explosion.
+///
+/// A workspace root only sets the process current directory. It is a trusted-host
+/// convenience, not a filesystem sandbox: commands and child processes retain
+/// normal host filesystem access unless the host supplies an OS sandbox.
 pub fn shell_tool() -> Arc<dyn Tool> {
     let tool = AgentTool::new(
         "shell",
@@ -29,7 +33,14 @@ pub fn shell_tool() -> Arc<dyn Tool> {
             let mut process = tokio::process::Command::new("sh");
             process.arg("-c").arg(command);
 
-            if let (Some(session_fs), Some(session_cwd)) =
+            if let Some(workspace_root) = ctx.workspace_root.as_ref() {
+                if let Some(provider) = ctx.sandbox_provider.as_ref() {
+                    provider
+                        .validate_workspace_shell_command(command, workspace_root)
+                        .await?;
+                }
+                process.current_dir(workspace_root);
+            } else if let (Some(session_fs), Some(session_cwd)) =
                 (ctx.session_fs.as_ref(), ctx.session_cwd.as_ref())
             {
                 if let Some(provider) = ctx.sandbox_provider.as_ref() {

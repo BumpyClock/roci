@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::service::{ClientInitializeError, ServiceExt};
@@ -10,10 +13,35 @@ use crate::mcp::elicitation::MCPClientHandler;
 
 use super::{MCPRunningService, MCPTransport};
 
+/// Public stdio transport configuration.
+#[derive(Clone, Default)]
+pub struct StdioTransportConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub cwd: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for StdioTransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_args = vec!["<redacted>"; self.args.len()];
+        let redacted_env = self
+            .env
+            .keys()
+            .map(|key| (key, "<redacted>"))
+            .collect::<HashMap<_, _>>();
+        f.debug_struct("StdioTransportConfig")
+            .field("command", &self.command)
+            .field("args", &redacted_args)
+            .field("env", &redacted_env)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
+}
+
 /// Stdio-based MCP transport (for local MCP servers).
 pub struct StdioTransport {
-    command: String,
-    args: Vec<String>,
+    config: StdioTransportConfig,
     inner: Option<Box<dyn DynRoleClientTransport>>,
     closed: bool,
 }
@@ -21,9 +49,17 @@ pub struct StdioTransport {
 impl StdioTransport {
     /// Create a stdio transport from command and args.
     pub fn new(command: impl Into<String>, args: Vec<String>) -> Self {
-        Self {
+        Self::from_config(StdioTransportConfig {
             command: command.into(),
             args,
+            ..StdioTransportConfig::default()
+        })
+    }
+
+    /// Create a stdio transport from public config.
+    pub fn from_config(config: StdioTransportConfig) -> Self {
+        Self {
+            config,
             inner: None,
             closed: false,
         }
@@ -35,11 +71,29 @@ impl StdioTransport {
     }
 
     pub fn command(&self) -> &str {
-        &self.command
+        &self.config.command
     }
 
     pub fn args(&self) -> &[String] {
-        &self.args
+        &self.config.args
+    }
+
+    pub fn env(&self) -> &HashMap<String, String> {
+        &self.config.env
+    }
+
+    pub fn cwd(&self) -> Option<&Path> {
+        self.config.cwd.as_deref()
+    }
+
+    fn build_command(&self) -> Command {
+        let mut command = Command::new(&self.config.command);
+        command.args(&self.config.args);
+        command.envs(&self.config.env);
+        if let Some(cwd) = &self.config.cwd {
+            command.current_dir(cwd);
+        }
+        command
     }
 
     fn ensure_connected(&mut self) -> Result<(), RociError> {
@@ -50,8 +104,7 @@ impl StdioTransport {
             return Ok(());
         }
 
-        let mut command = Command::new(&self.command);
-        command.args(&self.args);
+        let command = self.build_command();
         let transport = TokioChildProcess::new(command)?;
         self.inner = Some(Box::new(ErasedRoleClientTransport::new(transport)));
         Ok(())
@@ -77,8 +130,7 @@ impl MCPTransport for StdioTransport {
             ));
         }
 
-        let mut command = Command::new(&self.command);
-        command.args(&self.args);
+        let command = self.build_command();
         let transport = TokioChildProcess::new(command).map_err(|error| {
             ClientInitializeError::transport::<TokioChildProcess>(error, "spawn stdio transport")
         })?;
@@ -122,6 +174,44 @@ mod tests {
         test_client_request, test_server_response, MockInnerTransport,
     };
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn stdio_config_applies_env_and_cwd_without_debug_value_leak() {
+        let config = StdioTransportConfig {
+            command: "node".into(),
+            args: vec!["server.js".into(), "--opaque=value-marker".into()],
+            env: std::collections::HashMap::from([(
+                "SERVICE_OPTION".to_string(),
+                "environment-marker".to_string(),
+            )]),
+            cwd: Some(std::path::PathBuf::from("/tmp/mcp-server")),
+        };
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("SERVICE_OPTION"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("environment-marker"));
+        assert!(!debug.contains("value-marker"));
+
+        let transport = StdioTransport::from_config(config);
+        let command = transport.build_command();
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "node");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("server.js"),
+                std::ffi::OsStr::new("--opaque=value-marker"),
+            ]
+        );
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("/tmp/mcp-server"))
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "SERVICE_OPTION" && value == Some(std::ffi::OsStr::new("environment-marker"))
+        }));
+    }
 
     #[test]
     fn stdio_constructor_keeps_command_and_args() {

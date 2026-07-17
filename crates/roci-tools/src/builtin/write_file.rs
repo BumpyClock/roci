@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use roci::error::RociError;
+use roci::security::filesystem::PathOperation;
 use roci::tools::arguments::ToolArguments;
 use roci::tools::tool::{
     AgentTool, Tool, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
 };
 use roci::tools::types::AgentToolParameters;
 
-use super::common::resolve_session_path;
+use super::common::{resolve_session_path, resolve_workspace_path};
 
 /// Create the `write_file` tool — writes content to a file.
 ///
@@ -24,6 +25,33 @@ pub fn write_file_tool() -> Arc<dyn Tool> {
         |args_val, ctx: ToolExecutionContext| async move {
             let path = args_val.get_str("path")?;
             let content = args_val.get_str("content")?;
+
+            if let Some(workspace_path) = resolve_workspace_path(&ctx, path, PathOperation::Write)?
+            {
+                if let Some(parent) = workspace_path.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        RociError::ToolExecution {
+                            tool_name: "write_file".into(),
+                            message: format!(
+                                "failed to create directories for {}: {e}",
+                                workspace_path.display()
+                            ),
+                        }
+                    })?;
+                }
+                let bytes = content.len();
+                tokio::fs::write(&workspace_path, content)
+                    .await
+                    .map_err(|e| RociError::ToolExecution {
+                        tool_name: "write_file".into(),
+                        message: format!("{}: {e}", workspace_path.display()),
+                    })?;
+                return Ok(serde_json::json!({
+                    "success": true,
+                    "path": path,
+                    "bytes_written": bytes,
+                }));
+            }
 
             if let (Some(session_fs), Some(logical_path)) =
                 (ctx.session_fs.as_ref(), resolve_session_path(&ctx, path)?)

@@ -1,13 +1,16 @@
 [workspace]
 members = [".", "crates/roci-cli", "crates/roci-tools", "crates/roci-core", "crates/roci-providers"]
 
+[workspace.package]
+rust-version = "1.96.1"
+
 [package]
 name = "roci"
 version = "0.1.0"
 edition = "2021"
 description = "Rust AI SDK — spiritual port of Tachikoma"
 license = "MIT"
-rust-version = "1.75"
+rust-version.workspace = true
 
 [dependencies]
 roci-core = { path = "crates/roci-core" }

@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use roci::error::RociError;
 use roci::prelude::SessionFileKind;
+use roci::security::filesystem::PathOperation;
 use roci::tools::arguments::ToolArguments;
 use roci::tools::tool::{
     AgentTool, Tool, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
 };
 use roci::tools::types::AgentToolParameters;
 
-use super::common::resolve_session_path;
+use super::common::{resolve_session_path, resolve_workspace_path};
 
 /// Create the `list_directory` tool — lists directory entries.
 ///
@@ -23,6 +24,10 @@ pub fn list_directory_tool() -> Arc<dyn Tool> {
             .build(),
         |args_val, ctx: ToolExecutionContext| async move {
             let path = args_val.get_str("path")?;
+
+            if let Some(workspace_path) = resolve_workspace_path(&ctx, path, PathOperation::List)? {
+                return list_host_directory(&workspace_path, path).await;
+            }
 
             if let (Some(session_fs), Some(logical_path)) =
                 (ctx.session_fs.as_ref(), resolve_session_path(&ctx, path)?)
@@ -72,62 +77,69 @@ pub fn list_directory_tool() -> Arc<dyn Tool> {
                 }));
             }
 
-            let mut read_dir =
-                tokio::fs::read_dir(path)
-                    .await
-                    .map_err(|e| RociError::ToolExecution {
-                        tool_name: "list_directory".into(),
-                        message: format!("{path}: {e}"),
-                    })?;
-
-            let mut entries = Vec::new();
-            while let Some(entry) =
-                read_dir
-                    .next_entry()
-                    .await
-                    .map_err(|e| RociError::ToolExecution {
-                        tool_name: "list_directory".into(),
-                        message: e.to_string(),
-                    })?
-            {
-                let metadata = entry
-                    .metadata()
-                    .await
-                    .map_err(|e| RociError::ToolExecution {
-                        tool_name: "list_directory".into(),
-                        message: e.to_string(),
-                    })?;
-
-                let entry_type = if metadata.is_dir() {
-                    "dir"
-                } else if metadata.is_file() {
-                    "file"
-                } else {
-                    "other"
-                };
-
-                entries.push(serde_json::json!({
-                    "name": entry.file_name().to_string_lossy(),
-                    "type": entry_type,
-                    "size": metadata.len(),
-                }));
-            }
-
-            entries.sort_by(|a, b| {
-                let a_name = a["name"].as_str().unwrap_or("");
-                let b_name = b["name"].as_str().unwrap_or("");
-                a_name.cmp(b_name)
-            });
-
-            let count = entries.len();
-            Ok(serde_json::json!({
-                "path": path,
-                "entries": entries,
-                "count": count,
-            }))
+            list_host_directory(std::path::Path::new(path), path).await
         },
     );
     Arc::new(tool.with_safety(list_directory_safety_summary(), list_directory_safety))
+}
+
+async fn list_host_directory(
+    resolved_path: &std::path::Path,
+    display_path: &str,
+) -> Result<serde_json::Value, RociError> {
+    let mut read_dir =
+        tokio::fs::read_dir(resolved_path)
+            .await
+            .map_err(|e| RociError::ToolExecution {
+                tool_name: "list_directory".into(),
+                message: format!("{}: {e}", resolved_path.display()),
+            })?;
+
+    let mut entries = Vec::new();
+    while let Some(entry) = read_dir
+        .next_entry()
+        .await
+        .map_err(|e| RociError::ToolExecution {
+            tool_name: "list_directory".into(),
+            message: e.to_string(),
+        })?
+    {
+        let metadata = tokio::fs::symlink_metadata(entry.path())
+            .await
+            .map_err(|e| RociError::ToolExecution {
+                tool_name: "list_directory".into(),
+                message: e.to_string(),
+            })?;
+
+        let entry_type = if metadata.file_type().is_symlink() {
+            "symlink"
+        } else if metadata.is_dir() {
+            "dir"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+
+        entries.push(serde_json::json!({
+            "name": entry.file_name().to_string_lossy(),
+            "type": entry_type,
+            "size": metadata.len(),
+        }));
+    }
+
+    entries.sort_by(|a, b| {
+        let a_name = a["name"].as_str().unwrap_or("");
+        let b_name = b["name"].as_str().unwrap_or("");
+        a_name.cmp(b_name)
+    });
+
+    let count = entries.len();
+    Ok(serde_json::json!({
+        "path": display_path,
+        "entries": entries,
+        "count": count,
+    }))
 }
 
 fn list_directory_safety(args: &ToolArguments) -> ToolSafetyPlan {

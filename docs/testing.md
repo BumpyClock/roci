@@ -278,6 +278,7 @@ Subagent CLI/runtime changes must prove the real `roci-agent` binary can:
 - run a child provider call
 - render semantic subagent events
 - return the child summary to the parent turn
+- persist `--agent` in a durable session and reuse it when resumed without `--agent`
 
 Framed OpenAI-compatible endpoint:
 
@@ -320,3 +321,37 @@ Acceptance: log contains `[subagent] started`, `[subagent] ... completed`,
 ## Environment
 
 Use `.env` for local secrets and `.env.example` as the template.
+
+### Durable subagent selection
+
+Run this separate smoke when profile persistence or resume precedence changes.
+With the Framed provider environment already configured, it proves an explicit
+`--agent` selection survives a second CLI process without repeating the flag.
+
+```bash
+WORKDIR=$(mktemp -d /tmp/roci-subagent-resume.XXXXXX)
+mkdir -p "$WORKDIR/.roci/subagents"
+printf '%s\n' \
+  'name = "smoke"' \
+  'display_name = "Smoke Worker"' \
+  'default = true' \
+  '[[models]]' \
+  'provider = "openai"' \
+  'model = "gemma-4-e4b"' \
+  >"$WORKDIR/.roci/subagents/smoke.toml"
+SESSION_ROOT="$WORKDIR/sessions"
+cd "$WORKDIR"
+cargo run -q --manifest-path /path/to/roci/Cargo.toml -p roci-cli -- \
+  chat --no-skills --agent smoke --model openai:gemma-4-e4b \
+  --session-root "$SESSION_ROOT" --session-id subagent-resume \
+  "Reply exactly: profile-stored"
+rg '"agent_profile": "smoke"' "$SESSION_ROOT/subagent-resume/metadata.json"
+cargo run -q --manifest-path /path/to/roci/Cargo.toml -p roci-cli -- \
+  chat --no-skills --model openai:gemma-4-e4b \
+  --session-root "$SESSION_ROOT" --session-id subagent-resume \
+  "Use delegate_subagent once, then reply exactly: profile-resumed"
+```
+
+Acceptance: metadata contains `"agent_profile": "smoke"`; resumed output
+contains `[subagent] started`, `[subagent] ... completed`, and
+`profile-resumed`.

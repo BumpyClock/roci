@@ -20,10 +20,7 @@ use crate::types::{
     GenerationSettings, ModelMessage, OpenAiResponsesOptions, ResponseFormat, Role,
 };
 #[cfg(feature = "agent")]
-use crate::{
-    agent::subagents::{project_main_agent_profile, SubagentProfile},
-    tools::catalog::ToolVisibilityPolicy,
-};
+use crate::{agent::subagents::project_main_agent_profile, tools::catalog::ToolVisibilityPolicy};
 
 #[derive(Debug, Clone)]
 pub(super) struct TurnRunOptions {
@@ -116,7 +113,7 @@ impl AgentRuntime {
         let mut catalog = Self::merge_static_and_dynamic_tools(static_tools, providers).await?;
         #[cfg(feature = "agent")]
         self.inject_subagent_tools(&mut catalog)?;
-        let policy = self.effective_tool_visibility_policy(&catalog)?;
+        let policy = self.effective_tool_visibility_policy(&catalog).await?;
         Ok(catalog.resolve(&policy))
     }
 
@@ -132,12 +129,18 @@ impl AgentRuntime {
     }
 
     #[cfg(feature = "agent")]
-    fn effective_tool_visibility_policy(
+    async fn effective_tool_visibility_policy(
         &self,
         catalog: &ToolCatalog,
     ) -> Result<ToolVisibilityPolicy, RociError> {
         let base_policy = &self.config.tool_visibility_policy;
-        let Some(profile) = self.main_subagent_profile()? else {
+        let Some(controller) = &self.subagent_controller else {
+            return Ok(base_policy.clone());
+        };
+        let Some(profile) = controller
+            .effective_main_profile(&crate::agent::subagents::SubagentCaller::main_agent())
+            .await?
+        else {
             return Ok(base_policy.clone());
         };
         let base_names = catalog
@@ -159,29 +162,11 @@ impl AgentRuntime {
     }
 
     #[cfg(not(feature = "agent"))]
-    fn effective_tool_visibility_policy(
+    async fn effective_tool_visibility_policy(
         &self,
         _catalog: &ToolCatalog,
     ) -> Result<crate::tools::catalog::ToolVisibilityPolicy, RociError> {
         Ok(self.config.tool_visibility_policy.clone())
-    }
-
-    #[cfg(feature = "agent")]
-    fn main_subagent_profile(&self) -> Result<Option<SubagentProfile>, RociError> {
-        let Some(subagents) = &self.config.subagents else {
-            return Ok(None);
-        };
-        if !subagents.enabled {
-            return Ok(None);
-        }
-        let Some(profile_ref) = subagents
-            .main_profile
-            .clone()
-            .or_else(|| subagents.profiles.default_profile_ref())
-        else {
-            return Ok(None);
-        };
-        subagents.profiles.resolve(&profile_ref).map(Some)
     }
 
     async fn merge_static_and_dynamic_tools(
@@ -354,6 +339,9 @@ impl AgentRuntime {
         if let (Some(session_config), Some(session_fs)) = (&self.session_config, &self.session_fs) {
             let session_fs: Arc<dyn crate::session::SessionFs + Send + Sync> = session_fs.clone();
             request = request.with_session_context(session_fs, session_config.cwd.clone());
+        }
+        if let Some(workspace_root) = &self.config.workspace_root {
+            request = request.with_workspace_root(workspace_root.clone());
         }
         if let Some(sandbox_provider) = &self.sandbox_provider {
             request = request.with_sandbox_provider(sandbox_provider.clone());

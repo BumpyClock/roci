@@ -23,6 +23,13 @@ impl CliSubagentProfiles {
     }
 }
 
+pub(crate) fn select_session_agent_profile(
+    explicit_profile: Option<&str>,
+    persisted_profile: Option<&str>,
+) -> Option<String> {
+    explicit_profile.or(persisted_profile).map(str::to_string)
+}
+
 pub(crate) fn load_cli_subagent_profiles(
     cwd: &Path,
     selected_profile: Option<String>,
@@ -252,5 +259,22 @@ display_name = "Project Custom"
             load_cli_subagent_profiles_with_home(temp.path(), Some(temp.path()), None).unwrap();
 
         assert!(profiles.into_config(false).is_none());
+    }
+
+    #[test]
+    fn session_profile_prefers_explicit_over_persisted() {
+        assert_eq!(
+            select_session_agent_profile(Some("builtin:planner"), Some("builtin:developer"))
+                .as_deref(),
+            Some("builtin:planner")
+        );
+    }
+
+    #[test]
+    fn session_profile_uses_persisted_without_explicit_override() {
+        assert_eq!(
+            select_session_agent_profile(None, Some("builtin:developer")).as_deref(),
+            Some("builtin:developer")
+        );
     }
 }

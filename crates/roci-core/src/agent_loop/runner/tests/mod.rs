@@ -17,6 +17,7 @@ use crate::tools::types::AgentToolParameters;
 use crate::types::{ContentPart, StreamEventType};
 
 mod support;
+mod workspace;
 
 use support::{
     capture_agent_events, capture_events, test_model, test_runner, test_runner_by_model,

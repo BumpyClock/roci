@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Provider-agnostic SDK kernel for Roci"
 license = "MIT"
-rust-version = "1.75"
+rust-version.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -32,6 +32,9 @@ sha2 = "0.10"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
 tokio-util = { version = "0.7", optional = true }
 rmcp = { version = "0.16", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 wiremock = "0.6"

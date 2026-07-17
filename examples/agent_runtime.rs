@@ -100,6 +100,7 @@ async fn main() {
         user_input_timeout_ms: None,
         context_budget: None,
         session: None,
+        workspace_root: None,
         sandbox_provider: None,
         chat: Default::default(),
         subagents: None,

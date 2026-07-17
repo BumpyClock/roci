@@ -42,9 +42,13 @@ impl OpenAiResponsesProvider {
         base_url: Option<String>,
         account_id: Option<String>,
     ) -> Self {
-        let capabilities = model.capabilities();
         let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let is_codex = base_url.contains("chatgpt.com/backend-api/codex");
+        let capabilities = if is_codex {
+            model.codex_capabilities()
+        } else {
+            model.capabilities()
+        };
         Self {
             base_url,
             model,

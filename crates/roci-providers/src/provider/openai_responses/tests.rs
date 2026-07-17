@@ -35,15 +35,31 @@ fn gpt5_rejects_sampling_settings() {
 }
 
 #[test]
-fn gpt52_rejects_sampling_without_reasoning_none() {
+fn gpt52_allows_sampling_with_default_reasoning_none() {
     let provider =
         OpenAiResponsesProvider::new(OpenAiModel::Gpt52, "test-key".to_string(), None, None);
     let settings = GenerationSettings {
         temperature: Some(0.7),
         ..Default::default()
     };
-    let err = provider.validate_settings(&settings).unwrap_err();
-    assert!(matches!(err, RociError::InvalidArgument(_)));
+    assert!(provider.validate_settings(&settings).is_ok());
+}
+
+#[test]
+fn gpt51_allows_sampling_with_default_or_explicit_reasoning_none() {
+    let provider =
+        OpenAiResponsesProvider::new(OpenAiModel::Gpt51, "test-key".to_string(), None, None);
+    let default_settings = GenerationSettings {
+        temperature: Some(0.7),
+        ..Default::default()
+    };
+    let explicit_settings = GenerationSettings {
+        reasoning_effort: Some(ReasoningEffort::None),
+        ..default_settings.clone()
+    };
+
+    assert!(provider.validate_settings(&default_settings).is_ok());
+    assert!(provider.validate_settings(&explicit_settings).is_ok());
 }
 
 #[test]
@@ -56,6 +72,141 @@ fn gpt52_allows_sampling_with_reasoning_none() {
         ..Default::default()
     };
     assert!(provider.validate_settings(&settings).is_ok());
+}
+
+#[test]
+fn public_gpt54_allows_sampling_with_default_reasoning_none() {
+    let provider =
+        OpenAiResponsesProvider::new(OpenAiModel::Gpt54, "test-key".to_string(), None, None);
+    let settings = GenerationSettings {
+        temperature: Some(0.7),
+        ..Default::default()
+    };
+
+    assert!(provider.validate_settings(&settings).is_ok());
+}
+
+#[test]
+fn public_gpt55_allows_sampling_only_with_explicit_reasoning_none() {
+    let provider =
+        OpenAiResponsesProvider::new(OpenAiModel::Gpt55, "test-key".to_string(), None, None);
+    let default_settings = GenerationSettings {
+        temperature: Some(0.7),
+        ..Default::default()
+    };
+    let non_reasoning_settings = GenerationSettings {
+        reasoning_effort: Some(ReasoningEffort::None),
+        ..default_settings.clone()
+    };
+
+    assert!(provider.validate_settings(&default_settings).is_err());
+    assert!(provider.validate_settings(&non_reasoning_settings).is_ok());
+}
+
+#[test]
+fn public_gpt56_models_allow_sampling_with_explicit_reasoning_none() {
+    for model in [
+        OpenAiModel::Gpt56Sol,
+        OpenAiModel::Gpt56Terra,
+        OpenAiModel::Gpt56Luna,
+    ] {
+        let provider = OpenAiResponsesProvider::new(model, "test-key".to_string(), None, None);
+        let settings = GenerationSettings {
+            temperature: Some(0.7),
+            reasoning_effort: Some(ReasoningEffort::None),
+            ..Default::default()
+        };
+
+        assert!(provider.validate_settings(&settings).is_ok());
+    }
+}
+
+#[test]
+fn gpt52_request_defaults_reasoning_to_none() {
+    let provider =
+        OpenAiResponsesProvider::new(OpenAiModel::Gpt52, "test-key".to_string(), None, None);
+    let request = ProviderRequest {
+        messages: vec![ModelMessage::user("hello")],
+        settings: settings(),
+        tools: None,
+        response_format: None,
+        api_key_override: None,
+        headers: reqwest::header::HeaderMap::new(),
+        metadata: std::collections::HashMap::new(),
+        payload_callback: None,
+        session_id: None,
+        transport: None,
+    };
+
+    let body = provider.build_request_body(&request, false);
+
+    assert_eq!(body["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn public_gpt54_defaults_reasoning_to_none() {
+    let provider =
+        OpenAiResponsesProvider::new(OpenAiModel::Gpt54, "test-key".to_string(), None, None);
+    let request = ProviderRequest {
+        messages: vec![ModelMessage::user("hello")],
+        settings: settings(),
+        tools: None,
+        response_format: None,
+        api_key_override: None,
+        headers: reqwest::header::HeaderMap::new(),
+        metadata: std::collections::HashMap::new(),
+        payload_callback: None,
+        session_id: None,
+        transport: None,
+    };
+
+    let body = provider.build_request_body(&request, false);
+
+    assert_eq!(body["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn codex_gpt54_rejects_public_only_reasoning_none() {
+    let provider = OpenAiResponsesProvider::new(
+        OpenAiModel::Gpt54,
+        "test-key".to_string(),
+        Some("https://chatgpt.com/backend-api/codex".to_string()),
+        None,
+    );
+    let settings = GenerationSettings {
+        reasoning_effort: Some(ReasoningEffort::None),
+        ..Default::default()
+    };
+
+    let err = provider.validate_settings(&settings).unwrap_err();
+
+    assert!(matches!(err, RociError::InvalidArgument(_)));
+}
+
+#[test]
+fn codex_gpt54_defaults_reasoning_to_medium() {
+    let provider = OpenAiResponsesProvider::new(
+        OpenAiModel::Gpt54,
+        "test-key".to_string(),
+        Some("https://chatgpt.com/backend-api/codex".to_string()),
+        None,
+    );
+    let request = ProviderRequest {
+        messages: vec![ModelMessage::user("hello")],
+        settings: settings(),
+        tools: None,
+        response_format: None,
+        api_key_override: None,
+        headers: reqwest::header::HeaderMap::new(),
+        metadata: std::collections::HashMap::new(),
+        payload_callback: None,
+        session_id: None,
+        transport: None,
+    };
+
+    let body = provider.build_request_body(&request, false);
+
+    assert_eq!(body["reasoning"]["effort"], "medium");
 }
 
 #[test]
@@ -233,6 +384,59 @@ fn request_body_defaults_reasoning_and_text_for_gpt5() {
     assert_eq!(body["reasoning"]["summary"], "auto");
     assert_eq!(body["text"]["verbosity"], "high");
     assert!(body.get("truncation").is_none());
+}
+
+#[test]
+fn gpt5_chat_request_omits_reasoning_without_explicit_effort() {
+    let provider = OpenAiResponsesProvider::new(
+        OpenAiModel::Gpt5ChatLatest,
+        "test-key".to_string(),
+        None,
+        None,
+    );
+    let request = ProviderRequest {
+        messages: vec![ModelMessage::user("hello")],
+        settings: settings(),
+        tools: None,
+        response_format: None,
+        api_key_override: None,
+        headers: reqwest::header::HeaderMap::new(),
+        metadata: std::collections::HashMap::new(),
+        payload_callback: None,
+        session_id: None,
+        transport: None,
+    };
+
+    let body = provider.build_request_body(&request, false);
+
+    assert!(body.get("reasoning").is_none());
+}
+
+#[test]
+fn codex_request_uses_the_selected_models_default_reasoning_effort() {
+    let provider = OpenAiResponsesProvider::new(
+        OpenAiModel::Gpt56Sol,
+        "test-key".to_string(),
+        Some("https://chatgpt.com/backend-api/codex".to_string()),
+        None,
+    );
+    let request = ProviderRequest {
+        messages: vec![ModelMessage::user("hello")],
+        settings: settings(),
+        tools: None,
+        response_format: None,
+        api_key_override: None,
+        headers: reqwest::header::HeaderMap::new(),
+        metadata: std::collections::HashMap::new(),
+        payload_callback: None,
+        session_id: None,
+        transport: None,
+    };
+
+    let body = provider.build_request_body(&request, false);
+
+    assert_eq!(body["model"], "gpt-5.6-sol");
+    assert_eq!(body["reasoning"]["effort"], "low");
 }
 
 #[test]

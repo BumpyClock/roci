@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent_loop::events::RetryMode;
@@ -88,6 +89,11 @@ pub struct AgentConfig {
     pub session_id: Option<String>,
     /// Optional durable local session configuration.
     pub session: Option<SessionConfig>,
+    /// Trusted host workspace exposed to coding tools.
+    ///
+    /// The runtime canonicalizes and validates this directory during construction.
+    /// It is independent from durable session storage.
+    pub workspace_root: Option<PathBuf>,
     /// Optional sandbox provider exposed to command-capable tools.
     pub sandbox_provider: Option<Arc<dyn SandboxProvider>>,
     /// Drain mode for steering queue retrieval.
@@ -179,6 +185,7 @@ impl Default for AgentConfig {
             approval_handler: None,
             session_id: None,
             session: None,
+            workspace_root: None,
             sandbox_provider: None,
             steering_mode: QueueDrainMode::All,
             follow_up_mode: QueueDrainMode::All,

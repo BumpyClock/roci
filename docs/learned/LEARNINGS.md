@@ -28,6 +28,11 @@
 - Profile inheritance is single-parent only. Child scalars replace parent scalars. `models` replaces wholesale (no merge). `tools` uses `ToolPolicy` (Inherit / Replace / InheritWithOverrides).
 - TOML profiles support both single-file (top-level fields) and multi-profile (`[[profiles]]`) formats. `TomlProfileFile::parse()` tries multi first, falls back to single.
 - Human interaction routing across multiple children uses the same `HumanInteractionCoordinator` -- `request_id` correlation handles multi-child dispatch without a generic bus. `ask_user` is the current model-tool payload.
+- Child input hosts must retain the typed request and clear it from `SubagentInputResolved` / `SubagentInputCanceled`; generic child steering cannot resolve a blocking `ask_user` request.
+- Keep stream ownership categorical: foreground turn subscriptions filter to one `turn_id`; session subscriptions carry child lifecycle/progress/tool/input/terminal events, including post-parent-turn events. Never map child payloads into both streams.
+- Session reconnect uses a durable opaque cursor at host boundaries. Register live receiver before replay, suppress replay/live overlap, and resubscribe from the last projected cursor after a stale live subscription.
+- Runtime subagent bridge pins each child to its original parent turn, then falls back to thread-scoped projection after parent terminal without rewriting the child snapshot's parent pin. Child bridge lifetime is independent of parent turn stream lifetime.
+- Persistence-critical child events must bypass the best-effort supervisor broadcast. Send them through the runtime FIFO before observer fan-out so broadcast lag cannot create durable replay holes. The current FIFO is unbounded; bounded async backpressure needs an async child event sink.
 - Supervisor concurrency is bounded by `Semaphore` (max_concurrent, default 4). `max_active_children` is a separate hard cap that rejects spawns.
 - `abort_on_drop` (default true) cancels all children via `CancellationToken` in the `Drop` impl. Uses `try_lock()` since `Drop` is synchronous.
 - Launcher seam (`SubagentLauncher` trait) is `pub(super)` -- not part of the public API. Exists for testability and future out-of-process extensibility.

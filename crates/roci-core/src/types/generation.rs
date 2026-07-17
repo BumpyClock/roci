@@ -61,13 +61,18 @@ pub enum OpenAiTruncation {
 
 /// Reasoning effort level for reasoning models.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
+#[non_exhaustive]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
+    Ultra,
 }
 
 /// Text verbosity level for GPT-5 responses.

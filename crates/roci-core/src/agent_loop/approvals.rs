@@ -523,7 +523,7 @@ fn matcher_specificity(
             .mcp
             .as_ref()
             .filter(|mcp| {
-                server.as_ref().map_or(true, |server| server == &mcp.server) && &mcp.tool == tool
+                server.as_ref().is_none_or(|server| server == &mcp.server) && &mcp.tool == tool
             })
             .map(|_| ApprovalSpecificity::Exact),
         ApprovalMatcher::SandboxRequirement { requirement } => context

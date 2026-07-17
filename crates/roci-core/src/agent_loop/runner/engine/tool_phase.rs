@@ -92,6 +92,7 @@ pub(super) async fn run_tool_phase(args: ToolPhaseArgs<'_>) -> ToolPhaseOutcome 
     let tool_inputs = ToolExecutionInputs::new(
         request.session_fs.clone(),
         request.session_cwd.clone(),
+        request.workspace_root.clone(),
         request.sandbox_provider.clone(),
         #[cfg(feature = "agent")]
         request.user_input_callback.as_ref(),

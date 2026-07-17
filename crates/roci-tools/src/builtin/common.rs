@@ -1,7 +1,12 @@
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use roci::error::RociError;
 use roci::prelude::LogicalPath;
+use roci::security::filesystem::{
+    FilesystemPolicy, PathAccessRequest, PathBoundary, PathOperation, PathResolutionMode,
+    SymlinkPolicy,
+};
 use roci::tools::tool::ToolExecutionContext;
 
 pub(super) const SHELL_OUTPUT_MAX_BYTES: usize = 32_768;
@@ -33,6 +38,57 @@ pub(super) fn resolve_session_path(
         message: err.to_string(),
     })?;
     Ok(Some(path))
+}
+
+pub(super) fn resolve_workspace_path(
+    ctx: &ToolExecutionContext,
+    raw_path: &str,
+    operation: PathOperation,
+) -> Result<Option<PathBuf>, RociError> {
+    let Some(root) = ctx.workspace_root.as_ref() else {
+        return Ok(None);
+    };
+    let requested = Path::new(raw_path);
+    if requested.is_absolute() {
+        return Err(workspace_path_error(ctx, "absolute paths are not allowed"));
+    }
+    if requested.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(workspace_path_error(ctx, "parent traversal is not allowed"));
+    }
+
+    let boundary = PathBoundary::root(root.clone());
+    let policy = FilesystemPolicy {
+        readable_roots: vec![boundary.clone()],
+        writable_roots: vec![boundary],
+        denied: Vec::new(),
+        resolution_mode: PathResolutionMode::CanonicalizeBestEffort,
+        symlink_policy: SymlinkPolicy::FollowIfTargetAllowed,
+    };
+    let decision = policy.evaluate(PathAccessRequest {
+        operation,
+        path: requested.to_path_buf(),
+        cwd: Some(root.clone()),
+    });
+    if !decision.allowed {
+        return Err(workspace_path_error(ctx, &decision.reason));
+    }
+
+    let normalized_path = decision
+        .normalized_path
+        .ok_or_else(|| workspace_path_error(ctx, "path resolution returned no path"))?;
+    Ok(Some(normalized_path))
+}
+
+fn workspace_path_error(ctx: &ToolExecutionContext, reason: &str) -> RociError {
+    RociError::ToolExecution {
+        tool_name: ctx.tool_name.clone().unwrap_or_else(|| "tool".to_string()),
+        message: format!("workspace path denied: {reason}"),
+    }
 }
 
 pub(super) fn validate_session_shell_command(command: &str) -> Result<(), String> {

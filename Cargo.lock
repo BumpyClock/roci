@@ -1682,6 +1682,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
@@ -1713,6 +1714,7 @@ dependencies = [
 name = "roci-tools"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "roci",
  "serde_json",
  "tempfile",

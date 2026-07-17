@@ -16,6 +16,10 @@ use crate::session::store::{
 use crate::types::ModelMessage;
 
 use super::{
+    locks::{
+        ensure_store_root, tighten_directory, validate_session_directory, SessionFileLock,
+        SessionLockKind,
+    },
     LocalProviderLedger, LocalSessionFs, LocalSessionResources, PathConventions, RuntimeCursor,
     RuntimeSnapshotCache, SessionConfig, SessionError, SessionId, SessionLease, SessionMetadata,
     SessionResourceManifest, SessionResult, SessionResumeState, SessionSnapshot, ThreadId,
@@ -278,26 +282,40 @@ pub async fn recover_import_into_store(
 
     let default_thread_id = recovered.snapshot.default_thread_id;
     let provider_history = recovered.snapshot.provider_ledger.effective_history.clone();
-    let target_config = SessionConfig::new(target_id.clone(), store.root());
+    let root = ensure_store_root(store.root())?;
+    let lease = SessionLease::acquire(&root, &target_id)?;
+    let target_config = SessionConfig::new(target_id.clone(), root.clone());
     let target_dir = target_config.conventions().root().to_path_buf();
-    std::fs::create_dir_all(store.root())
-        .map_err(|source| SessionError::io(store.root(), source))?;
-    let lease = SessionLease::acquire(target_dir.clone())?;
     if target_dir.exists() {
         return Err(SessionError::AlreadyExists { path: target_dir });
     }
 
-    let staging_dir = create_unique_staging_dir(store.root(), &target_id)?;
+    let staging_dir = create_unique_staging_dir(&target_config.root, &target_id)?;
+    tighten_directory(&staging_dir)?;
 
     if let Err(error) = write_recovered_staging(&staging_dir, &recovered, target_id.clone()).await {
         let _ = std::fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
 
+    let metadata_lock =
+        match SessionFileLock::acquire(&root, &target_id, SessionLockKind::Metadata).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(error);
+            }
+        };
+    if target_dir.exists() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(SessionError::AlreadyExists { path: target_dir });
+    }
     if let Err(source) = std::fs::rename(&staging_dir, &target_dir) {
         let _ = std::fs::remove_dir_all(&staging_dir);
         return Err(SessionError::io(&target_dir, source));
     }
+    validate_session_directory(&target_config.root, &target_id)?;
+    drop(metadata_lock);
 
     match store
         .load_state(target_config, default_thread_id, lease)
@@ -698,7 +716,7 @@ async fn write_recovered_staging(
     metadata.id = target_id;
     metadata.updated_at = Utc::now();
     metadata.last_activity_at = metadata.updated_at;
-    metadata.write_to_path(staging_conventions.metadata_file())?;
+    metadata.write_new_to_path(staging_conventions.metadata_file())?;
 
     write_strict_events(&staging_conventions, snapshot).await?;
     write_strict_provider_ledger(&staging_conventions, snapshot)?;

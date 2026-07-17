@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::{LogicalPath, PathConventions, SessionId};
+use super::{LogicalPath, PathConventions, SessionError, SessionId, SessionResult};
 
 /// Host-provided durable session configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,5 +30,13 @@ impl SessionConfig {
     #[must_use]
     pub fn conventions(&self) -> PathConventions {
         PathConventions::for_session(&self.root, &self.id)
+    }
+
+    /// Resolve filesystem aliases in the session root before comparing a prepared state.
+    pub(crate) fn canonicalize_root(&mut self) -> SessionResult<()> {
+        let canonical = std::fs::canonicalize(&self.root)
+            .map_err(|source| SessionError::io(&self.root, source))?;
+        self.root = canonical;
+        Ok(())
     }
 }

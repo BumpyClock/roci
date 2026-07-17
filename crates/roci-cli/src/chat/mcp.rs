@@ -129,13 +129,7 @@ fn required_transport_field(
 }
 
 fn optional_non_empty(value: Option<String>) -> Option<String> {
-    value.and_then(|candidate| {
-        if candidate.trim().is_empty() {
-            None
-        } else {
-            Some(candidate)
-        }
-    })
+    value.filter(|candidate| !candidate.trim().is_empty())
 }
 
 fn redact_mcp_spec(raw: &str) -> String {

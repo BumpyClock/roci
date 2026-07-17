@@ -1,13 +1,19 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::ModelMessage;
 
-use super::{LogicalPath, SessionConfig, SessionError, SessionMetadata, SessionResourceNamespace};
+#[cfg(feature = "agent")]
+use super::{
+    locks::{ensure_store_root, SessionFileLock, SessionLockKind},
+    SessionError, SessionId,
+};
+use super::{
+    LogicalPath, SessionConfig, SessionMetadata, SessionModelPreferences, SessionResourceNamespace,
+};
 
 #[cfg(feature = "agent")]
 pub use crate::agent::runtime::chat::{
@@ -74,6 +80,8 @@ pub struct CreateSessionOptions {
     pub title: Option<String>,
     pub host_cwd: Option<PathBuf>,
     pub import_source: Option<PathBuf>,
+    /// Model settings persisted for subsequent turns in this session.
+    pub model_preferences: SessionModelPreferences,
     pub default_thread_id: Option<ThreadId>,
 }
 
@@ -140,48 +148,21 @@ pub struct RuntimeSnapshotCache {
 /// Placeholder session write lease for resume state ownership.
 #[derive(Debug)]
 pub struct SessionLease {
-    key: PathBuf,
+    #[cfg(feature = "agent")]
+    _lock: SessionFileLock,
 }
 
 impl SessionLease {
-    pub(crate) fn acquire(key: PathBuf) -> Result<Arc<Self>, SessionError> {
-        let key = canonical_lease_key(key)?;
-        let leases = ACTIVE_SESSION_LEASES.get_or_init(Default::default);
-        let mut guard = leases
-            .lock()
-            .expect("session lease registry mutex poisoned");
-        if !guard.insert(key.clone()) {
-            return Err(SessionError::AlreadyOpen { path: key });
-        }
-        Ok(Arc::new(Self { key }))
-    }
-}
-
-static ACTIVE_SESSION_LEASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-
-fn canonical_lease_key(key: PathBuf) -> Result<PathBuf, SessionError> {
-    if key.exists() {
-        return std::fs::canonicalize(&key).map_err(|source| SessionError::io(&key, source));
-    }
-    let Some(parent) = key.parent() else {
-        return Ok(key);
-    };
-    let canonical_parent =
-        std::fs::canonicalize(parent).map_err(|source| SessionError::io(parent, source))?;
-    Ok(canonical_parent.join(
-        key.file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("")),
-    ))
-}
-
-impl Drop for SessionLease {
-    fn drop(&mut self) {
-        if let Some(leases) = ACTIVE_SESSION_LEASES.get() {
-            if let Ok(mut guard) = leases.lock() {
-                guard.remove(&self.key);
-            }
-        }
+    #[cfg(feature = "agent")]
+    pub(crate) fn acquire(
+        root: &std::path::Path,
+        id: &SessionId,
+    ) -> Result<Arc<Self>, SessionError> {
+        let root = ensure_store_root(root)?;
+        let session_path = root.join(id.as_str());
+        let lock =
+            SessionFileLock::try_acquire(&root, id, SessionLockKind::Runtime, &session_path)?;
+        Ok(Arc::new(Self { _lock: lock }))
     }
 }
 
@@ -204,13 +185,14 @@ pub struct SessionResumeState {
 #[allow(dead_code)]
 impl SessionResumeState {
     #[must_use]
+    #[cfg(feature = "agent")]
     pub(crate) fn new(
         session_config: SessionConfig,
         metadata: SessionMetadata,
         default_thread_id: ThreadId,
         runtime: RuntimeSnapshot,
     ) -> Self {
-        let lease = SessionLease::acquire(session_config.conventions().root().to_path_buf())
+        let lease = SessionLease::acquire(&session_config.root, &session_config.id)
             .expect("new resume state should acquire session lease");
         Self {
             session_config,

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use roci::session::{
-    CreateSessionOptions, ImportPolicy, LocalSessionStore, PathConventions, RecoveredSession,
-    RecoveryReport, SessionId, SessionMetadata, SessionRecoverySource, SessionSnapshot,
+    CreateSessionOptions, ImportPolicy, LocalSessionStore, RecoveredSession, RecoveryReport,
+    SessionCatalogQuery, SessionId, SessionRecoverySource, SessionSnapshot,
     RECOVERED_SESSION_ARTIFACT_TYPE,
 };
 
@@ -129,6 +129,7 @@ async fn create_session(
             title: args.title,
             host_cwd: host_cwd.clone(),
             import_source: None,
+            model_preferences: Default::default(),
             default_thread_id: None,
         })
         .await?;
@@ -145,69 +146,26 @@ fn list_sessions(
     args: SessionListArgs,
 ) -> Result<Vec<SessionListEntry>, Box<dyn std::error::Error>> {
     let root = resolve_root(args.root)?;
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(&root)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_dir() {
-            continue;
-        }
-
-        let Ok(dir_name) = entry.file_name().into_string() else {
-            continue;
-        };
-        let Ok(dir_id) = SessionId::parse(&dir_name) else {
-            continue;
-        };
-        let metadata_path = entry.path().join("metadata.json");
-        let Ok(metadata) = SessionMetadata::read_from_path(&metadata_path) else {
-            continue;
-        };
-        if metadata.id != dir_id {
-            continue;
-        }
-        entries.push(SessionListEntry {
-            id: metadata.id.to_string(),
-            title: metadata.title,
-            last_activity_at: metadata.last_activity_at,
-            host_cwd: metadata.host_cwd,
-        });
-    }
-    entries.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(entries)
+    let store = LocalSessionStore::new(root);
+    Ok(store
+        .list(&SessionCatalogQuery::default())?
+        .into_iter()
+        .map(|entry| SessionListEntry {
+            id: entry.metadata.id.to_string(),
+            title: entry.metadata.title,
+            last_activity_at: entry.metadata.last_activity_at,
+            host_cwd: entry.metadata.host_cwd,
+        })
+        .collect())
 }
 
 fn delete_session(args: SessionDeleteArgs) -> Result<DeleteSummary, Box<dyn std::error::Error>> {
     let root = resolve_root(args.root)?;
     let id = SessionId::parse(args.id)?;
-    let session_dir = PathConventions::for_session(&root, &id)
-        .root()
-        .to_path_buf();
-    let metadata_path = session_dir.join("metadata.json");
-    if !session_dir.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("session '{}' not found", id.as_str()),
-        )
-        .into());
-    }
-    let metadata = SessionMetadata::read_from_path(&metadata_path)?;
-    if metadata.id != id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("session '{}' metadata id mismatch", id.as_str()),
-        )
-        .into());
-    }
-
-    fs::remove_dir_all(&session_dir)?;
+    let deleted = LocalSessionStore::new(root).delete(&id)?;
     Ok(DeleteSummary {
         id: id.to_string(),
-        path: session_dir,
+        path: deleted.path,
     })
 }
 
@@ -500,10 +458,16 @@ fn print_import_summary(summary: &ImportSummary) -> Result<(), Box<dyn std::erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roci::session::{PathConventions, SessionMetadata};
     use tempfile::tempdir;
 
     fn root_args(root: &Path) -> Option<PathBuf> {
         Some(root.to_path_buf())
+    }
+
+    fn write_test_metadata(path: &Path, id: &str) {
+        let metadata = SessionMetadata::new(SessionId::parse(id).unwrap(), None, None);
+        fs::write(path, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
     }
 
     #[tokio::test]
@@ -536,12 +500,13 @@ mod tests {
         let missing = root.path().join("missing");
 
         let entries = list_sessions(SessionListArgs {
-            root: Some(missing),
+            root: Some(missing.clone()),
             json: false,
         })
         .unwrap();
 
         assert!(entries.is_empty());
+        assert!(!missing.exists());
     }
 
     #[tokio::test]
@@ -563,9 +528,10 @@ mod tests {
         )
         .unwrap();
         fs::create_dir(root.path().join("alias-session")).unwrap();
-        SessionMetadata::new(SessionId::parse("other-session").unwrap(), None, None)
-            .write_to_path(root.path().join("alias-session").join("metadata.json"))
-            .unwrap();
+        write_test_metadata(
+            &root.path().join("alias-session").join("metadata.json"),
+            "other-session",
+        );
 
         let entries = list_sessions(SessionListArgs {
             root: root_args(root.path()),
@@ -596,7 +562,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.id, "delete-me");
-        assert_eq!(summary.path, root.path().join("delete-me"));
+        assert_eq!(
+            summary.path,
+            fs::canonicalize(root.path()).unwrap().join("delete-me")
+        );
         assert!(!root.path().join("delete-me").exists());
         assert!(delete_session(SessionDeleteArgs {
             root: root_args(root.path()),
@@ -610,9 +579,10 @@ mod tests {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join("not-session")).unwrap();
         fs::create_dir(root.path().join("alias-session")).unwrap();
-        SessionMetadata::new(SessionId::parse("other-session").unwrap(), None, None)
-            .write_to_path(root.path().join("alias-session").join("metadata.json"))
-            .unwrap();
+        write_test_metadata(
+            &root.path().join("alias-session").join("metadata.json"),
+            "other-session",
+        );
 
         assert!(delete_session(SessionDeleteArgs {
             root: root_args(root.path()),

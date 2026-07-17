@@ -52,9 +52,9 @@ use crate::agent_loop::compaction::{serialize_pi_mono_summary, PiMonoSummary};
 #[cfg(test)]
 use crate::agent_loop::runner::BeforeAgentStartHookResult;
 use crate::agent_loop::ApprovalPolicy;
-use crate::agent_loop::LoopRunner;
 #[cfg(test)]
 use crate::agent_loop::RunStatus;
+use crate::agent_loop::{canonical_workspace_root, LoopRunner};
 use crate::config::RociConfig;
 #[cfg(test)]
 use crate::context::estimate_message_tokens;
@@ -189,8 +189,13 @@ impl AgentRuntime {
     fn new_inner(
         registry: Arc<ProviderRegistry>,
         roci_config: RociConfig,
-        config: AgentConfig,
+        mut config: AgentConfig,
     ) -> Result<Self, RociError> {
+        config.workspace_root = config
+            .workspace_root
+            .as_deref()
+            .map(canonical_workspace_root)
+            .transpose()?;
         let runner = LoopRunner::with_registry(roci_config.clone(), registry.clone());
         let candidates = Arc::new(Mutex::new(
             ModelCandidates::new(config.candidates.clone())?.into_vec(),
@@ -241,26 +246,36 @@ impl AgentRuntime {
         let tool_permission_session_approvals =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
         #[cfg(feature = "agent")]
-        let subagent_controller = config.subagents.as_ref().and_then(|subagents| {
-            if !subagents.enabled {
-                return None;
+        if let Some(subagents) = &config.subagents {
+            if subagents.enabled {
+                if let Some(profile_ref) = &subagents.main_profile {
+                    subagents.profiles.resolve(profile_ref)?;
+                }
             }
-            let mut base_config = config.clone();
-            base_config.subagents = None;
-            Some(Arc::new(
-                crate::agent::subagents::SubagentRoutingController::new(
-                    registry.clone(),
-                    roci_config.clone(),
-                    base_config,
-                    subagents.supervisor.clone(),
-                    subagents.profiles.clone(),
-                ),
-            ))
-        });
+        }
         #[cfg(feature = "agent")]
-        if let Some(controller) = &subagent_controller {
+        let (subagent_controller, subagent_events) = match config.subagents.as_ref() {
+            Some(subagents) if subagents.enabled => {
+                let mut base_config = config.clone();
+                base_config.subagents = None;
+                let (controller, events) =
+                    crate::agent::subagents::SubagentRoutingController::new_with_critical_events(
+                        registry.clone(),
+                        roci_config.clone(),
+                        base_config,
+                        subagents.supervisor.clone(),
+                        subagents.profiles.clone(),
+                        subagents.main_profile.clone(),
+                    );
+                (Some(Arc::new(controller)), Some(events))
+            }
+            _ => (None, None),
+        };
+        #[cfg(feature = "agent")]
+        if let (Some(controller), Some(events)) = (&subagent_controller, subagent_events) {
             spawn_subagent_runtime_event_bridge(
                 controller.clone(),
+                events,
                 chat_projector.clone(),
                 runtime_event_publish_tx.clone(),
                 runtime_event_send_lock.clone(),
@@ -333,7 +348,10 @@ impl AgentRuntime {
                 "resume state session id does not match metadata id".to_string(),
             ));
         }
-        if let Some(existing) = &config.session {
+        if let Some(existing) = config.session.as_mut() {
+            existing
+                .canonicalize_root()
+                .map_err(|err| RociError::InvalidState(err.to_string()))?;
             if existing != &state.session_config {
                 return Err(RociError::InvalidState(
                     "resume session config does not match resume state".to_string(),
@@ -399,6 +417,95 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// List child sub-agents known to this runtime's routing controller.
+    #[cfg(feature = "agent")]
+    pub async fn list_subagents(
+        &self,
+    ) -> Result<Vec<crate::agent::subagents::SubagentKnownChild>, RociError> {
+        self.require_subagent_controller()?
+            .list_subagents(&crate::agent::subagents::SubagentCaller::main_agent())
+            .await
+    }
+
+    /// List profiles available to this runtime's main/default agent.
+    #[cfg(feature = "agent")]
+    pub fn list_subagent_profiles(
+        &self,
+    ) -> Result<Vec<crate::agent::subagents::SubagentProfileSummary>, RociError> {
+        self.require_subagent_controller()?
+            .list_profiles(&crate::agent::subagents::SubagentCaller::main_agent())
+    }
+
+    /// Return the selected profile override, excluding registry default fallback.
+    #[cfg(feature = "agent")]
+    pub async fn current_subagent_profile(
+        &self,
+    ) -> Result<Option<crate::agent::subagents::SubagentProfileSummary>, RociError> {
+        self.require_subagent_controller()?
+            .current_profile(&crate::agent::subagents::SubagentCaller::main_agent())
+            .await
+    }
+
+    /// Select a main/default-agent profile for future runs.
+    #[cfg(feature = "agent")]
+    pub async fn select_subagent_profile(
+        &self,
+        profile_ref: &str,
+    ) -> Result<crate::agent::subagents::SubagentProfileSummary, RociError> {
+        self.require_subagent_controller()?
+            .select_profile(
+                profile_ref,
+                &crate::agent::subagents::SubagentCaller::main_agent(),
+            )
+            .await
+    }
+
+    /// Clear the selected profile override for future runs.
+    #[cfg(feature = "agent")]
+    pub async fn deselect_subagent_profile(&self) -> Result<(), RociError> {
+        self.require_subagent_controller()?
+            .deselect_profile(&crate::agent::subagents::SubagentCaller::main_agent())
+            .await
+    }
+
+    /// Cancel one child sub-agent managed by this runtime.
+    #[cfg(feature = "agent")]
+    pub async fn cancel_subagent(
+        &self,
+        id: crate::agent::subagents::SubagentId,
+    ) -> Result<crate::agent::subagents::SubagentCancelResult, RociError> {
+        self.require_subagent_controller()?
+            .cancel_subagent(id, &crate::agent::subagents::SubagentCaller::main_agent())
+            .await
+    }
+
+    /// Send a steering message to one active child sub-agent.
+    #[cfg(feature = "agent")]
+    pub async fn send_subagent_message(
+        &self,
+        id: crate::agent::subagents::SubagentId,
+        message: impl Into<crate::attachments::PromptInput>,
+    ) -> Result<crate::agent::subagents::SendSubagentMessageResult, RociError> {
+        self.require_subagent_controller()?
+            .send_subagent_message(
+                id,
+                message,
+                &crate::agent::subagents::SubagentCaller::main_agent(),
+            )
+            .await
+    }
+
+    #[cfg(feature = "agent")]
+    fn require_subagent_controller(
+        &self,
+    ) -> Result<&Arc<crate::agent::subagents::SubagentRoutingController>, RociError> {
+        self.subagent_controller.as_ref().ok_or_else(|| {
+            RociError::UnsupportedOperation(
+                "subagent management is not enabled for this AgentRuntime".to_string(),
+            )
+        })
+    }
+
     /// Submit a user input response.
     ///
     /// This is called by the CLI/host when a user responds to a human interaction event.
@@ -435,12 +542,12 @@ fn normalized_replay_capacity(replay_capacity: usize) -> NonZeroUsize {
 #[cfg(feature = "agent")]
 fn spawn_subagent_runtime_event_bridge(
     controller: Arc<crate::agent::subagents::SubagentRoutingController>,
+    mut events: mpsc::UnboundedReceiver<crate::agent::subagents::SubagentEvent>,
     chat_projector: Arc<StdMutex<ChatProjector>>,
     runtime_event_publish_tx: mpsc::UnboundedSender<RuntimeEventPublishRequest>,
     runtime_event_send_lock: Arc<StdMutex<()>>,
 ) {
-    use std::collections::{HashMap, HashSet, VecDeque};
-    use std::time::{Duration, Instant};
+    use std::collections::HashMap;
 
     use crate::agent::runtime::chat::{
         AgentRuntimeError, AgentRuntimeEventPayload, MessageStatus, SubagentMessageSnapshot,
@@ -448,92 +555,63 @@ fn spawn_subagent_runtime_event_bridge(
     };
     use crate::agent::subagents::{SubagentEvent, SubagentId, SubagentRoutingMetadata};
     use crate::agent_loop::AgentEvent;
-    use crate::human_interaction::HumanInteractionPayload;
-    use crate::tools::AskUserPrompt;
 
-    const PENDING_EVENT_CAP: usize = 64;
-    const PENDING_EVENT_TTL: Duration = Duration::from_secs(300);
-
-    struct PendingSubagentEvents {
-        first_seen: Instant,
-        events: VecDeque<SubagentEvent>,
-    }
-
-    let mut events = controller.subscribe();
     let controller = Arc::downgrade(&controller);
     tokio::spawn(async move {
         let mut sequences: HashMap<SubagentId, u64> = HashMap::new();
-        let mut started: HashSet<SubagentId> = HashSet::new();
-        let mut pending: HashMap<SubagentId, PendingSubagentEvents> = HashMap::new();
+        let mut parent_turn_ids: HashMap<SubagentId, Option<TurnId>> = HashMap::new();
         let projection_error = Arc::new(StdMutex::new(None));
 
-        'events: loop {
+        'events: while let Some(event) = events.recv().await {
             log_projection_error(&projection_error, None, None, None);
-            purge_stale_pending(&mut pending);
-            let event = match events.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
             let subagent_id = subagent_event_id(&event);
-            if !matches!(event, SubagentEvent::Spawned { .. }) && !started.contains(&subagent_id) {
-                if matches!(
-                    event,
-                    SubagentEvent::Failed { .. } | SubagentEvent::Aborted { .. }
-                ) {
-                    pending.remove(&subagent_id);
-                    continue;
-                }
-                let entry = pending
-                    .entry(subagent_id)
-                    .or_insert_with(|| PendingSubagentEvents {
-                        first_seen: Instant::now(),
-                        events: VecDeque::new(),
-                    });
-                if entry.events.len() == PENDING_EVENT_CAP {
-                    entry.events.pop_front();
-                }
-                entry.events.push_back(event);
-                continue;
-            }
-
-            let mut events_to_project = vec![event];
-            if matches!(events_to_project[0], SubagentEvent::Spawned { .. }) {
-                started.insert(subagent_id);
-                if let Some(buffered) = pending.remove(&subagent_id) {
-                    events_to_project.extend(buffered.events);
-                }
-            }
-
-            for event in events_to_project {
+            {
                 let Some(controller) = controller.upgrade() else {
                     break 'events;
                 };
-                let subagent_id = subagent_event_id(&event);
-                let sequence = sequences
-                    .entry(subagent_id)
-                    .and_modify(|value| *value += 1)
-                    .or_insert(1);
+                let sequence = sequences.get(&subagent_id).copied().unwrap_or(0) + 1;
                 let metadata = controller.metadata(subagent_id).await;
-                let (thread_id, active_turn_id) = match chat_projector.lock() {
+                let (thread_id, discovered_parent_turn_id) = match chat_projector.lock() {
                     Ok(projector) => {
                         let thread_id = projector.default_thread_id();
-                        let active_turn_id = projector
-                            .read_thread(thread_id)
-                            .ok()
-                            .and_then(|thread| thread.active_turn_id);
-                        (thread_id, active_turn_id)
+                        let discovered_parent_turn_id =
+                            projector.read_thread(thread_id).ok().and_then(|thread| {
+                                metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.parent_tool_call_id.as_deref())
+                                    .and_then(|parent_tool_call_id| {
+                                        thread
+                                            .tools
+                                            .iter()
+                                            .find(|tool| tool.tool_call_id == parent_tool_call_id)
+                                            .map(|tool| tool.turn_id)
+                                    })
+                                    .or(thread.active_turn_id)
+                            });
+                        (thread_id, discovered_parent_turn_id)
                     }
                     Err(_) => continue,
                 };
+                let parent_turn_id = *parent_turn_ids
+                    .entry(subagent_id)
+                    .or_insert(discovered_parent_turn_id);
+                if matches!(
+                    event,
+                    SubagentEvent::Completed { .. }
+                        | SubagentEvent::Failed { .. }
+                        | SubagentEvent::Aborted { .. }
+                ) {
+                    parent_turn_ids.remove(&subagent_id);
+                }
                 let Some(payload) =
-                    subagent_runtime_payload(event, metadata, active_turn_id, *sequence)
+                    subagent_runtime_payload(event, metadata, parent_turn_id, sequence)
                 else {
                     continue;
                 };
+                sequences.insert(subagent_id, sequence);
                 let projected = match chat_projector.lock() {
                     Ok(mut projector) => {
-                        if let Some(turn_id) = active_turn_id {
+                        if let Some(turn_id) = parent_turn_id {
                             projector
                                 .record_subagent_event(turn_id, payload.clone())
                                 .or_else(|_| {
@@ -548,7 +626,7 @@ fn spawn_subagent_runtime_event_bridge(
                 let projected = match projected {
                     Ok(projected) => projected,
                     Err(err) => {
-                        log_chat_projection_error(subagent_id, *sequence, Some(thread_id), &err);
+                        log_chat_projection_error(subagent_id, sequence, Some(thread_id), &err);
                         continue;
                     }
                 };
@@ -558,23 +636,18 @@ fn spawn_subagent_runtime_event_bridge(
                     projected,
                     projection_error.clone(),
                 ) {
-                    log_chat_projection_error(subagent_id, *sequence, Some(thread_id), &err);
+                    log_chat_projection_error(subagent_id, sequence, Some(thread_id), &err);
                     continue;
                 }
                 log_projection_error(
                     &projection_error,
                     Some(subagent_id),
-                    Some(*sequence),
+                    Some(sequence),
                     Some(thread_id),
                 );
             }
         }
     });
-
-    fn purge_stale_pending(pending: &mut HashMap<SubagentId, PendingSubagentEvents>) {
-        let now = Instant::now();
-        pending.retain(|_, entry| now.duration_since(entry.first_seen) <= PENDING_EVENT_TTL);
-    }
 
     fn log_projection_error(
         slot: &Arc<StdMutex<Option<AgentRuntimeError>>>,
@@ -800,14 +873,16 @@ fn spawn_subagent_runtime_event_bridge(
                 },
             }),
             AgentEvent::HumanInteractionRequested { request } => {
-                let (question, context) = match &request.payload {
-                    HumanInteractionPayload::AskUser(payload) => ask_user_question(&payload.prompt),
-                    _ => ("Child sub-agent requested input".to_string(), None),
-                };
-                Some(AgentRuntimeEventPayload::SubagentNeedsInput {
+                Some(AgentRuntimeEventPayload::SubagentNeedsInput { subagent, request })
+            }
+            AgentEvent::HumanInteractionResolved { response } => {
+                Some(AgentRuntimeEventPayload::SubagentInputResolved { subagent, response })
+            }
+            AgentEvent::HumanInteractionCanceled { request_id, reason } => {
+                Some(AgentRuntimeEventPayload::SubagentInputCanceled {
                     subagent,
-                    question,
-                    context,
+                    request_id,
+                    reason,
                 })
             }
             _ => None,
@@ -874,21 +949,6 @@ fn spawn_subagent_runtime_event_bridge(
                 .as_ref()
                 .and_then(|metadata| metadata.target_subagent_id),
             sequence,
-        }
-    }
-
-    fn ask_user_question(prompt: &AskUserPrompt) -> (String, Option<String>) {
-        match prompt {
-            AskUserPrompt::Question { question, .. }
-            | AskUserPrompt::Confirm { question, .. }
-            | AskUserPrompt::Choice { question, .. }
-            | AskUserPrompt::MultiChoice { question, .. } => (question.clone(), None),
-            AskUserPrompt::Form { title, .. } => (
-                title
-                    .clone()
-                    .unwrap_or_else(|| "Child sub-agent requested input".to_string()),
-                Some(prompt.id().to_string()),
-            ),
         }
     }
 }

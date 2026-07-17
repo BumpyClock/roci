@@ -196,7 +196,9 @@ Cover:
 
 - [ ] **Step 3: Implement mapper**
 
-Implement pure mapping helpers first. Keep mapping lossy and semantic; do not serialize raw `AgentEvent`.
+Implement pure mapping helpers first. Keep child message/tool mapping semantic;
+preserve the full `HumanInteractionRequest` for input events. Do not serialize
+the surrounding raw `AgentEvent`.
 The mapper must read `SubagentRoutingMetadata` from the controller, maintain a
 bridge-local `HashMap<SubagentId, u64>` sequence counter, increment sequence per
 mapped event, and populate `SubagentRuntimeSnapshot.sequence`.

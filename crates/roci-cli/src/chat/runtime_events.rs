@@ -353,6 +353,26 @@ fn handle_human_interaction_request(
     }
 }
 
+fn human_interaction_preview(request: &HumanInteractionRequest) -> String {
+    match &request.payload {
+        HumanInteractionPayload::AskUser(request) => match &request.prompt {
+            roci::tools::AskUserPrompt::Question { question, .. }
+            | roci::tools::AskUserPrompt::Confirm { question, .. }
+            | roci::tools::AskUserPrompt::Choice { question, .. }
+            | roci::tools::AskUserPrompt::MultiChoice { question, .. } => question.clone(),
+            roci::tools::AskUserPrompt::Form { title, .. } => title
+                .clone()
+                .unwrap_or_else(|| "structured input requested".to_string()),
+        },
+        HumanInteractionPayload::UiElicitation(request) => request.message.clone(),
+        HumanInteractionPayload::ToolPermission(request) => request
+            .approval
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("approve tool {}", request.tool_name)),
+    }
+}
+
 fn prompt_for_approval(request: ApprovalRequest) -> ApprovalDecision {
     eprintln!("\n? approval required: {}", request.id);
     eprintln!("  kind: {:?}", request.kind);
@@ -741,14 +761,34 @@ impl ChatRenderer {
                     );
                 }
             }
-            AgentRuntimeEventPayload::SubagentNeedsInput {
-                subagent, question, ..
-            } => {
+            AgentRuntimeEventPayload::SubagentNeedsInput { subagent, request } => {
                 let _ = writeln!(
                     stderr,
                     "[subagent] {} needs input: {}",
                     subagent.profile_id,
-                    truncate_preview(&question, 200)
+                    truncate_preview(&human_interaction_preview(&request), 200)
+                );
+            }
+            AgentRuntimeEventPayload::SubagentInputResolved { subagent, response } => {
+                let _ = writeln!(
+                    stderr,
+                    "[subagent] {} input {}: resolved",
+                    subagent.profile_id, response.request_id
+                );
+            }
+            AgentRuntimeEventPayload::SubagentInputCanceled {
+                subagent,
+                request_id,
+                reason,
+            } => {
+                let suffix = reason
+                    .as_deref()
+                    .map(|reason| format!(": {}", truncate_preview(reason, 120)))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    stderr,
+                    "[subagent] {} input {}: canceled{}",
+                    subagent.profile_id, request_id, suffix
                 );
             }
             AgentRuntimeEventPayload::SubagentCompleted { subagent, result } => {
@@ -1165,11 +1205,40 @@ mod tests {
             &mut stdout,
             &mut stderr,
         ));
+        let input_request_id = UserInputRequestId::new_v4();
         assert!(!renderer.render_payload_to(
             AgentRuntimeEventPayload::SubagentNeedsInput {
                 subagent: subagent.clone(),
-                question: "confirm deploy?".to_string(),
-                context: Some("request-1".to_string()),
+                request: HumanInteractionRequest::from_user_input(UserInputRequest {
+                    request_id: input_request_id,
+                    tool_call_id: "request-1".to_string(),
+                    prompt: AskUserPrompt::Confirm {
+                        id: "deploy".to_string(),
+                        question: "confirm deploy?".to_string(),
+                        default: None,
+                    },
+                    timeout_ms: None,
+                }),
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentInputResolved {
+                subagent: subagent.clone(),
+                response: HumanInteractionResponse::from_user_input(UserInputResponse {
+                    request_id: input_request_id,
+                    result: UserInputResult::Confirm { confirmed: true },
+                }),
+            },
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert!(!renderer.render_payload_to(
+            AgentRuntimeEventPayload::SubagentInputCanceled {
+                subagent: subagent.clone(),
+                request_id: input_request_id,
+                reason: Some("timed out".to_string()),
             },
             &mut stdout,
             &mut stderr,
@@ -1212,6 +1281,12 @@ mod tests {
         assert!(stderr.contains("[subagent] dev tool inspect (child-call)"));
         assert!(stderr.contains("[subagent] dev tool inspect done: {\"ok\":true}"));
         assert!(stderr.contains("[subagent] dev needs input: confirm deploy?"));
+        assert!(stderr.contains(&format!(
+            "[subagent] dev input {input_request_id}: resolved"
+        )));
+        assert!(stderr.contains(&format!(
+            "[subagent] dev input {input_request_id}: canceled: timed out"
+        )));
         assert!(stderr.contains("[subagent] dev completed id=aaaaaaaa status=Completed: task done"));
         assert!(stderr.contains("[subagent] dev failed id=aaaaaaaa: boom"));
         assert!(stderr.contains("[subagent] dev cancelled id=aaaaaaaa"));
