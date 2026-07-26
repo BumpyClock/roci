@@ -7,6 +7,12 @@ use crate::models::{ModelCatalog, ModelListOptions};
 use futures::future::BoxFuture;
 
 /// Factory for creating ModelProvider instances from a provider key + model ID.
+///
+/// Implementations own launch-time construction (`create`), catalog discovery
+/// (`list_models`), and availability checks (`is_available`). Registries and
+/// hosts must consult the factory instead of re-implementing credential
+/// heuristics so alias keys, OAuth token-store entries, and required endpoints
+/// stay provider-owned.
 pub trait ProviderFactory: Send + Sync {
     /// Provider key(s) this factory handles (e.g., &["openai", "codex"]).
     fn provider_keys(&self) -> &[&str];
@@ -14,6 +20,17 @@ pub trait ProviderFactory: Send + Sync {
     /// Whether this provider key needs credentials before launch-time use.
     fn requires_credentials(&self, _provider_key: &str) -> bool {
         true
+    }
+
+    /// Whether this factory can launch for `provider_key` with the given config.
+    ///
+    /// Default treats a factory as available when it does not require
+    /// credentials, or when `config` already has credentials for the provider
+    /// key. Override when create viability depends on alias keys, OAuth
+    /// token-store entries, required endpoints, or local no-credential launch.
+    /// Must stay hermetic: no network I/O.
+    fn is_available(&self, config: &RociConfig, provider_key: &str) -> bool {
+        !self.requires_credentials(provider_key) || config.has_credentials(provider_key)
     }
 
     /// List models for the given provider key.
@@ -24,10 +41,7 @@ pub trait ProviderFactory: Send + Sync {
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
         Box::pin(async move {
-            if !options.include_unavailable
-                && self.requires_credentials(provider_key)
-                && config.get_api_key(provider_key).is_none()
-            {
+            if !options.include_unavailable && !self.is_available(config, provider_key) {
                 return Err(RociError::MissingCredential {
                     provider: provider_key.to_string(),
                 });
@@ -70,6 +84,27 @@ mod tests {
         ) -> Result<Box<dyn ModelProvider>, RociError> {
             panic!("default list_models tests must not create providers")
         }
+    }
+
+    #[test]
+    fn default_is_available_uses_requires_credentials_and_config() {
+        let config = RociConfig::new().with_token_store(None);
+
+        assert!(!DefaultFactory {
+            requires_credentials: true,
+        }
+        .is_available(&config, "default"));
+
+        assert!(DefaultFactory {
+            requires_credentials: false,
+        }
+        .is_available(&config, "default"));
+
+        config.set_api_key("default", "token".to_string());
+        assert!(DefaultFactory {
+            requires_credentials: true,
+        }
+        .is_available(&config, "default"));
     }
 
     #[tokio::test]

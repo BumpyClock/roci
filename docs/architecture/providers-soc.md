@@ -90,11 +90,13 @@ All concrete provider implementations and OAuth flows:
 `OpenAiModel`, `AnthropicModel`, `GoogleModel`, `GrokModel`, `GroqModel`, `MistralModel`, `OllamaModel`, `LmStudioModel`
 
 **OAuth flow implementations**:
+
 - `ClaudeCodeAuth` + `PkceSession`
 - `GitHubCopilotAuth`
 - `OpenAiCodexAuth`
 
 **Registration functions**:
+
 - `register_default_providers(registry: &mut ProviderRegistry)` — registers a `ProviderFactory` impl for each enabled provider
 - `register_default_auth_backends(service: &mut AuthService)` — registers an `AuthBackend` impl for each OAuth provider
 
@@ -130,6 +132,14 @@ pub fn default_auth_service(
 pub trait ProviderFactory: Send + Sync {
     /// Provider key(s) this factory handles (e.g., ["openai", "codex"]).
     fn provider_keys(&self) -> &[&str];
+
+    /// Whether launch requires credentials for this provider key.
+    fn requires_credentials(&self, provider_key: &str) -> bool;
+
+    /// Factory-owned launch viability for hosts and all-provider listing.
+    /// Default uses `requires_credentials` + `RociConfig::has_credentials`.
+    /// Overrides cover alias keys, OAuth token-store entries, and endpoints.
+    fn is_available(&self, config: &RociConfig, provider_key: &str) -> bool;
 
     /// Create a ModelProvider for the given model ID and config.
     fn create(
@@ -183,6 +193,9 @@ impl ProviderRegistry {
     ) -> Result<ModelCatalog, RociError>;
 
     pub fn has_provider(&self, provider_key: &str) -> bool;
+
+    /// `None` for unknown providers; otherwise factory-owned availability.
+    pub fn is_available(&self, provider_key: &str, config: &RociConfig) -> Option<bool>;
 }
 ```
 

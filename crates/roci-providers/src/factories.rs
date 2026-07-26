@@ -477,9 +477,28 @@ impl ProviderFactory for LmStudioFactory {
 pub struct OpenAiCompatibleFactory;
 
 #[cfg(feature = "openai-compatible")]
+fn resolve_openai_compatible_credentials(
+    config: &RociConfig,
+) -> Result<(String, String), RociError> {
+    let api_key = config
+        .get_api_key_for(ProviderKey::OpenAiCompatible)
+        .or_else(|| config.get_api_key_for(ProviderKey::OpenAi))
+        .ok_or_else(|| RociError::Authentication("Missing OPENAI_COMPAT_API_KEY".into()))?;
+    let base_url = config
+        .get_base_url_for(ProviderKey::OpenAiCompatible)
+        .or_else(|| config.get_base_url_for(ProviderKey::OpenAi))
+        .ok_or_else(|| RociError::Configuration("Missing OPENAI_COMPAT_BASE_URL".into()))?;
+    Ok((api_key, base_url))
+}
+
+#[cfg(feature = "openai-compatible")]
 impl ProviderFactory for OpenAiCompatibleFactory {
     fn provider_keys(&self) -> &[&str] {
         &["openai-compatible"]
+    }
+
+    fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
+        resolve_openai_compatible_credentials(config).is_ok()
     }
 
     fn list_models<'a>(
@@ -497,14 +516,7 @@ impl ProviderFactory for OpenAiCompatibleFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = config
-            .get_api_key_for(ProviderKey::OpenAiCompatible)
-            .or_else(|| config.get_api_key_for(ProviderKey::OpenAi))
-            .ok_or_else(|| RociError::Authentication("Missing OPENAI_COMPAT_API_KEY".into()))?;
-        let base_url = config
-            .get_base_url_for(ProviderKey::OpenAiCompatible)
-            .or_else(|| config.get_base_url_for(ProviderKey::OpenAi))
-            .ok_or_else(|| RociError::Configuration("Missing OPENAI_COMPAT_BASE_URL".into()))?;
+        let (api_key, base_url) = resolve_openai_compatible_credentials(config)?;
         Ok(Box::new(
             crate::provider::openai_compatible::OpenAiCompatibleProvider::new(
                 model_id.to_string(),
@@ -622,6 +634,10 @@ impl ProviderFactory for GitHubCopilotFactory {
         &["github-copilot"]
     }
 
+    fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
+        resolve_github_copilot_credentials(config).is_ok()
+    }
+
     fn list_models<'a>(
         &'a self,
         config: &'a RociConfig,
@@ -695,9 +711,26 @@ impl ProviderFactory for GitHubCopilotFactory {
 pub struct AnthropicCompatibleFactory;
 
 #[cfg(feature = "anthropic-compatible")]
+fn resolve_anthropic_compatible_credentials(
+    config: &RociConfig,
+) -> Result<(String, String), RociError> {
+    let api_key = config
+        .get_api_key_for(ProviderKey::Anthropic)
+        .ok_or_else(|| RociError::Authentication("Missing ANTHROPIC_COMPAT_API_KEY".into()))?;
+    let base_url = config
+        .get_base_url_for(ProviderKey::Anthropic)
+        .ok_or_else(|| RociError::Configuration("Missing ANTHROPIC_COMPAT_BASE_URL".into()))?;
+    Ok((api_key, base_url))
+}
+
+#[cfg(feature = "anthropic-compatible")]
 impl ProviderFactory for AnthropicCompatibleFactory {
     fn provider_keys(&self) -> &[&str] {
         &["anthropic-compatible"]
+    }
+
+    fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
+        resolve_anthropic_compatible_credentials(config).is_ok()
     }
 
     fn list_models<'a>(
@@ -715,12 +748,7 @@ impl ProviderFactory for AnthropicCompatibleFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = config
-            .get_api_key_for(ProviderKey::Anthropic)
-            .ok_or_else(|| RociError::Authentication("Missing ANTHROPIC_COMPAT_API_KEY".into()))?;
-        let base_url = config
-            .get_base_url_for(ProviderKey::Anthropic)
-            .ok_or_else(|| RociError::Configuration("Missing ANTHROPIC_COMPAT_BASE_URL".into()))?;
+        let (api_key, base_url) = resolve_anthropic_compatible_credentials(config)?;
         Ok(Box::new(
             crate::provider::anthropic_compatible::AnthropicCompatibleProvider::new(
                 model_id.to_string(),
@@ -739,9 +767,30 @@ impl ProviderFactory for AnthropicCompatibleFactory {
 pub struct AzureFactory;
 
 #[cfg(feature = "azure")]
+fn resolve_azure_credentials(config: &RociConfig) -> Result<(String, String), RociError> {
+    let api_key =
+        config
+            .get_api_key_for(ProviderKey::Azure)
+            .ok_or_else(|| RociError::MissingCredential {
+                provider: "azure".to_string(),
+            })?;
+    let endpoint = config.get_base_url_for(ProviderKey::Azure).ok_or_else(|| {
+        RociError::MissingConfiguration {
+            key: "AZURE_OPENAI_ENDPOINT".to_string(),
+            provider: "azure".to_string(),
+        }
+    })?;
+    Ok((api_key, endpoint))
+}
+
+#[cfg(feature = "azure")]
 impl ProviderFactory for AzureFactory {
     fn provider_keys(&self) -> &[&str] {
         &["azure"]
+    }
+
+    fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
+        resolve_azure_credentials(config).is_ok()
     }
 
     fn list_models<'a>(
@@ -759,17 +808,7 @@ impl ProviderFactory for AzureFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = config.get_api_key_for(ProviderKey::Azure).ok_or_else(|| {
-            RociError::MissingCredential {
-                provider: "azure".to_string(),
-            }
-        })?;
-        let endpoint = config.get_base_url_for(ProviderKey::Azure).ok_or_else(|| {
-            RociError::MissingConfiguration {
-                key: "AZURE_OPENAI_ENDPOINT".to_string(),
-                provider: "azure".to_string(),
-            }
-        })?;
+        let (api_key, endpoint) = resolve_azure_credentials(config)?;
         let api_version = "2024-06-01".to_string();
         Ok(Box::new(crate::provider::azure::AzureOpenAiProvider::new(
             endpoint,
@@ -929,6 +968,7 @@ mod tests {
         crate::register_default_providers(&mut registry);
         let options = ModelListOptions {
             provider_key: Some("openai".to_string()),
+            include_unavailable: true,
             ..ModelListOptions::default()
         };
 
@@ -1115,5 +1155,131 @@ mod tests {
                     .is_some_and(|warning| warning.contains("status 503"))
             }));
         }
+
+        #[test]
+        fn is_available_requires_api_token_and_base_url() {
+            let missing = config_without_credentials();
+            assert!(!GitHubCopilotFactory.is_available(&missing, "github-copilot"));
+
+            let key_only = config_without_credentials();
+            key_only.set_api_key("github-copilot", "token".to_string());
+            assert!(!GitHubCopilotFactory.is_available(&key_only, "github-copilot"));
+
+            let ready = config_with_copilot("https://api.example".to_string());
+            assert!(GitHubCopilotFactory.is_available(&ready, "github-copilot"));
+        }
+
+        #[test]
+        fn is_available_accepts_github_copilot_api_token_store() {
+            use chrono::{Duration, Utc};
+            use roci_core::auth::store::{FileTokenStore, TokenStore, TokenStoreConfig};
+            use roci_core::auth::token::Token;
+            use std::sync::Arc;
+            use tempfile::TempDir;
+
+            let dir = TempDir::new().unwrap();
+            let store = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+                dir.path().to_path_buf(),
+            )));
+            store
+                .save(
+                    "github-copilot-api",
+                    "default",
+                    &Token {
+                        access_token: "api-token".to_string(),
+                        refresh_token: None,
+                        id_token: None,
+                        expires_at: Some(Utc::now() + Duration::hours(1)),
+                        last_refresh: None,
+                        scopes: None,
+                        account_id: Some("https://api.githubcopilot.com".to_string()),
+                    },
+                )
+                .unwrap();
+
+            let config = RociConfig::new().with_token_store(Some(store));
+
+            // github-copilot-api is a distinct store key from provider-key credentials.
+            assert!(!config.has_credentials("github-copilot"));
+            assert!(GitHubCopilotFactory.is_available(&config, "github-copilot"));
+        }
+    }
+
+    #[cfg(feature = "openai-compatible")]
+    #[test]
+    fn openai_compatible_is_available_needs_key_and_endpoint_aliases() {
+        let missing = config_without_credentials();
+        assert!(!OpenAiCompatibleFactory.is_available(&missing, "openai-compatible"));
+
+        let key_only = config_without_credentials();
+        key_only.set_api_key("openai-compatible", "compat-key".to_string());
+        assert!(!OpenAiCompatibleFactory.is_available(&key_only, "openai-compatible"));
+
+        let dedicated = config_without_credentials();
+        dedicated.set_api_key("openai-compatible", "compat-key".to_string());
+        dedicated.set_base_url("openai-compatible", "https://compat.example".to_string());
+        assert!(OpenAiCompatibleFactory.is_available(&dedicated, "openai-compatible"));
+
+        let via_openai = config_without_credentials();
+        via_openai.set_api_key("openai", "openai-key".to_string());
+        via_openai.set_base_url("openai", "https://api.openai.com/v1".to_string());
+        assert!(OpenAiCompatibleFactory.is_available(&via_openai, "openai-compatible"));
+    }
+
+    #[cfg(feature = "anthropic-compatible")]
+    #[test]
+    fn anthropic_compatible_is_available_uses_inherited_anthropic_config() {
+        let missing = config_without_credentials();
+        assert!(!AnthropicCompatibleFactory.is_available(&missing, "anthropic-compatible"));
+
+        let own_keys_ignored = config_without_credentials();
+        own_keys_ignored.set_api_key("anthropic-compatible", "compat-key".to_string());
+        own_keys_ignored.set_base_url("anthropic-compatible", "https://compat.example".to_string());
+        assert!(!AnthropicCompatibleFactory.is_available(&own_keys_ignored, "anthropic-compatible"));
+
+        let inherited = config_without_credentials();
+        inherited.set_api_key("anthropic", "anthropic-key".to_string());
+        inherited.set_base_url("anthropic", "https://api.anthropic.com".to_string());
+        assert!(AnthropicCompatibleFactory.is_available(&inherited, "anthropic-compatible"));
+    }
+
+    #[cfg(feature = "ollama")]
+    #[test]
+    fn local_ollama_is_available_without_credentials() {
+        let config = config_without_credentials();
+        assert!(OllamaFactory.is_available(&config, "ollama"));
+    }
+
+    #[cfg(feature = "lmstudio")]
+    #[test]
+    fn local_lmstudio_is_available_without_credentials() {
+        let config = config_without_credentials();
+        assert!(LmStudioFactory.is_available(&config, "lmstudio"));
+    }
+
+    #[cfg(feature = "azure")]
+    #[test]
+    fn azure_is_available_needs_key_and_endpoint() {
+        let missing = config_without_credentials();
+        assert!(!AzureFactory.is_available(&missing, "azure"));
+
+        let key_only = config_without_credentials();
+        key_only.set_api_key("azure", "azure-key".to_string());
+        assert!(!AzureFactory.is_available(&key_only, "azure"));
+
+        let ready = config_without_credentials();
+        ready.set_api_key("azure", "azure-key".to_string());
+        ready.set_base_url("azure", "https://example.openai.azure.com".to_string());
+        assert!(AzureFactory.is_available(&ready, "azure"));
+    }
+
+    #[cfg(feature = "google")]
+    #[test]
+    fn unavailable_remote_is_not_available_without_credentials() {
+        let config = config_without_credentials();
+        assert!(!GoogleFactory.is_available(&config, "google"));
+
+        config.set_api_key("google", "google-key".to_string());
+        assert!(GoogleFactory.is_available(&config, "google"));
     }
 }
