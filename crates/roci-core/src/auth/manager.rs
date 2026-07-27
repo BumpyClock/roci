@@ -5,6 +5,7 @@
 //! login orchestration with opaque pending session IDs.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -27,7 +28,7 @@ use super::status::{ConfiguredSource, ProviderAuthState, ProviderAuthStatus};
 /// factory. Descriptor assembly and status projection are hermetic (no network).
 pub struct ProviderAuthManager {
     auth: AuthService,
-    registry: ProviderRegistry,
+    registry: Arc<ProviderRegistry>,
     config: RociConfig,
     /// Canonical key → merged descriptor (factory base + OAuth overlays).
     descriptors: HashMap<String, ProviderDescriptor>,
@@ -46,6 +47,18 @@ impl ProviderAuthManager {
     pub fn new(
         auth: AuthService,
         registry: ProviderRegistry,
+        config: RociConfig,
+    ) -> Result<Self, AuthError> {
+        Self::new_shared(auth, Arc::new(registry), config)
+    }
+
+    /// Builds a manager over a registry shared with its execution host.
+    ///
+    /// Use this constructor when model catalog execution and provider auth must
+    /// observe the same dynamically registered factories.
+    pub fn new_shared(
+        auth: AuthService,
+        registry: Arc<ProviderRegistry>,
         config: RociConfig,
     ) -> Result<Self, AuthError> {
         let mut descriptors: HashMap<String, ProviderDescriptor> = HashMap::new();
@@ -116,7 +129,7 @@ impl ProviderAuthManager {
 
     /// Borrow the provider registry.
     pub fn registry(&self) -> &ProviderRegistry {
-        &self.registry
+        self.registry.as_ref()
     }
 
     /// Resolve a user-facing key/alias to a merged descriptor.
