@@ -2106,6 +2106,7 @@ dependencies = [
  "futures",
  "ignore",
  "keyring",
+ "libc",
  "mime_guess",
  "pretty_assertions",
  "regex",

@@ -132,14 +132,15 @@ pub trait ProviderCredentialStore: Send + Sync {
 }
 
 #[derive(Serialize, Deserialize)]
-struct StoredProviderCredentialRecord {
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredProviderCredentialRecord {
     version: u32,
     api_key: String,
     endpoint: Option<String>,
 }
 
 impl StoredProviderCredentialRecord {
-    fn from_record(record: &ProviderCredentialRecord) -> Self {
+    pub(crate) fn from_record(record: &ProviderCredentialRecord) -> Self {
         Self {
             version: CREDENTIAL_RECORD_VERSION,
             api_key: record.api_key.expose_secret().to_string(),
@@ -150,12 +151,20 @@ impl StoredProviderCredentialRecord {
         }
     }
 
-    fn into_record(self) -> Result<ProviderCredentialRecord, ProviderCredentialStoreError> {
-        if self.version != CREDENTIAL_RECORD_VERSION {
-            return Err(ProviderCredentialStoreError::UnsupportedVersion(
+    pub(crate) fn validate_version(&self) -> Result<(), ProviderCredentialStoreError> {
+        if self.version == CREDENTIAL_RECORD_VERSION {
+            Ok(())
+        } else {
+            Err(ProviderCredentialStoreError::UnsupportedVersion(
                 self.version,
-            ));
+            ))
         }
+    }
+
+    pub(crate) fn into_record(
+        self,
+    ) -> Result<ProviderCredentialRecord, ProviderCredentialStoreError> {
+        self.validate_version()?;
         Ok(ProviderCredentialRecord::new(
             ProviderApiKey::new(self.api_key),
             self.endpoint.map(ProviderEndpoint::new),
