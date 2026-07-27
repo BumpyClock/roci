@@ -117,9 +117,13 @@ fn default_provider_credential_store() -> Option<Arc<dyn ProviderCredentialStore
     match production_provider_credential_store_kind() {
         #[cfg(unix)]
         ProductionProviderCredentialStoreKind::FileAuthJson => {
-            FileProviderCredentialStore::new_default()
-                .ok()
-                .map(|store| Arc::new(store) as Arc<dyn ProviderCredentialStore>)
+            match FileProviderCredentialStore::new_default() {
+                Ok(store) => Some(Arc::new(store) as Arc<dyn ProviderCredentialStore>),
+                Err(error) => {
+                    tracing::warn!(%error, "default provider credential store unavailable");
+                    None
+                }
+            }
         }
         #[cfg(not(unix))]
         ProductionProviderCredentialStoreKind::OsCredentialManager => {
@@ -329,11 +333,13 @@ impl RociConfig {
         let canonical = ProviderKey::parse(provider)
             .map(ProviderKey::as_str)
             .unwrap_or(provider);
-        self.provider_credential_store
-            .as_ref()?
-            .load(canonical)
-            .ok()
-            .flatten()
+        match self.provider_credential_store.as_ref()?.load(canonical) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load protected provider credentials");
+                None
+            }
+        }
     }
 }
 

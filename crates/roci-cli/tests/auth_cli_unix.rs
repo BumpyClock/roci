@@ -3,7 +3,7 @@
 //! Uses a temporary absolute `HOME` and scrubs external credential env vars so
 //! the real home/keychain and ambient env cannot satisfy the flow.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "openai-compatible"))]
 
 use std::fs;
 use std::io::Write;

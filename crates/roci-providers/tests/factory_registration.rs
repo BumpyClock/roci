@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 use roci_core::auth::{AuthService, FileTokenStore, ProviderAuthManager, TokenStoreConfig};
 use roci_core::config::RociConfig;
-#[cfg(feature = "ollama")]
+#[cfg(any(feature = "github-copilot", feature = "ollama"))]
 use roci_core::models::ModelListOptions;
 use roci_core::provider::ProviderRegistry;
 
@@ -72,6 +72,28 @@ fn register_default_providers_registers_github_copilot_when_feature_enabled() {
         registry.has_provider("github-copilot"),
         "expected github-copilot to be registered"
     );
+}
+
+#[cfg(feature = "github-copilot")]
+#[tokio::test]
+async fn explicit_github_copilot_catalog_falls_back_without_credentials() {
+    let config = RociConfig::new()
+        .with_token_store(None)
+        .with_provider_credential_store(None);
+    let mut registry = ProviderRegistry::new();
+    roci_providers::register_default_providers(&mut registry);
+    let options = ModelListOptions {
+        provider_key: Some("github-copilot".to_string()),
+        ..ModelListOptions::default()
+    };
+
+    let catalog = registry.list_models(&config, &options).await.unwrap();
+
+    assert!(!catalog.models().is_empty());
+    assert!(catalog
+        .models()
+        .iter()
+        .all(|model| model.provider_key == "github-copilot"));
 }
 
 #[test]
@@ -151,7 +173,10 @@ fn default_auth_backends_match_enabled_launch_factories() {
     let mut registry = ProviderRegistry::new();
     roci_providers::register_default_providers(&mut registry);
 
-    let result = ProviderAuthManager::new(auth, registry, RociConfig::new());
+    let config = RociConfig::new()
+        .with_token_store(None)
+        .with_provider_credential_store(None);
+    let result = ProviderAuthManager::new(auth, registry, config);
 
     assert!(result.is_ok());
 }

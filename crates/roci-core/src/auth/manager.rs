@@ -309,14 +309,23 @@ impl ProviderAuthManager {
             }
         };
 
-        let _token = self
+        match self
             .auth
             .complete_pkce_with_session(&alias, code, &state, Some(&session_data))
-            .await?;
-        self.pending.remove(session_id);
-        Ok(HostAuthCompletion {
-            provider: canonical,
-        })
+            .await
+        {
+            Ok(_) => {
+                self.pending.remove(session_id);
+                Ok(HostAuthCompletion {
+                    provider: canonical,
+                })
+            }
+            Err(error @ (AuthError::Network(_) | AuthError::RateLimited { .. })) => Err(error),
+            Err(error) => {
+                self.pending.remove(session_id);
+                Err(error)
+            }
+        }
     }
 
     /// Persist an API key and optional endpoint for a known provider.
@@ -452,7 +461,17 @@ impl ProviderAuthManager {
             if backend.canonical_provider_key() != canonical {
                 continue;
             }
-            if let Ok(Some(_)) = backend.get_status(self.auth.store()) {
+            let has_valid_token = backend
+                .get_status(self.auth.store())
+                .ok()
+                .flatten()
+                .is_some_and(|token| {
+                    token
+                        .expires_at
+                        .map(|expires_at| expires_at > chrono::Utc::now())
+                        .unwrap_or(true)
+                });
+            if has_valid_token {
                 return true;
             }
         }
@@ -493,8 +512,7 @@ mod tests {
     use crate::provider::{ModelProvider, ProviderFactory};
     use async_trait::async_trait;
     use chrono::Utc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     struct LaunchFactory {
@@ -528,13 +546,20 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CompletePkceFailure {
+        None,
+        NetworkOnce,
+        InvalidResponseOnce,
+    }
+
     struct StubBackend {
         aliases: &'static [&'static str],
         canonical: &'static str,
         flow: CredentialFlow,
         store_key: &'static str,
         fail_logout: bool,
-        fail_complete_once: AtomicBool,
+        complete_pkce_failure: Mutex<CompletePkceFailure>,
     }
 
     #[async_trait]
@@ -584,10 +609,18 @@ mod tests {
             _code: &str,
             _state: &str,
         ) -> Result<Token, AuthError> {
-            if self.fail_complete_once.swap(false, Ordering::SeqCst) {
-                Err(AuthError::Network("retryable test failure".into()))
-            } else {
-                Ok(sample_token())
+            let failure = std::mem::replace(
+                &mut *self.complete_pkce_failure.lock().unwrap(),
+                CompletePkceFailure::None,
+            );
+            match failure {
+                CompletePkceFailure::None => Ok(sample_token()),
+                CompletePkceFailure::NetworkOnce => {
+                    Err(AuthError::Network("retryable test failure".into()))
+                }
+                CompletePkceFailure::InvalidResponseOnce => {
+                    Err(AuthError::InvalidResponse("terminal test failure".into()))
+                }
             }
         }
 
@@ -609,7 +642,7 @@ mod tests {
             access_token: "access-secret".into(),
             refresh_token: Some("refresh-secret".into()),
             id_token: Some("id-secret".into()),
-            expires_at: Some(Utc::now()),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             last_refresh: None,
             scopes: None,
             account_id: Some("https://endpoint.example/account".into()),
@@ -652,7 +685,7 @@ mod tests {
             store,
             Arc::new(InMemoryProviderCredentialStore::default()),
             false,
-            false,
+            CompletePkceFailure::None,
         )
     }
 
@@ -660,7 +693,7 @@ mod tests {
         store: Arc<dyn TokenStore>,
         credential_store: Arc<dyn ProviderCredentialStore>,
         fail_logout: bool,
-        fail_complete_once: bool,
+        complete_pkce_failure: CompletePkceFailure,
     ) -> ProviderAuthManager {
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(LaunchFactory {
@@ -677,7 +710,7 @@ mod tests {
             flow: CredentialFlow::Pkce,
             store_key: "claude-code",
             fail_logout,
-            fail_complete_once: AtomicBool::new(fail_complete_once),
+            complete_pkce_failure: Mutex::new(complete_pkce_failure),
         }));
 
         let config = RociConfig::new()
@@ -697,7 +730,7 @@ mod tests {
             flow: CredentialFlow::DeviceCode,
             store_key: "orphan",
             fail_logout: false,
-            fail_complete_once: AtomicBool::new(false),
+            complete_pkce_failure: Mutex::new(CompletePkceFailure::None),
         }));
         let config = RociConfig::new().with_token_store(Some(store));
         let result = ProviderAuthManager::new(auth, registry, config);
@@ -784,6 +817,21 @@ mod tests {
         assert!(!json.contains("access-secret"));
     }
 
+    #[test]
+    fn expired_oauth_token_is_not_reported_as_signed_in() {
+        let (_dir, store) = temp_store();
+        let manager = anthropic_manager(store.clone());
+        let mut token = sample_token();
+        token.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        store.save("claude-code", "default", &token).unwrap();
+
+        let status = manager.status("anthropic").unwrap();
+
+        assert!(status.configured_sources.is_empty());
+        assert_eq!(status.auth_state, ProviderAuthState::SignedOut);
+        assert!(!status.launch_available);
+    }
+
     #[tokio::test]
     async fn start_login_returns_host_safe_pkce_step() {
         let (_dir, store) = temp_store();
@@ -818,7 +866,7 @@ mod tests {
             token_store,
             credential_store.clone(),
             /*fail_logout*/ false,
-            /*fail_complete_once*/ false,
+            CompletePkceFailure::None,
         );
 
         let result = manager.configure_api_key(
@@ -838,7 +886,7 @@ mod tests {
             store,
             Arc::new(FailingCredentialStore),
             /*fail_logout*/ false,
-            /*fail_complete_once*/ false,
+            CompletePkceFailure::None,
         );
         manager
             .config()
@@ -870,7 +918,7 @@ mod tests {
             token_store.clone(),
             credential_store.clone(),
             /*fail_logout*/ false,
-            /*fail_complete_once*/ false,
+            CompletePkceFailure::None,
         );
         let expected = ProviderCredentialRecord::new(
             ProviderApiKey::new("stored-secret"),
@@ -891,7 +939,7 @@ mod tests {
             token_store,
             credential_store,
             /*fail_logout*/ false,
-            /*fail_complete_once*/ false,
+            CompletePkceFailure::None,
         );
         assert_eq!(
             restarted.config().get_api_key("anthropic"),
@@ -921,7 +969,7 @@ mod tests {
             token_store.clone(),
             credential_store.clone(),
             /*fail_logout*/ false,
-            /*fail_complete_once*/ false,
+            CompletePkceFailure::None,
         );
         manager
             .config()
@@ -961,7 +1009,7 @@ mod tests {
             token_store.clone(),
             credential_store.clone(),
             /*fail_logout*/ true,
-            /*fail_complete_once*/ false,
+            CompletePkceFailure::None,
         );
         manager
             .configure_api_key("anthropic", ProviderApiKey::new("stored-secret"), None)
@@ -996,7 +1044,7 @@ mod tests {
             store,
             Arc::new(InMemoryProviderCredentialStore::default()),
             /*fail_logout*/ false,
-            /*fail_complete_once*/ true,
+            CompletePkceFailure::NetworkOnce,
         );
         let session_id = match manager.start_login("anthropic").await.unwrap() {
             HostAuthStep::Pkce { session_id, .. } => session_id,
@@ -1011,6 +1059,37 @@ mod tests {
             .complete_pkce(&session_id, "auth-code")
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_pkce_error_consumes_pending_session() {
+        let (_dir, store) = temp_store();
+        let manager = anthropic_manager_with(
+            store,
+            Arc::new(InMemoryProviderCredentialStore::default()),
+            /*fail_logout*/ false,
+            CompletePkceFailure::InvalidResponseOnce,
+        );
+        let session_id = match manager.start_login("anthropic").await.unwrap() {
+            HostAuthStep::Pkce { session_id, .. } => session_id,
+            other => panic!("expected Pkce, got {other:?}"),
+        };
+
+        let first_error = manager
+            .complete_pkce(&session_id, "auth-code")
+            .await
+            .unwrap_err();
+        let second_error = manager
+            .complete_pkce(&session_id, "auth-code")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(first_error, AuthError::InvalidResponse(ref message) if message == "terminal test failure")
+        );
+        assert!(
+            matches!(second_error, AuthError::InvalidResponse(ref message) if message == "unknown or expired login session")
+        );
     }
 
     #[tokio::test]

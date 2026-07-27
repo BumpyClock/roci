@@ -561,13 +561,22 @@ impl ProviderFactory for OpenAiCompatibleFactory {
         resolve_openai_compatible_credentials(config).is_ok()
     }
 
+    fn check_available(&self, config: &RociConfig, _provider_key: &str) -> Result<(), RociError> {
+        resolve_openai_compatible_credentials(config).map(|_| ())
+    }
+
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(provider_key, options, crate::models::catalog::empty_catalog)
+        Box::pin(async move {
+            if !options.include_unavailable {
+                self.check_available(config, provider_key)?;
+            }
+            catalog_future(provider_key, options, crate::models::catalog::empty_catalog).await
+        })
     }
 
     fn create(
@@ -702,6 +711,10 @@ impl ProviderFactory for GitHubCopilotFactory {
         resolve_github_copilot_credentials(config).is_ok()
     }
 
+    fn check_available(&self, config: &RociConfig, _provider_key: &str) -> Result<(), RociError> {
+        resolve_github_copilot_credentials(config).map(|_| ())
+    }
+
     fn list_models<'a>(
         &'a self,
         config: &'a RociConfig,
@@ -779,10 +792,12 @@ fn resolve_anthropic_compatible_credentials(
     config: &RociConfig,
 ) -> Result<(String, String), RociError> {
     let api_key = config
-        .get_api_key_for(ProviderKey::Anthropic)
+        .get_api_key("anthropic-compatible")
+        .or_else(|| config.get_api_key_for(ProviderKey::Anthropic))
         .ok_or_else(|| RociError::Authentication("Missing ANTHROPIC_COMPAT_API_KEY".into()))?;
     let base_url = config
-        .get_base_url_for(ProviderKey::Anthropic)
+        .get_base_url("anthropic-compatible")
+        .or_else(|| config.get_base_url_for(ProviderKey::Anthropic))
         .ok_or_else(|| RociError::Configuration("Missing ANTHROPIC_COMPAT_BASE_URL".into()))?;
     Ok((api_key, base_url))
 }
@@ -806,13 +821,22 @@ impl ProviderFactory for AnthropicCompatibleFactory {
         resolve_anthropic_compatible_credentials(config).is_ok()
     }
 
+    fn check_available(&self, config: &RociConfig, _provider_key: &str) -> Result<(), RociError> {
+        resolve_anthropic_compatible_credentials(config).map(|_| ())
+    }
+
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(provider_key, options, crate::models::catalog::empty_catalog)
+        Box::pin(async move {
+            if !options.include_unavailable {
+                self.check_available(config, provider_key)?;
+            }
+            catalog_future(provider_key, options, crate::models::catalog::empty_catalog).await
+        })
     }
 
     fn create(
@@ -870,13 +894,22 @@ impl ProviderFactory for AzureFactory {
         resolve_azure_credentials(config).is_ok()
     }
 
+    fn check_available(&self, config: &RociConfig, _provider_key: &str) -> Result<(), RociError> {
+        resolve_azure_credentials(config).map(|_| ())
+    }
+
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(provider_key, options, crate::models::catalog::empty_catalog)
+        Box::pin(async move {
+            if !options.include_unavailable {
+                self.check_available(config, provider_key)?;
+            }
+            catalog_future(provider_key, options, crate::models::catalog::empty_catalog).await
+        })
     }
 
     fn create(
@@ -1373,14 +1406,14 @@ mod tests {
 
     #[cfg(feature = "anthropic-compatible")]
     #[test]
-    fn anthropic_compatible_is_available_uses_inherited_anthropic_config() {
+    fn anthropic_compatible_is_available_with_dedicated_or_inherited_config() {
         let missing = config_without_credentials();
         assert!(!AnthropicCompatibleFactory.is_available(&missing, "anthropic-compatible"));
 
-        let own_keys_ignored = config_without_credentials();
-        own_keys_ignored.set_api_key("anthropic-compatible", "compat-key".to_string());
-        own_keys_ignored.set_base_url("anthropic-compatible", "https://compat.example".to_string());
-        assert!(!AnthropicCompatibleFactory.is_available(&own_keys_ignored, "anthropic-compatible"));
+        let dedicated = config_without_credentials();
+        dedicated.set_api_key("anthropic-compatible", "compat-key".to_string());
+        dedicated.set_base_url("anthropic-compatible", "https://compat.example".to_string());
+        assert!(AnthropicCompatibleFactory.is_available(&dedicated, "anthropic-compatible"));
 
         let inherited = config_without_credentials();
         inherited.set_api_key("anthropic", "anthropic-key".to_string());

@@ -240,8 +240,8 @@ where
             verification_uri,
             user_code,
             interval_secs,
+            expires_at,
             session_id,
-            ..
         } => {
             writeln!(stdout, "Visit: {verification_uri}")?;
             writeln!(stdout, "Enter code: {user_code}")?;
@@ -250,7 +250,19 @@ where
 
             let mut interval = Duration::from_secs(interval_secs.max(1));
             loop {
-                tokio::time::sleep(interval).await;
+                let remaining = expires_at
+                    .signed_duration_since(chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or_default();
+                if !remaining.is_zero() {
+                    tokio::time::sleep(interval.min(remaining)).await;
+                }
+                if remaining.is_zero() || chrono::Utc::now() >= expires_at {
+                    writeln!(stderr, "Device code expired; please try again")?;
+                    return Err(AuthCliError::Message(
+                        "Device code expired; please try again".into(),
+                    ));
+                }
                 match manager.poll_device_code(&session_id).await? {
                     HostAuthPollResult::Pending => continue,
                     HostAuthPollResult::SlowDown { interval_secs } => {
@@ -736,7 +748,7 @@ mod tests {
                 verification_uri: "https://example.com/device".into(),
                 user_code: "ABCD".into(),
                 interval_secs: 0,
-                expires_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
                 session_id: LoginSessionId::new("sess-denied"),
             }));
         manager
@@ -771,7 +783,7 @@ mod tests {
                 verification_uri: "https://example.com/device".into(),
                 user_code: "ABCD".into(),
                 interval_secs: 0,
-                expires_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
                 session_id: LoginSessionId::new("sess-expired"),
             }));
         manager
@@ -795,6 +807,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_device_deadline_expires_before_polling() {
+        let manager = FakeManager::default();
+        manager
+            .login_steps
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostAuthStep::DeviceCode {
+                verification_uri: "https://example.com/device".into(),
+                user_code: "ABCD".into(),
+                interval_secs: 30,
+                expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+                session_id: LoginSessionId::new("sess-deadline"),
+            }));
+        manager
+            .poll_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostAuthPollResult::Pending));
+
+        let mut stdin = b"".as_slice();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = run_login(
+            &manager,
+            "codex",
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("expired"));
+        assert_eq!(manager.poll_results.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn login_device_slow_down_updates_interval_then_authorizes() {
         let manager = FakeManager::default();
         manager
@@ -805,7 +856,7 @@ mod tests {
                 verification_uri: "https://example.com/device".into(),
                 user_code: "ABCD".into(),
                 interval_secs: 0,
-                expires_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
                 session_id: LoginSessionId::new("sess-slow"),
             }));
         {
@@ -904,11 +955,12 @@ mod tests {
         assert!(String::from_utf8(stdout).unwrap().contains("> "));
     }
 
+    #[cfg(feature = "openai-compatible")]
     #[test]
-    fn default_manager_registers_openai_compatible() {
-        let manager = build_default_manager().unwrap();
+    fn default_registry_registers_openai_compatible() {
+        let registry = roci::default_registry();
 
-        assert!(manager.descriptor("openai-compatible").is_ok());
+        assert!(registry.has_provider("openai-compatible"));
     }
 
     #[test]

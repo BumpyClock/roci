@@ -46,6 +46,21 @@ pub trait ProviderFactory: Send + Sync {
         !self.requires_credentials(provider_key) || config.has_credentials(provider_key)
     }
 
+    /// Validate launch availability and preserve provider-specific failure details.
+    ///
+    /// Default maps unavailability to [`RociError::MissingCredential`]. Override
+    /// when launch also requires provider-specific configuration such as an
+    /// endpoint. Must stay hermetic: no network I/O.
+    fn check_available(&self, config: &RociConfig, provider_key: &str) -> Result<(), RociError> {
+        if self.is_available(config, provider_key) {
+            Ok(())
+        } else {
+            Err(RociError::MissingCredential {
+                provider: provider_key.to_string(),
+            })
+        }
+    }
+
     /// List models for the given provider key.
     fn list_models<'a>(
         &'a self,
@@ -54,10 +69,8 @@ pub trait ProviderFactory: Send + Sync {
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
         Box::pin(async move {
-            if !options.include_unavailable && !self.is_available(config, provider_key) {
-                return Err(RociError::MissingCredential {
-                    provider: provider_key.to_string(),
-                });
+            if !options.include_unavailable {
+                self.check_available(config, provider_key)?;
             }
             Ok(ModelCatalog::default())
         })

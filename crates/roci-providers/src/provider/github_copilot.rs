@@ -85,10 +85,10 @@ pub(crate) fn parse_copilot_models_response(
 
     let mut catalog = ModelCatalog::default();
     for model in models {
-        let model_picker_enabled = model
+        let model_picker_disabled = model
             .get("model_picker_enabled")
             .and_then(serde_json::Value::as_bool)
-            == Some(true);
+            == Some(false);
         let policy_disabled = model
             .get("policy")
             .and_then(serde_json::Value::as_object)
@@ -103,7 +103,7 @@ pub(crate) fn parse_copilot_models_response(
             .and_then(|supports| supports.get("tool_calls"))
             .and_then(serde_json::Value::as_bool)
             == Some(false);
-        if !model_picker_enabled || policy_disabled || tool_calls_disabled {
+        if model_picker_disabled || policy_disabled || tool_calls_disabled {
             continue;
         }
 
@@ -274,7 +274,15 @@ mod tests {
             .map(|model| model.model_id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, vec!["claude-sonnet-4", "gemini-2.5-pro", "gpt-4.1"]);
+        assert_eq!(
+            ids,
+            vec![
+                "claude-sonnet-4",
+                "gemini-2.5-pro",
+                "gpt-4.1",
+                "missing-picker"
+            ]
+        );
     }
 
     #[test]

@@ -86,12 +86,6 @@ impl ProviderRegistry {
                 ))
             })?;
 
-            if !options.include_unavailable && !factory.is_available(config, provider_key) {
-                return Err(RociError::MissingCredential {
-                    provider: provider_key.to_string(),
-                });
-            }
-
             return factory.list_models(config, provider_key, options).await;
         }
 
@@ -104,7 +98,7 @@ impl ProviderRegistry {
                 .expect("provider key came from registry");
 
             // Skip unavailable factories via factory-owned availability; explicit
-            // provider requests still surface the provider's MissingCredential error.
+            // provider requests surface the factory's precise availability error.
             if !options.include_unavailable && !factory.is_available(config, provider_key) {
                 continue;
             }
@@ -407,6 +401,25 @@ mod tests {
         let err = registry.list_models(&config, &options).await.unwrap_err();
 
         assert!(matches!(err, RociError::MissingCredential { provider } if provider == "remote"));
+    }
+
+    #[tokio::test]
+    async fn explicit_unavailable_remote_preserves_configuration_error() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(ConfigurationRequiredCatalogFactory));
+        let config = RociConfig::new().with_token_store(None);
+        let options = ModelListOptions {
+            provider_key: Some("configured-remote".to_string()),
+            ..ModelListOptions::default()
+        };
+
+        let error = registry.list_models(&config, &options).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            RociError::MissingConfiguration { key, provider }
+                if key == "endpoint" && provider == "configured-remote"
+        ));
     }
 
     #[tokio::test]
@@ -717,6 +730,41 @@ mod tests {
                     true,
                 )]))
             })
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            unreachable!("catalog tests must not create providers")
+        }
+    }
+
+    struct ConfigurationRequiredCatalogFactory;
+
+    impl ProviderFactory for ConfigurationRequiredCatalogFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["configured-remote"]
+        }
+
+        fn is_available(&self, config: &RociConfig, provider_key: &str) -> bool {
+            config.get_base_url(provider_key).is_some()
+        }
+
+        fn check_available(
+            &self,
+            config: &RociConfig,
+            provider_key: &str,
+        ) -> Result<(), RociError> {
+            config
+                .get_base_url(provider_key)
+                .map(|_| ())
+                .ok_or_else(|| RociError::MissingConfiguration {
+                    key: "endpoint".to_string(),
+                    provider: provider_key.to_string(),
+                })
         }
 
         fn create(
