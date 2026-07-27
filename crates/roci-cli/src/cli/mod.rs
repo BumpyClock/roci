@@ -71,29 +71,64 @@ pub struct AuthArgs {
     pub command: AuthCommands,
 }
 
-/// Auth subcommands for login, status, and logout.
+/// Auth subcommands for login, status, logout, configure, and providers.
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
     /// Login to a provider
     Login(LoginArgs),
     /// Show authentication status
-    Status,
+    Status(StatusArgs),
     /// Logout from a provider
     Logout(LogoutArgs),
+    /// Configure a provider API key (read from stdin) and optional endpoint
+    Configure(ConfigureArgs),
+    /// List known providers and secret-free auth status
+    Providers(ProvidersArgs),
 }
 
 /// Arguments for `roci-agent auth login`.
 #[derive(Parser, Debug)]
 pub struct LoginArgs {
-    /// Provider to login to (copilot, codex, claude)
+    /// Provider to login to (github-copilot, codex, anthropic, ...)
     pub provider: String,
+}
+
+/// Arguments for `roci-agent auth status`.
+#[derive(Parser, Debug)]
+pub struct StatusArgs {
+    /// Print secret-free status rows as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `roci-agent auth logout`.
 #[derive(Parser, Debug)]
 pub struct LogoutArgs {
-    /// Provider to logout from (copilot, codex, claude)
+    /// Provider to logout from (github-copilot, codex, anthropic, ...)
     pub provider: String,
+}
+
+/// Arguments for `roci-agent auth configure`.
+#[derive(Parser, Debug)]
+pub struct ConfigureArgs {
+    /// Provider to configure (for example: openai-compatible, anthropic, openai)
+    pub provider: String,
+
+    /// Optional provider endpoint/base URL
+    #[arg(long, value_name = "URL")]
+    pub endpoint: Option<String>,
+
+    /// Read the API key from stdin (required; never pass keys on argv)
+    #[arg(long, required = true)]
+    pub api_key_stdin: bool,
+}
+
+/// Arguments for `roci-agent auth providers`.
+#[derive(Parser, Debug)]
+pub struct ProvidersArgs {
+    /// Print secret-free provider status rows as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the `audio` subcommand group.
@@ -685,9 +720,22 @@ mod tests {
     fn parse_auth_status() {
         let cli = Cli::try_parse_from(["roci-agent", "auth", "status"]).unwrap();
         match cli.command {
-            Commands::Auth(auth) => {
-                assert!(matches!(auth.command, AuthCommands::Status));
-            }
+            Commands::Auth(auth) => match auth.command {
+                AuthCommands::Status(args) => assert!(!args.json),
+                other => panic!("expected Status, got {other:?}"),
+            },
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_status_json() {
+        let cli = Cli::try_parse_from(["roci-agent", "auth", "status", "--json"]).unwrap();
+        match cli.command {
+            Commands::Auth(auth) => match auth.command {
+                AuthCommands::Status(args) => assert!(args.json),
+                other => panic!("expected Status, got {other:?}"),
+            },
             other => panic!("expected Auth, got {other:?}"),
         }
     }
@@ -702,6 +750,109 @@ mod tests {
             },
             other => panic!("expected Auth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_auth_configure_requires_api_key_stdin_and_allows_endpoint() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "auth",
+            "configure",
+            "openai-compatible",
+            "--endpoint",
+            "http://framed:4001/v1",
+            "--api-key-stdin",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Auth(auth) => match auth.command {
+                AuthCommands::Configure(args) => {
+                    assert_eq!(args.provider, "openai-compatible");
+                    assert_eq!(args.endpoint.as_deref(), Some("http://framed:4001/v1"));
+                    assert!(args.api_key_stdin);
+                }
+                other => panic!("expected Configure, got {other:?}"),
+            },
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_configure_without_api_key_stdin_is_error() {
+        assert!(
+            Cli::try_parse_from(["roci-agent", "auth", "configure", "openai-compatible",]).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_auth_configure_rejects_api_key_value_flag() {
+        let err = Cli::try_parse_from([
+            "roci-agent",
+            "auth",
+            "configure",
+            "openai-compatible",
+            "--api-key",
+            "sk-secret",
+            "--api-key-stdin",
+        ])
+        .expect_err("api-key value flag must not exist");
+        let message = err.to_string();
+        assert!(
+            message.contains("unexpected argument") || message.contains("unrecognized"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_auth_configure_endpoint_is_optional() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "auth",
+            "configure",
+            "anthropic",
+            "--api-key-stdin",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Auth(auth) => match auth.command {
+                AuthCommands::Configure(args) => {
+                    assert_eq!(args.provider, "anthropic");
+                    assert!(args.endpoint.is_none());
+                    assert!(args.api_key_stdin);
+                }
+                other => panic!("expected Configure, got {other:?}"),
+            },
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_providers_json() {
+        let cli = Cli::try_parse_from(["roci-agent", "auth", "providers", "--json"]).unwrap();
+        match cli.command {
+            Commands::Auth(auth) => match auth.command {
+                AuthCommands::Providers(args) => assert!(args.json),
+                other => panic!("expected Providers, got {other:?}"),
+            },
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_configure_help_mentions_api_key_stdin_not_value_flag() {
+        use clap::CommandFactory;
+        let mut app = Cli::command();
+        let mut help = Vec::new();
+        app.find_subcommand_mut("auth")
+            .expect("auth")
+            .find_subcommand_mut("configure")
+            .expect("configure")
+            .write_long_help(&mut help)
+            .unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("--api-key-stdin"));
+        assert!(!help.contains("--api-key <"));
+        assert!(help.contains("--endpoint"));
     }
 
     #[test]

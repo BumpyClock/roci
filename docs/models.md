@@ -58,6 +58,8 @@ The Codex provider has a separate catalog from the public OpenAI provider. Its
 current local presets are synchronized from
 `../codex/codex-rs/models-manager/models.json`; they use the existing Codex
 Responses transport and do not claim public OpenAI API availability.
+`gpt-5.3-codex-spark` is a separately live-attested ChatGPT Codex entry and is
+not synchronized from that upstream file.
 
 The public OpenAI and Codex catalogs may expose the same model ID with distinct
 capabilities. For example, public `gpt-5.4` defaults to `none`, while Codex's
@@ -67,6 +69,7 @@ sending a request.
 
 | Codex model | Context | Default effort | Supported efforts |
 | --- | ---: | --- | --- |
+| `gpt-5.3-codex-spark` | 128,000 | none exposed | none exposed |
 | `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5` | 272,000 | `medium` | `low`, `medium`, `high`, `xhigh` |
 | `gpt-5.6-sol` | 372,000 | `low` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
 | `gpt-5.6-terra` | 372,000 | `medium` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |

@@ -90,6 +90,7 @@ pub fn codex_catalog(provider_key: &str) -> ModelCatalog {
         OpenAiModel::Gpt54,
         OpenAiModel::Gpt54Mini,
         OpenAiModel::Gpt55,
+        OpenAiModel::Custom("gpt-5.3-codex-spark".to_string()),
         OpenAiModel::Gpt56Sol,
         OpenAiModel::Gpt56Terra,
         OpenAiModel::Gpt56Luna,
@@ -308,6 +309,11 @@ mod tests {
     #[test]
     fn codex_catalog_uses_current_codex_model_presets() {
         let catalog = codex_catalog("codex");
+        let spark = catalog
+            .models()
+            .iter()
+            .find(|model| model.model_id == "gpt-5.3-codex-spark")
+            .expect("GPT-5.3 Codex Spark present");
         let terra = catalog
             .models()
             .iter()
@@ -319,6 +325,11 @@ mod tests {
             .find(|model| model.model_id == "gpt-5.6-luna")
             .expect("GPT-5.6 Luna present");
 
+        assert!(spark.capabilities.supports_tools);
+        assert_eq!(spark.capabilities.context_length, 128_000);
+        assert!(spark.capabilities.reasoning_effort_options().is_empty());
+        assert!(!spark.policy.default_for_provider);
+        assert_eq!(spark.provider_key, "codex");
         assert_eq!(terra.capabilities.context_length, 372_000);
         assert_eq!(
             terra.capabilities.default_reasoning_effort(),

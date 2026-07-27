@@ -421,8 +421,16 @@ impl roci_core::provider::ProviderFactory for OverflowClassifyingFactory {
         self.inner.provider_keys()
     }
 
+    fn descriptor(&self) -> roci_core::auth::ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
     fn requires_credentials(&self, provider_key: &str) -> bool {
         self.inner.requires_credentials(provider_key)
+    }
+
+    fn is_available(&self, config: &roci_core::config::RociConfig, provider_key: &str) -> bool {
+        self.inner.is_available(config, provider_key)
     }
 
     fn list_models<'a>(

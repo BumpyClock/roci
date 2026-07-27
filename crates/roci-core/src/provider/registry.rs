@@ -51,11 +51,26 @@ impl ProviderRegistry {
         self.factories.contains_key(provider_key)
     }
 
+    /// Borrow the factory registered for `provider_key`, if any.
+    pub fn factory(&self, provider_key: &str) -> Option<&Arc<dyn ProviderFactory>> {
+        self.factories.get(provider_key)
+    }
+
     /// Check whether the registered factory requires credentials.
     pub fn requires_credentials(&self, provider_key: &str) -> Option<bool> {
         self.factories
             .get(provider_key)
             .map(|factory| factory.requires_credentials(provider_key))
+    }
+
+    /// Check whether the registered factory can launch with the given config.
+    ///
+    /// Returns `None` when no factory is registered for `provider_key` so hosts
+    /// can distinguish unknown providers from unavailable ones.
+    pub fn is_available(&self, provider_key: &str, config: &RociConfig) -> Option<bool> {
+        self.factories
+            .get(provider_key)
+            .map(|factory| factory.is_available(config, provider_key))
     }
 
     /// List models for one provider or all registered providers.
@@ -82,12 +97,9 @@ impl ProviderRegistry {
                 .get(provider_key)
                 .expect("provider key came from registry");
 
-            // Skip known unavailable remotes before calling `list_models`; explicit
-            // provider requests still surface the provider's MissingCredential error.
-            if !options.include_unavailable
-                && factory.requires_credentials(provider_key)
-                && !has_credentials(config, provider_key)
-            {
+            // Skip unavailable factories via factory-owned availability; explicit
+            // provider requests surface the factory's precise availability error.
+            if !options.include_unavailable && !factory.is_available(config, provider_key) {
                 continue;
             }
 
@@ -113,10 +125,6 @@ impl ProviderRegistry {
         keys.sort();
         keys
     }
-}
-
-fn has_credentials(config: &RociConfig, provider_key: &str) -> bool {
-    config.get_api_key(provider_key).is_some()
 }
 
 impl Default for ProviderRegistry {
@@ -356,6 +364,7 @@ mod tests {
         let config = RociConfig::new().with_token_store(None);
         let options = ModelListOptions {
             provider_key: Some("stub".to_string()),
+            include_unavailable: true,
             ..ModelListOptions::default()
         };
 
@@ -392,6 +401,41 @@ mod tests {
         let err = registry.list_models(&config, &options).await.unwrap_err();
 
         assert!(matches!(err, RociError::MissingCredential { provider } if provider == "remote"));
+    }
+
+    #[tokio::test]
+    async fn explicit_unavailable_remote_preserves_configuration_error() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(ConfigurationRequiredCatalogFactory));
+        let config = RociConfig::new().with_token_store(None);
+        let options = ModelListOptions {
+            provider_key: Some("configured-remote".to_string()),
+            ..ModelListOptions::default()
+        };
+
+        let error = registry.list_models(&config, &options).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            RociError::MissingConfiguration { key, provider }
+                if key == "endpoint" && provider == "configured-remote"
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_unavailable_remote_is_included_when_requested() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CredentialedCatalogFactory));
+        let config = RociConfig::new().with_token_store(None);
+        let options = ModelListOptions {
+            provider_key: Some("remote".to_string()),
+            include_unavailable: true,
+            ..ModelListOptions::default()
+        };
+
+        let catalog = registry.list_models(&config, &options).await.unwrap();
+
+        assert_eq!(catalog.models()[0].model_id, "remote-model");
     }
 
     #[tokio::test]
@@ -455,6 +499,91 @@ mod tests {
         assert_eq!(registry.requires_credentials("stub"), Some(true));
         assert_eq!(registry.requires_credentials("local"), Some(false));
         assert_eq!(registry.requires_credentials("missing"), None);
+    }
+
+    #[test]
+    fn is_available_uses_factory_override_not_provider_key_heuristic() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(AliasCredentialFactory));
+        let config = RociConfig::new().with_token_store(None);
+
+        assert_eq!(registry.is_available("alias-remote", &config), Some(false));
+
+        // Credentials live under the alias source key, not the registered provider key.
+        config.set_api_key("source", "token".to_string());
+        assert_eq!(registry.is_available("alias-remote", &config), Some(true));
+        assert_eq!(registry.is_available("missing", &config), None);
+    }
+
+    #[tokio::test]
+    async fn list_models_uses_factory_availability_override() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(AliasCredentialFactory));
+        let config = RociConfig::new().with_token_store(None);
+        config.set_api_key("source", "token".to_string());
+
+        let catalog = registry
+            .list_models(&config, &ModelListOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(catalog.models().len(), 1);
+        assert_eq!(catalog.models()[0].provider_key, "alias-remote");
+        assert_eq!(catalog.models()[0].model_id, "alias-model");
+    }
+
+    #[tokio::test]
+    async fn list_models_aggregates_available_and_omits_unavailable() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CredentialedCatalogFactory));
+        registry.register(Arc::new(LocalFactory));
+        registry.register(Arc::new(LocalCatalogFactory));
+        let config = RociConfig::new().with_token_store(None);
+
+        let catalog = registry
+            .list_models(&config, &ModelListOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .models()
+                .iter()
+                .map(|model| model.provider_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-catalog"]
+        );
+
+        config.set_api_key("remote", "token".to_string());
+        let catalog = registry
+            .list_models(&config, &ModelListOptions::default())
+            .await
+            .unwrap();
+
+        let mut providers = catalog
+            .models()
+            .iter()
+            .map(|model| model.provider_key.as_str())
+            .collect::<Vec<_>>();
+        providers.sort_unstable();
+        assert_eq!(providers, vec!["local-catalog", "remote"]);
+    }
+
+    #[tokio::test]
+    async fn available_factory_discovery_errors_propagate() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(FailingAvailableFactory));
+        let config = RociConfig::new().with_token_store(None);
+
+        let err = registry
+            .list_models(&config, &ModelListOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RociError::UnsupportedOperation(message) if message == "catalog boom"
+        ));
     }
 
     #[test]
@@ -586,10 +715,10 @@ mod tests {
             &'a self,
             config: &'a RociConfig,
             provider_key: &'a str,
-            _options: &'a ModelListOptions,
+            options: &'a ModelListOptions,
         ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
             Box::pin(async move {
-                if config.get_api_key(provider_key).is_none() {
+                if !options.include_unavailable && config.get_api_key(provider_key).is_none() {
                     return Err(RociError::MissingCredential {
                         provider: provider_key.to_string(),
                     });
@@ -601,6 +730,150 @@ mod tests {
                     true,
                 )]))
             })
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            unreachable!("catalog tests must not create providers")
+        }
+    }
+
+    struct ConfigurationRequiredCatalogFactory;
+
+    impl ProviderFactory for ConfigurationRequiredCatalogFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["configured-remote"]
+        }
+
+        fn is_available(&self, config: &RociConfig, provider_key: &str) -> bool {
+            config.get_base_url(provider_key).is_some()
+        }
+
+        fn check_available(
+            &self,
+            config: &RociConfig,
+            provider_key: &str,
+        ) -> Result<(), RociError> {
+            config
+                .get_base_url(provider_key)
+                .map(|_| ())
+                .ok_or_else(|| RociError::MissingConfiguration {
+                    key: "endpoint".to_string(),
+                    provider: provider_key.to_string(),
+                })
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            unreachable!("catalog tests must not create providers")
+        }
+    }
+
+    /// Available only when credentials exist under a different source key.
+    struct AliasCredentialFactory;
+
+    impl ProviderFactory for AliasCredentialFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["alias-remote"]
+        }
+
+        fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
+            config.has_credentials("source")
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            config: &'a RociConfig,
+            provider_key: &'a str,
+            _options: &'a ModelListOptions,
+        ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
+            Box::pin(async move {
+                if !config.has_credentials("source") {
+                    return Err(RociError::MissingCredential {
+                        provider: provider_key.to_string(),
+                    });
+                }
+
+                Ok(ModelCatalog::from_models([catalog_model(
+                    provider_key,
+                    "alias-model",
+                    true,
+                )]))
+            })
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            unreachable!("catalog tests must not create providers")
+        }
+    }
+
+    struct LocalCatalogFactory;
+
+    impl ProviderFactory for LocalCatalogFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["local-catalog"]
+        }
+
+        fn requires_credentials(&self, _provider_key: &str) -> bool {
+            false
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _config: &'a RociConfig,
+            provider_key: &'a str,
+            _options: &'a ModelListOptions,
+        ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
+            Box::pin(async move {
+                Ok(ModelCatalog::from_models([catalog_model(
+                    provider_key,
+                    "local-model",
+                    false,
+                )]))
+            })
+        }
+
+        fn create(
+            &self,
+            _config: &RociConfig,
+            _provider_key: &str,
+            _model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            unreachable!("catalog tests must not create providers")
+        }
+    }
+
+    struct FailingAvailableFactory;
+
+    impl ProviderFactory for FailingAvailableFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["failing"]
+        }
+
+        fn requires_credentials(&self, _provider_key: &str) -> bool {
+            false
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _config: &'a RociConfig,
+            _provider_key: &'a str,
+            _options: &'a ModelListOptions,
+        ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
+            Box::pin(async move { Err(RociError::UnsupportedOperation("catalog boom".into())) })
         }
 
         fn create(

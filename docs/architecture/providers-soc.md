@@ -90,11 +90,13 @@ All concrete provider implementations and OAuth flows:
 `OpenAiModel`, `AnthropicModel`, `GoogleModel`, `GrokModel`, `GroqModel`, `MistralModel`, `OllamaModel`, `LmStudioModel`
 
 **OAuth flow implementations**:
+
 - `ClaudeCodeAuth` + `PkceSession`
 - `GitHubCopilotAuth`
 - `OpenAiCodexAuth`
 
 **Registration functions**:
+
 - `register_default_providers(registry: &mut ProviderRegistry)` — registers a `ProviderFactory` impl for each enabled provider
 - `register_default_auth_backends(service: &mut AuthService)` — registers an `AuthBackend` impl for each OAuth provider
 
@@ -131,6 +133,34 @@ pub trait ProviderFactory: Send + Sync {
     /// Provider key(s) this factory handles (e.g., ["openai", "codex"]).
     fn provider_keys(&self) -> &[&str];
 
+    /// Host-safe descriptor. Built-ins override the third-party-safe default.
+    fn descriptor(&self) -> ProviderDescriptor { /* default */ }
+
+    /// Whether launch requires credentials. Default returns `true`.
+    fn requires_credentials(&self, _provider_key: &str) -> bool { true }
+
+    /// Factory-owned launch viability. Default uses `requires_credentials`
+    /// plus `RociConfig::has_credentials`.
+    fn is_available(&self, config: &RociConfig, provider_key: &str) -> bool {
+        /* default */
+    }
+
+    /// Preserve provider-specific configuration failures when unavailable.
+    /// Default returns `MissingCredential` when `is_available` is false.
+    fn check_available(
+        &self,
+        config: &RociConfig,
+        provider_key: &str,
+    ) -> Result<(), RociError> { /* default */ }
+
+    /// List provider-backed models, optionally filtered by policy.
+    fn list_models<'a>(
+        &'a self,
+        config: &'a RociConfig,
+        provider_key: &'a str,
+        options: &'a ModelListOptions,
+    ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> { /* default */ }
+
     /// Create a ModelProvider for the given model ID and config.
     fn create(
         &self,
@@ -138,20 +168,11 @@ pub trait ProviderFactory: Send + Sync {
         provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError>;
-
-    /// List provider-backed models, optionally filtered by policy.
-    fn list_models(
-        &self,
-        config: &RociConfig,
-        provider_key: &str,
-        options: &ModelListOptions,
-    ) -> crate::provider::BoxModelCatalogFuture;
-
 }
 ```
 
-`list_models` is object-safe and uses a boxed future type so registries can
-merge async providers in a provider-neutral way.
+`list_models` is object-safe and uses `futures::future::BoxFuture` so
+registries can merge async providers in a provider-neutral way.
 
 **ProviderRegistry**:
 
@@ -183,6 +204,9 @@ impl ProviderRegistry {
     ) -> Result<ModelCatalog, RociError>;
 
     pub fn has_provider(&self, provider_key: &str) -> bool;
+
+    /// `None` for unknown providers; otherwise factory-owned availability.
+    pub fn is_available(&self, provider_key: &str, config: &RociConfig) -> Option<bool>;
 }
 ```
 

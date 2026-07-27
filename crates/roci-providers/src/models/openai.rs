@@ -504,6 +504,13 @@ mod tests {
     }
 
     #[test]
+    fn custom_codex_spark_uses_responses_api() {
+        let model = OpenAiModel::Custom("gpt-5.3-codex-spark".to_string());
+
+        assert!(model.uses_responses_api());
+    }
+
+    #[test]
     fn reasoning_models_expose_model_specific_effort_options() {
         let gpt5 = OpenAiModel::Gpt5.capabilities();
         let gpt51 = OpenAiModel::Gpt51.capabilities();

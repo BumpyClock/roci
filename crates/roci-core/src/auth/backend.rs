@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::descriptor::CredentialFlow;
 use super::device_code::DeviceCodeSession;
 use super::error::AuthError;
 use super::service::{AuthPollResult, AuthStep};
@@ -12,8 +13,11 @@ use super::token::Token;
 
 /// Registerable authentication backend for a provider.
 ///
-/// Implement this trait for each OAuth provider (GitHub Copilot, OpenAI Codex,
-/// Claude Code, etc.) and register it with [`super::AuthService`].
+/// Role: own one OAuth flow (device-code or PKCE) and the token-store key for a
+/// canonical launch provider. Implement for each OAuth integration (GitHub
+/// Copilot, OpenAI Codex, Claude Code, etc.) and register with
+/// [`super::AuthService`]. The host-facing [`super::manager::ProviderAuthManager`]
+/// overlays [`oauth_flow`] onto the matching factory descriptor.
 #[async_trait]
 pub trait AuthBackend: Send + Sync {
     /// Provider aliases this backend handles (e.g., ["copilot", "github-copilot"]).
@@ -24,6 +28,15 @@ pub trait AuthBackend: Send + Sync {
 
     /// Token store key (e.g., "github-copilot").
     fn store_key(&self) -> &str;
+
+    /// Canonical launch provider key this OAuth flow attaches to.
+    ///
+    /// Must match a registered [`crate::provider::ProviderFactory`] key so the
+    /// manager can overlay flows and reject auth-only backends.
+    fn canonical_provider_key(&self) -> &str;
+
+    /// OAuth credential flow contributed by this backend.
+    fn oauth_flow(&self) -> CredentialFlow;
 
     /// Start a login flow.
     async fn start_login(&self, store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError>;

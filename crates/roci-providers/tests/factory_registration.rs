@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use roci_core::auth::{AuthService, FileTokenStore, TokenStoreConfig};
+use roci_core::auth::{AuthService, FileTokenStore, ProviderAuthManager, TokenStoreConfig};
+use roci_core::config::RociConfig;
+#[cfg(any(feature = "github-copilot", feature = "ollama"))]
+use roci_core::models::ModelListOptions;
 use roci_core::provider::ProviderRegistry;
-#[cfg(feature = "ollama")]
-use roci_core::{config::RociConfig, models::ModelListOptions};
 
 // ---------------------------------------------------------------------------
 // register_default_providers
@@ -73,6 +74,28 @@ fn register_default_providers_registers_github_copilot_when_feature_enabled() {
     );
 }
 
+#[cfg(feature = "github-copilot")]
+#[tokio::test]
+async fn explicit_github_copilot_catalog_falls_back_without_credentials() {
+    let config = RociConfig::new()
+        .with_token_store(None)
+        .with_provider_credential_store(None);
+    let mut registry = ProviderRegistry::new();
+    roci_providers::register_default_providers(&mut registry);
+    let options = ModelListOptions {
+        provider_key: Some("github-copilot".to_string()),
+        ..ModelListOptions::default()
+    };
+
+    let catalog = registry.list_models(&config, &options).await.unwrap();
+
+    assert!(!catalog.models().is_empty());
+    assert!(catalog
+        .models()
+        .iter()
+        .all(|model| model.provider_key == "github-copilot"));
+}
+
 #[test]
 fn register_default_providers_populates_multiple_keys() {
     let mut registry = ProviderRegistry::new();
@@ -113,7 +136,9 @@ fn register_default_providers_registers_ollama_when_feature_enabled() {
 #[cfg(feature = "ollama")]
 #[tokio::test]
 async fn register_default_providers_all_catalog_keeps_local_ollama_without_credentials() {
-    let config = RociConfig::new().with_token_store(None);
+    let config = RociConfig::new()
+        .with_token_store(None)
+        .with_provider_credential_store(None);
     let mut registry = ProviderRegistry::new();
     roci_providers::register_default_providers(&mut registry);
     assert_eq!(registry.requires_credentials("ollama"), Some(false));
@@ -142,19 +167,21 @@ fn temp_auth_service() -> (TempDir, AuthService) {
 }
 
 #[test]
-fn register_default_auth_backends_registers_three_backends() {
-    let (_dir, mut svc) = temp_auth_service();
-    roci_providers::register_default_auth_backends(&mut svc);
+fn default_auth_backends_match_enabled_launch_factories() {
+    let (_dir, mut auth) = temp_auth_service();
+    roci_providers::register_default_auth_backends(&mut auth);
+    let mut registry = ProviderRegistry::new();
+    roci_providers::register_default_providers(&mut registry);
 
-    let statuses = svc.all_statuses();
-    assert_eq!(
-        statuses.len(),
-        3,
-        "expected 3 backends, got {}",
-        statuses.len()
-    );
+    let config = RociConfig::new()
+        .with_token_store(None)
+        .with_provider_credential_store(None);
+    let result = ProviderAuthManager::new(auth, registry, config);
+
+    assert!(result.is_ok());
 }
 
+#[cfg(feature = "github-copilot")]
 #[test]
 fn register_default_auth_backends_includes_github_copilot() {
     let (_dir, mut svc) = temp_auth_service();
@@ -168,6 +195,7 @@ fn register_default_auth_backends_includes_github_copilot() {
     );
 }
 
+#[cfg(feature = "openai")]
 #[test]
 fn register_default_auth_backends_includes_codex() {
     let (_dir, mut svc) = temp_auth_service();
@@ -178,6 +206,7 @@ fn register_default_auth_backends_includes_codex() {
     assert!(names.contains(&"Codex"), "expected Codex in {names:?}");
 }
 
+#[cfg(feature = "anthropic")]
 #[test]
 fn register_default_auth_backends_includes_claude() {
     let (_dir, mut svc) = temp_auth_service();
@@ -188,6 +217,7 @@ fn register_default_auth_backends_includes_claude() {
     assert!(names.contains(&"Claude"), "expected Claude in {names:?}");
 }
 
+#[cfg(feature = "github-copilot")]
 #[tokio::test]
 async fn copilot_alias_resolves_after_registration() {
     let (_dir, mut svc) = temp_auth_service();
@@ -197,6 +227,7 @@ async fn copilot_alias_resolves_after_registration() {
     assert!(result.is_ok(), "copilot alias should resolve to backend");
 }
 
+#[cfg(feature = "anthropic")]
 #[tokio::test]
 async fn claude_alias_resolves_after_registration() {
     let (_dir, mut svc) = temp_auth_service();

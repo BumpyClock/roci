@@ -128,6 +128,14 @@ impl AuthBackend for MockAuthBackend {
         self.store_key
     }
 
+    fn canonical_provider_key(&self) -> &str {
+        self.store_key
+    }
+
+    fn oauth_flow(&self) -> roci_core::auth::CredentialFlow {
+        roci_core::auth::CredentialFlow::DeviceCode
+    }
+
     async fn start_login(&self, _store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
         let token = Token {
             access_token: format!("mock-token-{}", self.store_key),
