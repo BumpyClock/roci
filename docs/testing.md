@@ -23,6 +23,7 @@ cargo test -p roci-tools      # Tool tests (25 tests covering all tools)
 - Core integration tests: `cargo test -p roci-core --test registry_integration`
 - MCP tests (feature-gated in `roci-core`): `cargo test -p roci-core --features mcp`
 - Runtime namespace inventory: `cargo test -p roci-core --features agent "agent::runtime::tests::" -- --list`
+- Unix auth file smoke (two real `roci-agent` processes under temp `HOME`): `cargo test -p roci-cli --test auth_cli_unix`
 - To inspect test output: append `-- --nocapture`
 
 ## Live tmux/provider verification

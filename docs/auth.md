@@ -9,6 +9,39 @@ read_when: "Working on roci-cli auth login/status/logout/configure/providers or 
 command through Roci's host-facing `ProviderAuthManager`. The CLI does not
 inspect token files, invent provider aliases, or print secret material.
 
+## Credential storage
+
+CLI and Andromeda share the same Roci-owned provider credential store. There is
+no separate GUI key store and no default Keychain prompt path.
+
+| Platform | Default API-key store | Notes |
+| --- | --- | --- |
+| Unix (macOS, Linux) | Plaintext `~/.roci/auth.json` | Directory mode `0700`; `auth.json` and `auth.json.lock` mode `0600`. Same-user processes can read the file. |
+| Windows | OS credential manager (`OsProviderCredentialStore`) | File-backed storage waits on an ACL-safe design. |
+
+Tradeoff: Unix defaults favor a shared, inspectable file that CLI and Andromeda
+both read without Keychain prompts. The cost is plaintext exposure to anything
+running as the same user. Mode bits reduce casual cross-user reads; they do not
+protect against same-user malware or a compromised account.
+
+Additional rules:
+
+- JSON map keyed by canonical provider id; values use the versioned credential
+  record schema (`version`, `api_key`, optional `endpoint`).
+- Existing OAuth `FileTokenStore` TOMLs under `~/.roci/` stay on their own path
+  this stage and are not migrated into `auth.json`.
+- No automatic Keychain → file migration. API keys that only lived in Keychain
+  must be reconfigured (`auth configure ... --api-key-stdin`).
+- On Unix, `OsProviderCredentialStore` remains public for explicit host
+  injection (for example an embedding app that wants Keychain). Default Unix
+  `RociConfig` / `roci-agent` builds do not open Keychain for provider API keys.
+  Windows continues to use the OS credential manager by default.
+- Hosts that need a custom root still construct
+  `FileProviderCredentialStore::new(root)` and inject it through
+  `RociConfig::with_provider_credential_store`. Production defaults resolve
+  `~/.roci` from the process home (`HOME` / `directories`); there is no extra
+  `ROCI_HOME` override in this stage.
+
 ## Commands
 
 ### Login
@@ -68,6 +101,7 @@ Requirements:
 - Empty, invalid UTF-8, or oversized stdin fails with a clean error.
 - Success prints only `Configured <provider>` (no endpoint, no key).
 - Default `roci-agent` builds include the OpenAI-compatible factory, so the Framed command works without extra feature flags.
+- On Unix, configure writes the versioned record into `~/.roci/auth.json` (not Keychain).
 
 ### Logout
 
@@ -87,7 +121,9 @@ Production commands build one `ProviderAuthManager` with:
 - the same `Arc<FileTokenStore>` injected into `AuthService` and `RociConfig`
 - `roci::default_registry()` / `roci::default_auth_service(...)`
 - `RociConfig::from_env()` for explicit/environment values
-- `OsProviderCredentialStore` for protected API-key persistence
+- platform default provider credential store:
+  - Unix: locked `FileProviderCredentialStore` at `~/.roci/auth.json`
+  - non-Unix: `OsProviderCredentialStore`
 
 ## Security rules
 
@@ -95,3 +131,5 @@ Production commands build one `ProviderAuthManager` with:
 - Secrets only via stdin, never argv/env flags/output/errors.
 - Stable `--json` payloads are secret-free serializations of manager types.
 - Prompts only when interactive TTYs require them.
+- Unix `auth.json` is same-user readable by design; treat filesystem access as
+  the trust boundary, not Keychain ACLs.
