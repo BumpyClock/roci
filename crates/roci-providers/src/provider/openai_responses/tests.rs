@@ -210,6 +210,38 @@ fn codex_gpt54_defaults_reasoning_to_medium() {
 }
 
 #[test]
+fn custom_codex_spark_keeps_live_attested_request_shape() {
+    let provider = OpenAiResponsesProvider::new(
+        OpenAiModel::Custom("gpt-5.3-codex-spark".to_string()),
+        "test-key".to_string(),
+        Some("https://chatgpt.com/backend-api/codex".to_string()),
+        None,
+    );
+    let request = ProviderRequest {
+        messages: vec![ModelMessage::user("hello")],
+        settings: settings(),
+        tools: None,
+        response_format: None,
+        api_key_override: None,
+        headers: reqwest::header::HeaderMap::new(),
+        metadata: std::collections::HashMap::new(),
+        payload_callback: None,
+        session_id: None,
+        transport: None,
+    };
+
+    let body = provider.build_request_body(&request, false);
+
+    assert_eq!(body["model"], "gpt-5.3-codex-spark");
+    assert_eq!(body["store"], false);
+    assert_eq!(
+        body["include"],
+        serde_json::json!(["reasoning.encrypted_content"])
+    );
+    assert!(body.get("reasoning").is_none());
+}
+
+#[test]
 fn gpt41_allows_sampling_settings() {
     let provider =
         OpenAiResponsesProvider::new(OpenAiModel::Gpt41Nano, "test-key".to_string(), None, None);
