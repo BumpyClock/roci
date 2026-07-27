@@ -10,6 +10,8 @@ use super::descriptor::ProviderDescriptor;
 pub enum ConfiguredSource {
     /// In-process or environment configuration (not Roci-owned persistence).
     ExternallyConfigured,
+    /// Roci-owned API key present in protected credential storage.
+    StoredApiKey,
     /// OAuth token present in the token store.
     OAuthToken,
 }
@@ -22,7 +24,7 @@ pub enum ProviderAuthState {
     SignedOut,
     /// Only external/env/in-process configuration is present.
     ExternallyConfigured,
-    /// Roci-owned OAuth (or equivalent) session is present.
+    /// Roci-owned stored API key or OAuth session is present.
     ///
     /// `label` is generic non-secret text (never derived from tokens).
     SignedIn { label: String },

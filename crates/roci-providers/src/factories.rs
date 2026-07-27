@@ -980,7 +980,9 @@ mod tests {
     use super::*;
 
     fn config_without_credentials() -> RociConfig {
-        RociConfig::new().with_token_store(None)
+        RociConfig::new()
+            .with_token_store(None)
+            .with_provider_credential_store(None)
     }
 
     #[cfg(feature = "openai")]
@@ -1011,6 +1013,62 @@ mod tests {
         let provider = AnthropicFactory.create(&config, "anthropic", "claude-sonnet-4");
 
         assert!(provider.is_ok());
+    }
+
+    #[cfg(feature = "anthropic")]
+    #[test]
+    fn anthropic_registry_uses_stored_key_before_oauth_fallback() {
+        use roci_core::auth::{
+            FileTokenStore, InMemoryProviderCredentialStore, ProviderApiKey,
+            ProviderCredentialRecord, ProviderCredentialStore, Token, TokenStore, TokenStoreConfig,
+        };
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let token_store = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+            dir.path().to_path_buf(),
+        )));
+        token_store
+            .save(
+                "claude-code",
+                "default",
+                &Token {
+                    access_token: "oauth-token".into(),
+                    refresh_token: None,
+                    id_token: None,
+                    expires_at: None,
+                    last_refresh: None,
+                    scopes: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        let credential_store = Arc::new(InMemoryProviderCredentialStore::default());
+        credential_store
+            .save(
+                "anthropic",
+                &ProviderCredentialRecord::new(ProviderApiKey::new("stored-key"), None),
+            )
+            .unwrap();
+        let config = RociConfig::new()
+            .with_token_store(Some(token_store))
+            .with_provider_credential_store(Some(credential_store.clone()));
+        let mut registry = roci_core::provider::ProviderRegistry::new();
+        registry.register(Arc::new(AnthropicFactory));
+
+        assert_eq!(config.get_api_key("anthropic"), Some("stored-key".into()));
+        assert_eq!(registry.is_available("anthropic", &config), Some(true));
+        assert!(registry
+            .create_provider("anthropic", "claude-sonnet-4", &config)
+            .is_ok());
+
+        credential_store.clear("anthropic").unwrap();
+        assert_eq!(config.get_api_key("anthropic"), Some("oauth-token".into()));
+        assert_eq!(registry.is_available("anthropic", &config), Some(true));
+        assert!(registry
+            .create_provider("anthropic", "claude-sonnet-4", &config)
+            .is_ok());
     }
 
     #[test]
@@ -1282,7 +1340,9 @@ mod tests {
                 )
                 .unwrap();
 
-            let config = RociConfig::new().with_token_store(Some(store));
+            let config = RociConfig::new()
+                .with_token_store(Some(store))
+                .with_provider_credential_store(None);
 
             // github-copilot-api is a distinct store key from provider-key credentials.
             assert!(!config.has_credentials("github-copilot"));
@@ -1474,7 +1534,11 @@ mod tests {
         crate::register_default_providers(&mut registry);
         let mut auth = AuthService::new(store.clone());
         crate::register_default_auth_backends(&mut auth);
-        let config = RociConfig::new().with_token_store(Some(store));
+        let config = RociConfig::new()
+            .with_token_store(Some(store))
+            .with_provider_credential_store(Some(Arc::new(
+                roci_core::auth::InMemoryProviderCredentialStore::default(),
+            )));
         let manager = ProviderAuthManager::new(auth, registry, config).unwrap();
 
         let anthropic = manager.descriptor("anthropic").unwrap();

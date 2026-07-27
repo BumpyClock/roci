@@ -5,36 +5,21 @@
 //! login orchestration with opaque pending session IDs.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use uuid::Uuid;
 
 use crate::config::RociConfig;
 use crate::provider::ProviderRegistry;
 
-use super::descriptor::ProviderDescriptor;
-use super::device_code::DeviceCodeSession;
+use super::credential::{ProviderApiKey, ProviderCredentialRecord, ProviderEndpoint};
+use super::descriptor::{CredentialFlow, ProviderDescriptor};
 use super::error::AuthError;
 use super::host::{
     duration_secs, HostAuthCompletion, HostAuthPollResult, HostAuthStep, LoginSessionId,
 };
+use super::pending::{PendingLogin, PendingLoginStore};
 use super::service::{AuthPollResult, AuthService, AuthStep};
 use super::status::{ConfiguredSource, ProviderAuthState, ProviderAuthStatus};
-
-/// Internal pending login material that must never cross the manager boundary.
-enum PendingLogin {
-    DeviceCode {
-        provider_alias: String,
-        canonical: String,
-        session: DeviceCodeSession,
-    },
-    Pkce {
-        provider_alias: String,
-        canonical: String,
-        state: String,
-        session_data: serde_json::Value,
-    },
-}
 
 /// Host-facing auth manager over registry + auth service + config.
 ///
@@ -50,7 +35,7 @@ pub struct ProviderAuthManager {
     key_index: HashMap<String, String>,
     /// Canonical key → preferred auth-service alias for login dispatch.
     login_aliases: HashMap<String, String>,
-    pending: Mutex<HashMap<String, PendingLogin>>,
+    pending: PendingLoginStore,
 }
 
 impl ProviderAuthManager {
@@ -120,7 +105,7 @@ impl ProviderAuthManager {
             descriptors,
             key_index,
             login_aliases,
-            pending: Mutex::new(HashMap::new()),
+            pending: PendingLoginStore::new(),
         })
     }
 
@@ -205,14 +190,14 @@ impl ProviderAuthManager {
                 session,
             } => {
                 let session_id = new_session_id();
-                self.store_pending(
-                    session_id.clone(),
+                self.pending.insert(
+                    &session_id,
                     PendingLogin::DeviceCode {
                         provider_alias: alias,
                         canonical: canonical.clone(),
                         session,
                     },
-                );
+                )?;
                 Ok(HostAuthStep::DeviceCode {
                     verification_uri: verification_url,
                     user_code,
@@ -227,15 +212,10 @@ impl ProviderAuthManager {
                 session_data,
             } => {
                 let session_id = new_session_id();
-                self.store_pending(
-                    session_id.clone(),
-                    PendingLogin::Pkce {
-                        provider_alias: alias,
-                        canonical: canonical.clone(),
-                        state,
-                        session_data,
-                    },
-                );
+                self.pending.insert(
+                    &session_id,
+                    PendingLogin::pkce(alias, canonical.clone(), state, session_data),
+                )?;
                 Ok(HostAuthStep::Pkce {
                     authorization_url: authorize_url,
                     session_id,
@@ -249,24 +229,21 @@ impl ProviderAuthManager {
         &self,
         session_id: &LoginSessionId,
     ) -> Result<HostAuthPollResult, AuthError> {
-        let (alias, canonical, session) = {
-            let guard = self.pending.lock().expect("pending login map");
-            match guard.get(session_id.as_str()) {
-                Some(PendingLogin::DeviceCode {
-                    provider_alias,
-                    canonical,
-                    session,
-                }) => (provider_alias.clone(), canonical.clone(), session.clone()),
-                Some(PendingLogin::Pkce { .. }) => {
-                    return Err(AuthError::Unsupported(
-                        "session is a PKCE login; use complete_pkce".into(),
-                    ));
-                }
-                None => {
-                    return Err(AuthError::InvalidResponse(
-                        "unknown or expired login session".into(),
-                    ));
-                }
+        let (alias, canonical, session) = match self.pending.get(session_id) {
+            Some(PendingLogin::DeviceCode {
+                provider_alias,
+                canonical,
+                session,
+            }) => (provider_alias, canonical, session),
+            Some(PendingLogin::Pkce { .. }) => {
+                return Err(AuthError::Unsupported(
+                    "session is a PKCE login; use complete_pkce".into(),
+                ));
+            }
+            None => {
+                return Err(AuthError::InvalidResponse(
+                    "unknown or expired login session".into(),
+                ));
             }
         };
 
@@ -277,17 +254,17 @@ impl ProviderAuthManager {
                 interval_secs: duration_secs(new_interval),
             }),
             AuthPollResult::Authorized { token: _ } => {
-                self.take_pending(session_id.as_str());
+                self.pending.remove(session_id);
                 Ok(HostAuthPollResult::Authorized {
                     provider: canonical,
                 })
             }
             AuthPollResult::Denied => {
-                self.take_pending(session_id.as_str());
+                self.pending.remove(session_id);
                 Ok(HostAuthPollResult::Denied)
             }
             AuthPollResult::Expired => {
-                self.take_pending(session_id.as_str());
+                self.pending.remove(session_id);
                 Ok(HostAuthPollResult::Expired)
             }
         }
@@ -299,30 +276,23 @@ impl ProviderAuthManager {
         session_id: &LoginSessionId,
         code: &str,
     ) -> Result<HostAuthCompletion, AuthError> {
-        let (alias, canonical, state, session_data) = {
-            let guard = self.pending.lock().expect("pending login map");
-            match guard.get(session_id.as_str()) {
-                Some(PendingLogin::Pkce {
-                    provider_alias,
-                    canonical,
-                    state,
-                    session_data,
-                }) => (
-                    provider_alias.clone(),
-                    canonical.clone(),
-                    state.clone(),
-                    session_data.clone(),
-                ),
-                Some(PendingLogin::DeviceCode { .. }) => {
-                    return Err(AuthError::Unsupported(
-                        "session is a device-code login; use poll_device_code".into(),
-                    ));
-                }
-                None => {
-                    return Err(AuthError::InvalidResponse(
-                        "unknown or expired login session".into(),
-                    ));
-                }
+        let (alias, canonical, state, session_data) = match self.pending.get(session_id) {
+            Some(PendingLogin::Pkce {
+                provider_alias,
+                canonical,
+                state,
+                session_data,
+                ..
+            }) => (provider_alias, canonical, state, session_data),
+            Some(PendingLogin::DeviceCode { .. }) => {
+                return Err(AuthError::Unsupported(
+                    "session is a device-code login; use poll_device_code".into(),
+                ));
+            }
+            None => {
+                return Err(AuthError::InvalidResponse(
+                    "unknown or expired login session".into(),
+                ));
             }
         };
 
@@ -330,21 +300,109 @@ impl ProviderAuthManager {
             .auth
             .complete_pkce_with_session(&alias, code, &state, Some(&session_data))
             .await?;
-        self.take_pending(session_id.as_str());
+        self.pending.remove(session_id);
         Ok(HostAuthCompletion {
             provider: canonical,
         })
     }
 
-    /// Logout Roci-owned credentials for a provider (alias or canonical).
+    /// Persist an API key and optional endpoint for a known provider.
+    ///
+    /// Validation happens before protected persistence. The config resolves the
+    /// stored record only after `save` succeeds, so persistence failure leaves
+    /// active explicit/environment configuration unchanged.
+    pub fn configure_api_key(
+        &self,
+        provider: &str,
+        api_key: ProviderApiKey,
+        endpoint: Option<ProviderEndpoint>,
+    ) -> Result<(), AuthError> {
+        let canonical = self.resolve_canonical(provider)?;
+        if api_key.expose_secret().trim().is_empty() {
+            return Err(AuthError::InvalidResponse(format!(
+                "provider '{canonical}' API key must not be empty"
+            )));
+        }
+        let descriptor = self
+            .descriptors
+            .get(canonical.as_str())
+            .ok_or_else(|| AuthError::UnknownProvider(provider.to_string()))?;
+        if !descriptor
+            .credential_flows
+            .contains(&CredentialFlow::ApiKey)
+        {
+            return Err(AuthError::Unsupported(format!(
+                "provider '{canonical}' does not support API-key configuration"
+            )));
+        }
+        if endpoint.is_some() && !descriptor.endpoint_configurable {
+            return Err(AuthError::Unsupported(format!(
+                "provider '{canonical}' does not support a custom endpoint"
+            )));
+        }
+        let store = self.config.provider_credential_store().ok_or_else(|| {
+            AuthError::Unsupported("provider credential storage is disabled".into())
+        })?;
+        store
+            .save(
+                &canonical,
+                &ProviderCredentialRecord::new(api_key, endpoint),
+            )
+            .map_err(|_| {
+                AuthError::Io(format!(
+                    "failed to persist protected credentials for provider '{canonical}'"
+                ))
+            })
+    }
+
+    /// Logout all Roci-owned API-key and OAuth credentials for a provider.
+    ///
+    /// External/in-process config is never mutated. Credential removal occurs
+    /// first; if any OAuth backend logout fails, the prior provider record is
+    /// restored best-effort so status does not falsely report full logout.
     pub fn logout(&self, provider: &str) -> Result<(), AuthError> {
         let canonical = self.resolve_canonical(provider)?;
-        if let Some(alias) = self.login_aliases.get(canonical.as_str()) {
-            self.auth.logout(alias)?;
-        } else {
-            self.auth.logout(&canonical)?;
+        let credential_store = self.config.provider_credential_store();
+        let previous_record = credential_store
+            .map(|store| store.load(&canonical))
+            .transpose()
+            .map_err(|_| {
+                AuthError::Io(format!(
+                    "failed to access protected credentials for provider '{canonical}'"
+                ))
+            })?
+            .flatten();
+
+        if let Some(store) = credential_store {
+            store.clear(&canonical).map_err(|_| {
+                AuthError::Io(format!(
+                    "failed to clear protected credentials for provider '{canonical}'"
+                ))
+            })?;
         }
-        Ok(())
+
+        let mut oauth_failed = false;
+        for backend in self.auth.backends() {
+            if backend.canonical_provider_key() == canonical
+                && backend.logout(self.auth.store()).is_err()
+            {
+                oauth_failed = true;
+            }
+        }
+        if !oauth_failed {
+            return Ok(());
+        }
+
+        if let (Some(store), Some(record)) = (credential_store, previous_record.as_ref()) {
+            if store.save(&canonical, record).is_err() {
+                return Err(AuthError::Io(format!(
+                    "OAuth logout and protected credential rollback failed for provider '{canonical}'"
+                )));
+            }
+        }
+        Err(AuthError::Io(format!(
+            "failed to clear OAuth credentials for provider '{canonical}'"
+        )))
     }
 
     fn resolve_canonical(&self, provider: &str) -> Result<String, AuthError> {
@@ -367,6 +425,9 @@ impl ProviderAuthManager {
         if self.config.has_explicit_api_key(canonical) {
             sources.push(ConfiguredSource::ExternallyConfigured);
         }
+        if self.config.has_stored_api_key(canonical) {
+            sources.push(ConfiguredSource::StoredApiKey);
+        }
         if self.oauth_token_present(canonical) {
             sources.push(ConfiguredSource::OAuthToken);
         }
@@ -386,7 +447,9 @@ impl ProviderAuthManager {
     }
 
     fn auth_state(&self, sources: &[ConfiguredSource]) -> ProviderAuthState {
-        if sources.contains(&ConfiguredSource::OAuthToken) {
+        if sources.contains(&ConfiguredSource::OAuthToken)
+            || sources.contains(&ConfiguredSource::StoredApiKey)
+        {
             ProviderAuthState::SignedIn {
                 label: "Signed in".to_string(),
             }
@@ -395,20 +458,6 @@ impl ProviderAuthManager {
         } else {
             ProviderAuthState::SignedOut
         }
-    }
-
-    fn store_pending(&self, session_id: LoginSessionId, pending: PendingLogin) {
-        self.pending
-            .lock()
-            .expect("pending login map")
-            .insert(session_id.as_str().to_string(), pending);
-    }
-
-    fn take_pending(&self, session_id: &str) -> Option<PendingLogin> {
-        self.pending
-            .lock()
-            .expect("pending login map")
-            .remove(session_id)
     }
 }
 
@@ -420,13 +469,18 @@ fn new_session_id() -> LoginSessionId {
 mod tests {
     use super::*;
     use crate::auth::backend::AuthBackend;
+    use crate::auth::credential::{
+        InMemoryProviderCredentialStore, ProviderCredentialStore, ProviderCredentialStoreError,
+    };
     use crate::auth::descriptor::CredentialFlow;
+    use crate::auth::device_code::DeviceCodeSession;
     use crate::auth::store::{FileTokenStore, TokenStore, TokenStoreConfig};
     use crate::auth::token::Token;
     use crate::error::RociError;
     use crate::provider::{ModelProvider, ProviderFactory};
     use async_trait::async_trait;
     use chrono::Utc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -466,6 +520,8 @@ mod tests {
         canonical: &'static str,
         flow: CredentialFlow,
         store_key: &'static str,
+        fail_logout: bool,
+        fail_complete_once: AtomicBool,
     }
 
     #[async_trait]
@@ -515,7 +571,11 @@ mod tests {
             _code: &str,
             _state: &str,
         ) -> Result<Token, AuthError> {
-            Ok(sample_token())
+            if self.fail_complete_once.swap(false, Ordering::SeqCst) {
+                Err(AuthError::Network("retryable test failure".into()))
+            } else {
+                Ok(sample_token())
+            }
         }
 
         fn get_status(&self, store: &Arc<dyn TokenStore>) -> Result<Option<Token>, AuthError> {
@@ -523,7 +583,11 @@ mod tests {
         }
 
         fn logout(&self, store: &Arc<dyn TokenStore>) -> Result<(), AuthError> {
-            store.clear(self.store_key, "default")
+            if self.fail_logout {
+                Err(AuthError::Io("backend detail must not escape".into()))
+            } else {
+                store.clear(self.store_key, "default")
+            }
         }
     }
 
@@ -547,7 +611,44 @@ mod tests {
         (dir, store)
     }
 
+    struct FailingCredentialStore;
+
+    impl ProviderCredentialStore for FailingCredentialStore {
+        fn load(
+            &self,
+            _provider: &str,
+        ) -> Result<Option<ProviderCredentialRecord>, ProviderCredentialStoreError> {
+            Ok(None)
+        }
+
+        fn save(
+            &self,
+            _provider: &str,
+            _record: &ProviderCredentialRecord,
+        ) -> Result<(), ProviderCredentialStoreError> {
+            Err(ProviderCredentialStoreError::Unavailable)
+        }
+
+        fn clear(&self, _provider: &str) -> Result<(), ProviderCredentialStoreError> {
+            Ok(())
+        }
+    }
+
     fn anthropic_manager(store: Arc<dyn TokenStore>) -> ProviderAuthManager {
+        anthropic_manager_with(
+            store,
+            Arc::new(InMemoryProviderCredentialStore::default()),
+            false,
+            false,
+        )
+    }
+
+    fn anthropic_manager_with(
+        store: Arc<dyn TokenStore>,
+        credential_store: Arc<dyn ProviderCredentialStore>,
+        fail_logout: bool,
+        fail_complete_once: bool,
+    ) -> ProviderAuthManager {
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(LaunchFactory {
             keys: &["anthropic"],
@@ -562,9 +663,13 @@ mod tests {
             canonical: "anthropic",
             flow: CredentialFlow::Pkce,
             store_key: "claude-code",
+            fail_logout,
+            fail_complete_once: AtomicBool::new(fail_complete_once),
         }));
 
-        let config = RociConfig::new().with_token_store(Some(store));
+        let config = RociConfig::new()
+            .with_token_store(Some(store))
+            .with_provider_credential_store(Some(credential_store));
         ProviderAuthManager::new(auth, registry, config).unwrap()
     }
 
@@ -578,6 +683,8 @@ mod tests {
             canonical: "orphan",
             flow: CredentialFlow::DeviceCode,
             store_key: "orphan",
+            fail_logout: false,
+            fail_complete_once: AtomicBool::new(false),
         }));
         let config = RociConfig::new().with_token_store(Some(store));
         let result = ProviderAuthManager::new(auth, registry, config);
@@ -688,6 +795,209 @@ mod tests {
         assert!(!json.contains("should-not-leak"));
         assert!(!json.contains("state-secret"));
         assert!(!json.contains("session_data"));
+    }
+
+    #[test]
+    fn configure_rejects_empty_api_key_without_persisting() {
+        let (_dir, token_store) = temp_store();
+        let credential_store = Arc::new(InMemoryProviderCredentialStore::default());
+        let manager = anthropic_manager_with(
+            token_store,
+            credential_store.clone(),
+            /*fail_logout*/ false,
+            /*fail_complete_once*/ false,
+        );
+
+        let result = manager.configure_api_key(
+            "anthropic",
+            ProviderApiKey::new("  "),
+            /*endpoint*/ None,
+        );
+
+        assert!(matches!(result, Err(AuthError::InvalidResponse(_))));
+        assert_eq!(credential_store.load("anthropic").unwrap(), None);
+    }
+
+    #[test]
+    fn configure_persistence_failure_leaves_active_config_unchanged() {
+        let (_dir, store) = temp_store();
+        let manager = anthropic_manager_with(
+            store,
+            Arc::new(FailingCredentialStore),
+            /*fail_logout*/ false,
+            /*fail_complete_once*/ false,
+        );
+        manager
+            .config()
+            .set_api_key("anthropic", "external-secret".into());
+
+        let error = manager
+            .configure_api_key(
+                "anthropic",
+                ProviderApiKey::new("new-secret"),
+                Some(ProviderEndpoint::new("https://new.example")),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            manager.config().get_api_key("anthropic"),
+            Some("external-secret".into())
+        );
+        let rendered = error.to_string();
+        assert!(!rendered.contains("external-secret"));
+        assert!(!rendered.contains("new-secret"));
+        assert!(!rendered.contains("new.example"));
+    }
+
+    #[test]
+    fn configure_success_survives_new_config_and_manager() {
+        let (_dir, token_store) = temp_store();
+        let credential_store = Arc::new(InMemoryProviderCredentialStore::default());
+        let manager = anthropic_manager_with(
+            token_store.clone(),
+            credential_store.clone(),
+            /*fail_logout*/ false,
+            /*fail_complete_once*/ false,
+        );
+        let expected = ProviderCredentialRecord::new(
+            ProviderApiKey::new("stored-secret"),
+            Some(ProviderEndpoint::new("https://stored.example")),
+        );
+
+        manager
+            .configure_api_key(
+                "claude",
+                expected.api_key.clone(),
+                expected.endpoint.clone(),
+            )
+            .unwrap();
+        assert_eq!(credential_store.load("anthropic").unwrap(), Some(expected));
+        drop(manager);
+
+        let restarted = anthropic_manager_with(
+            token_store,
+            credential_store,
+            /*fail_logout*/ false,
+            /*fail_complete_once*/ false,
+        );
+        assert_eq!(
+            restarted.config().get_api_key("anthropic"),
+            Some("stored-secret".into())
+        );
+        assert_eq!(
+            restarted.config().get_base_url("anthropic"),
+            Some("https://stored.example".into())
+        );
+        let status = restarted.status("anthropic").unwrap();
+        assert_eq!(
+            status.configured_sources,
+            vec![ConfiguredSource::StoredApiKey]
+        );
+        assert!(matches!(
+            status.auth_state,
+            ProviderAuthState::SignedIn { .. }
+        ));
+        assert!(status.launch_available);
+    }
+
+    #[test]
+    fn logout_clears_roci_owned_sources_and_preserves_external_config() {
+        let (_dir, token_store) = temp_store();
+        let credential_store = Arc::new(InMemoryProviderCredentialStore::default());
+        let manager = anthropic_manager_with(
+            token_store.clone(),
+            credential_store.clone(),
+            /*fail_logout*/ false,
+            /*fail_complete_once*/ false,
+        );
+        manager
+            .config()
+            .set_api_key("anthropic", "external-secret".into());
+        manager
+            .configure_api_key("anthropic", ProviderApiKey::new("stored-secret"), None)
+            .unwrap();
+        token_store
+            .save("claude-code", "default", &sample_token())
+            .unwrap();
+
+        manager.logout("anthropic").unwrap();
+
+        assert_eq!(credential_store.load("anthropic").unwrap(), None);
+        assert!(token_store
+            .load("claude-code", "default")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            manager.config().get_api_key("anthropic"),
+            Some("external-secret".into())
+        );
+        let status = manager.status("anthropic").unwrap();
+        assert_eq!(
+            status.configured_sources,
+            vec![ConfiguredSource::ExternallyConfigured]
+        );
+        assert_eq!(status.auth_state, ProviderAuthState::ExternallyConfigured);
+        assert!(status.launch_available);
+    }
+
+    #[test]
+    fn logout_rolls_back_provider_record_when_oauth_logout_fails() {
+        let (_dir, token_store) = temp_store();
+        let credential_store = Arc::new(InMemoryProviderCredentialStore::default());
+        let manager = anthropic_manager_with(
+            token_store.clone(),
+            credential_store.clone(),
+            /*fail_logout*/ true,
+            /*fail_complete_once*/ false,
+        );
+        manager
+            .configure_api_key("anthropic", ProviderApiKey::new("stored-secret"), None)
+            .unwrap();
+        token_store
+            .save("claude-code", "default", &sample_token())
+            .unwrap();
+
+        let error = manager.logout("anthropic").unwrap_err();
+
+        assert!(credential_store.load("anthropic").unwrap().is_some());
+        assert!(token_store
+            .load("claude-code", "default")
+            .unwrap()
+            .is_some());
+        let rendered = error.to_string();
+        assert!(!rendered.contains("backend detail"));
+        assert!(!rendered.contains("stored-secret"));
+        let status = manager.status("anthropic").unwrap();
+        assert!(status
+            .configured_sources
+            .contains(&ConfiguredSource::StoredApiKey));
+        assert!(status
+            .configured_sources
+            .contains(&ConfiguredSource::OAuthToken));
+    }
+
+    #[tokio::test]
+    async fn retryable_pkce_error_retains_pending_session() {
+        let (_dir, store) = temp_store();
+        let manager = anthropic_manager_with(
+            store,
+            Arc::new(InMemoryProviderCredentialStore::default()),
+            /*fail_logout*/ false,
+            /*fail_complete_once*/ true,
+        );
+        let session_id = match manager.start_login("anthropic").await.unwrap() {
+            HostAuthStep::Pkce { session_id, .. } => session_id,
+            other => panic!("expected Pkce, got {other:?}"),
+        };
+
+        assert!(matches!(
+            manager.complete_pkce(&session_id, "auth-code").await,
+            Err(AuthError::Network(_))
+        ));
+        assert!(manager
+            .complete_pkce(&session_id, "auth-code")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

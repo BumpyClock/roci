@@ -1,32 +1,52 @@
-//! Configuration system (layered: code > env > credential file).
+//! Configuration system (layered: code/env > protected credentials > OAuth).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
+#[cfg(test)]
+use crate::auth::credential::InMemoryProviderCredentialStore;
+#[cfg(not(test))]
+use crate::auth::credential::OsProviderCredentialStore;
+use crate::auth::credential::{ProviderCredentialRecord, ProviderCredentialStore};
 use crate::auth::store::TokenStore;
 use crate::models::ProviderKey;
 
 /// Layered configuration for Roci.
 ///
-/// Resolution order for API keys:
-/// 1. Explicit keys (from env vars or `set_api_key`)
-/// 2. OAuth tokens from `TokenStore` (from `roci auth login`)
+/// Resolution order for API keys and endpoints:
+/// 1. Explicit in-process/environment maps
+/// 2. Protected [`ProviderCredentialStore`] records
+/// 3. OAuth tokens from `TokenStore` aliases (API key only)
 #[derive(Clone)]
 pub struct RociConfig {
     api_keys: Arc<RwLock<HashMap<String, String>>>,
     base_urls: Arc<RwLock<HashMap<String, String>>>,
     account_ids: Arc<RwLock<HashMap<String, String>>>,
     token_store: Option<Arc<dyn TokenStore>>,
+    provider_credential_store: Option<Arc<dyn ProviderCredentialStore>>,
 }
 
 impl fmt::Debug for RociConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let api_key_providers = map_keys(&self.api_keys);
+        let base_url_providers = map_keys(&self.base_urls);
+        let account_id_providers = map_keys(&self.account_ids);
         f.debug_struct("RociConfig")
-            .field("api_keys", &self.api_keys)
-            .field("base_urls", &self.base_urls)
-            .field("account_ids", &self.account_ids)
-            .field("token_store", &self.token_store.as_ref().map(|_| ".."))
+            .field("api_key_providers", &api_key_providers)
+            .field("base_url_providers", &base_url_providers)
+            .field("account_id_providers", &account_id_providers)
+            .field(
+                "token_store",
+                &self.token_store.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "provider_credential_store",
+                &self
+                    .provider_credential_store
+                    .as_ref()
+                    .map(|_| "configured"),
+            )
             .finish()
     }
 }
@@ -35,6 +55,15 @@ impl Default for RociConfig {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn map_keys(map: &RwLock<HashMap<String, String>>) -> Vec<String> {
+    let mut keys: Vec<_> = map
+        .read()
+        .map(|guard| guard.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
 }
 
 fn get_from_map(
@@ -56,6 +85,16 @@ fn get_from_map(
     None
 }
 
+#[cfg(not(test))]
+fn default_provider_credential_store() -> Arc<dyn ProviderCredentialStore> {
+    Arc::new(OsProviderCredentialStore::new())
+}
+
+#[cfg(test)]
+fn default_provider_credential_store() -> Arc<dyn ProviderCredentialStore> {
+    Arc::new(InMemoryProviderCredentialStore::default())
+}
+
 impl RociConfig {
     /// Create empty config with default file-backed token store.
     pub fn new() -> Self {
@@ -64,6 +103,7 @@ impl RociConfig {
             base_urls: Arc::new(RwLock::new(HashMap::new())),
             account_ids: Arc::new(RwLock::new(HashMap::new())),
             token_store: Some(Arc::new(crate::auth::store::FileTokenStore::new_default())),
+            provider_credential_store: Some(default_provider_credential_store()),
         }
     }
 
@@ -76,6 +116,23 @@ impl RociConfig {
     /// Access the underlying token store (if configured).
     pub fn token_store(&self) -> Option<&Arc<dyn TokenStore>> {
         self.token_store.as_ref()
+    }
+
+    /// Set the protected provider credential store, or disable stored fallback.
+    ///
+    /// Intended for host wiring and hermetic tests. Production defaults to the
+    /// OS credential manager.
+    pub fn with_provider_credential_store(
+        mut self,
+        store: Option<Arc<dyn ProviderCredentialStore>>,
+    ) -> Self {
+        self.provider_credential_store = store;
+        self
+    }
+
+    /// Access the protected provider credential store (if configured).
+    pub fn provider_credential_store(&self) -> Option<&Arc<dyn ProviderCredentialStore>> {
+        self.provider_credential_store.as_ref()
     }
 
     /// Load from environment variables (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.).
@@ -142,12 +199,17 @@ impl RociConfig {
 
     /// Resolve an API key for a provider.
     ///
-    /// Checks explicit keys first, then falls back to the token store
-    /// for OAuth tokens saved via `roci auth login`.
+    /// Checks explicit/environment keys, a protected stored API key, then the
+    /// existing OAuth token-store alias. Protected-store access failures fail
+    /// closed and never trigger plaintext fallback.
     pub fn get_api_key(&self, provider: &str) -> Option<String> {
         let provider_key = ProviderKey::parse(provider);
         if let Some(key) = get_from_map(&self.api_keys, provider, provider_key) {
             return Some(key);
+        }
+
+        if let Some(record) = self.stored_credential(provider) {
+            return Some(record.api_key.expose_secret().to_string());
         }
 
         if let Some(ref store) = self.token_store {
@@ -179,7 +241,14 @@ impl RociConfig {
     }
 
     pub fn get_base_url(&self, provider: &str) -> Option<String> {
-        get_from_map(&self.base_urls, provider, ProviderKey::parse(provider))
+        let provider_key = ProviderKey::parse(provider);
+        let explicit_base_url = get_from_map(&self.base_urls, provider, provider_key);
+        if explicit_base_url.is_some() || self.has_explicit_api_key(provider) {
+            return explicit_base_url;
+        }
+        self.stored_credential(provider)
+            .and_then(|record| record.endpoint)
+            .map(|endpoint| endpoint.as_str().to_string())
     }
 
     pub fn get_base_url_for(&self, provider: ProviderKey) -> Option<String> {
@@ -206,16 +275,35 @@ impl RociConfig {
         self.get_api_key(provider).is_some()
     }
 
-    /// True when an explicit/env API key is set (ignores token-store OAuth fallback).
+    /// True when an explicit/env API key is set (ignores all stored fallback).
     pub fn has_explicit_api_key(&self, provider: &str) -> bool {
         let provider_key = ProviderKey::parse(provider);
         get_from_map(&self.api_keys, provider, provider_key).is_some()
+    }
+
+    /// True when a protected Roci-owned provider credential record is present.
+    pub fn has_stored_api_key(&self, provider: &str) -> bool {
+        self.stored_credential(provider).is_some()
+    }
+
+    fn stored_credential(&self, provider: &str) -> Option<ProviderCredentialRecord> {
+        let canonical = ProviderKey::parse(provider)
+            .map(ProviderKey::as_str)
+            .unwrap_or(provider);
+        self.provider_credential_store
+            .as_ref()?
+            .load(canonical)
+            .ok()
+            .flatten()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::credential::{
+        InMemoryProviderCredentialStore, ProviderApiKey, ProviderEndpoint,
+    };
     use crate::auth::store::{FileTokenStore, TokenStoreConfig};
     use crate::auth::token::Token;
     use chrono::{Duration, Utc};
@@ -223,7 +311,17 @@ mod tests {
 
     fn config_with_temp_store(dir: &std::path::Path) -> RociConfig {
         let store = FileTokenStore::new(TokenStoreConfig::new(dir.to_path_buf()));
-        RociConfig::new().with_token_store(Some(Arc::new(store)))
+        RociConfig::new()
+            .with_token_store(Some(Arc::new(store)))
+            .with_provider_credential_store(Some(Arc::new(
+                InMemoryProviderCredentialStore::default(),
+            )))
+    }
+
+    fn config_with_credential_store(store: Arc<dyn ProviderCredentialStore>) -> RociConfig {
+        RociConfig::new()
+            .with_token_store(None)
+            .with_provider_credential_store(Some(store))
     }
 
     fn make_token(access_token: &str, expires_at: Option<chrono::DateTime<Utc>>) -> Token {
@@ -329,7 +427,9 @@ mod tests {
 
     #[test]
     fn config_without_token_store_returns_none_for_missing_key() {
-        let config = RociConfig::new().with_token_store(None);
+        let config = RociConfig::new()
+            .with_token_store(None)
+            .with_provider_credential_store(None);
 
         assert_eq!(config.get_api_key("openai"), None);
     }
@@ -362,5 +462,105 @@ mod tests {
             config.get_api_key("github-copilot"),
             Some("copilot-token".to_string()),
         );
+    }
+
+    #[test]
+    fn explicit_maps_take_precedence_over_full_stored_record() {
+        let store = Arc::new(InMemoryProviderCredentialStore::default());
+        store
+            .save(
+                "anthropic",
+                &ProviderCredentialRecord::new(
+                    ProviderApiKey::new("stored-key"),
+                    Some(ProviderEndpoint::new("https://stored.example")),
+                ),
+            )
+            .unwrap();
+        let config = config_with_credential_store(store);
+        config.set_api_key("anthropic", "explicit-key".into());
+        config.set_base_url("anthropic", "https://explicit.example".into());
+
+        assert_eq!(config.get_api_key("anthropic"), Some("explicit-key".into()));
+        assert_eq!(
+            config.get_base_url("anthropic"),
+            Some("https://explicit.example".into())
+        );
+        assert!(config.has_explicit_api_key("anthropic"));
+        assert!(config.has_stored_api_key("anthropic"));
+    }
+
+    #[test]
+    fn explicit_key_does_not_mix_with_stored_endpoint() {
+        let store = Arc::new(InMemoryProviderCredentialStore::default());
+        store
+            .save(
+                "anthropic",
+                &ProviderCredentialRecord::new(
+                    ProviderApiKey::new("stored-key"),
+                    Some(ProviderEndpoint::new("https://stored.example")),
+                ),
+            )
+            .unwrap();
+        let config = config_with_credential_store(store);
+        config.set_api_key("anthropic", "explicit-key".into());
+
+        assert_eq!(config.get_api_key("anthropic"), Some("explicit-key".into()));
+        assert_eq!(config.get_base_url("anthropic"), None);
+    }
+
+    #[test]
+    fn stored_record_precedes_anthropic_oauth_token_as_full_object() {
+        let dir = TempDir::new().unwrap();
+        let token_store = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+            dir.path().to_path_buf(),
+        )));
+        token_store
+            .save("claude-code", "default", &make_token("oauth-token", None))
+            .unwrap();
+        let credential_store = Arc::new(InMemoryProviderCredentialStore::default());
+        let expected = ProviderCredentialRecord::new(
+            ProviderApiKey::new("stored-key"),
+            Some(ProviderEndpoint::new("https://stored.example")),
+        );
+        credential_store.save("anthropic", &expected).unwrap();
+        assert_eq!(credential_store.load("anthropic").unwrap(), Some(expected));
+        let config = RociConfig::new()
+            .with_token_store(Some(token_store))
+            .with_provider_credential_store(Some(credential_store));
+
+        assert_eq!(config.get_api_key("anthropic"), Some("stored-key".into()));
+        assert_eq!(
+            config.get_base_url("anthropic"),
+            Some("https://stored.example".into())
+        );
+    }
+
+    #[test]
+    fn config_debug_redacts_keys_tokens_endpoints_and_account_material() {
+        let credential_store = Arc::new(InMemoryProviderCredentialStore::default());
+        credential_store
+            .save(
+                "anthropic",
+                &ProviderCredentialRecord::new(
+                    ProviderApiKey::new("stored-secret"),
+                    Some(ProviderEndpoint::new("https://user:pass@stored.example")),
+                ),
+            )
+            .unwrap();
+        let config = config_with_credential_store(credential_store);
+        config.set_api_key("anthropic", "explicit-secret".into());
+        config.set_base_url("anthropic", "https://token@explicit.example".into());
+        config.set_account_id("anthropic", "account-secret".into());
+
+        let debug = format!("{config:?}");
+        for secret in [
+            "stored-secret",
+            "user:pass",
+            "explicit-secret",
+            "token@explicit",
+            "account-secret",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}");
+        }
     }
 }

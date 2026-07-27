@@ -18,6 +18,9 @@ pub enum AuthError {
     /// Distinct from a known provider that is merely unconfigured.
     #[error("Unknown provider: {0}")]
     UnknownProvider(String),
+    /// Pending login map reached its hard bound after expired sessions were swept.
+    #[error("Too many pending login sessions")]
+    PendingLoginLimit,
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
     #[error("Invalid response: {0}")]

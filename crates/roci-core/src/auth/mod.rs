@@ -1,17 +1,24 @@
 //! OAuth device-code flows, token storage, and generic auth orchestration.
 
 pub mod backend;
+pub mod credential;
 pub mod descriptor;
 pub mod device_code;
 pub mod error;
 pub mod host;
 pub mod manager;
+mod pending;
 pub mod service;
 pub mod status;
 pub mod store;
 pub mod token;
 
 pub use backend::AuthBackend;
+pub use credential::{
+    InMemoryProviderCredentialStore, OsProviderCredentialStore, ProviderApiKey,
+    ProviderCredentialRecord, ProviderCredentialStore, ProviderCredentialStoreError,
+    ProviderEndpoint,
+};
 pub use descriptor::{CredentialFlow, ProviderDescriptor};
 pub use device_code::DeviceCodeSession;
 pub use error::AuthError;

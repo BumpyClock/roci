@@ -114,7 +114,9 @@ fn register_default_providers_registers_ollama_when_feature_enabled() {
 #[cfg(feature = "ollama")]
 #[tokio::test]
 async fn register_default_providers_all_catalog_keeps_local_ollama_without_credentials() {
-    let config = RociConfig::new().with_token_store(None);
+    let config = RociConfig::new()
+        .with_token_store(None)
+        .with_provider_credential_store(None);
     let mut registry = ProviderRegistry::new();
     roci_providers::register_default_providers(&mut registry);
     assert_eq!(registry.requires_credentials("ollama"), Some(false));
