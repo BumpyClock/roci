@@ -109,10 +109,12 @@ pub enum ProviderCredentialStoreError {
 /// Protected persistence for Roci-owned provider API-key records.
 ///
 /// Role: load, atomically replace, and clear one record per canonical provider.
-/// Production hosts should use [`OsProviderCredentialStore`], which delegates
-/// to the OS credential manager and fails closed. Tests and embedding hosts can
-/// inject [`InMemoryProviderCredentialStore`] through
-/// [`crate::config::RociConfig::with_provider_credential_store`].
+/// [`crate::config::RociConfig`] defaults to the locked Unix `~/.roci/auth.json`
+/// file store on Unix production builds and [`OsProviderCredentialStore`] on
+/// non-Unix production builds. Hosts may still inject
+/// [`OsProviderCredentialStore`] or [`InMemoryProviderCredentialStore`] through
+/// [`crate::config::RociConfig::with_provider_credential_store`]. Implementations
+/// must fail closed.
 pub trait ProviderCredentialStore: Send + Sync {
     /// Load the provider record, or `None` when no Roci-owned record exists.
     fn load(
@@ -210,10 +212,12 @@ impl CredentialBackend for KeyringBackend {
     }
 }
 
-/// Production provider credential store backed only by the OS credential manager.
+/// Provider credential store backed only by the OS credential manager.
 ///
 /// Uses Keychain Services on macOS, Windows Credential Manager on Windows, and
-/// Secret Service on Linux. It never falls back to plaintext storage.
+/// Secret Service on Linux. It never falls back to plaintext storage. Non-Unix
+/// [`crate::config::RociConfig`] defaults select this store; Unix defaults use
+/// the shared auth file instead. Hosts may still inject this type explicitly.
 pub struct OsProviderCredentialStore {
     backend: Arc<dyn CredentialBackend>,
 }

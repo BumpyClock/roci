@@ -6,10 +6,12 @@ use std::sync::{Arc, RwLock};
 
 #[cfg(test)]
 use crate::auth::credential::InMemoryProviderCredentialStore;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(unix)))]
 use crate::auth::credential::OsProviderCredentialStore;
 use crate::auth::credential::{ProviderCredentialRecord, ProviderCredentialStore};
 use crate::auth::store::TokenStore;
+#[cfg(all(not(test), unix))]
+use crate::auth::FileProviderCredentialStore;
 use crate::models::ProviderKey;
 
 /// Layered configuration for Roci.
@@ -85,14 +87,50 @@ fn get_from_map(
     None
 }
 
+/// Production platform default credential-store backend.
+///
+/// Independent of the `cfg(test)` hermetic override so tests can assert the
+/// shipping resolver without constructing real home-directory paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionProviderCredentialStoreKind {
+    /// Locked `~/.roci/auth.json` map used on Unix production defaults.
+    #[cfg(unix)]
+    FileAuthJson,
+    /// OS credential manager used on non-Unix production defaults.
+    #[cfg(not(unix))]
+    OsCredentialManager,
+}
+
+const fn production_provider_credential_store_kind() -> ProductionProviderCredentialStoreKind {
+    #[cfg(unix)]
+    {
+        ProductionProviderCredentialStoreKind::FileAuthJson
+    }
+    #[cfg(not(unix))]
+    {
+        ProductionProviderCredentialStoreKind::OsCredentialManager
+    }
+}
+
 #[cfg(not(test))]
-fn default_provider_credential_store() -> Arc<dyn ProviderCredentialStore> {
-    Arc::new(OsProviderCredentialStore::new())
+fn default_provider_credential_store() -> Option<Arc<dyn ProviderCredentialStore>> {
+    match production_provider_credential_store_kind() {
+        #[cfg(unix)]
+        ProductionProviderCredentialStoreKind::FileAuthJson => {
+            FileProviderCredentialStore::new_default()
+                .ok()
+                .map(|store| Arc::new(store) as Arc<dyn ProviderCredentialStore>)
+        }
+        #[cfg(not(unix))]
+        ProductionProviderCredentialStoreKind::OsCredentialManager => {
+            Some(Arc::new(OsProviderCredentialStore::new()))
+        }
+    }
 }
 
 #[cfg(test)]
-fn default_provider_credential_store() -> Arc<dyn ProviderCredentialStore> {
-    Arc::new(InMemoryProviderCredentialStore::default())
+fn default_provider_credential_store() -> Option<Arc<dyn ProviderCredentialStore>> {
+    Some(Arc::new(InMemoryProviderCredentialStore::default()))
 }
 
 impl RociConfig {
@@ -103,7 +141,7 @@ impl RociConfig {
             base_urls: Arc::new(RwLock::new(HashMap::new())),
             account_ids: Arc::new(RwLock::new(HashMap::new())),
             token_store: Some(Arc::new(crate::auth::store::FileTokenStore::new_default())),
-            provider_credential_store: Some(default_provider_credential_store()),
+            provider_credential_store: default_provider_credential_store(),
         }
     }
 
@@ -121,7 +159,8 @@ impl RociConfig {
     /// Set the protected provider credential store, or disable stored fallback.
     ///
     /// Intended for host wiring and hermetic tests. Production defaults to the
-    /// OS credential manager.
+    /// locked Unix `~/.roci/auth.json` file store on Unix and the OS credential
+    /// manager elsewhere; tests default to an in-memory store.
     pub fn with_provider_credential_store(
         mut self,
         store: Option<Arc<dyn ProviderCredentialStore>>,
@@ -562,5 +601,73 @@ mod tests {
         ] {
             assert!(!debug.contains(secret), "debug leaked {secret}");
         }
+    }
+
+    #[test]
+    fn production_default_credential_store_kind_matches_platform() {
+        let kind = production_provider_credential_store_kind();
+        #[cfg(unix)]
+        assert_eq!(kind, ProductionProviderCredentialStoreKind::FileAuthJson);
+        #[cfg(not(unix))]
+        assert_eq!(
+            kind,
+            ProductionProviderCredentialStoreKind::OsCredentialManager
+        );
+    }
+
+    #[test]
+    fn config_new_defaults_to_in_memory_credential_store_under_tests() {
+        let config = RociConfig::new().with_token_store(None);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("provider_credential_store: Some(\"configured\")"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_file_default_store_debug_identifies_type_without_paths() {
+        use crate::auth::FileProviderCredentialStore;
+
+        assert_eq!(
+            production_provider_credential_store_kind(),
+            ProductionProviderCredentialStoreKind::FileAuthJson
+        );
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join(".roci");
+        let store = FileProviderCredentialStore::new(&root);
+        let debug = format!("{store:?}");
+        assert_eq!(debug, "FileProviderCredentialStore([REDACTED])");
+        assert!(!debug.contains(root.to_string_lossy().as_ref()));
+
+        let record = ProviderCredentialRecord::new(
+            ProviderApiKey::new("file-default-secret"),
+            Some(ProviderEndpoint::new("https://file.example")),
+        );
+        store.save("openai", &record).unwrap();
+
+        let config = RociConfig::new()
+            .with_token_store(None)
+            .with_provider_credential_store(Some(Arc::new(store)));
+        assert_eq!(
+            config.get_api_key("openai"),
+            Some("file-default-secret".into())
+        );
+        let config_debug = format!("{config:?}");
+        assert!(config_debug.contains("provider_credential_store: Some(\"configured\")"));
+        assert!(!config_debug.contains("file-default-secret"));
+        assert!(!config_debug.contains(root.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_os_default_store_debug_identifies_type() {
+        use crate::auth::credential::OsProviderCredentialStore;
+
+        assert_eq!(
+            production_provider_credential_store_kind(),
+            ProductionProviderCredentialStoreKind::OsCredentialManager
+        );
+        let store = OsProviderCredentialStore::new();
+        assert_eq!(format!("{store:?}"), "OsProviderCredentialStore(..)");
     }
 }

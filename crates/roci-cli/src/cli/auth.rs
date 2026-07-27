@@ -10,9 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roci::auth::{
-    AuthError, FileTokenStore, HostAuthPollResult, HostAuthStep, LoginSessionId,
-    OsProviderCredentialStore, ProviderApiKey, ProviderAuthManager, ProviderAuthState,
-    ProviderAuthStatus, ProviderEndpoint, TokenStore,
+    AuthError, FileTokenStore, HostAuthPollResult, HostAuthStep, LoginSessionId, ProviderApiKey,
+    ProviderAuthManager, ProviderAuthState, ProviderAuthStatus, ProviderEndpoint, TokenStore,
 };
 use roci::config::RociConfig;
 
@@ -145,15 +144,15 @@ impl From<serde_json::Error> for AuthCliError {
     }
 }
 
-/// Build production manager: shared file token store, env config, OS credentials.
+/// Build production manager: shared file token store, env config, default credentials.
 pub(crate) fn build_default_manager() -> Result<ProviderAuthManager, AuthCliError> {
     let store: Arc<FileTokenStore> = Arc::new(FileTokenStore::new_default());
     let token_store: Arc<dyn TokenStore> = store.clone();
     let auth = roci::default_auth_service(token_store.clone());
     let registry = roci::default_registry();
-    let config = RociConfig::from_env()
-        .with_token_store(Some(token_store))
-        .with_provider_credential_store(Some(Arc::new(OsProviderCredentialStore::new())));
+    // Keep the shared FileTokenStore override; provider credentials use the
+    // platform RociConfig default (Unix auth.json / non-Unix OS store).
+    let config = RociConfig::from_env().with_token_store(Some(token_store));
     ProviderAuthManager::new(auth, registry, config).map_err(AuthCliError::from)
 }
 
