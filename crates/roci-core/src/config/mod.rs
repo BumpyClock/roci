@@ -270,15 +270,19 @@ impl RociConfig {
         let stored_base_url = stored
             .and_then(|record| record.endpoint)
             .map(|endpoint| endpoint.as_str().to_string());
-        let oauth_api_key = self.token_store.as_ref().and_then(|store| {
-            let store_key = provider_key.and_then(ProviderKey::token_store_key)?;
-            store
-                .load(store_key, "default")
-                .ok()
-                .flatten()
-                .filter(crate::auth::token::Token::is_valid)
-                .map(|token| token.access_token)
-        });
+        let oauth_api_key = if stored_api_key.is_some() {
+            None
+        } else {
+            self.token_store.as_ref().and_then(|store| {
+                let store_key = provider_key.and_then(ProviderKey::token_store_key)?;
+                store
+                    .load(store_key, "default")
+                    .ok()
+                    .flatten()
+                    .filter(crate::auth::token::Token::is_valid)
+                    .map(|token| token.access_token)
+            })
+        };
 
         (
             stored_api_key.or(oauth_api_key),
@@ -424,6 +428,34 @@ mod tests {
         }
 
         fn clear(&self, _provider: &str) -> Result<(), ProviderCredentialStoreError> {
+            Ok(())
+        }
+    }
+
+    struct CountingTokenStore {
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TokenStore for CountingTokenStore {
+        fn load(
+            &self,
+            _provider: &str,
+            _profile: &str,
+        ) -> Result<Option<Token>, crate::auth::AuthError> {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+
+        fn save(
+            &self,
+            _provider: &str,
+            _profile: &str,
+            _token: &Token,
+        ) -> Result<(), crate::auth::AuthError> {
+            Ok(())
+        }
+
+        fn clear(&self, _provider: &str, _profile: &str) -> Result<(), crate::auth::AuthError> {
             Ok(())
         }
     }
@@ -638,6 +670,29 @@ mod tests {
             )
         );
         assert_eq!(store.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stored_record_skips_oauth_token_store_load() {
+        let token_store = Arc::new(CountingTokenStore {
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let credential_store = Arc::new(InMemoryProviderCredentialStore::default());
+        credential_store
+            .save(
+                "anthropic",
+                &ProviderCredentialRecord::new(ProviderApiKey::new("stored-key"), None),
+            )
+            .unwrap();
+        let config = RociConfig::new()
+            .with_token_store(Some(token_store.clone()))
+            .with_provider_credential_store(Some(credential_store));
+
+        assert_eq!(config.get_api_key("anthropic"), Some("stored-key".into()));
+        assert_eq!(
+            token_store.loads.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]

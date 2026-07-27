@@ -55,12 +55,15 @@ impl ProviderAuthManager {
     /// Builds a manager over a registry shared with its execution host.
     ///
     /// Use this constructor when model catalog execution and provider auth must
-    /// observe the same dynamically registered factories.
+    /// observe the same dynamically registered factories. The auth service's
+    /// token store becomes the config's OAuth source so login, status, and
+    /// provider launch always observe the same credentials.
     pub fn new_shared(
         auth: AuthService,
         registry: Arc<ProviderRegistry>,
         config: RociConfig,
     ) -> Result<Self, AuthError> {
+        let config = config.with_token_store(Some(auth.store().clone()));
         let mut descriptors: HashMap<String, ProviderDescriptor> = HashMap::new();
         let mut key_index: HashMap<String, String> = HashMap::new();
         let mut login_aliases: HashMap<String, String> = HashMap::new();
@@ -242,42 +245,46 @@ impl ProviderAuthManager {
         &self,
         session_id: &LoginSessionId,
     ) -> Result<HostAuthPollResult, AuthError> {
-        let (alias, canonical, session) = match self.pending.get(session_id) {
-            Some(PendingLogin::DeviceCode {
+        let claim = self.pending.claim(session_id)?;
+        let (alias, canonical, session) = match claim.pending() {
+            PendingLogin::DeviceCode {
                 provider_alias,
                 canonical,
                 session,
-            }) => (provider_alias, canonical, session),
-            Some(PendingLogin::Pkce { .. }) => {
+            } => (provider_alias, canonical, session),
+            PendingLogin::Pkce { .. } => {
                 return Err(AuthError::Unsupported(
                     "session is a PKCE login; use complete_pkce".into(),
                 ));
             }
-            None => {
-                return Err(AuthError::InvalidResponse(
-                    "unknown or expired login session".into(),
-                ));
-            }
         };
 
-        let result = self.auth.poll_device_code(&alias, &session).await?;
+        let result = match self.auth.poll_device_code(alias, session).await {
+            Ok(result) => result,
+            Err(error @ (AuthError::Network(_) | AuthError::RateLimited { .. })) => {
+                return Err(error);
+            }
+            Err(error) => {
+                claim.consume();
+                return Err(error);
+            }
+        };
         match result {
             AuthPollResult::Pending => Ok(HostAuthPollResult::Pending),
             AuthPollResult::SlowDown { new_interval } => Ok(HostAuthPollResult::SlowDown {
                 interval_secs: duration_secs(new_interval),
             }),
             AuthPollResult::Authorized { token: _ } => {
-                self.pending.remove(session_id);
-                Ok(HostAuthPollResult::Authorized {
-                    provider: canonical,
-                })
+                let provider = canonical.clone();
+                claim.consume();
+                Ok(HostAuthPollResult::Authorized { provider })
             }
             AuthPollResult::Denied => {
-                self.pending.remove(session_id);
+                claim.consume();
                 Ok(HostAuthPollResult::Denied)
             }
             AuthPollResult::Expired => {
-                self.pending.remove(session_id);
+                claim.consume();
                 Ok(HostAuthPollResult::Expired)
             }
         }
@@ -289,40 +296,35 @@ impl ProviderAuthManager {
         session_id: &LoginSessionId,
         code: &str,
     ) -> Result<HostAuthCompletion, AuthError> {
-        let (alias, canonical, state, session_data) = match self.pending.get(session_id) {
-            Some(PendingLogin::Pkce {
+        let claim = self.pending.claim(session_id)?;
+        let (alias, canonical, state, session_data) = match claim.pending() {
+            PendingLogin::Pkce {
                 provider_alias,
                 canonical,
                 state,
                 session_data,
                 ..
-            }) => (provider_alias, canonical, state, session_data),
-            Some(PendingLogin::DeviceCode { .. }) => {
+            } => (provider_alias, canonical, state, session_data),
+            PendingLogin::DeviceCode { .. } => {
                 return Err(AuthError::Unsupported(
                     "session is a device-code login; use poll_device_code".into(),
-                ));
-            }
-            None => {
-                return Err(AuthError::InvalidResponse(
-                    "unknown or expired login session".into(),
                 ));
             }
         };
 
         match self
             .auth
-            .complete_pkce_with_session(&alias, code, &state, Some(&session_data))
+            .complete_pkce_with_session(alias, code, state, Some(session_data))
             .await
         {
             Ok(_) => {
-                self.pending.remove(session_id);
-                Ok(HostAuthCompletion {
-                    provider: canonical,
-                })
+                let provider = canonical.clone();
+                claim.consume();
+                Ok(HostAuthCompletion { provider })
             }
             Err(error @ (AuthError::Network(_) | AuthError::RateLimited { .. })) => Err(error),
             Err(error) => {
-                self.pending.remove(session_id);
+                claim.consume();
                 Err(error)
             }
         }
@@ -507,8 +509,10 @@ mod tests {
     use crate::provider::{ModelProvider, ProviderFactory};
     use async_trait::async_trait;
     use chrono::Utc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tokio::sync::Notify;
 
     struct LaunchFactory {
         keys: &'static [&'static str],
@@ -548,6 +552,26 @@ mod tests {
         InvalidResponseOnce,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum DevicePollBehavior {
+        Pending,
+        SlowDown,
+        Authorized,
+        Denied,
+        Expired,
+        Network,
+        RateLimited,
+        InvalidResponse,
+    }
+
+    enum DevicePollGate {
+        Open,
+        BlockFirst {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        },
+    }
+
     struct StubBackend {
         aliases: &'static [&'static str],
         canonical: &'static str,
@@ -555,6 +579,13 @@ mod tests {
         store_key: &'static str,
         fail_logout: bool,
         complete_pkce_failure: Mutex<CompletePkceFailure>,
+        complete_pkce_calls: Option<Arc<AtomicUsize>>,
+        complete_pkce_started: Option<Arc<Notify>>,
+        complete_pkce_release: Option<Arc<Notify>>,
+        device_poll_behavior: Option<DevicePollBehavior>,
+        device_poll_calls: Option<Arc<AtomicUsize>>,
+        device_poll_started: Option<Arc<Notify>>,
+        device_poll_release: Option<Arc<Notify>>,
     }
 
     #[async_trait]
@@ -580,6 +611,22 @@ mod tests {
         }
 
         async fn start_login(&self, _store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
+            if self.flow == CredentialFlow::DeviceCode {
+                return Ok(AuthStep::DeviceCode {
+                    verification_url: "https://example.com/device".into(),
+                    user_code: "TEST-CODE".into(),
+                    interval: std::time::Duration::from_secs(1),
+                    expires_at: Utc::now() + chrono::Duration::minutes(5),
+                    session: DeviceCodeSession {
+                        provider: self.canonical.into(),
+                        verification_url: "https://example.com/device".into(),
+                        user_code: "TEST-CODE".into(),
+                        device_code: "device-secret".into(),
+                        interval_secs: 1,
+                        expires_at: Utc::now() + chrono::Duration::minutes(5),
+                    },
+                });
+            }
             Ok(AuthStep::Pkce {
                 authorize_url: "https://example.com/authorize".into(),
                 state: "state-secret".into(),
@@ -595,7 +642,39 @@ mod tests {
             _store: &Arc<dyn TokenStore>,
             _session: &DeviceCodeSession,
         ) -> Result<AuthPollResult, AuthError> {
-            Err(AuthError::Unsupported("not device code".into()))
+            let Some(behavior) = self.device_poll_behavior else {
+                return Err(AuthError::Unsupported("not device code".into()));
+            };
+            let call = self
+                .device_poll_calls
+                .as_ref()
+                .map(|calls| calls.fetch_add(1, Ordering::SeqCst));
+            if call == Some(0) {
+                if let Some(started) = &self.device_poll_started {
+                    started.notify_one();
+                }
+                if let Some(release) = &self.device_poll_release {
+                    release.notified().await;
+                }
+            }
+            match behavior {
+                DevicePollBehavior::Pending => Ok(AuthPollResult::Pending),
+                DevicePollBehavior::SlowDown => Ok(AuthPollResult::SlowDown {
+                    new_interval: std::time::Duration::from_secs(2),
+                }),
+                DevicePollBehavior::Authorized => Ok(AuthPollResult::Authorized {
+                    token: sample_token(),
+                }),
+                DevicePollBehavior::Denied => Ok(AuthPollResult::Denied),
+                DevicePollBehavior::Expired => Ok(AuthPollResult::Expired),
+                DevicePollBehavior::Network => Err(AuthError::Network("retryable".into())),
+                DevicePollBehavior::RateLimited => Err(AuthError::RateLimited {
+                    retry_after_ms: Some(10),
+                }),
+                DevicePollBehavior::InvalidResponse => {
+                    Err(AuthError::InvalidResponse("terminal".into()))
+                }
+            }
         }
 
         async fn complete_pkce(
@@ -604,6 +683,19 @@ mod tests {
             _code: &str,
             _state: &str,
         ) -> Result<Token, AuthError> {
+            let call = self
+                .complete_pkce_calls
+                .as_ref()
+                .map(|calls| calls.fetch_add(1, Ordering::SeqCst));
+            if call == Some(0) {
+                if let Some(started) = &self.complete_pkce_started {
+                    started.notify_one();
+                }
+                if let Some(release) = &self.complete_pkce_release {
+                    release.notified().await;
+                }
+            }
+
             let failure = std::mem::replace(
                 &mut *self.complete_pkce_failure.lock().unwrap(),
                 CompletePkceFailure::None,
@@ -706,12 +798,106 @@ mod tests {
             store_key: "claude-code",
             fail_logout,
             complete_pkce_failure: Mutex::new(complete_pkce_failure),
+            complete_pkce_calls: None,
+            complete_pkce_started: None,
+            complete_pkce_release: None,
+            device_poll_behavior: None,
+            device_poll_calls: None,
+            device_poll_started: None,
+            device_poll_release: None,
         }));
 
         let config = RociConfig::new()
             .with_token_store(Some(store))
             .with_provider_credential_store(Some(credential_store));
         ProviderAuthManager::new(auth, registry, config).unwrap()
+    }
+
+    fn blocking_pkce_manager(
+        calls: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    ) -> (TempDir, Arc<ProviderAuthManager>) {
+        let (dir, store) = temp_store();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(LaunchFactory {
+            keys: &["anthropic"],
+            display: "Anthropic",
+            flows: vec![CredentialFlow::ApiKey],
+            endpoint: true,
+        }));
+        let mut auth = AuthService::new(store.clone());
+        auth.register_backend(Arc::new(StubBackend {
+            aliases: &["anthropic"],
+            canonical: "anthropic",
+            flow: CredentialFlow::Pkce,
+            store_key: "claude-code",
+            fail_logout: false,
+            complete_pkce_failure: Mutex::new(CompletePkceFailure::None),
+            complete_pkce_calls: Some(calls),
+            complete_pkce_started: Some(started),
+            complete_pkce_release: Some(release),
+            device_poll_behavior: None,
+            device_poll_calls: None,
+            device_poll_started: None,
+            device_poll_release: None,
+        }));
+        let manager = ProviderAuthManager::new(
+            auth,
+            registry,
+            RociConfig::new().with_token_store(Some(store)),
+        )
+        .unwrap();
+        (dir, Arc::new(manager))
+    }
+
+    fn device_manager(
+        behavior: DevicePollBehavior,
+        calls: Arc<AtomicUsize>,
+        gate: DevicePollGate,
+    ) -> (TempDir, Arc<ProviderAuthManager>) {
+        let (started, release) = match gate {
+            DevicePollGate::Open => (None, None),
+            DevicePollGate::BlockFirst { started, release } => (Some(started), Some(release)),
+        };
+        let (dir, store) = temp_store();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(LaunchFactory {
+            keys: &["device"],
+            display: "Device",
+            flows: vec![CredentialFlow::ApiKey],
+            endpoint: false,
+        }));
+        let mut auth = AuthService::new(store.clone());
+        auth.register_backend(Arc::new(StubBackend {
+            aliases: &["device"],
+            canonical: "device",
+            flow: CredentialFlow::DeviceCode,
+            store_key: "device",
+            fail_logout: false,
+            complete_pkce_failure: Mutex::new(CompletePkceFailure::None),
+            complete_pkce_calls: None,
+            complete_pkce_started: None,
+            complete_pkce_release: None,
+            device_poll_behavior: Some(behavior),
+            device_poll_calls: Some(calls),
+            device_poll_started: started,
+            device_poll_release: release,
+        }));
+        let manager = ProviderAuthManager::new(
+            auth,
+            registry,
+            RociConfig::new().with_token_store(Some(store)),
+        )
+        .unwrap();
+        (dir, Arc::new(manager))
+    }
+
+    async fn start_device_session(manager: &ProviderAuthManager) -> LoginSessionId {
+        match manager.start_login("device").await.unwrap() {
+            HostAuthStep::DeviceCode { session_id, .. } => session_id,
+            other => panic!("expected DeviceCode, got {other:?}"),
+        }
     }
 
     #[test]
@@ -726,6 +912,13 @@ mod tests {
             store_key: "orphan",
             fail_logout: false,
             complete_pkce_failure: Mutex::new(CompletePkceFailure::None),
+            complete_pkce_calls: None,
+            complete_pkce_started: None,
+            complete_pkce_release: None,
+            device_poll_behavior: None,
+            device_poll_calls: None,
+            device_poll_started: None,
+            device_poll_release: None,
         }));
         let config = RociConfig::new().with_token_store(Some(store));
         let result = ProviderAuthManager::new(auth, registry, config);
@@ -1030,6 +1223,188 @@ mod tests {
         assert!(status
             .configured_sources
             .contains(&ConfiguredSource::OAuthToken));
+    }
+
+    #[test]
+    fn manager_uses_auth_service_token_store_for_launch_config() {
+        let (_auth_dir, auth_store) = temp_store();
+        let (_config_dir, config_store) = temp_store();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(LaunchFactory {
+            keys: &["anthropic"],
+            display: "Anthropic",
+            flows: vec![CredentialFlow::ApiKey],
+            endpoint: true,
+        }));
+        let mut auth = AuthService::new(auth_store.clone());
+        auth.register_backend(Arc::new(StubBackend {
+            aliases: &["anthropic"],
+            canonical: "anthropic",
+            flow: CredentialFlow::Pkce,
+            store_key: "claude-code",
+            fail_logout: false,
+            complete_pkce_failure: Mutex::new(CompletePkceFailure::None),
+            complete_pkce_calls: None,
+            complete_pkce_started: None,
+            complete_pkce_release: None,
+            device_poll_behavior: None,
+            device_poll_calls: None,
+            device_poll_started: None,
+            device_poll_release: None,
+        }));
+        let config = RociConfig::new().with_token_store(Some(config_store));
+        let manager = ProviderAuthManager::new(auth, registry, config).unwrap();
+        auth_store
+            .save("claude-code", "default", &sample_token())
+            .unwrap();
+
+        let status = manager.status("anthropic").unwrap();
+
+        assert!(matches!(
+            status.auth_state,
+            ProviderAuthState::SignedIn { .. }
+        ));
+        assert!(status.launch_available);
+        assert_eq!(
+            manager.config().get_api_key("anthropic"),
+            Some("access-secret".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_pkce_completion_dispatches_backend_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (_dir, manager) =
+            blocking_pkce_manager(calls.clone(), started.clone(), release.clone());
+        let session_id = match manager.start_login("anthropic").await.unwrap() {
+            HostAuthStep::Pkce { session_id, .. } => session_id,
+            other => panic!("expected Pkce, got {other:?}"),
+        };
+        let first = tokio::spawn({
+            let manager = manager.clone();
+            let session_id = session_id.clone();
+            async move { manager.complete_pkce(&session_id, "first-code").await }
+        });
+        started.notified().await;
+
+        let second = manager.complete_pkce(&session_id, "second-code").await;
+        release.notify_one();
+        let first = first.await.unwrap();
+
+        assert!(first.is_ok());
+        assert!(matches!(
+            second,
+            Err(AuthError::InvalidResponse(ref message))
+                if message == "login session is already in progress"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_pkce_completion_releases_claim_for_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (_dir, manager) = blocking_pkce_manager(calls.clone(), started.clone(), release);
+        let session_id = match manager.start_login("anthropic").await.unwrap() {
+            HostAuthStep::Pkce { session_id, .. } => session_id,
+            other => panic!("expected Pkce, got {other:?}"),
+        };
+        let first = tokio::spawn({
+            let manager = manager.clone();
+            let session_id = session_id.clone();
+            async move { manager.complete_pkce(&session_id, "first-code").await }
+        });
+        started.notified().await;
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(manager
+            .complete_pkce(&session_id, "retry-code")
+            .await
+            .is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_device_poll_dispatches_backend_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (_dir, manager) = device_manager(
+            DevicePollBehavior::Pending,
+            calls.clone(),
+            DevicePollGate::BlockFirst {
+                started: started.clone(),
+                release: release.clone(),
+            },
+        );
+        let session_id = start_device_session(&manager).await;
+        let first = tokio::spawn({
+            let manager = manager.clone();
+            let session_id = session_id.clone();
+            async move { manager.poll_device_code(&session_id).await }
+        });
+        started.notified().await;
+
+        let second = manager.poll_device_code(&session_id).await;
+        release.notify_one();
+        let first = first.await.unwrap();
+
+        assert!(matches!(first, Ok(HostAuthPollResult::Pending)));
+        assert!(matches!(
+            second,
+            Err(AuthError::InvalidResponse(ref message))
+                if message == "login session is already in progress"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn device_poll_restores_retryable_and_consumes_terminal_sessions() {
+        for behavior in [
+            DevicePollBehavior::Pending,
+            DevicePollBehavior::SlowDown,
+            DevicePollBehavior::Network,
+            DevicePollBehavior::RateLimited,
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (_dir, manager) = device_manager(behavior, calls.clone(), DevicePollGate::Open);
+            let session_id = start_device_session(&manager).await;
+
+            let _ = manager.poll_device_code(&session_id).await;
+            let second = manager.poll_device_code(&session_id).await;
+
+            assert!(!matches!(
+                second,
+                Err(AuthError::InvalidResponse(ref message))
+                    if message == "unknown or expired login session"
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+
+        for behavior in [
+            DevicePollBehavior::Authorized,
+            DevicePollBehavior::Denied,
+            DevicePollBehavior::Expired,
+            DevicePollBehavior::InvalidResponse,
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (_dir, manager) = device_manager(behavior, calls.clone(), DevicePollGate::Open);
+            let session_id = start_device_session(&manager).await;
+
+            let _ = manager.poll_device_code(&session_id).await;
+            let second = manager.poll_device_code(&session_id).await;
+
+            assert!(matches!(
+                second,
+                Err(AuthError::InvalidResponse(ref message))
+                    if message == "unknown or expired login session"
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

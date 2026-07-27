@@ -59,6 +59,9 @@ Starts the manager login flow for a known provider alias or canonical key
   never logs the code. The `>` prompt appears only when both stdin and stdout
   are TTYs.
 - Imported credentials complete immediately without a browser step.
+- Pending login sessions are single-flight. Concurrent use of one session id is
+  rejected; cancellation and retryable provider responses release it for retry,
+  while success and terminal responses consume it.
 
 Primary output goes to stdout. Diagnostics go to stderr. Handlers return
 actionable errors to `main` (no `process::exit` inside auth handlers).
@@ -118,7 +121,9 @@ and may still appear as `ExternallyConfigured` in status. Success prints only
 
 Production commands build one `ProviderAuthManager` with:
 
-- the same `Arc<FileTokenStore>` injected into `AuthService` and `RociConfig`
+- one `Arc<FileTokenStore>` injected into `AuthService`; `ProviderAuthManager`
+  makes that store `RociConfig`'s OAuth source so login, status, and launch cannot
+  diverge even if callers supplied a different config token store
 - `roci::default_registry()` / `roci::default_auth_service(...)`
 - `RociConfig::from_env()` for explicit/environment values
 - platform default provider credential store:

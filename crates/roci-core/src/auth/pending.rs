@@ -53,9 +53,41 @@ impl PendingLogin {
     }
 }
 
+struct PendingLoginEntry {
+    pending: PendingLogin,
+    claimed: bool,
+}
+
 pub(crate) struct PendingLoginStore {
-    entries: Mutex<HashMap<String, PendingLogin>>,
+    entries: Mutex<HashMap<String, PendingLoginEntry>>,
     capacity: usize,
+}
+
+/// Exclusive, cancellation-safe claim on one pending login.
+pub(crate) struct PendingLoginClaim<'a> {
+    store: &'a PendingLoginStore,
+    session_id: String,
+    pending: PendingLogin,
+    consumed: bool,
+}
+
+impl PendingLoginClaim<'_> {
+    pub(crate) fn pending(&self) -> &PendingLogin {
+        &self.pending
+    }
+
+    pub(crate) fn consume(mut self) {
+        self.store.remove(&self.session_id);
+        self.consumed = true;
+    }
+}
+
+impl Drop for PendingLoginClaim<'_> {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.store.release(&self.session_id, Utc::now());
+        }
+    }
 }
 
 impl PendingLoginStore {
@@ -81,29 +113,64 @@ impl PendingLoginStore {
         now: DateTime<Utc>,
     ) -> Result<(), AuthError> {
         let mut entries = self.entries.lock().expect("pending login map");
-        entries.retain(|_, item| item.expires_at() > now);
+        entries.retain(|_, entry| entry.pending.expires_at() > now);
         if entries.len() >= self.capacity {
             return Err(AuthError::PendingLoginLimit);
         }
-        entries.insert(session_id.as_str().to_string(), pending);
+        entries.insert(
+            session_id.as_str().to_string(),
+            PendingLoginEntry {
+                pending,
+                claimed: false,
+            },
+        );
         Ok(())
     }
 
-    pub(crate) fn get(&self, session_id: &LoginSessionId) -> Option<PendingLogin> {
-        self.get_at(session_id, Utc::now())
-    }
-
-    fn get_at(&self, session_id: &LoginSessionId, now: DateTime<Utc>) -> Option<PendingLogin> {
+    pub(crate) fn claim(
+        &self,
+        session_id: &LoginSessionId,
+    ) -> Result<PendingLoginClaim<'_>, AuthError> {
+        let now = Utc::now();
         let mut entries = self.entries.lock().expect("pending login map");
-        entries.retain(|_, item| item.expires_at() > now);
-        entries.get(session_id.as_str()).cloned()
+        entries.retain(|_, entry| entry.pending.expires_at() > now);
+        let entry = entries
+            .get_mut(session_id.as_str())
+            .ok_or_else(|| AuthError::InvalidResponse("unknown or expired login session".into()))?;
+        if entry.claimed {
+            return Err(AuthError::InvalidResponse(
+                "login session is already in progress".into(),
+            ));
+        }
+        entry.claimed = true;
+        let pending = entry.pending.clone();
+        drop(entries);
+        Ok(PendingLoginClaim {
+            store: self,
+            session_id: session_id.as_str().to_string(),
+            pending,
+            consumed: false,
+        })
     }
 
-    pub(crate) fn remove(&self, session_id: &LoginSessionId) -> Option<PendingLogin> {
+    fn release(&self, session_id: &str, now: DateTime<Utc>) {
+        let mut entries = self.entries.lock().expect("pending login map");
+        let expired = entries
+            .get(session_id)
+            .is_some_and(|entry| entry.pending.expires_at() <= now);
+        if expired {
+            entries.remove(session_id);
+        } else if let Some(entry) = entries.get_mut(session_id) {
+            entry.claimed = false;
+        }
+    }
+
+    fn remove(&self, session_id: &str) -> Option<PendingLogin> {
         self.entries
             .lock()
             .expect("pending login map")
-            .remove(session_id.as_str())
+            .remove(session_id)
+            .map(|entry| entry.pending)
     }
 }
 
@@ -174,7 +241,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store.get_at(&stale_id, later).is_none());
+        assert!(store.claim(&stale_id).is_err());
         assert_eq!(store.entries.lock().unwrap().len(), 1);
     }
 
@@ -202,7 +269,63 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store.get_at(&id, now).is_some());
-        assert!(store.get_at(&id, now + Duration::seconds(2)).is_none());
+        let claim = store.claim(&id).unwrap();
+        assert!(matches!(claim.pending(), PendingLogin::DeviceCode { .. }));
+        drop(claim);
+        store.release(id.as_str(), now + Duration::seconds(2));
+        assert!(store.claim(&id).is_err());
+    }
+
+    #[test]
+    fn claim_is_exclusive_and_drop_restores_session() {
+        let store = PendingLoginStore::new();
+        let id = LoginSessionId::new("exclusive");
+        store
+            .insert(&id, pkce(Utc::now() + Duration::minutes(1)))
+            .unwrap();
+
+        let first = store.claim(&id).unwrap();
+        assert!(matches!(
+            store.claim(&id),
+            Err(AuthError::InvalidResponse(ref message))
+                if message == "login session is already in progress"
+        ));
+        drop(first);
+
+        assert!(store.claim(&id).is_ok());
+    }
+
+    #[test]
+    fn claimed_session_counts_toward_capacity_and_expiry_is_not_restored() {
+        let store = PendingLoginStore {
+            entries: Mutex::new(HashMap::new()),
+            capacity: 1,
+        };
+        let now = Utc::now();
+        let claimed_id = LoginSessionId::new("claimed");
+        store
+            .insert_at(&claimed_id, pkce(now + Duration::seconds(1)), now)
+            .unwrap();
+        let claim = store.claim(&claimed_id).unwrap();
+
+        assert!(matches!(
+            store.insert_at(
+                &LoginSessionId::new("other"),
+                pkce(now + Duration::minutes(1)),
+                now,
+            ),
+            Err(AuthError::PendingLoginLimit)
+        ));
+        store.release(claimed_id.as_str(), now + Duration::seconds(2));
+        drop(claim);
+
+        assert!(store.claim(&claimed_id).is_err());
+        assert!(store
+            .insert_at(
+                &LoginSessionId::new("other"),
+                pkce(now + Duration::minutes(1)),
+                now + Duration::seconds(2),
+            )
+            .is_ok());
     }
 }

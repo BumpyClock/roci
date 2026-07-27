@@ -511,12 +511,13 @@ impl ProviderFactory for LmStudioFactory {
 #[cfg(feature = "openai-compatible")]
 pub struct OpenAiCompatibleFactory;
 
-#[cfg(feature = "openai-compatible")]
-fn resolve_openai_compatible_credentials(
-    config: &RociConfig,
+#[cfg(any(feature = "openai-compatible", feature = "anthropic-compatible"))]
+fn resolve_dedicated_or_inherited_pair(
+    dedicated: (Option<String>, Option<String>),
+    inherited: (Option<String>, Option<String>),
+    missing_key_message: &'static str,
+    missing_url_message: &'static str,
 ) -> Result<(String, String), RociError> {
-    let dedicated = config.get_api_key_and_base_url_for(ProviderKey::OpenAiCompatible);
-    let inherited = config.get_api_key_and_base_url_for(ProviderKey::OpenAi);
     let has_any_api_key = dedicated.0.is_some() || inherited.0.is_some();
     if let (Some(api_key), Some(base_url)) = dedicated {
         return Ok((api_key, base_url));
@@ -525,14 +526,22 @@ fn resolve_openai_compatible_credentials(
         return Ok((api_key, base_url));
     }
     if !has_any_api_key {
-        Err(RociError::Authentication(
-            "Missing OPENAI_COMPAT_API_KEY".into(),
-        ))
+        Err(RociError::Authentication(missing_key_message.into()))
     } else {
-        Err(RociError::Configuration(
-            "Missing OPENAI_COMPAT_BASE_URL".into(),
-        ))
+        Err(RociError::Configuration(missing_url_message.into()))
     }
+}
+
+#[cfg(feature = "openai-compatible")]
+fn resolve_openai_compatible_credentials(
+    config: &RociConfig,
+) -> Result<(String, String), RociError> {
+    resolve_dedicated_or_inherited_pair(
+        config.get_api_key_and_base_url_for(ProviderKey::OpenAiCompatible),
+        config.get_api_key_and_base_url_for(ProviderKey::OpenAi),
+        "Missing OPENAI_COMPAT_API_KEY",
+        "Missing OPENAI_COMPAT_BASE_URL",
+    )
 }
 
 #[cfg(feature = "openai-compatible")]
@@ -789,24 +798,12 @@ pub struct AnthropicCompatibleFactory;
 fn resolve_anthropic_compatible_credentials(
     config: &RociConfig,
 ) -> Result<(String, String), RociError> {
-    let dedicated = config.get_api_key_and_base_url("anthropic-compatible");
-    let inherited = config.get_api_key_and_base_url_for(ProviderKey::Anthropic);
-    let has_any_api_key = dedicated.0.is_some() || inherited.0.is_some();
-    if let (Some(api_key), Some(base_url)) = dedicated {
-        return Ok((api_key, base_url));
-    }
-    if let (Some(api_key), Some(base_url)) = inherited {
-        return Ok((api_key, base_url));
-    }
-    if !has_any_api_key {
-        Err(RociError::Authentication(
-            "Missing ANTHROPIC_COMPAT_API_KEY".into(),
-        ))
-    } else {
-        Err(RociError::Configuration(
-            "Missing ANTHROPIC_COMPAT_BASE_URL".into(),
-        ))
-    }
+    resolve_dedicated_or_inherited_pair(
+        config.get_api_key_and_base_url("anthropic-compatible"),
+        config.get_api_key_and_base_url_for(ProviderKey::Anthropic),
+        "Missing ANTHROPIC_COMPAT_API_KEY",
+        "Missing ANTHROPIC_COMPAT_BASE_URL",
+    )
 }
 
 #[cfg(feature = "anthropic-compatible")]
