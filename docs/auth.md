@@ -124,6 +124,11 @@ Production commands build one `ProviderAuthManager` with:
 - platform default provider credential store:
   - Unix: locked `FileProviderCredentialStore` at `~/.roci/auth.json`
   - non-Unix: `OsProviderCredentialStore`
+- provider constructors resolve API key and endpoint from one credential snapshot;
+  compatible-provider fallback selects one complete dedicated or inherited pair
+  instead of mixing partial sources
+- protected provider-store read failures stop credential fallback; OAuth aliases
+  are consulted only when the provider store successfully reports no record
 
 ## Security rules
 

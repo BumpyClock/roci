@@ -465,12 +465,7 @@ impl ProviderAuthManager {
                 .get_status(self.auth.store())
                 .ok()
                 .flatten()
-                .is_some_and(|token| {
-                    token
-                        .expires_at
-                        .map(|expires_at| expires_at > chrono::Utc::now())
-                        .unwrap_or(true)
-                });
+                .is_some_and(|token| token.is_valid());
             if has_valid_token {
                 return true;
             }

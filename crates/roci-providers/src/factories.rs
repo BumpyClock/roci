@@ -31,14 +31,6 @@ fn require_api_key(
 }
 
 #[cfg_attr(
-    not(any(feature = "openai", feature = "anthropic", test)),
-    allow(dead_code)
-)]
-fn optional_api_key_for(config: &RociConfig, provider: ProviderKey) -> String {
-    config.get_api_key_for(provider).unwrap_or_default()
-}
-
-#[cfg_attr(
     not(any(feature = "openrouter", feature = "together", test)),
     allow(dead_code)
 )]
@@ -99,24 +91,19 @@ impl ProviderFactory for OpenAiFactory {
         use crate::models::openai::OpenAiModel;
         use std::str::FromStr;
 
-        let api_key = optional_api_key_for(config, ProviderKey::OpenAi);
+        let (api_key, base_url) = config.get_api_key_and_base_url_for(ProviderKey::OpenAi);
+        let api_key = api_key.unwrap_or_default();
         let model =
             OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
         if model.uses_responses_api() {
             Ok(Box::new(
                 crate::provider::openai_responses::OpenAiResponsesProvider::new(
-                    model,
-                    api_key,
-                    config.get_base_url_for(ProviderKey::OpenAi),
-                    None,
+                    model, api_key, base_url, None,
                 ),
             ))
         } else {
             Ok(Box::new(crate::provider::openai::OpenAiProvider::new(
-                model,
-                api_key,
-                config.get_base_url_for(ProviderKey::OpenAi),
-                None,
+                model, api_key, base_url, None,
             )))
         }
     }
@@ -157,10 +144,10 @@ impl ProviderFactory for CodexFactory {
         use crate::models::openai::OpenAiModel;
         use std::str::FromStr;
 
-        let api_key = optional_api_key_for(config, ProviderKey::Codex);
-        let base_url = config
-            .get_base_url_for(ProviderKey::Codex)
-            .or_else(|| Some("https://chatgpt.com/backend-api/codex".to_string()));
+        let (api_key, base_url) = config.get_api_key_and_base_url_for(ProviderKey::Codex);
+        let api_key = api_key.unwrap_or_default();
+        let base_url =
+            base_url.or_else(|| Some("https://chatgpt.com/backend-api/codex".to_string()));
         let account_id = config.get_account_id_for(ProviderKey::Codex);
         let model =
             OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
@@ -217,15 +204,12 @@ impl ProviderFactory for AnthropicFactory {
         use crate::models::anthropic::AnthropicModel;
         use std::str::FromStr;
 
-        let api_key = optional_api_key_for(config, ProviderKey::Anthropic);
+        let (api_key, base_url) = config.get_api_key_and_base_url_for(ProviderKey::Anthropic);
+        let api_key = api_key.unwrap_or_default();
         let model = AnthropicModel::from_str(model_id)
             .unwrap_or(AnthropicModel::Custom(model_id.to_string()));
         Ok(Box::new(
-            crate::provider::anthropic::AnthropicProvider::new(
-                model,
-                api_key,
-                config.get_base_url_for(ProviderKey::Anthropic),
-            ),
+            crate::provider::anthropic::AnthropicProvider::new(model, api_key, base_url),
         ))
     }
 }
@@ -531,15 +515,24 @@ pub struct OpenAiCompatibleFactory;
 fn resolve_openai_compatible_credentials(
     config: &RociConfig,
 ) -> Result<(String, String), RociError> {
-    let api_key = config
-        .get_api_key_for(ProviderKey::OpenAiCompatible)
-        .or_else(|| config.get_api_key_for(ProviderKey::OpenAi))
-        .ok_or_else(|| RociError::Authentication("Missing OPENAI_COMPAT_API_KEY".into()))?;
-    let base_url = config
-        .get_base_url_for(ProviderKey::OpenAiCompatible)
-        .or_else(|| config.get_base_url_for(ProviderKey::OpenAi))
-        .ok_or_else(|| RociError::Configuration("Missing OPENAI_COMPAT_BASE_URL".into()))?;
-    Ok((api_key, base_url))
+    let dedicated = config.get_api_key_and_base_url_for(ProviderKey::OpenAiCompatible);
+    let inherited = config.get_api_key_and_base_url_for(ProviderKey::OpenAi);
+    let has_any_api_key = dedicated.0.is_some() || inherited.0.is_some();
+    if let (Some(api_key), Some(base_url)) = dedicated {
+        return Ok((api_key, base_url));
+    }
+    if let (Some(api_key), Some(base_url)) = inherited {
+        return Ok((api_key, base_url));
+    }
+    if !has_any_api_key {
+        Err(RociError::Authentication(
+            "Missing OPENAI_COMPAT_API_KEY".into(),
+        ))
+    } else {
+        Err(RociError::Configuration(
+            "Missing OPENAI_COMPAT_BASE_URL".into(),
+        ))
+    }
 }
 
 #[cfg(feature = "openai-compatible")]
@@ -650,24 +643,29 @@ fn resolve_github_copilot_credentials(config: &RociConfig) -> Result<(String, St
         (None, None, None)
     };
 
-    let api_key = cached_key
-        .or_else(|| config.get_api_key_for(ProviderKey::GitHubCopilot))
-        .ok_or_else(|| match load_err {
-            Some(e) => RociError::Authentication(format!(
-                "failed to load github-copilot-api credentials: {e}"
+    let cached = (cached_key, cached_url);
+    let fallback = config.get_api_key_and_base_url_for(ProviderKey::GitHubCopilot);
+    let has_any_api_key = cached.0.is_some() || fallback.0.is_some();
+    if let (Some(api_key), Some(base_url)) = cached {
+        return Ok((api_key, base_url));
+    }
+    if let (Some(api_key), Some(base_url)) = fallback {
+        return Ok((api_key, base_url));
+    }
+    if !has_any_api_key {
+        return Err(match load_err {
+            Some(error) => RociError::Authentication(format!(
+                "failed to load github-copilot-api credentials: {error}"
             )),
             None => RociError::MissingCredential {
                 provider: "github-copilot".to_string(),
             },
-        })?;
-    let base_url = cached_url
-        .or_else(|| config.get_base_url_for(ProviderKey::GitHubCopilot))
-        .ok_or_else(|| RociError::MissingConfiguration {
-            key: "base_url".to_string(),
-            provider: "github-copilot".to_string(),
-        })?;
-
-    Ok((api_key, base_url))
+        });
+    }
+    Err(RociError::MissingConfiguration {
+        key: "base_url".to_string(),
+        provider: "github-copilot".to_string(),
+    })
 }
 
 #[cfg(feature = "github-copilot")]
@@ -791,15 +789,24 @@ pub struct AnthropicCompatibleFactory;
 fn resolve_anthropic_compatible_credentials(
     config: &RociConfig,
 ) -> Result<(String, String), RociError> {
-    let api_key = config
-        .get_api_key("anthropic-compatible")
-        .or_else(|| config.get_api_key_for(ProviderKey::Anthropic))
-        .ok_or_else(|| RociError::Authentication("Missing ANTHROPIC_COMPAT_API_KEY".into()))?;
-    let base_url = config
-        .get_base_url("anthropic-compatible")
-        .or_else(|| config.get_base_url_for(ProviderKey::Anthropic))
-        .ok_or_else(|| RociError::Configuration("Missing ANTHROPIC_COMPAT_BASE_URL".into()))?;
-    Ok((api_key, base_url))
+    let dedicated = config.get_api_key_and_base_url("anthropic-compatible");
+    let inherited = config.get_api_key_and_base_url_for(ProviderKey::Anthropic);
+    let has_any_api_key = dedicated.0.is_some() || inherited.0.is_some();
+    if let (Some(api_key), Some(base_url)) = dedicated {
+        return Ok((api_key, base_url));
+    }
+    if let (Some(api_key), Some(base_url)) = inherited {
+        return Ok((api_key, base_url));
+    }
+    if !has_any_api_key {
+        Err(RociError::Authentication(
+            "Missing ANTHROPIC_COMPAT_API_KEY".into(),
+        ))
+    } else {
+        Err(RociError::Configuration(
+            "Missing ANTHROPIC_COMPAT_BASE_URL".into(),
+        ))
+    }
 }
 
 #[cfg(feature = "anthropic-compatible")]
@@ -865,17 +872,13 @@ pub struct AzureFactory;
 
 #[cfg(feature = "azure")]
 fn resolve_azure_credentials(config: &RociConfig) -> Result<(String, String), RociError> {
-    let api_key =
-        config
-            .get_api_key_for(ProviderKey::Azure)
-            .ok_or_else(|| RociError::MissingCredential {
-                provider: "azure".to_string(),
-            })?;
-    let endpoint = config.get_base_url_for(ProviderKey::Azure).ok_or_else(|| {
-        RociError::MissingConfiguration {
-            key: "AZURE_OPENAI_ENDPOINT".to_string(),
-            provider: "azure".to_string(),
-        }
+    let (api_key, endpoint) = config.get_api_key_and_base_url_for(ProviderKey::Azure);
+    let api_key = api_key.ok_or_else(|| RociError::MissingCredential {
+        provider: "azure".to_string(),
+    })?;
+    let endpoint = endpoint.ok_or_else(|| RociError::MissingConfiguration {
+        key: "AZURE_OPENAI_ENDPOINT".to_string(),
+        provider: "azure".to_string(),
     })?;
     Ok((api_key, endpoint))
 }
@@ -1402,6 +1405,18 @@ mod tests {
         via_openai.set_api_key("openai", "openai-key".to_string());
         via_openai.set_base_url("openai", "https://api.openai.com/v1".to_string());
         assert!(OpenAiCompatibleFactory.is_available(&via_openai, "openai-compatible"));
+
+        let partial_dedicated = config_without_credentials();
+        partial_dedicated.set_api_key("openai-compatible", "partial-key".to_string());
+        partial_dedicated.set_api_key("openai", "openai-key".to_string());
+        partial_dedicated.set_base_url("openai", "https://api.openai.com/v1".to_string());
+        assert_eq!(
+            resolve_openai_compatible_credentials(&partial_dedicated).unwrap(),
+            (
+                "openai-key".to_string(),
+                "https://api.openai.com/v1".to_string()
+            )
+        );
     }
 
     #[cfg(feature = "anthropic-compatible")]
@@ -1419,6 +1434,18 @@ mod tests {
         inherited.set_api_key("anthropic", "anthropic-key".to_string());
         inherited.set_base_url("anthropic", "https://api.anthropic.com".to_string());
         assert!(AnthropicCompatibleFactory.is_available(&inherited, "anthropic-compatible"));
+
+        let partial_dedicated = config_without_credentials();
+        partial_dedicated.set_api_key("anthropic-compatible", "partial-key".to_string());
+        partial_dedicated.set_api_key("anthropic", "anthropic-key".to_string());
+        partial_dedicated.set_base_url("anthropic", "https://api.anthropic.com".to_string());
+        assert_eq!(
+            resolve_anthropic_compatible_credentials(&partial_dedicated).unwrap(),
+            (
+                "anthropic-key".to_string(),
+                "https://api.anthropic.com".to_string()
+            )
+        );
     }
 
     #[cfg(feature = "ollama")]

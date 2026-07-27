@@ -21,6 +21,18 @@ pub struct Token {
     pub account_id: Option<String>,
 }
 
+impl Token {
+    /// Whether the access token is unexpired at the current time.
+    ///
+    /// Tokens without an expiry remain valid because some OAuth backends manage
+    /// refresh or validity outside the serialized access-token payload.
+    pub fn is_valid(&self) -> bool {
+        self.expires_at
+            .map(|expires_at| expires_at > Utc::now())
+            .unwrap_or(true)
+    }
+}
+
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Token")

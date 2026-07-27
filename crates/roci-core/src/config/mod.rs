@@ -8,7 +8,9 @@ use std::sync::{Arc, RwLock};
 use crate::auth::credential::InMemoryProviderCredentialStore;
 #[cfg(all(not(test), not(unix)))]
 use crate::auth::credential::OsProviderCredentialStore;
-use crate::auth::credential::{ProviderCredentialRecord, ProviderCredentialStore};
+use crate::auth::credential::{
+    ProviderCredentialRecord, ProviderCredentialStore, ProviderCredentialStoreError,
+};
 use crate::auth::store::TokenStore;
 #[cfg(all(not(test), unix))]
 use crate::auth::FileProviderCredentialStore;
@@ -240,40 +242,65 @@ impl RociConfig {
             .insert(provider.to_string(), key);
     }
 
-    /// Resolve an API key for a provider.
+    /// Resolve an API key and associated base URL from one credential snapshot.
     ///
-    /// Checks explicit/environment keys, a protected stored API key, then the
-    /// existing OAuth token-store alias. Protected-store access failures fail
-    /// closed and never trigger plaintext fallback.
-    pub fn get_api_key(&self, provider: &str) -> Option<String> {
+    /// Checks explicit/environment values, one protected provider-record load,
+    /// then the existing OAuth token-store alias only when no provider record
+    /// exists. A protected-store failure is logged and stops fallback. Provider
+    /// constructors should use this pair API so concurrent record replacement
+    /// cannot mix key and endpoint versions.
+    pub fn get_api_key_and_base_url(&self, provider: &str) -> (Option<String>, Option<String>) {
         let provider_key = ProviderKey::parse(provider);
-        if let Some(key) = get_from_map(&self.api_keys, provider, provider_key) {
-            return Some(key);
+        let explicit_api_key = get_from_map(&self.api_keys, provider, provider_key);
+        let explicit_base_url = get_from_map(&self.base_urls, provider, provider_key);
+        if explicit_api_key.is_some() {
+            return (explicit_api_key, explicit_base_url);
         }
 
-        if let Some(record) = self.stored_credential(provider) {
-            return Some(record.api_key.expose_secret().to_string());
-        }
-
-        if let Some(ref store) = self.token_store {
-            if let Some(store_key) = provider_key.and_then(ProviderKey::token_store_key) {
-                if let Ok(Some(token)) = store.load(store_key, "default") {
-                    let is_valid = token
-                        .expires_at
-                        .map(|exp| exp > chrono::Utc::now())
-                        .unwrap_or(true);
-                    if is_valid {
-                        return Some(token.access_token);
-                    }
-                }
+        let stored = match self.stored_credential(provider) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load protected provider credentials");
+                return (None, explicit_base_url);
             }
-        }
+        };
+        let stored_api_key = stored
+            .as_ref()
+            .map(|record| record.api_key.expose_secret().to_string());
+        let stored_base_url = stored
+            .and_then(|record| record.endpoint)
+            .map(|endpoint| endpoint.as_str().to_string());
+        let oauth_api_key = self.token_store.as_ref().and_then(|store| {
+            let store_key = provider_key.and_then(ProviderKey::token_store_key)?;
+            store
+                .load(store_key, "default")
+                .ok()
+                .flatten()
+                .filter(crate::auth::token::Token::is_valid)
+                .map(|token| token.access_token)
+        });
 
-        None
+        (
+            stored_api_key.or(oauth_api_key),
+            explicit_base_url.or(stored_base_url),
+        )
+    }
+
+    /// Resolve an API key and associated base URL for a typed provider key.
+    pub fn get_api_key_and_base_url_for(
+        &self,
+        provider: ProviderKey,
+    ) -> (Option<String>, Option<String>) {
+        self.get_api_key_and_base_url(provider.as_str())
+    }
+
+    /// Resolve an API key for a provider.
+    pub fn get_api_key(&self, provider: &str) -> Option<String> {
+        self.get_api_key_and_base_url(provider).0
     }
 
     pub fn get_api_key_for(&self, provider: ProviderKey) -> Option<String> {
-        self.get_api_key(provider.as_str())
+        self.get_api_key_and_base_url_for(provider).0
     }
 
     pub fn set_base_url(&self, provider: &str, url: String) {
@@ -284,18 +311,11 @@ impl RociConfig {
     }
 
     pub fn get_base_url(&self, provider: &str) -> Option<String> {
-        let provider_key = ProviderKey::parse(provider);
-        let explicit_base_url = get_from_map(&self.base_urls, provider, provider_key);
-        if explicit_base_url.is_some() || self.has_explicit_api_key(provider) {
-            return explicit_base_url;
-        }
-        self.stored_credential(provider)
-            .and_then(|record| record.endpoint)
-            .map(|endpoint| endpoint.as_str().to_string())
+        self.get_api_key_and_base_url(provider).1
     }
 
     pub fn get_base_url_for(&self, provider: ProviderKey) -> Option<String> {
-        self.get_base_url(provider.as_str())
+        self.get_api_key_and_base_url_for(provider).1
     }
 
     pub fn set_account_id(&self, provider: &str, account_id: String) {
@@ -326,20 +346,26 @@ impl RociConfig {
 
     /// True when a protected Roci-owned provider credential record is present.
     pub fn has_stored_api_key(&self, provider: &str) -> bool {
-        self.stored_credential(provider).is_some()
+        match self.stored_credential(provider) {
+            Ok(record) => record.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "failed to load protected provider credentials");
+                false
+            }
+        }
     }
 
-    fn stored_credential(&self, provider: &str) -> Option<ProviderCredentialRecord> {
+    fn stored_credential(
+        &self,
+        provider: &str,
+    ) -> Result<Option<ProviderCredentialRecord>, ProviderCredentialStoreError> {
         let canonical = ProviderKey::parse(provider)
             .map(ProviderKey::as_str)
             .unwrap_or(provider);
-        match self.provider_credential_store.as_ref()?.load(canonical) {
-            Ok(record) => record,
-            Err(error) => {
-                tracing::warn!(%error, "failed to load protected provider credentials");
-                None
-            }
-        }
+        let Some(store) = self.provider_credential_store.as_ref() else {
+            return Ok(None);
+        };
+        store.load(canonical)
     }
 }
 
@@ -347,7 +373,8 @@ impl RociConfig {
 mod tests {
     use super::*;
     use crate::auth::credential::{
-        InMemoryProviderCredentialStore, ProviderApiKey, ProviderEndpoint,
+        InMemoryProviderCredentialStore, ProviderApiKey, ProviderCredentialStoreError,
+        ProviderEndpoint,
     };
     use crate::auth::store::{FileTokenStore, TokenStoreConfig};
     use crate::auth::token::Token;
@@ -367,6 +394,61 @@ mod tests {
         RociConfig::new()
             .with_token_store(None)
             .with_provider_credential_store(Some(store))
+    }
+
+    struct RotatingCredentialStore {
+        first: ProviderCredentialRecord,
+        second: ProviderCredentialRecord,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProviderCredentialStore for RotatingCredentialStore {
+        fn load(
+            &self,
+            _provider: &str,
+        ) -> Result<Option<ProviderCredentialRecord>, ProviderCredentialStoreError> {
+            let index = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(if index == 0 {
+                self.first.clone()
+            } else {
+                self.second.clone()
+            }))
+        }
+
+        fn save(
+            &self,
+            _provider: &str,
+            _record: &ProviderCredentialRecord,
+        ) -> Result<(), ProviderCredentialStoreError> {
+            Ok(())
+        }
+
+        fn clear(&self, _provider: &str) -> Result<(), ProviderCredentialStoreError> {
+            Ok(())
+        }
+    }
+
+    struct FailingLoadCredentialStore;
+
+    impl ProviderCredentialStore for FailingLoadCredentialStore {
+        fn load(
+            &self,
+            _provider: &str,
+        ) -> Result<Option<ProviderCredentialRecord>, ProviderCredentialStoreError> {
+            Err(ProviderCredentialStoreError::InvalidRecord)
+        }
+
+        fn save(
+            &self,
+            _provider: &str,
+            _record: &ProviderCredentialRecord,
+        ) -> Result<(), ProviderCredentialStoreError> {
+            Ok(())
+        }
+
+        fn clear(&self, _provider: &str) -> Result<(), ProviderCredentialStoreError> {
+            Ok(())
+        }
     }
 
     fn make_token(access_token: &str, expires_at: Option<chrono::DateTime<Utc>>) -> Token {
@@ -406,6 +488,28 @@ mod tests {
             config.get_api_key("codex"),
             Some("oauth-access-token".to_string()),
         );
+    }
+
+    #[test]
+    fn provider_store_failure_does_not_fall_back_to_oauth_token() {
+        let dir = TempDir::new().unwrap();
+        let token_store = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+            dir.path().to_path_buf(),
+        )));
+        token_store
+            .save(
+                "claude-code",
+                "default",
+                &make_token("oauth-access-token", None),
+            )
+            .unwrap();
+        let config = RociConfig::new()
+            .with_token_store(Some(token_store))
+            .with_provider_credential_store(Some(Arc::new(FailingLoadCredentialStore)));
+
+        let credentials = config.get_api_key_and_base_url("anthropic");
+
+        assert_eq!(credentials, (None, None));
     }
 
     #[test]
@@ -507,6 +611,33 @@ mod tests {
             config.get_api_key("github-copilot"),
             Some("copilot-token".to_string()),
         );
+    }
+
+    #[test]
+    fn api_key_and_base_url_share_one_stored_record_snapshot() {
+        let store = Arc::new(RotatingCredentialStore {
+            first: ProviderCredentialRecord::new(
+                ProviderApiKey::new("first-key"),
+                Some(ProviderEndpoint::new("https://first.example")),
+            ),
+            second: ProviderCredentialRecord::new(
+                ProviderApiKey::new("second-key"),
+                Some(ProviderEndpoint::new("https://second.example")),
+            ),
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config = config_with_credential_store(store.clone());
+
+        let credentials = config.get_api_key_and_base_url("anthropic");
+
+        assert_eq!(
+            credentials,
+            (
+                Some("first-key".to_string()),
+                Some("https://first.example".to_string())
+            )
+        );
+        assert_eq!(store.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -257,7 +257,7 @@ where
                 if !remaining.is_zero() {
                     tokio::time::sleep(interval.min(remaining)).await;
                 }
-                if remaining.is_zero() || chrono::Utc::now() >= expires_at {
+                if chrono::Utc::now() >= expires_at {
                     writeln!(stderr, "Device code expired; please try again")?;
                     return Err(AuthCliError::Message(
                         "Device code expired; please try again".into(),
