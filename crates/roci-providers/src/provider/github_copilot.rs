@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -83,24 +83,37 @@ pub(crate) fn parse_copilot_models_response(
         }
     };
 
-    if models.is_empty() {
-        return Err(RociError::Provider {
-            provider: provider_key.to_string(),
-            message: "Copilot models response contained no model ids".to_string(),
-        });
-    }
-
     let mut catalog = ModelCatalog::default();
     for model in models {
-        let id = model
+        let model_picker_enabled = model
+            .get("model_picker_enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let policy_disabled = model
+            .get("policy")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|policy| policy.get("state"))
+            .and_then(serde_json::Value::as_str)
+            == Some("disabled");
+        let tool_calls_disabled = model
+            .get("capabilities")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|capabilities| capabilities.get("supports"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|supports| supports.get("tool_calls"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+        if !model_picker_enabled || policy_disabled || tool_calls_disabled {
+            continue;
+        }
+
+        let Some(id) = model
             .get("id")
             .and_then(serde_json::Value::as_str)
             .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| RociError::Provider {
-                provider: provider_key.to_string(),
-                message: "Copilot models response contained a missing or empty model id"
-                    .to_string(),
-            })?;
+        else {
+            continue;
+        };
         catalog.insert(copilot_model_info(provider_key, id));
     }
 
@@ -138,6 +151,7 @@ pub(crate) async fn list_copilot_models(
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let mut headers = bearer_headers(api_key);
     headers.extend(copilot_headers());
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
     let response = shared_client()
         .get(url)
@@ -198,7 +212,10 @@ mod tests {
     #[test]
     fn parser_accepts_data_wrapper() {
         let catalog = parse_copilot_models_response(
-            r#"{"data":[{"id":"gpt-5"},{"id":"copilot-custom"}]}"#,
+            r#"{"data":[
+                {"id":"gpt-5","model_picker_enabled":true},
+                {"id":"copilot-custom","model_picker_enabled":true}
+            ]}"#,
             "github-copilot",
         )
         .unwrap();
@@ -226,21 +243,89 @@ mod tests {
 
     #[test]
     fn parser_accepts_raw_array() {
-        let catalog =
-            parse_copilot_models_response(r#"[{"id":"gpt-4.1"}]"#, "github-copilot").unwrap();
+        let catalog = parse_copilot_models_response(
+            r#"[{"id":"gpt-4.1","model_picker_enabled":true}]"#,
+            "github-copilot",
+        )
+        .unwrap();
 
         assert_eq!(catalog.models()[0].model_id, "gpt-4.1");
     }
 
     #[test]
-    fn parser_rejects_missing_ids() {
-        let err = parse_copilot_models_response(
-            r#"{"data":[{"id":"gpt-5"},{"name":"missing"}]}"#,
+    fn parser_filters_nonselectable_models() {
+        let catalog = parse_copilot_models_response(
+            r#"{"data":[
+                {"id":"chamomile","model_picker_enabled":false},
+                {"id":"gpt-41-copilot","model_picker_enabled":true,"policy":{"state":"disabled"}},
+                {"id":"embedding","model_picker_enabled":true,"capabilities":{"supports":{"tool_calls":false}}},
+                {"id":"missing-picker","policy":{"state":"enabled"}},
+                {"id":"claude-sonnet-4","model_picker_enabled":true,"policy":{"state":"enabled"}},
+                {"id":"gemini-2.5-pro","model_picker_enabled":true,"policy":{"state":"enabled"}},
+                {"id":"gpt-4.1","model_picker_enabled":true,"policy":{"state":"enabled"}}
+            ]}"#,
             "github-copilot",
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, RociError::Provider { .. }));
+        let ids = catalog
+            .models()
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["claude-sonnet-4", "gemini-2.5-pro", "gpt-4.1"]);
+    }
+
+    #[test]
+    fn parser_returns_empty_catalog_when_all_models_are_filtered() {
+        let catalog = parse_copilot_models_response(
+            r#"{"data":[
+                {"id":"chamomile","model_picker_enabled":false},
+                {"id":"gpt-41-copilot","model_picker_enabled":true,"policy":{"state":"disabled"}},
+                {"id":"embedding","model_picker_enabled":true,"capabilities":{"supports":{"tool_calls":false}}}
+            ]}"#,
+            "github-copilot",
+        )
+        .unwrap();
+
+        let ids = catalog
+            .models()
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, Vec::<&str>::new());
+    }
+
+    #[test]
+    fn parser_skips_malformed_ids_without_dropping_valid_models() {
+        let catalog = parse_copilot_models_response(
+            r#"{"data":[
+                {"id":"gpt-5","model_picker_enabled":true},
+                {"name":"missing","model_picker_enabled":true},
+                {"id":42,"model_picker_enabled":true},
+                {"id":"   ","model_picker_enabled":true},
+                {"id":"claude-sonnet-4","model_picker_enabled":true}
+            ]}"#,
+            "github-copilot",
+        )
+        .unwrap();
+
+        let ids = catalog
+            .models()
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["claude-sonnet-4", "gpt-5"]);
+    }
+
+    #[test]
+    fn parser_accepts_empty_data_wrapper() {
+        let catalog = parse_copilot_models_response(r#"{"data":[]}"#, "github-copilot").unwrap();
+
+        assert!(catalog.models().is_empty());
     }
 
     #[tokio::test]
@@ -250,8 +335,9 @@ mod tests {
             .and(path("/models"))
             .and(header("authorization", "Bearer test-token"))
             .and(header("Copilot-Integration-Id", "vscode-chat"))
+            .and(header("accept", "application/json"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{"id": "gpt-5"}]
+                "data": [{"id": "gpt-5", "model_picker_enabled": true}]
             })))
             .mount(&server)
             .await;
