@@ -1,6 +1,7 @@
 //! ProviderFactory implementations for each built-in provider.
 
 use futures::future::BoxFuture;
+use roci_core::auth::{CredentialFlow, ProviderDescriptor};
 use roci_core::config::RociConfig;
 use roci_core::error::RociError;
 use roci_core::models::{ModelCatalog, ModelListOptions, ProviderKey};
@@ -45,6 +46,20 @@ fn optional_api_key(config: &RociConfig, provider: &str) -> String {
     config.get_api_key(provider).unwrap_or_default()
 }
 
+fn explicit_descriptor(
+    canonical_key: &'static str,
+    display_name: &'static str,
+    flows: &[CredentialFlow],
+    endpoint_configurable: bool,
+) -> ProviderDescriptor {
+    ProviderDescriptor::new(
+        canonical_key,
+        display_name,
+        flows.to_vec(),
+        endpoint_configurable,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI
 // ---------------------------------------------------------------------------
@@ -56,6 +71,10 @@ pub struct OpenAiFactory;
 impl ProviderFactory for OpenAiFactory {
     fn provider_keys(&self) -> &[&str] {
         &["openai"]
+    }
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("openai", "OpenAI", &[CredentialFlow::ApiKey], true)
     }
 
     fn list_models<'a>(
@@ -116,6 +135,10 @@ impl ProviderFactory for CodexFactory {
         &["codex"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("codex", "Codex", &[CredentialFlow::ApiKey], true)
+    }
+
     fn list_models<'a>(
         &'a self,
         _config: &'a RociConfig,
@@ -168,6 +191,10 @@ impl ProviderFactory for AnthropicFactory {
         &["anthropic"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("anthropic", "Anthropic", &[CredentialFlow::ApiKey], true)
+    }
+
     fn list_models<'a>(
         &'a self,
         _config: &'a RociConfig,
@@ -216,6 +243,10 @@ impl ProviderFactory for GoogleFactory {
         &["google"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("google", "Google", &[CredentialFlow::ApiKey], false)
+    }
+
     fn list_models<'a>(
         &'a self,
         _config: &'a RociConfig,
@@ -260,6 +291,10 @@ impl ProviderFactory for GrokFactory {
         &["grok"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("grok", "Grok", &[CredentialFlow::ApiKey], false)
+    }
+
     fn list_models<'a>(
         &'a self,
         _config: &'a RociConfig,
@@ -300,6 +335,10 @@ impl ProviderFactory for GroqFactory {
         &["groq"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("groq", "Groq", &[CredentialFlow::ApiKey], false)
+    }
+
     fn list_models<'a>(
         &'a self,
         _config: &'a RociConfig,
@@ -338,6 +377,10 @@ pub struct MistralFactory;
 impl ProviderFactory for MistralFactory {
     fn provider_keys(&self) -> &[&str] {
         &["mistral"]
+    }
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("mistral", "Mistral", &[CredentialFlow::ApiKey], false)
     }
 
     fn list_models<'a>(
@@ -382,6 +425,10 @@ pub struct OllamaFactory;
 impl ProviderFactory for OllamaFactory {
     fn provider_keys(&self) -> &[&str] {
         &["ollama"]
+    }
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("ollama", "Ollama", &[CredentialFlow::Local], true)
     }
 
     fn requires_credentials(&self, _provider_key: &str) -> bool {
@@ -432,6 +479,10 @@ pub struct LmStudioFactory;
 impl ProviderFactory for LmStudioFactory {
     fn provider_keys(&self) -> &[&str] {
         &["lmstudio"]
+    }
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("lmstudio", "LM Studio", &[CredentialFlow::Local], true)
     }
 
     fn requires_credentials(&self, _provider_key: &str) -> bool {
@@ -495,6 +546,15 @@ fn resolve_openai_compatible_credentials(
 impl ProviderFactory for OpenAiCompatibleFactory {
     fn provider_keys(&self) -> &[&str] {
         &["openai-compatible"]
+    }
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor(
+            "openai-compatible",
+            "OpenAI Compatible",
+            &[CredentialFlow::ApiKey],
+            true,
+        )
     }
 
     fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
@@ -634,6 +694,10 @@ impl ProviderFactory for GitHubCopilotFactory {
         &["github-copilot"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("github-copilot", "GitHub Copilot", &[], false)
+    }
+
     fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
         resolve_github_copilot_credentials(config).is_ok()
     }
@@ -729,6 +793,15 @@ impl ProviderFactory for AnthropicCompatibleFactory {
         &["anthropic-compatible"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor(
+            "anthropic-compatible",
+            "Anthropic Compatible",
+            &[CredentialFlow::ApiKey],
+            true,
+        )
+    }
+
     fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
         resolve_anthropic_compatible_credentials(config).is_ok()
     }
@@ -789,6 +862,10 @@ impl ProviderFactory for AzureFactory {
         &["azure"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("azure", "Azure OpenAI", &[CredentialFlow::ApiKey], true)
+    }
+
     fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
         resolve_azure_credentials(config).is_ok()
     }
@@ -832,6 +909,10 @@ impl ProviderFactory for OpenRouterFactory {
         &["openrouter"]
     }
 
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("openrouter", "OpenRouter", &[CredentialFlow::ApiKey], false)
+    }
+
     fn list_models<'a>(
         &'a self,
         _config: &'a RociConfig,
@@ -865,6 +946,10 @@ pub struct TogetherFactory;
 impl ProviderFactory for TogetherFactory {
     fn provider_keys(&self) -> &[&str] {
         &["together"]
+    }
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        explicit_descriptor("together", "Together", &[CredentialFlow::ApiKey], false)
     }
 
     fn list_models<'a>(
@@ -1281,5 +1366,146 @@ mod tests {
 
         config.set_api_key("google", "google-key".to_string());
         assert!(GoogleFactory.is_available(&config, "google"));
+    }
+
+    #[test]
+    fn built_in_descriptors_match_explicit_table() {
+        // Drift guard: every built-in factory must keep an explicit descriptor.
+        let expected: &[(&str, &str, &[CredentialFlow], bool)] = &[
+            #[cfg(feature = "openai")]
+            ("openai", "OpenAI", &[CredentialFlow::ApiKey], true),
+            #[cfg(feature = "openai")]
+            ("codex", "Codex", &[CredentialFlow::ApiKey], true),
+            #[cfg(feature = "anthropic")]
+            ("anthropic", "Anthropic", &[CredentialFlow::ApiKey], true),
+            #[cfg(feature = "google")]
+            ("google", "Google", &[CredentialFlow::ApiKey], false),
+            #[cfg(feature = "grok")]
+            ("grok", "Grok", &[CredentialFlow::ApiKey], false),
+            #[cfg(feature = "groq")]
+            ("groq", "Groq", &[CredentialFlow::ApiKey], false),
+            #[cfg(feature = "mistral")]
+            ("mistral", "Mistral", &[CredentialFlow::ApiKey], false),
+            #[cfg(feature = "ollama")]
+            ("ollama", "Ollama", &[CredentialFlow::Local], true),
+            #[cfg(feature = "lmstudio")]
+            ("lmstudio", "LM Studio", &[CredentialFlow::Local], true),
+            #[cfg(feature = "openai-compatible")]
+            (
+                "openai-compatible",
+                "OpenAI Compatible",
+                &[CredentialFlow::ApiKey],
+                true,
+            ),
+            #[cfg(feature = "github-copilot")]
+            ("github-copilot", "GitHub Copilot", &[], false),
+            #[cfg(feature = "anthropic-compatible")]
+            (
+                "anthropic-compatible",
+                "Anthropic Compatible",
+                &[CredentialFlow::ApiKey],
+                true,
+            ),
+            #[cfg(feature = "azure")]
+            ("azure", "Azure OpenAI", &[CredentialFlow::ApiKey], true),
+            #[cfg(feature = "openrouter")]
+            ("openrouter", "OpenRouter", &[CredentialFlow::ApiKey], false),
+            #[cfg(feature = "together")]
+            ("together", "Together", &[CredentialFlow::ApiKey], false),
+        ];
+
+        let mut registry = roci_core::provider::ProviderRegistry::new();
+        crate::register_default_providers(&mut registry);
+
+        let mut seen = std::collections::BTreeSet::new();
+        for key in registry.provider_keys() {
+            let factory = registry.factory(key).expect("factory");
+            let descriptor = factory.descriptor();
+            assert_eq!(
+                descriptor.canonical_key, key,
+                "descriptor canonical key must match registered key for {key}"
+            );
+            assert!(
+                factory
+                    .provider_keys()
+                    .contains(&descriptor.canonical_key.as_str()),
+                "canonical key must be one of provider_keys for {key}"
+            );
+            seen.insert(key.to_string());
+
+            let exp = expected
+                .iter()
+                .find(|(k, ..)| *k == key)
+                .unwrap_or_else(|| panic!("missing expected descriptor row for {key}"));
+            assert_eq!(descriptor.display_name, exp.1, "display drift for {key}");
+            assert_eq!(
+                descriptor.credential_flows.as_slice(),
+                exp.2,
+                "flow drift for {key}"
+            );
+            assert_eq!(
+                descriptor.endpoint_configurable, exp.3,
+                "endpoint drift for {key}"
+            );
+        }
+
+        for (key, ..) in expected {
+            assert!(
+                seen.contains(*key),
+                "expected built-in {key} missing from registry"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "github-copilot"))]
+    #[test]
+    fn auth_manager_overlays_oauth_flows_and_rejects_unknown() {
+        use roci_core::auth::{
+            AuthService, ConfiguredSource, ProviderAuthManager, ProviderAuthState,
+        };
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(roci_core::auth::FileTokenStore::new(
+            roci_core::auth::TokenStoreConfig::new(dir.path().to_path_buf()),
+        ));
+        let mut registry = roci_core::provider::ProviderRegistry::new();
+        crate::register_default_providers(&mut registry);
+        let mut auth = AuthService::new(store.clone());
+        crate::register_default_auth_backends(&mut auth);
+        let config = RociConfig::new().with_token_store(Some(store));
+        let manager = ProviderAuthManager::new(auth, registry, config).unwrap();
+
+        let anthropic = manager.descriptor("anthropic").unwrap();
+        assert_eq!(
+            anthropic.credential_flows,
+            vec![CredentialFlow::ApiKey, CredentialFlow::Pkce]
+        );
+        let codex = manager.descriptor("codex").unwrap();
+        assert!(codex.credential_flows.contains(&CredentialFlow::DeviceCode));
+        let copilot = manager.descriptor("github-copilot").unwrap();
+        assert_eq!(copilot.credential_flows, vec![CredentialFlow::DeviceCode]);
+
+        let unknown = manager.status("nope").unwrap_err();
+        assert!(matches!(
+            unknown,
+            roci_core::auth::AuthError::UnknownProvider(_)
+        ));
+
+        let unconfigured = manager.status("anthropic").unwrap();
+        assert_eq!(unconfigured.auth_state, ProviderAuthState::SignedOut);
+        assert!(unconfigured.configured_sources.is_empty());
+        assert!(!unconfigured.launch_available);
+
+        manager.config().set_api_key("anthropic", "sk-test".into());
+        let configured = manager.status("anthropic").unwrap();
+        assert_eq!(
+            configured.configured_sources,
+            vec![ConfiguredSource::ExternallyConfigured]
+        );
+        assert!(configured.launch_available);
+        let json = serde_json::to_string(&configured).unwrap();
+        assert!(!json.contains("sk-test"));
     }
 }

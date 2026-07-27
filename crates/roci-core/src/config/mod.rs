@@ -205,6 +205,12 @@ impl RociConfig {
     pub fn has_credentials(&self, provider: &str) -> bool {
         self.get_api_key(provider).is_some()
     }
+
+    /// True when an explicit/env API key is set (ignores token-store OAuth fallback).
+    pub fn has_explicit_api_key(&self, provider: &str) -> bool {
+        let provider_key = ProviderKey::parse(provider);
+        get_from_map(&self.api_keys, provider, provider_key).is_some()
+    }
 }
 
 #[cfg(test)]

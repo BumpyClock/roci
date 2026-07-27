@@ -1,6 +1,7 @@
 //! Provider factory trait for creating ModelProvider instances.
 
 use super::ModelProvider;
+use crate::auth::ProviderDescriptor;
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::{ModelCatalog, ModelListOptions};
@@ -8,14 +9,26 @@ use futures::future::BoxFuture;
 
 /// Factory for creating ModelProvider instances from a provider key + model ID.
 ///
-/// Implementations own launch-time construction (`create`), catalog discovery
-/// (`list_models`), and availability checks (`is_available`). Registries and
+/// Role: own launch-time construction (`create`), catalog discovery
+/// (`list_models`), availability checks (`is_available`), and the base
+/// host-facing [`descriptor`] for transport credential modes. Registries and
 /// hosts must consult the factory instead of re-implementing credential
 /// heuristics so alias keys, OAuth token-store entries, and required endpoints
-/// stay provider-owned.
+/// stay provider-owned. OAuth backends overlay additional flows in
+/// [`crate::auth::ProviderAuthManager`].
 pub trait ProviderFactory: Send + Sync {
     /// Provider key(s) this factory handles (e.g., &["openai", "codex"]).
     fn provider_keys(&self) -> &[&str];
+
+    /// Host-safe base descriptor for this factory's canonical provider.
+    ///
+    /// Default is third-party safe: first provider key, humanized display name,
+    /// API-key or local flow from [`requires_credentials`], endpoint allowed.
+    /// Built-in factories override with explicit drift-tested descriptors.
+    fn descriptor(&self) -> ProviderDescriptor {
+        let key = self.provider_keys().first().copied().unwrap_or("unknown");
+        ProviderDescriptor::third_party_default(key, self.requires_credentials(key))
+    }
 
     /// Whether this provider key needs credentials before launch-time use.
     fn requires_credentials(&self, _provider_key: &str) -> bool {
@@ -62,6 +75,7 @@ pub trait ProviderFactory: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::CredentialFlow;
 
     struct DefaultFactory {
         requires_credentials: bool,
@@ -84,6 +98,23 @@ mod tests {
         ) -> Result<Box<dyn ModelProvider>, RociError> {
             panic!("default list_models tests must not create providers")
         }
+    }
+
+    #[test]
+    fn default_descriptor_is_third_party_safe() {
+        let with_creds = DefaultFactory {
+            requires_credentials: true,
+        }
+        .descriptor();
+        assert_eq!(with_creds.canonical_key, "default");
+        assert_eq!(with_creds.credential_flows, vec![CredentialFlow::ApiKey]);
+        assert!(with_creds.endpoint_configurable);
+
+        let local = DefaultFactory {
+            requires_credentials: false,
+        }
+        .descriptor();
+        assert_eq!(local.credential_flows, vec![CredentialFlow::Local]);
     }
 
     #[test]

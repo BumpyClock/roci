@@ -158,6 +158,11 @@ impl AuthService {
         &self.store
     }
 
+    /// Registered auth backends (used by the host auth manager for overlays).
+    pub fn backends(&self) -> &[Arc<dyn AuthBackend>] {
+        &self.backends
+    }
+
     fn find_backend(&self, alias: &str) -> Result<&Arc<dyn AuthBackend>, AuthError> {
         let normalized = alias.to_lowercase();
         self.backends

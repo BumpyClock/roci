@@ -103,7 +103,10 @@ pub fn register_default_providers(registry: &mut roci_core::provider::ProviderRe
 
 /// Register all built-in auth backends with the given auth service.
 pub fn register_default_auth_backends(service: &mut roci_core::auth::AuthService) {
+    #[cfg(feature = "github-copilot")]
     service.register_backend(Arc::new(auth::GitHubCopilotBackend));
+    #[cfg(feature = "openai")]
     service.register_backend(Arc::new(auth::OpenAiCodexBackend));
+    #[cfg(feature = "anthropic")]
     service.register_backend(Arc::new(auth::ClaudeCodeBackend));
 }

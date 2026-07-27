@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use roci_core::auth::{AuthService, FileTokenStore, TokenStoreConfig};
-use roci_core::provider::ProviderRegistry;
+use roci_core::auth::{AuthService, FileTokenStore, ProviderAuthManager, TokenStoreConfig};
+use roci_core::config::RociConfig;
 #[cfg(feature = "ollama")]
-use roci_core::{config::RociConfig, models::ModelListOptions};
+use roci_core::models::ModelListOptions;
+use roci_core::provider::ProviderRegistry;
 
 // ---------------------------------------------------------------------------
 // register_default_providers
@@ -142,19 +143,18 @@ fn temp_auth_service() -> (TempDir, AuthService) {
 }
 
 #[test]
-fn register_default_auth_backends_registers_three_backends() {
-    let (_dir, mut svc) = temp_auth_service();
-    roci_providers::register_default_auth_backends(&mut svc);
+fn default_auth_backends_match_enabled_launch_factories() {
+    let (_dir, mut auth) = temp_auth_service();
+    roci_providers::register_default_auth_backends(&mut auth);
+    let mut registry = ProviderRegistry::new();
+    roci_providers::register_default_providers(&mut registry);
 
-    let statuses = svc.all_statuses();
-    assert_eq!(
-        statuses.len(),
-        3,
-        "expected 3 backends, got {}",
-        statuses.len()
-    );
+    let result = ProviderAuthManager::new(auth, registry, RociConfig::new());
+
+    assert!(result.is_ok());
 }
 
+#[cfg(feature = "github-copilot")]
 #[test]
 fn register_default_auth_backends_includes_github_copilot() {
     let (_dir, mut svc) = temp_auth_service();
@@ -168,6 +168,7 @@ fn register_default_auth_backends_includes_github_copilot() {
     );
 }
 
+#[cfg(feature = "openai")]
 #[test]
 fn register_default_auth_backends_includes_codex() {
     let (_dir, mut svc) = temp_auth_service();
@@ -178,6 +179,7 @@ fn register_default_auth_backends_includes_codex() {
     assert!(names.contains(&"Codex"), "expected Codex in {names:?}");
 }
 
+#[cfg(feature = "anthropic")]
 #[test]
 fn register_default_auth_backends_includes_claude() {
     let (_dir, mut svc) = temp_auth_service();
@@ -188,6 +190,7 @@ fn register_default_auth_backends_includes_claude() {
     assert!(names.contains(&"Claude"), "expected Claude in {names:?}");
 }
 
+#[cfg(feature = "github-copilot")]
 #[tokio::test]
 async fn copilot_alias_resolves_after_registration() {
     let (_dir, mut svc) = temp_auth_service();
@@ -197,6 +200,7 @@ async fn copilot_alias_resolves_after_registration() {
     assert!(result.is_ok(), "copilot alias should resolve to backend");
 }
 
+#[cfg(feature = "anthropic")]
 #[tokio::test]
 async fn claude_alias_resolves_after_registration() {
     let (_dir, mut svc) = temp_auth_service();

@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use roci_core::auth::{
-    AuthBackend, AuthError, AuthPollResult, AuthStep, DeviceCodeSession, Token, TokenStore,
+    AuthBackend, AuthError, AuthPollResult, AuthStep, CredentialFlow, DeviceCodeSession, Token,
+    TokenStore,
 };
 
 use super::claude_code::{ClaudeCodeAuth, PkceSession};
@@ -32,6 +33,14 @@ impl AuthBackend for GitHubCopilotBackend {
 
     fn store_key(&self) -> &str {
         "github-copilot"
+    }
+
+    fn canonical_provider_key(&self) -> &str {
+        "github-copilot"
+    }
+
+    fn oauth_flow(&self) -> CredentialFlow {
+        CredentialFlow::DeviceCode
     }
 
     async fn start_login(&self, store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
@@ -130,6 +139,14 @@ impl AuthBackend for OpenAiCodexBackend {
         "openai-codex"
     }
 
+    fn canonical_provider_key(&self) -> &str {
+        "codex"
+    }
+
+    fn oauth_flow(&self) -> CredentialFlow {
+        CredentialFlow::DeviceCode
+    }
+
     async fn start_login(&self, store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
         let auth = OpenAiCodexAuth::new(store.clone());
         if let Ok(Some(token)) = auth.import_codex_auth_json(None) {
@@ -193,6 +210,14 @@ impl AuthBackend for ClaudeCodeBackend {
 
     fn store_key(&self) -> &str {
         "claude-code"
+    }
+
+    fn canonical_provider_key(&self) -> &str {
+        "anthropic"
+    }
+
+    fn oauth_flow(&self) -> CredentialFlow {
+        CredentialFlow::Pkce
     }
 
     async fn start_login(&self, store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {

@@ -51,6 +51,11 @@ impl ProviderRegistry {
         self.factories.contains_key(provider_key)
     }
 
+    /// Borrow the factory registered for `provider_key`, if any.
+    pub fn factory(&self, provider_key: &str) -> Option<&Arc<dyn ProviderFactory>> {
+        self.factories.get(provider_key)
+    }
+
     /// Check whether the registered factory requires credentials.
     pub fn requires_credentials(&self, provider_key: &str) -> Option<bool> {
         self.factories
