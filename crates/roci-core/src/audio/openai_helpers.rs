@@ -55,25 +55,6 @@ pub(super) fn trim_trailing_slash(url: &str) -> &str {
     url.trim_end_matches('/')
 }
 
-pub(super) fn is_supported_transcription_mime(mime_type: &str) -> bool {
-    matches!(
-        mime_type,
-        "audio/mpeg"
-            | "audio/mp3"
-            | "audio/mp4"
-            | "video/mp4"
-            | "audio/mpga"
-            | "audio/x-m4a"
-            | "audio/wav"
-            | "audio/x-wav"
-            | "audio/wave"
-            | "audio/webm"
-            | "audio/ogg"
-            | "audio/flac"
-            | "audio/x-flac"
-    )
-}
-
 pub(super) fn transcription_extension_for_mime(mime_type: &str) -> Option<&'static str> {
     match mime_type {
         "audio/mpeg" | "audio/mp3" | "audio/mpga" => Some("mp3"),

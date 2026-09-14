@@ -26,7 +26,6 @@ struct RealtimeRuntime {
     task: JoinHandle<()>,
 }
 
-#[derive(Clone)]
 struct RuntimeParams {
     url: String,
     api_key: String,

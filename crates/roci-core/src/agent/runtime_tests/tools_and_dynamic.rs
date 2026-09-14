@@ -507,37 +507,62 @@ async fn subagent_event_never_attaches_to_unrelated_active_parent_turn() {
     }
 }
 
-#[tokio::test]
-async fn set_dynamic_tool_providers_replaces_runtime_registry() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
-    let provider: Arc<dyn DynamicToolProvider> = Arc::new(MockDynamicToolProvider::new(Vec::new()));
-
-    agent
-        .set_dynamic_tool_providers(vec![Arc::clone(&provider)])
-        .await
-        .expect("dynamic providers should be replaced");
-
-    let providers = agent.dynamic_tool_providers.lock().await;
-    assert_eq!(providers.len(), 1);
+fn dynamic_provider_with_tool(name: &str) -> Arc<dyn DynamicToolProvider> {
+    Arc::new(MockDynamicToolProvider::new(vec![DynamicTool::new(
+        name,
+        "dynamic tool",
+        AgentToolParameters::empty(),
+    )
+    .with_safety(
+        ToolSafetyPlan::approval_required(ToolSafetyKind::Other),
+        ToolSafetySummary::default(),
+    )]))
 }
 
 #[tokio::test]
-async fn clear_dynamic_tool_providers_empties_registry() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
-    let provider: Arc<dyn DynamicToolProvider> = Arc::new(MockDynamicToolProvider::new(Vec::new()));
+async fn set_dynamic_tool_providers_replaces_resolved_tools() {
+    let agent = AgentRuntime::new(
+        test_registry(),
+        test_config(),
+        AgentConfig {
+            dynamic_tool_providers: vec![dynamic_provider_with_tool("old")],
+            ..test_agent_config()
+        },
+    );
+    assert_eq!(resolved_tool_names(&agent).await, ["old"]);
 
     agent
-        .set_dynamic_tool_providers(vec![Arc::clone(&provider)])
+        .set_dynamic_tool_providers(vec![dynamic_provider_with_tool("replacement")])
+        .await
+        .expect("dynamic providers should be replaced");
+
+    assert_eq!(resolved_tool_names(&agent).await, ["replacement"]);
+}
+
+#[tokio::test]
+async fn clear_dynamic_tool_providers_removes_only_dynamic_tools() {
+    let agent = AgentRuntime::new(
+        test_registry(),
+        test_config(),
+        AgentConfig {
+            tools: vec![dummy_tool("static")],
+            ..test_agent_config()
+        },
+    );
+    agent
+        .set_dynamic_tool_providers(vec![dynamic_provider_with_tool("dynamic")])
         .await
         .expect("dynamic providers should be set");
+    let mut names = resolved_tool_names(&agent).await;
+    names.sort();
+    assert_eq!(names, ["dynamic", "static"]);
 
     agent
         .clear_dynamic_tool_providers()
         .await
         .expect("dynamic providers should be cleared");
 
-    let providers = agent.dynamic_tool_providers.lock().await;
-    assert!(providers.is_empty());
+    assert_eq!(resolved_tool_names(&agent).await, ["static"]);
 }
 
 #[cfg(feature = "agent")]
@@ -571,7 +596,6 @@ fn test_subagent_config(
     }
 }
 
-#[cfg(feature = "agent")]
 async fn resolved_tool_names(agent: &AgentRuntime) -> Vec<String> {
     agent
         .resolve_tools_for_run()

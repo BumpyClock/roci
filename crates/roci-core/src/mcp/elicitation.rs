@@ -82,11 +82,7 @@ impl MCPClientHandler {
         let (meta, request) = map_mcp_elicitation_request(&handler.server_id, params)?;
         reject_sensitive_elicitation(meta.as_ref(), &request)?;
 
-        let pending = handler
-            .coordinator
-            .create_request(request.clone())
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let pending = handler.coordinator.create_request(request.clone()).await;
 
         let response = pending.wait(request.timeout_ms).await;
         map_ui_elicitation_response(response, &request)

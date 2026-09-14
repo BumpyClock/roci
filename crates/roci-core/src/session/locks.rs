@@ -1,8 +1,10 @@
 #[cfg(feature = "agent")]
 use std::collections::HashSet;
+#[cfg(any(feature = "agent", test))]
 use std::fs;
 #[cfg(feature = "agent")]
 use std::fs::{File, OpenOptions};
+#[cfg(any(feature = "agent", test))]
 use std::path::Path;
 #[cfg(feature = "agent")]
 use std::path::PathBuf;
@@ -11,6 +13,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 #[cfg(feature = "agent")]
 use super::SessionId;
+#[cfg(any(feature = "agent", test))]
 use super::{SessionError, SessionResult};
 
 #[cfg(feature = "agent")]
@@ -166,7 +169,7 @@ pub(crate) fn validate_session_directory(root: &Path, id: &SessionId) -> Session
     Ok(canonical)
 }
 
-#[cfg_attr(not(feature = "agent"), allow(dead_code))]
+#[cfg(any(feature = "agent", test))]
 pub(crate) fn tighten_file(path: &Path) -> SessionResult<()> {
     #[cfg(unix)]
     {
@@ -238,7 +241,6 @@ fn ensure_lock_directory(root: &Path) -> SessionResult<()> {
     tighten_directory(&path)
 }
 
-#[cfg(feature = "agent")]
 #[cfg(feature = "agent")]
 pub(crate) fn tighten_directory(path: &Path) -> SessionResult<()> {
     #[cfg(unix)]

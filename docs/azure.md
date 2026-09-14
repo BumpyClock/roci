@@ -80,7 +80,6 @@ async fn main() -> anyhow::Result<()> {
         &provider,
         messages,
         GenerationSettings::default(),
-        &[],
     )
     .await?;
 

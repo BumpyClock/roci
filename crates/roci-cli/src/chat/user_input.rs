@@ -583,10 +583,7 @@ mod tests {
     async fn prompt_handler_submits_response_for_active_request() {
         let coordinator = Arc::new(HumanInteractionCoordinator::new());
         let request = test_request();
-        let pending = coordinator
-            .create_user_input_request(request.clone())
-            .await
-            .unwrap();
+        let pending = coordinator.create_user_input_request(request.clone()).await;
         let join_handle = spawn_prompt_handler(
             request.clone(),
             coordinator.clone(),
@@ -615,10 +612,7 @@ mod tests {
     async fn prompt_handler_ignores_late_response_after_timeout() {
         let coordinator = Arc::new(HumanInteractionCoordinator::new());
         let request = test_request();
-        let pending = coordinator
-            .create_user_input_request(request.clone())
-            .await
-            .unwrap();
+        let pending = coordinator.create_user_input_request(request.clone()).await;
         let release_flag = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
@@ -660,10 +654,7 @@ mod tests {
     async fn prompt_handler_submits_interactive_unavailable_error() {
         let coordinator = Arc::new(HumanInteractionCoordinator::new());
         let request = test_request();
-        let pending = coordinator
-            .create_user_input_request(request.clone())
-            .await
-            .unwrap();
+        let pending = coordinator.create_user_input_request(request.clone()).await;
         let join_handle = spawn_prompt_handler(
             request.clone(),
             coordinator.clone(),

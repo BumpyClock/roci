@@ -432,12 +432,15 @@ mod tests {
             cut_index: 3,
         };
 
-        let span = CompactionSpan::from_prepared(&prepared, estimate_message_tokens);
+        let span = CompactionSpan::from_prepared(&prepared, |_| 7);
 
         assert_eq!(span.start_index, 0);
         assert_eq!(span.end_index, 2);
         assert_eq!(span.entries_compacted, 2);
-        assert!(span.tokens_before > 0);
+        assert_eq!(
+            span.tokens_before, 14,
+            "only the two summarized messages count"
+        );
     }
 
     #[test]
@@ -519,29 +522,6 @@ mod tests {
             }
             _ => panic!("expected Summary variant"),
         }
-    }
-
-    // -- SummaryArtifact ------------------------------------------------------
-
-    #[test]
-    fn summary_artifact_holds_text_and_span() {
-        let artifact = SummaryArtifact {
-            text: "Implemented auth module".to_string(),
-            file_operations: FileOperationSnapshot {
-                read_files: BTreeSet::from(["src/auth.rs".to_string()]),
-                modified_files: BTreeSet::from(["src/auth.rs".to_string()]),
-            },
-            span: CompactionSpan {
-                start_index: 0,
-                end_index: 5,
-                entries_compacted: 5,
-                tokens_before: 2_000,
-            },
-        };
-
-        assert_eq!(artifact.text, "Implemented auth module");
-        assert_eq!(artifact.span.entries_compacted, 5);
-        assert!(!artifact.file_operations.is_empty());
     }
 
     // -- CompactionResult (strategy-typed) ------------------------------------

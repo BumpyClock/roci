@@ -46,7 +46,7 @@ pub async fn generate_object<T: DeserializeOwned>(
         messages.insert(0, ModelMessage::system(schema_instruction));
     }
 
-    let result = super::text::generate_text(provider, messages, settings, &[]).await?;
+    let result = super::text::generate_text(provider, messages, settings).await?;
 
     // Parse the JSON from the response
     let raw_text = result.text.trim().to_string();
@@ -66,14 +66,8 @@ pub async fn generate_object<T: DeserializeOwned>(
 /// Strip markdown code fences from JSON response.
 fn strip_code_fences(text: &str) -> String {
     let trimmed = text.trim();
-    if trimmed.starts_with("```") {
-        let without_opening = if let Some(rest) = trimmed.strip_prefix("```json") {
-            rest
-        } else if let Some(rest) = trimmed.strip_prefix("```") {
-            rest
-        } else {
-            trimmed
-        };
+    if let Some(without_fence) = trimmed.strip_prefix("```") {
+        let without_opening = without_fence.strip_prefix("json").unwrap_or(without_fence);
         if let Some(stripped) = without_opening.strip_suffix("```") {
             return stripped.trim().to_string();
         }

@@ -152,10 +152,7 @@ impl OpenAiProvider {
         }
     }
 
-    #[cfg_attr(
-        not(any(feature = "lmstudio", feature = "ollama", test)),
-        allow(dead_code)
-    )]
+    #[cfg(any(feature = "lmstudio", feature = "ollama", test))]
     pub(crate) fn new_without_auth(model: OpenAiModel, base_url: Option<String>) -> Self {
         Self::new_full_with_auth_required(
             model,
@@ -900,8 +897,10 @@ mod tests {
         assert_eq!(deltas[2].reasoning.as_deref(), Some("detail"));
         assert_eq!(deltas[3].event_type, StreamEventType::Reasoning);
         assert_eq!(deltas[3].reasoning.as_deref(), Some(" first"));
+        assert!(deltas[..4].iter().all(|delta| delta.text.is_empty()));
         assert_eq!(deltas[4].event_type, StreamEventType::TextDelta);
         assert_eq!(deltas[4].text, "answer");
+        assert!(deltas[4].reasoning.is_none());
         assert_eq!(deltas[5].event_type, StreamEventType::Done);
         assert_eq!(deltas[5].finish_reason, Some(FinishReason::Stop));
         assert_eq!(deltas[6].event_type, StreamEventType::Done);

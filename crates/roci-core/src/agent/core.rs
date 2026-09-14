@@ -131,7 +131,6 @@ impl Agent {
             provider.as_ref(),
             messages,
             self.settings.clone(),
-            &self.tools,
         )
         .await?;
 
@@ -178,11 +177,10 @@ impl Agent {
         )?;
         let provider = Arc::from(provider);
 
-        crate::generation::stream::stream_text_with_tools(
+        crate::generation::stream::stream_text(
             provider,
             messages,
             self.settings.clone(),
-            &self.tools,
             Vec::new(),
         )
         .await

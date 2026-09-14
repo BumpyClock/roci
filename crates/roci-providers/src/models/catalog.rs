@@ -1,11 +1,13 @@
 //! Static model catalogs for built-in providers.
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use std::collections::BTreeMap;
 
-use roci_core::models::{
-    ModelCapabilities, ModelCatalog, ModelCatalogSource, ModelInfo, ModelPolicy,
-};
+use roci_core::models::ModelCatalog;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
+use roci_core::models::{ModelCapabilities, ModelCatalogSource, ModelInfo, ModelPolicy};
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 fn model_info(
     provider_key: &str,
     model_id: &str,
@@ -270,7 +272,7 @@ pub fn empty_catalog(_provider_key: &str) -> ModelCatalog {
     ModelCatalog::default()
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "openai", feature = "google")))]
 mod tests {
     use super::*;
 

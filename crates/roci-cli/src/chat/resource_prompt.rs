@@ -154,11 +154,10 @@ mod tests {
         let assembled = build_resource_system_prompt(Some("cli system".to_string()), &resources)
             .expect("assembled system prompt should exist");
 
-        assert!(assembled.starts_with("cli system"));
-        assert!(assembled.contains("append instructions"));
-        assert_eq!(assembled.matches("## Project Context").count(), 1);
-        assert!(assembled.contains("agent context"));
-        assert!(assembled.contains("claude context"));
+        assert_eq!(
+            assembled,
+            "cli system\n\nappend instructions\n\n## Project Context\n\n### /repo/AGENTS.md\nagent context\n\n### /repo/CLAUDE.md\nclaude context"
+        );
     }
 
     #[test]

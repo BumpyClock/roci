@@ -4,7 +4,6 @@ use tracing::debug;
 
 use crate::error::RociError;
 use crate::provider::{ModelProvider, ProviderRequest};
-use crate::tools::tool::Tool;
 use crate::types::*;
 
 /// Generate text with no tool execution.
@@ -12,14 +11,7 @@ pub async fn generate_text(
     provider: &dyn ModelProvider,
     messages: Vec<ModelMessage>,
     settings: GenerationSettings,
-    tools: &[std::sync::Arc<dyn Tool>],
 ) -> Result<GenerateTextResult, RociError> {
-    if !tools.is_empty() {
-        return Err(RociError::UnsupportedOperation(
-            "generation::generate_text does not execute tools; use Agent, AgentRuntime, or agent_loop::LoopRunner for tool-capable runs".to_string(),
-        ));
-    }
-
     let request = ProviderRequest {
         messages: messages.clone(),
         settings: settings.clone(),
@@ -35,16 +27,9 @@ pub async fn generate_text(
 
     debug!("generate_text: calling provider");
     let response = provider.generate_text(&request).await?;
-    let step = GenerationStep {
-        text: response.text.clone(),
-        tool_calls: response.tool_calls.clone(),
-        tool_results: Vec::new(),
-        usage: response.usage.clone(),
-        finish_reason: response.finish_reason,
-    };
     Ok(GenerateTextResult {
         text: response.text,
-        steps: vec![step],
+        tool_calls: response.tool_calls,
         messages,
         usage: response.usage,
         finish_reason: response.finish_reason,
@@ -53,15 +38,12 @@ pub async fn generate_text(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use async_trait::async_trait;
     use futures::stream::BoxStream;
 
     use super::*;
     use crate::models::ModelCapabilities;
     use crate::provider::ProviderResponse;
-    use crate::tools::{AgentTool, AgentToolParameters};
 
     struct StubProvider;
 
@@ -83,9 +65,35 @@ mod tests {
 
         async fn generate_text(
             &self,
-            _request: &ProviderRequest,
+            request: &ProviderRequest,
         ) -> Result<ProviderResponse, RociError> {
-            panic!("provider should not be called when tools are supplied")
+            assert_eq!(request.messages.len(), 1);
+            assert_eq!(request.messages[0].text(), "hello");
+            assert_eq!(request.settings.temperature, Some(0.25));
+            assert_eq!(request.settings.max_tokens, Some(80));
+            assert!(matches!(
+                request.response_format,
+                Some(ResponseFormat::JsonObject)
+            ));
+            assert!(request.tools.is_none());
+            Ok(ProviderResponse {
+                text: r#"{"answer":42}"#.into(),
+                usage: Usage {
+                    input_tokens: 3,
+                    output_tokens: 5,
+                    total_tokens: 8,
+                    ..Usage::default()
+                },
+                tool_calls: vec![AgentToolCall {
+                    id: "unexpected-call".into(),
+                    name: "lookup".into(),
+                    arguments: serde_json::json!({"item": "answer"}),
+                    called_as: None,
+                    recipient: None,
+                }],
+                finish_reason: Some(FinishReason::Stop),
+                thinking: Vec::new(),
+            })
         }
 
         async fn stream_text(
@@ -97,24 +105,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_text_rejects_tools() {
-        let tool = Arc::new(AgentTool::new(
-            "lookup",
-            "lookup",
-            AgentToolParameters::empty(),
-            |_args, _ctx| async { Ok(serde_json::json!({ "ok": true })) },
-        ));
-        let err = generate_text(
+    async fn generate_text_preserves_request_and_response() {
+        let result = generate_text(
             &StubProvider,
             vec![ModelMessage::user("hello")],
-            GenerationSettings::default(),
-            &[tool],
+            GenerationSettings {
+                temperature: Some(0.25),
+                max_tokens: Some(80),
+                response_format: Some(ResponseFormat::JsonObject),
+                ..GenerationSettings::default()
+            },
         )
         .await
-        .expect_err("tools should be rejected");
+        .unwrap();
 
-        assert!(
-            matches!(err, RociError::UnsupportedOperation(message) if message.contains("AgentRuntime"))
+        assert_eq!(result.text, r#"{"answer":42}"#);
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].text(), "hello");
+        assert_eq!(
+            result.usage,
+            Usage {
+                input_tokens: 3,
+                output_tokens: 5,
+                total_tokens: 8,
+                ..Usage::default()
+            }
+        );
+        assert_eq!(result.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "unexpected-call");
+        assert_eq!(result.tool_calls[0].name, "lookup");
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({"item": "answer"})
         );
     }
 }

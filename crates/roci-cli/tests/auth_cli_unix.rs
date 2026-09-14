@@ -1,4 +1,4 @@
-//! Two-process Unix auth smoke: configure then status share `~/.roci/auth.json`.
+//! Cross-process Unix auth smoke: configure and status share `~/.roci/auth.json`.
 //!
 //! Uses a temporary absolute `HOME` and scrubs external credential env vars so
 //! the real home/keychain and ambient env cannot satisfy the flow.
@@ -202,7 +202,28 @@ fn configure_then_status_share_auth_json_under_temp_home() {
         Some("Signed in")
     );
 
-    // Second process must not have rewritten modes or dropped the record.
+    // Exercise both output formats and the providers alias with a stored secret.
+    // Unit fixtures contain only status DTOs, so they cannot establish redaction.
+    for args in [vec!["auth", "status"], vec!["auth", "providers", "--json"]] {
+        let output = run_auth(&home_path, &args, None);
+        let stdout = utf8(&output.stdout);
+        let stderr = utf8(&output.stderr);
+        assert_no_secret("auth stdout", &stdout);
+        assert_no_secret("auth stderr", &stderr);
+        assert!(
+            output.status.success(),
+            "{args:?} failed: status={:?} stderr={stderr}",
+            output.status.code()
+        );
+        if args.contains(&"--json") {
+            assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), statuses);
+        } else {
+            assert!(stdout.contains(PROVIDER));
+            assert!(stdout.contains("Signed in [launch: available]"));
+        }
+    }
+
+    // Status commands must not have rewritten modes or dropped the record.
     assert_eq!(mode(&roci_dir), 0o700, ".roci mode after status");
     assert_eq!(mode(&auth_json), 0o600, "auth.json mode after status");
     assert_eq!(mode(&auth_lock), 0o600, "lock mode after status");

@@ -227,7 +227,6 @@ async fn recover_export_session(
             .into());
         }
     };
-    let source = source.clone();
     let source_label = match &source {
         SessionRecoverySource::SessionId(id) => format!("session id {id}"),
         SessionRecoverySource::SessionDir { path, source_id } => match source_id {

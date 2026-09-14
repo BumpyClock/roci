@@ -49,16 +49,16 @@ async fn follow_up_queues_message() {
 }
 
 #[tokio::test]
-async fn abort_returns_false_when_idle() {
-    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
-    assert!(!agent.abort().await);
-}
-
-#[tokio::test]
 async fn reset_clears_all_state() {
     let agent = runtime_with_streaming_model("stub", "state-lifecycle");
 
-    // Seed some queue data.
+    let result = agent.prompt("history to clear").await.unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(agent.messages().await.len(), 2);
+    assert_eq!(agent.snapshot().await.turn_index, 1);
+    assert_eq!(agent.session_usage().await.total_tokens, 11);
+
+    // Seed queues after the run so reset must clear both pending and completed state.
     agent.steer("msg1").await.expect("steer should queue");
     agent
         .follow_up("msg2")
@@ -71,6 +71,8 @@ async fn reset_clears_all_state() {
     assert!(agent.steering_queue.lock().await.is_empty());
     assert!(agent.follow_up_queue.lock().await.is_empty());
     assert!(agent.messages().await.is_empty());
+    assert_eq!(agent.snapshot().await.turn_index, 0);
+    assert_eq!(agent.session_usage().await, Usage::default());
 }
 
 #[tokio::test]
@@ -107,6 +109,38 @@ async fn set_model_replaces_runtime_model_when_idle() {
 
     agent.set_model(model.clone()).await.unwrap();
     assert_eq!(agent.current_candidates().await, vec![model]);
+}
+
+#[tokio::test]
+async fn candidate_replacement_validates_before_changing_runtime_selection() {
+    let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
+    let original = agent.current_candidates().await;
+    let first: LanguageModel = "stub:first".parse().unwrap();
+    let fallback: LanguageModel = "stub:fallback".parse().unwrap();
+
+    let previous = agent
+        .set_model_candidates(vec![first.clone(), fallback.clone(), first.clone()])
+        .await
+        .unwrap();
+    assert_eq!(previous, original);
+    assert_eq!(agent.current_model().await, first);
+    assert_eq!(
+        agent.current_candidates().await,
+        [first.clone(), fallback.clone()]
+    );
+
+    assert!(matches!(
+        agent.set_model_candidates(Vec::new()).await,
+        Err(RociError::Configuration(_))
+    ));
+    assert_eq!(agent.current_candidates().await, [first.clone(), fallback]);
+
+    *agent.state.lock().await = AgentState::Running;
+    assert!(matches!(
+        agent.set_model_candidates(original).await,
+        Err(RociError::InvalidState(_))
+    ));
+    assert_eq!(agent.current_model().await, first);
 }
 
 #[tokio::test]

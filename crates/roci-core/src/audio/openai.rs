@@ -8,9 +8,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::openai_helpers::{
-    build_transcription_multipart, content_type_matches_expected_audio,
-    is_supported_transcription_mime, normalize_mime_type, transcription_extension_for_mime,
-    trim_trailing_slash, tts_format_name,
+    build_transcription_multipart, content_type_matches_expected_audio, normalize_mime_type,
+    transcription_extension_for_mime, trim_trailing_slash, tts_format_name,
 };
 use super::transcription::AudioProvider;
 use super::tts::SpeechProvider;
@@ -76,7 +75,7 @@ impl OpenAiWhisperTranscriptionProvider {
         audio: &[u8],
         mime_type: &str,
         language: Option<&str>,
-    ) -> Result<String, RociError> {
+    ) -> Result<(String, &'static str), RociError> {
         if self.api_key.trim().is_empty() {
             return Err(RociError::Authentication(
                 "Missing OpenAI API key for audio transcription".to_string(),
@@ -95,11 +94,11 @@ impl OpenAiWhisperTranscriptionProvider {
 
         let normalized_mime = normalize_mime_type(mime_type)
             .ok_or_else(|| RociError::InvalidArgument("MIME type cannot be empty".to_string()))?;
-        if !is_supported_transcription_mime(normalized_mime) {
-            return Err(RociError::InvalidArgument(format!(
+        let extension = transcription_extension_for_mime(normalized_mime).ok_or_else(|| {
+            RociError::InvalidArgument(format!(
                 "Unsupported transcription MIME type: {normalized_mime}"
-            )));
-        }
+            ))
+        })?;
 
         if let Some(lang) = language {
             if lang.trim().is_empty() {
@@ -109,19 +108,16 @@ impl OpenAiWhisperTranscriptionProvider {
             }
         }
 
-        Ok(normalized_mime.to_string())
+        Ok((normalized_mime.to_string(), extension))
     }
 
     async fn transcribe_once(
         &self,
         audio: &[u8],
         mime_type: &str,
+        extension: &str,
         language: Option<&str>,
     ) -> Result<TranscriptionResult, RociError> {
-        let extension = transcription_extension_for_mime(mime_type).ok_or_else(|| {
-            RociError::InvalidArgument(format!("Unsupported transcription MIME type: {mime_type}"))
-        })?;
-
         let boundary = format!("roci-{}", Uuid::new_v4().simple());
         let multipart_body = build_transcription_multipart(
             &boundary,
@@ -170,10 +166,10 @@ impl AudioProvider for OpenAiWhisperTranscriptionProvider {
         mime_type: &str,
         language: Option<&str>,
     ) -> Result<TranscriptionResult, RociError> {
-        let normalized_mime = self.validate_inputs(audio, mime_type, language)?;
+        let (normalized_mime, extension) = self.validate_inputs(audio, mime_type, language)?;
 
         self.retry_policy
-            .execute(|| self.transcribe_once(audio, &normalized_mime, language))
+            .execute(|| self.transcribe_once(audio, &normalized_mime, extension, language))
             .await
     }
 }

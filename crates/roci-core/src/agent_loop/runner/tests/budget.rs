@@ -3,7 +3,7 @@ use crate::agent_loop::RunStatus;
 use crate::context::{estimate_message_tokens, ContextBudget};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{timeout, Duration};
 
 use support::{test_model, test_runner, ProviderScenario};
 
@@ -24,6 +24,7 @@ async fn no_budget_configured_preserves_existing_behavior() {
     let usage = result.usage_delta.expect("usage_delta should be present");
     assert_eq!(usage.input_tokens, 50);
     assert_eq!(usage.output_tokens, 10);
+    assert_eq!(usage.total_tokens, 60);
 }
 
 #[tokio::test]
@@ -148,28 +149,6 @@ async fn generous_budget_allows_request() {
 }
 
 #[tokio::test]
-async fn usage_delta_accumulates_across_iterations() {
-    // When no budget is set, usage delta should still be tracked from stream.
-    let (runner, _requests) = test_runner(ProviderScenario::TextOnlyWithUsage);
-    let request = RunRequest::new(test_model(), vec![ModelMessage::user("hi")]).with_retry_backoff(
-        RetryBackoffPolicy {
-            max_attempts: 1,
-            ..Default::default()
-        },
-    );
-    let handle = runner.start(request).await.unwrap();
-    let result = handle.wait().await;
-    assert_eq!(result.status, RunStatus::Completed);
-    let usage = result.usage_delta.expect("usage_delta should be present");
-    // TextOnlyWithUsage reports input=50, output=10
-    assert_eq!(usage.input_tokens, 50);
-    assert_eq!(usage.output_tokens, 10);
-    assert_eq!(usage.total_tokens, 60);
-}
-
-// ---- New tests for follow-up fixes ----
-
-#[tokio::test]
 async fn mid_stream_failure_still_captures_usage() {
     // TextWithUsageThenStreamError emits partial text with usage (input=30,
     // output=5) then a stream error. The run should fail but usage_delta
@@ -277,7 +256,7 @@ async fn stream_error_before_any_delta_does_not_charge_output_tokens() {
 
 #[tokio::test]
 async fn cancel_before_any_delta_does_not_charge_output_tokens() {
-    let (runner, _requests) = test_runner(ProviderScenario::IdleBeforeAnyDelta);
+    let (runner, requests) = test_runner(ProviderScenario::IdleBeforeAnyDelta);
     let mut handle = runner
         .start(RunRequest::new(
             test_model(),
@@ -286,7 +265,13 @@ async fn cancel_before_any_delta_does_not_charge_output_tokens() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(10)).await;
+    timeout(Duration::from_secs(1), async {
+        while requests.lock().expect("request lock").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider stream should start before cancellation");
     assert!(handle.abort(), "abort should be accepted");
     let result = timeout(Duration::from_secs(2), handle.wait())
         .await

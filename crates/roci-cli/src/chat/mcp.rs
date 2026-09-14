@@ -172,15 +172,13 @@ fn redact_mcp_value(key: &str, raw_value: &str) -> String {
 
 fn redact_stdio_args_value(raw_value: &str, redact_first_value: bool) -> (String, bool) {
     let mut redact_current_value = redact_first_value;
-    let mut redact_next_value = false;
     let mut values = Vec::new();
     for value in raw_value.split('|') {
         let (redacted_value, redact_next) = redact_stdio_arg_value(value, redact_current_value);
         values.push(redacted_value);
         redact_current_value = redact_next;
-        redact_next_value = redact_next;
     }
-    (values.join("|"), redact_next_value)
+    (values.join("|"), redact_current_value)
 }
 
 fn redact_stdio_arg_value(raw_value: &str, redact_value: bool) -> (String, bool) {

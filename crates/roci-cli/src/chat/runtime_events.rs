@@ -345,12 +345,6 @@ fn prompt_for_approval(request: ApprovalRequest) -> ApprovalDecision {
             truncate_preview(&request.payload.to_string(), 400)
         );
     }
-    if let Some(update) = request.suggested_policy_change.as_ref() {
-        eprintln!(
-            "  suggested policy: rule={:?} argv={:?}",
-            update.rule_id, update.argv
-        );
-    }
 
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         eprintln!("  declining: interactive terminal unavailable");
@@ -1002,7 +996,6 @@ mod tests {
             allow_session: true,
             reason: Some("Run shell".to_string()),
             payload: serde_json::json!({ "tool_name": "shell" }),
-            suggested_policy_change: None,
         }
     }
 
@@ -1256,10 +1249,7 @@ mod tests {
     async fn raw_agent_sink_forwards_user_input_into_terminal_actor() {
         let coordinator = Arc::new(HumanInteractionCoordinator::new());
         let request = user_input_request();
-        let pending = coordinator
-            .create_user_input_request(request.clone())
-            .await
-            .unwrap();
+        let pending = coordinator.create_user_input_request(request.clone()).await;
         let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let renderer = RuntimeEventRenderer::spawn_with_prompt_fns(
             coordinator.clone(),

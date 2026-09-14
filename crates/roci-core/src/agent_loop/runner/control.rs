@@ -318,7 +318,6 @@ pub(super) async fn resolve_approval(
             "filesystem": context.filesystem,
             "evaluation": sanitized_evaluation_for_payload(&evaluation),
         }),
-        suggested_policy_change: None,
     };
     emitter.emit(
         RunEventStream::Approval,
@@ -418,7 +417,7 @@ fn sanitized_evaluation_for_payload(evaluation: &ApprovalEvaluation) -> Approval
     sanitized.suggested_grant = evaluation
         .suggested_grant
         .as_ref()
-        .and_then(sanitized_grant_for_payload);
+        .map(sanitized_grant_for_payload);
     sanitized
 }
 
@@ -436,9 +435,9 @@ fn sanitized_command_for_payload(
     })
 }
 
-fn sanitized_grant_for_payload(grant: &ApprovalGrant) -> Option<ApprovalGrant> {
+fn sanitized_grant_for_payload(grant: &ApprovalGrant) -> ApprovalGrant {
     match grant {
-        ApprovalGrant::Exact { key } => Some(ApprovalGrant::Exact {
+        ApprovalGrant::Exact { key } => ApprovalGrant::Exact {
             key: ApprovalGrantKey {
                 permission_kind: key.permission_kind,
                 tool_name: key.tool_name.clone(),
@@ -446,8 +445,7 @@ fn sanitized_grant_for_payload(grant: &ApprovalGrant) -> Option<ApprovalGrant> {
                 arguments_digest: key.arguments_digest.clone(),
                 tool_provided_key: None,
             },
-        }),
-        ApprovalGrant::Rule { .. } => None,
+        },
     }
 }
 
@@ -477,19 +475,7 @@ async fn resolve_tool_permission(
         timeout_ms: None,
         created_at: chrono::Utc::now(),
     };
-    let pending = match coordinator
-        .create_tool_permission_request(request.clone())
-        .await
-    {
-        Ok(pending) => pending,
-        Err(error) => {
-            agent_emitter.emit(AgentEvent::HumanInteractionCanceled {
-                request_id,
-                reason: Some(error.to_string()),
-            });
-            return ApprovalDecision::Decline;
-        }
-    };
+    let pending = coordinator.create_request(request.clone()).await;
     agent_emitter.emit(AgentEvent::HumanInteractionRequested { request });
 
     match pending.wait_tool_permission(None).await {
@@ -549,7 +535,6 @@ pub(super) async fn resolve_iteration_limit_approval(
             "extension": extension,
             "attempt": attempt,
         }),
-        suggested_policy_change: None,
     };
     emitter.emit(
         RunEventStream::Approval,

@@ -118,7 +118,6 @@ fn semantic_payloads_serialize_with_stable_tags() {
             allow_session: true,
             reason: None,
             payload: serde_json::json!({}),
-            suggested_policy_change: None,
         },
         thread_id,
         turn_id,

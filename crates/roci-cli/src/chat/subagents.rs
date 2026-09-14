@@ -129,19 +129,17 @@ fn format_profile_summary(profile: &SubagentProfileSummary) -> String {
         format!(
             "  {} ({display}){default_marker} {models} - {}",
             profile.name,
-            truncate(hint, 96)
+            truncate_profile_hint(hint)
         )
     }
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
+fn truncate_profile_hint(value: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    if value.chars().count() <= MAX_CHARS {
         return value.to_string();
     }
-    if max_chars <= 3 {
-        return value.chars().take(max_chars).collect();
-    }
-    let mut truncated = value.chars().take(max_chars - 3).collect::<String>();
+    let mut truncated = value.chars().take(MAX_CHARS - 3).collect::<String>();
     truncated.push_str("...");
     truncated
 }
@@ -228,12 +226,25 @@ display_name = "Project Custom"
     }
 
     #[test]
-    fn truncate_respects_requested_width() {
-        assert_eq!(truncate("abcdef", 0), "");
-        assert_eq!(truncate("abcdef", 2), "ab");
-        assert_eq!(truncate("abcdef", 3), "abc");
-        assert_eq!(truncate("abcdef", 4), "a...");
-        assert_eq!(truncate("abcdef", 6), "abcdef");
+    fn profile_list_bounds_unicode_hints_to_96_characters() {
+        let registry = SubagentProfileRegistry::with_builtins();
+        let mut profile = registry.profile_summaries().unwrap().remove(0);
+        profile.name = "worker".into();
+        profile.display_name = None;
+        profile.models.clear();
+        profile.default = false;
+
+        for (description, expected) in [
+            ("short hint".to_string(), "short hint".to_string()),
+            ("é".repeat(96), "é".repeat(96)),
+            ("é".repeat(97), format!("{}...", "é".repeat(93))),
+        ] {
+            profile.description = Some(description);
+            assert_eq!(
+                format_profile_summary(&profile),
+                format!("  worker (worker) models=- - {expected}")
+            );
+        }
     }
 
     #[test]

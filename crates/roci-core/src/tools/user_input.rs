@@ -282,7 +282,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_serialization_roundtrip() {
+    fn request_wire_shape_and_roundtrip() {
         let request = UserInputRequest {
             request_id: Uuid::nil(),
             tool_call_id: "call_123".to_string(),
@@ -307,6 +307,25 @@ mod tests {
         };
 
         let json = serde_json::to_string(&request).expect("serialize");
+        let wire: serde_json::Value = serde_json::from_str(&json).expect("wire JSON");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "request_id": "00000000-0000-0000-0000-000000000000",
+                "tool_call_id": "call_123",
+                "prompt": {
+                    "kind": "choice",
+                    "id": "unit",
+                    "question": "C or F?",
+                    "choices": [
+                        {"id": "c", "label": "Celsius", "description": null},
+                        {"id": "f", "label": "Fahrenheit", "description": "Imperial temperature unit"}
+                    ],
+                    "default": "c"
+                },
+                "timeout_ms": 30000
+            })
+        );
         let decoded: UserInputRequest = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(decoded, request);
@@ -314,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn form_response_serialization_roundtrip() {
+    fn form_response_wire_shape_and_roundtrip() {
         let mut values = BTreeMap::new();
         values.insert(
             "name".to_string(),
@@ -328,6 +347,20 @@ mod tests {
         };
 
         let json = serde_json::to_string(&response).expect("serialize");
+        let wire: serde_json::Value = serde_json::from_str(&json).expect("wire JSON");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "request_id": "00000000-0000-0000-0000-000000000000",
+                "result": {
+                    "kind": "form",
+                    "values": {
+                        "name": {"kind": "text", "value": "Alice"},
+                        "enabled": {"kind": "boolean", "value": true}
+                    }
+                }
+            })
+        );
         let decoded: UserInputResponse = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(decoded, response);
@@ -341,32 +374,52 @@ mod tests {
         };
 
         let json = serde_json::to_string(&response).expect("serialize");
+        let wire: serde_json::Value = serde_json::from_str(&json).expect("wire JSON");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "request_id": "00000000-0000-0000-0000-000000000000",
+                "result": {"kind": "canceled"}
+            })
+        );
         let decoded: UserInputResponse = serde_json::from_str(&json).expect("deserialize");
 
-        assert!(matches!(decoded.result, UserInputResult::Canceled));
+        assert_eq!(decoded, response);
     }
 
     #[test]
     fn error_display() {
-        let request_id = Uuid::nil();
+        let request_id = Uuid::new_v4();
 
         let err = UserInputError::UnknownRequest { request_id };
-        assert!(err.to_string().contains("unknown"));
+        assert_eq!(
+            err.to_string(),
+            format!("unknown user input request: {request_id}")
+        );
 
         let err = UserInputError::Timeout { request_id };
-        assert!(err.to_string().contains("timed out"));
+        assert_eq!(
+            err.to_string(),
+            format!("user input request timed out: {request_id}")
+        );
 
         let err = UserInputError::Canceled { request_id };
-        assert!(err.to_string().contains("canceled"));
+        assert_eq!(
+            err.to_string(),
+            format!("user input request canceled: {request_id}")
+        );
 
         let err = UserInputError::NoCallback;
-        assert!(err.to_string().contains("callback"));
+        assert_eq!(err.to_string(), "no user input callback configured");
     }
 
     #[test]
     fn unknown_request_error_conversion() {
-        let unknown = UnknownUserInputRequest(Uuid::nil());
+        let request_id = Uuid::new_v4();
+        let unknown = UnknownUserInputRequest(request_id);
         let err: UserInputError = unknown.into();
-        assert!(matches!(err, UserInputError::UnknownRequest { .. }));
+        assert!(
+            matches!(err, UserInputError::UnknownRequest { request_id: actual } if actual == request_id)
+        );
     }
 }

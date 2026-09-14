@@ -331,8 +331,7 @@ impl RecoveryState {
 
 /// Lifecycle events for overflow recovery episodes.
 ///
-/// Emitted by the runtime at each stage of a recovery attempt. The types
-/// are defined here to establish the contract before runtime wiring.
+/// Emitted by the runtime at each stage of a recovery attempt.
 ///
 /// `EpisodeExhausted` accepts only [`AbortReason`] — non-terminal reasons
 /// are unrepresentable at the type level.
@@ -871,25 +870,6 @@ mod tests {
         assert_eq!(d2.action(), RecoveryAction::Abort);
         assert_eq!(d2.reason(), RecoveryReason::CompactionProgressInsufficient);
         assert_eq!(state.total_attempts(), 1);
-    }
-
-    // -- RecoveryEvent constructability -------------------------------------
-
-    #[test]
-    fn recovery_events_are_constructable_with_correct_types() {
-        let _started = RecoveryEvent::EpisodeStarted {
-            overflow_kind: OverflowKind::InputOverflow,
-        };
-        let _decided = RecoveryEvent::ActionDecided {
-            decision: RecoveryDecision::from_reason(RecoveryReason::CompactionRequired),
-            attempt_index: 0,
-        };
-        let _resolved = RecoveryEvent::EpisodeResolved { total_attempts: 1 };
-        // EpisodeExhausted only accepts AbortReason — not RecoveryReason.
-        let _exhausted = RecoveryEvent::EpisodeExhausted {
-            reason: AbortReason::CompactionAttemptsExhausted,
-            total_attempts: 2,
-        };
     }
 
     #[test]

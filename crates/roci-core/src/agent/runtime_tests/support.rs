@@ -1,5 +1,4 @@
 use super::*;
-use crate::agent_loop::runner::RetryBackoffPolicy;
 use crate::models::ModelCapabilities;
 use crate::provider::{ModelProvider, ProviderFactory, ProviderResponse};
 use crate::tools::arguments::ToolArguments;
@@ -114,45 +113,7 @@ pub(super) fn test_agent_config() -> AgentConfig {
     let model: LanguageModel = "openai:gpt-4o".parse().unwrap();
     AgentConfig {
         candidates: vec![model],
-        system_prompt: None,
-        tools: Vec::new(),
-        tool_visibility_policy: Default::default(),
-        dynamic_tool_providers: Vec::new(),
-        settings: GenerationSettings::default(),
-        transform_context: None,
-        convert_to_llm: None,
-        before_agent_start: None,
-        event_sink: None,
-        approval_policy: Default::default(),
-        approval_handler: None,
-        session_id: None,
-        session: None,
-        workspace_root: None,
-        sandbox_provider: None,
-        steering_mode: QueueDrainMode::All,
-        follow_up_mode: QueueDrainMode::All,
-        transport: None,
-        max_retry_delay_ms: None,
-        retry_backoff: RetryBackoffPolicy::default(),
-        retry_mode: Default::default(),
-        model_health: Arc::new(crate::models::SharedModelHealthRegistry::default()),
-        api_key_override: None,
-        provider_headers: reqwest::header::HeaderMap::new(),
-        provider_metadata: HashMap::new(),
-        provider_payload_callback: None,
-        get_api_key: None,
-        compaction: CompactionSettings::default(),
-        session_before_compact: None,
-        session_before_tree: None,
-        pre_tool_use: None,
-        post_tool_use: None,
-        user_input_timeout_ms: None,
-        context_budget: None,
-        chat: Default::default(),
-        #[cfg(feature = "agent")]
-        subagents: None,
-        #[cfg(feature = "agent")]
-        human_interaction_coordinator: None,
+        ..AgentConfig::default()
     }
 }
 

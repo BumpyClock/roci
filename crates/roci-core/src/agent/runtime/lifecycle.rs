@@ -136,23 +136,14 @@ impl AgentRuntime {
             Ok(_) => {}
         }
 
-        loop {
-            match self.transition_to_running() {
-                Ok(()) => break,
-                Err(RociError::InvalidState(_)) => {
-                    if matches!(
-                        self.chat_turn_status(queued.turn_id),
-                        Ok(TurnStatus::Canceled) | Err(_)
-                    ) {
-                        return;
-                    }
-                    self.wait_for_current_run_idle().await;
-                }
-                Err(err) => {
-                    self.record_background_error(err.to_string()).await;
-                    return;
-                }
+        while self.transition_to_running().is_err() {
+            if matches!(
+                self.chat_turn_status(queued.turn_id),
+                Ok(TurnStatus::Canceled) | Err(_)
+            ) {
+                return;
             }
+            self.wait_for_current_run_idle().await;
         }
 
         if matches!(

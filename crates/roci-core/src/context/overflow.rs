@@ -403,46 +403,10 @@ mod tests {
     }
 
     #[test]
-    fn null_detector_returns_none() {
-        let detector = NullDetector;
-        let err = RociError::api(500, "internal error");
-        let input = OverflowDetectionInput::from_error("test", "test-model", &err);
-        assert!(detector.detect(&input).is_none());
-    }
-
-    #[test]
     fn detector_trait_is_object_safe() {
         let detector: Box<dyn OverflowDetector> = Box::new(NullDetector);
         let err = RociError::api(400, "context overflow");
         let input = OverflowDetectionInput::from_error("test", "test-model", &err);
         assert!(detector.detect(&input).is_none());
-    }
-
-    /// Stub detector that always returns a fixed signal — verifies a
-    /// real implementation can produce [`OverflowSignal`] from the input.
-    struct AlwaysInputOverflowDetector;
-
-    impl OverflowDetector for AlwaysInputOverflowDetector {
-        fn detect(&self, _input: &OverflowDetectionInput<'_>) -> Option<OverflowSignal> {
-            Some(
-                OverflowSignal::new(
-                    OverflowKind::InputOverflow,
-                    OverflowRetryHint::CompactContextFirst,
-                )
-                .with_typed_code(ErrorCode::ContextLengthExceeded),
-            )
-        }
-    }
-
-    #[test]
-    fn stub_detector_returns_expected_signal() {
-        let detector = AlwaysInputOverflowDetector;
-        let err = RociError::api(400, "context length exceeded");
-        let input = OverflowDetectionInput::from_error("openai", "gpt-4o", &err);
-
-        let signal = detector.detect(&input).expect("should detect overflow");
-        assert_eq!(signal.kind, OverflowKind::InputOverflow);
-        assert_eq!(signal.typed_code, Some(ErrorCode::ContextLengthExceeded));
-        assert!(signal.is_recoverable());
     }
 }

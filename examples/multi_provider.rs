@@ -37,7 +37,6 @@ async fn main() -> roci::error::Result<()> {
             provider.as_ref(),
             vec![ModelMessage::user(prompt)],
             GenerationSettings::default(),
-            &[],
         )
         .await
         {

@@ -144,12 +144,17 @@ mod tests {
             ModelMessage::assistant("done"),
         ];
 
-        let keep_recent_tokens =
-            estimate_message_tokens(messages.last().expect("has last message"));
-        let cut_index = find_compaction_cut_index(&messages, keep_recent_tokens);
+        let final_message_tokens = estimate_message_tokens(&messages[3]);
+        for keep_recent_tokens in [
+            final_message_tokens,
+            final_message_tokens + estimate_message_tokens(&messages[2]),
+        ] {
+            let cut_index = find_compaction_cut_index(&messages, keep_recent_tokens);
 
-        assert!(cut_index < messages.len());
-        assert_ne!(messages[cut_index].role, Role::Tool);
+            // Even when the result fits, it cannot begin the kept tail without its call.
+            assert_eq!(cut_index, 3);
+            assert_eq!(messages[cut_index].role, Role::Assistant);
+        }
     }
 
     #[test]

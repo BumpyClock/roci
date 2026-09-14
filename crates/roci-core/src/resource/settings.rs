@@ -247,28 +247,24 @@ fn load_scope_settings(
     };
 
     let mut value: Value = serde_json::from_str(&raw)?;
-    if !value.is_object() {
-        return Err(RociError::Configuration(format!(
+    let object = value.as_object_mut().ok_or_else(|| {
+        RociError::Configuration(format!(
             "Settings file {} must contain a JSON object",
             path.display()
-        )));
-    }
+        ))
+    })?;
 
-    resolve_prompts_in_scope(&mut value, scope_dir, home_dir)?;
+    resolve_prompts_in_scope(object, scope_dir, home_dir)?;
 
     Ok(Some(value))
 }
 
 fn resolve_prompts_in_scope(
-    value: &mut Value,
+    object: &mut serde_json::Map<String, Value>,
     scope_dir: &Path,
     home_dir: Option<&Path>,
 ) -> Result<(), RociError> {
-    let Some(obj) = value.as_object_mut() else {
-        return Ok(());
-    };
-
-    let Some(prompts_value) = obj.get_mut("prompts") else {
+    let Some(prompts_value) = object.get_mut("prompts") else {
         return Ok(());
     };
 

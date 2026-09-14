@@ -169,32 +169,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_auth_step_debug_has_no_token_fields() {
+    fn host_auth_step_debug_preserves_pkce_fields() {
         let step = HostAuthStep::Pkce {
             authorization_url: "https://example.com/auth".into(),
             session_id: LoginSessionId::new("sess-1"),
         };
         let debug = format!("{step:?}");
-        assert!(debug.contains("authorization_url"));
-        assert!(!debug.to_lowercase().contains("token"));
-        assert!(!debug.contains("verifier"));
-        assert!(!debug.contains("session_data"));
+        assert_eq!(
+            debug,
+            r#"Pkce { authorization_url: "https://example.com/auth", session_id: LoginSessionId("sess-1") }"#
+        );
     }
 
     #[test]
-    fn host_types_serialize_without_secrets() {
+    fn host_device_code_serializes_expected_wire_fields() {
         let step = HostAuthStep::DeviceCode {
             verification_uri: "https://example.com/device".into(),
             user_code: "ABCD-EFGH".into(),
             interval_secs: 5,
-            expires_at: Utc::now(),
+            expires_at: "2026-09-14T12:00:00Z".parse().unwrap(),
             session_id: LoginSessionId::new("sess-2"),
         };
         let json = serde_json::to_string(&step).unwrap();
-        assert!(json.contains("sess-2"));
-        // Serde tag may be "device_code"; ensure raw OAuth device_code secret field is absent.
-        assert!(!json.contains("\"device_code\":"));
-        assert!(!json.contains("access_token"));
-        assert!(!json.contains("code_verifier"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({
+                "kind": "device_code",
+                "verification_uri": "https://example.com/device",
+                "user_code": "ABCD-EFGH",
+                "interval_secs": 5,
+                "expires_at": "2026-09-14T12:00:00Z",
+                "session_id": "sess-2"
+            })
+        );
     }
 }

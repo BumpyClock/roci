@@ -432,13 +432,15 @@ mod tests {
 
     #[test]
     fn build_context_budget_uses_core_defaults_for_unspecified_fields() {
-        let budget =
-            build_context_budget(Some(65_536), Some(2_048), None, Some(500_000), None).unwrap();
-        assert_eq!(budget.context_window_override, Some(65_536));
-        assert_eq!(budget.reserve_output_tokens, 2_048);
-        assert!(budget.max_turn_input_tokens.is_none());
-        assert_eq!(budget.max_session_input_tokens, Some(500_000));
-        assert!(budget.max_session_output_tokens.is_none());
+        for (reserve, expected_reserve) in [(Some(2_048), 2_048), (None, 4_096)] {
+            let budget =
+                build_context_budget(Some(65_536), reserve, None, Some(500_000), None).unwrap();
+            assert_eq!(budget.context_window_override, Some(65_536));
+            assert_eq!(budget.reserve_output_tokens, expected_reserve);
+            assert!(budget.max_turn_input_tokens.is_none());
+            assert_eq!(budget.max_session_input_tokens, Some(500_000));
+            assert!(budget.max_session_output_tokens.is_none());
+        }
     }
 
     #[tokio::test]

@@ -813,7 +813,9 @@ mod tests {
         match &result.messages[0].content[0] {
             ContentPart::ToolResult(tr) => {
                 let text = tr.result.as_str().unwrap();
-                assert!(text.ends_with(TOOL_RESULT_TRUNCATED_MARKER));
+                assert_eq!(text, format!("{}\n...[truncated]", "a".repeat(100)));
+                assert_eq!(tr.tool_call_id, "c1");
+                assert!(!tr.is_error);
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }

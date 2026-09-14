@@ -50,14 +50,3 @@ pub enum StreamEventType {
     /// Error during stream.
     Error,
 }
-
-/// Final result after consuming a text stream.
-#[derive(Debug, Clone)]
-pub struct StreamTextResult {
-    /// Full accumulated text.
-    pub text: String,
-    /// Token usage.
-    pub usage: Usage,
-    /// Finish reason.
-    pub finish_reason: Option<FinishReason>,
-}

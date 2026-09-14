@@ -12,8 +12,6 @@
 //! - Runtime mutators (`set/clear` system prompt, `replace_messages`, `set_tools`) while idle
 //! - Fine-grained queue controls (`clear_*_queue`, `clear_all_queues`, `has_queued_messages`)
 
-#[cfg(test)]
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -64,7 +62,7 @@ use crate::provider::ProviderRegistry;
 #[cfg(test)]
 use crate::provider::ProviderRequest;
 #[cfg(test)]
-use crate::resource::{BranchSummarySettings, CompactionSettings};
+use crate::resource::BranchSummarySettings;
 use crate::session::{
     LocalProviderLedger, LocalSessionFs, LocalSessionResources, SessionLease, SessionResumeState,
 };
@@ -103,7 +101,7 @@ pub struct AgentRuntime {
     state: Arc<Mutex<AgentState>>,
     state_tx: watch::Sender<AgentState>,
     state_rx: watch::Receiver<AgentState>,
-    candidates: Arc<Mutex<Vec<LanguageModel>>>,
+    candidates: Arc<Mutex<ModelCandidates>>,
     generation_settings: Arc<Mutex<GenerationSettings>>,
     approval_policy: Arc<Mutex<ApprovalPolicy>>,
     system_prompt: Arc<Mutex<Option<String>>>,
@@ -197,9 +195,7 @@ impl AgentRuntime {
             .map(canonical_workspace_root)
             .transpose()?;
         let runner = LoopRunner::with_registry(roci_config.clone(), registry.clone());
-        let candidates = Arc::new(Mutex::new(
-            ModelCandidates::new(config.candidates.clone())?.into_vec(),
-        ));
+        let candidates = Arc::new(Mutex::new(ModelCandidates::new(config.candidates.clone())?));
         let generation_settings = Arc::new(Mutex::new(config.settings.clone()));
         let approval_policy = Arc::new(Mutex::new(config.approval_policy.clone()));
         let system_prompt = Arc::new(Mutex::new(config.system_prompt.clone()));

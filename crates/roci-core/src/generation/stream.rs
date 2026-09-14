@@ -6,7 +6,6 @@ use futures::StreamExt;
 use crate::error::RociError;
 use crate::provider::{ModelProvider, ProviderRequest};
 use crate::stop::StopCondition;
-use crate::tools::tool::Tool;
 use crate::types::*;
 
 /// Stream text from a model, applying optional stop conditions.
@@ -18,23 +17,6 @@ pub async fn stream_text(
     settings: GenerationSettings,
     stop_conditions: Vec<Box<dyn StopCondition>>,
 ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
-    stream_text_with_tools(provider, messages, settings, &[], stop_conditions).await
-}
-
-/// Stream text from a model with stop conditions.
-pub async fn stream_text_with_tools(
-    provider: std::sync::Arc<dyn ModelProvider>,
-    messages: Vec<ModelMessage>,
-    settings: GenerationSettings,
-    tools: &[std::sync::Arc<dyn Tool>],
-    stop_conditions: Vec<Box<dyn StopCondition>>,
-) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
-    if !tools.is_empty() {
-        return Err(RociError::UnsupportedOperation(
-            "generation::stream_text_with_tools does not execute tools; use Agent, AgentRuntime, or agent_loop::LoopRunner for tool-capable streams".to_string(),
-        ));
-    }
-
     let stream = async_stream::stream! {
         let mut accumulated_text = String::new();
         for cond in &stop_conditions {
@@ -112,7 +94,6 @@ mod tests {
     use super::*;
     use crate::models::ModelCapabilities;
     use crate::provider::ProviderResponse;
-    use crate::tools::{AgentTool, AgentToolParameters};
 
     struct StubProvider;
 
@@ -141,35 +122,125 @@ mod tests {
 
         async fn stream_text(
             &self,
-            _request: &ProviderRequest,
+            request: &ProviderRequest,
         ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
-            panic!("provider should not be called when tools are supplied")
+            assert_eq!(request.messages[0].text(), "hello");
+            assert_eq!(request.settings.max_tokens, Some(80));
+            assert!(matches!(
+                request.response_format,
+                Some(ResponseFormat::JsonObject)
+            ));
+            assert!(request.tools.is_none());
+            Ok(futures::stream::iter(
+                [
+                    delta(StreamEventType::Start, ""),
+                    delta(StreamEventType::TextDelta, "first "),
+                    delta(StreamEventType::TextDelta, "second"),
+                    delta(StreamEventType::TextDelta, " ignored"),
+                    TextStreamDelta {
+                        finish_reason: Some(FinishReason::Length),
+                        usage: Some(Usage {
+                            input_tokens: 2,
+                            output_tokens: 4,
+                            total_tokens: 6,
+                            ..Usage::default()
+                        }),
+                        ..delta(StreamEventType::Done, "")
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            )
+            .boxed())
+        }
+    }
+
+    fn delta(event_type: StreamEventType, text: &str) -> TextStreamDelta {
+        TextStreamDelta {
+            text: text.into(),
+            event_type,
+            tool_call: None,
+            finish_reason: None,
+            usage: None,
+            reasoning: None,
+            reasoning_signature: None,
+            reasoning_type: None,
+        }
+    }
+
+    struct StopAfterSecond {
+        reset: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl StopCondition for StopAfterSecond {
+        async fn reset(&self) {
+            self.reset.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn should_stop(&self, text: &str, delta: Option<&str>) -> bool {
+            assert!(self.reset.load(std::sync::atomic::Ordering::SeqCst));
+            match text {
+                "first " => {
+                    assert_eq!(delta, Some("first "));
+                    false
+                }
+                "first second" => {
+                    assert_eq!(delta, Some("second"));
+                    true
+                }
+                _ => panic!("unexpected accumulated text: {text}"),
+            }
         }
     }
 
     #[tokio::test]
-    async fn stream_text_with_tools_rejects_tools() {
-        let tool = Arc::new(AgentTool::new(
-            "lookup",
-            "lookup",
-            AgentToolParameters::empty(),
-            |_args, _ctx| async { Ok(serde_json::json!({ "ok": true })) },
-        ));
-        let result = stream_text_with_tools(
-            Arc::new(StubProvider),
-            vec![ModelMessage::user("hello")],
-            GenerationSettings::default(),
-            &[tool],
-            Vec::new(),
-        )
-        .await;
-        let err = match result {
-            Err(err) => err,
-            Ok(_) => panic!("tools should be rejected"),
-        };
-
-        assert!(
-            matches!(err, RociError::UnsupportedOperation(message) if message.contains("AgentRuntime"))
-        );
+    async fn stream_preserves_provider_events_and_applies_stop_conditions() {
+        for stop_early in [false, true] {
+            let conditions: Vec<Box<dyn StopCondition>> = if stop_early {
+                vec![Box::new(StopAfterSecond {
+                    reset: false.into(),
+                })]
+            } else {
+                Vec::new()
+            };
+            let stream = stream_text(
+                Arc::new(StubProvider),
+                vec![ModelMessage::user("hello")],
+                GenerationSettings {
+                    max_tokens: Some(80),
+                    response_format: Some(ResponseFormat::JsonObject),
+                    ..GenerationSettings::default()
+                },
+                conditions,
+            )
+            .await
+            .unwrap();
+            let deltas: Vec<_> = stream.map(Result::unwrap).collect().await;
+            assert_eq!(deltas[0].event_type, StreamEventType::Start);
+            assert_eq!(deltas[1].text, "first ");
+            assert_eq!(deltas[2].text, "second");
+            let final_delta = deltas.last().unwrap();
+            assert_eq!(final_delta.event_type, StreamEventType::Done);
+            assert!(final_delta.text.is_empty());
+            if stop_early {
+                assert_eq!(deltas.len(), 4);
+                assert_eq!(final_delta.finish_reason, Some(FinishReason::Stop));
+                assert!(final_delta.usage.is_none());
+            } else {
+                assert_eq!(deltas.len(), 5);
+                assert_eq!(deltas[3].text, " ignored");
+                assert_eq!(final_delta.finish_reason, Some(FinishReason::Length));
+                assert_eq!(
+                    final_delta.usage,
+                    Some(Usage {
+                        input_tokens: 2,
+                        output_tokens: 4,
+                        total_tokens: 6,
+                        ..Usage::default()
+                    })
+                );
+            }
+        }
     }
 }

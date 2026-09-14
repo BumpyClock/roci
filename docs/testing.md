@@ -26,7 +26,7 @@ cargo test -p roci-tools      # Built-in and workspace tool contracts
 - Core integration tests: `cargo test -p roci-core --test registry_integration`
 - MCP tests (feature-gated in `roci-core`): `cargo test -p roci-core --features mcp`
 - Runtime namespace inventory: `cargo test -p roci-core --features agent "agent::runtime::tests::" -- --list`
-- Unix auth file smoke (two real `roci-agent` processes under temp `HOME`): `cargo test -p roci-cli --test auth_cli_unix`
+- Unix auth file smoke (four real `roci-agent` processes under temp `HOME`): `cargo test -p roci-cli --test auth_cli_unix`
 - To inspect test output: append `-- --nocapture`
 
 ## Live tmux/provider verification
@@ -180,6 +180,19 @@ Use `curl http://127.0.0.1:1234/api/v0/models` to confirm at least one local mod
 
 Remote provider smoke tests must not print secrets. Pass credentials through the environment or existing auth store, print only whether a credential is configured, and keep the prompt/token budget small.
 
+Local OpenAI-compatible proxy smoke (when configured at port 8317): run this
+inside an interactive tmux terminal and show its attach command. Use
+`timeout --foreground` around interactive CLI calls so raw terminal mode and
+user-input prompts remain in the foreground process group.
+
+```bash
+OPENAI_API_KEY=sk-dummy OPENAI_BASE_URL=http://127.0.0.1:8317/v1 \
+  timeout --foreground 90 target/debug/roci-agent chat \
+    --no-skills --no-tools --model openai:gpt-4o \
+    --max-tokens 64 --max-retry-attempts 1 \
+    "Reply exactly: roci-proxy-smoke-ok"
+```
+
 Tool contract smoke (result cap, prompt metadata, alias normalization evidence):
 
 ```bash
@@ -294,11 +307,10 @@ tmux new-session -d -s roci-subagent-live '
   WORKDIR=$(mktemp -d /tmp/roci-subagent-live-cwd.XXXXXX)
   mkdir -p "$WORKDIR/.roci/subagents"
   cat > "$WORKDIR/.roci/subagents/smoke.toml" <<EOF
-[[profiles]]
 name = "smoke"
 display_name = "Smoke Worker"
 default = true
-[[profiles.models]]
+[[models]]
 provider = "openai"
 # Local framed test infra model. Use an equivalent configured smoke model if unavailable.
 model = "gemma-4-e4b"

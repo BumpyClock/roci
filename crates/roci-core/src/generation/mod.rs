@@ -7,5 +7,5 @@ pub mod text;
 
 pub use convenience::{generate, stream};
 pub use object::generate_object;
-pub use stream::{stream_text, stream_text_with_tools};
+pub use stream::stream_text;
 pub use text::generate_text;

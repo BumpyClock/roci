@@ -232,7 +232,6 @@ impl ApprovalGrantKey {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ApprovalGrant {
     Exact { key: ApprovalGrantKey },
-    Rule { rule: Box<ApprovalRule> },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,7 +248,6 @@ impl ApprovalGrantSet {
     fn contains_exact(&self, key: &ApprovalGrantKey) -> bool {
         self.grants.iter().any(|grant| match grant {
             ApprovalGrant::Exact { key: candidate } => candidate == key,
-            ApprovalGrant::Rule { .. } => false,
         })
     }
 }
@@ -278,12 +276,10 @@ pub struct MatchedApprovalRule {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalSpecificity {
-    Default = 0,
     Metadata = 1,
     CategoryOrKind = 2,
     PrefixOrBoundary = 3,
     Exact = 4,
-    ExactInvocation = 5,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -588,21 +584,10 @@ pub struct ApprovalRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub payload: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suggested_policy_change: Option<ExecPolicyUpdate>,
 }
 
 fn default_approval_request_allow_session() -> bool {
     true
-}
-
-/// Optional execpolicy update suggestion.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ExecPolicyUpdate {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rule_id: Option<String>,
-    #[serde(default)]
-    pub argv: Vec<String>,
 }
 
 /// Approval decision for a request.

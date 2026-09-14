@@ -1,11 +1,16 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(any(feature = "agent", test))]
+use std::fs::OpenOptions;
+#[cfg(any(feature = "agent", test))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{locks::tighten_file, SessionError, SessionId, SessionResult};
+#[cfg(any(feature = "agent", test))]
+use super::locks::tighten_file;
+use super::{SessionError, SessionId, SessionResult};
 use crate::{models::LanguageModel, types::ReasoningEffort};
 
 /// Metadata recorded for a durable session.
@@ -149,7 +154,7 @@ impl SessionMetadata {
         })
     }
 
-    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    #[cfg(any(feature = "agent", test))]
     pub(crate) fn write_new_to_path(&self, path: impl AsRef<Path>) -> SessionResult<()> {
         let path = path.as_ref();
         let json = self.serialize(path)?;
@@ -213,7 +218,7 @@ impl SessionMetadata {
         Ok(())
     }
 
-    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    #[cfg(any(feature = "agent", test))]
     fn serialize(&self, path: &Path) -> SessionResult<Vec<u8>> {
         serde_json::to_vec_pretty(self).map_err(|source| SessionError::InvalidMetadata {
             path: path.to_path_buf(),

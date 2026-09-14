@@ -89,49 +89,20 @@ fn get_from_map(
     None
 }
 
-/// Production platform default credential-store backend.
-///
-/// Independent of the `cfg(test)` hermetic override so tests can assert the
-/// shipping resolver without constructing real home-directory paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProductionProviderCredentialStoreKind {
-    /// Locked `~/.roci/auth.json` map used on Unix production defaults.
-    #[cfg(unix)]
-    FileAuthJson,
-    /// OS credential manager used on non-Unix production defaults.
-    #[cfg(not(unix))]
-    OsCredentialManager,
-}
-
-const fn production_provider_credential_store_kind() -> ProductionProviderCredentialStoreKind {
-    #[cfg(unix)]
-    {
-        ProductionProviderCredentialStoreKind::FileAuthJson
-    }
-    #[cfg(not(unix))]
-    {
-        ProductionProviderCredentialStoreKind::OsCredentialManager
-    }
-}
-
-#[cfg(not(test))]
+#[cfg(all(not(test), unix))]
 fn default_provider_credential_store() -> Option<Arc<dyn ProviderCredentialStore>> {
-    match production_provider_credential_store_kind() {
-        #[cfg(unix)]
-        ProductionProviderCredentialStoreKind::FileAuthJson => {
-            match FileProviderCredentialStore::new_default() {
-                Ok(store) => Some(Arc::new(store) as Arc<dyn ProviderCredentialStore>),
-                Err(error) => {
-                    tracing::warn!(%error, "default provider credential store unavailable");
-                    None
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        ProductionProviderCredentialStoreKind::OsCredentialManager => {
-            Some(Arc::new(OsProviderCredentialStore::new()))
+    match FileProviderCredentialStore::new_default() {
+        Ok(store) => Some(Arc::new(store)),
+        Err(error) => {
+            tracing::warn!(%error, "default provider credential store unavailable");
+            None
         }
     }
+}
+
+#[cfg(all(not(test), not(unix)))]
+fn default_provider_credential_store() -> Option<Arc<dyn ProviderCredentialStore>> {
+    Some(Arc::new(OsProviderCredentialStore::new()))
 }
 
 #[cfg(test)]
@@ -796,18 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn production_default_credential_store_kind_matches_platform() {
-        let kind = production_provider_credential_store_kind();
-        #[cfg(unix)]
-        assert_eq!(kind, ProductionProviderCredentialStoreKind::FileAuthJson);
-        #[cfg(not(unix))]
-        assert_eq!(
-            kind,
-            ProductionProviderCredentialStoreKind::OsCredentialManager
-        );
-    }
-
-    #[test]
     fn config_new_defaults_to_isolated_credential_stores_under_tests() {
         let first = RociConfig::new().with_token_store(None);
         let second = RociConfig::new().with_token_store(None);
@@ -829,13 +788,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_file_default_store_debug_identifies_type_without_paths() {
+    fn unix_file_store_config_resolves_credentials_and_redacts_debug() {
         use crate::auth::FileProviderCredentialStore;
-
-        assert_eq!(
-            production_provider_credential_store_kind(),
-            ProductionProviderCredentialStoreKind::FileAuthJson
-        );
 
         let temp = TempDir::new().unwrap();
         let root = temp.path().join(".roci");
@@ -865,13 +819,9 @@ mod tests {
 
     #[cfg(not(unix))]
     #[test]
-    fn non_unix_os_default_store_debug_identifies_type() {
+    fn non_unix_os_store_debug_identifies_type() {
         use crate::auth::credential::OsProviderCredentialStore;
 
-        assert_eq!(
-            production_provider_credential_store_kind(),
-            ProductionProviderCredentialStoreKind::OsCredentialManager
-        );
         let store = OsProviderCredentialStore::new();
         assert_eq!(format!("{store:?}"), "OsProviderCredentialStore(..)");
     }

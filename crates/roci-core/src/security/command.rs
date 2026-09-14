@@ -1,37 +1,4 @@
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
-
-pub trait CommandClassifier: Send + Sync {
-    fn classify(&self, input: CommandInput) -> CommandInsight;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandInput {
-    pub raw_command: String,
-    pub cwd: Option<PathBuf>,
-    pub tool_name: Option<String>,
-    pub shell_kind: Option<ShellKind>,
-    pub platform: Option<CommandPlatform>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShellKind {
-    Sh,
-    Bash,
-    Zsh,
-    Fish,
-    PowerShell,
-    Cmd,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandPlatform {
-    Unix,
-    Windows,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,84 +31,70 @@ pub struct CommandInsight {
     pub confidence: CommandConfidence,
 }
 
-pub struct HeuristicCommandClassifier;
-
 pub fn classify_shell_command(raw_command: &str) -> CommandInsight {
-    HeuristicCommandClassifier.classify(CommandInput {
-        raw_command: raw_command.to_string(),
-        cwd: None,
-        tool_name: None,
-        shell_kind: None,
-        platform: None,
-    })
-}
+    let (segments, connectors) = split_segments(raw_command);
+    let mut categories = Vec::new();
+    let mut reasons = Vec::new();
+    let mut primary_executable = None;
+    let mut normalized_segments = Vec::new();
 
-impl CommandClassifier for HeuristicCommandClassifier {
-    fn classify(&self, input: CommandInput) -> CommandInsight {
-        let (segments, connectors) = split_segments(&input.raw_command);
-        let mut categories = Vec::new();
-        let mut reasons = Vec::new();
-        let mut primary_executable = None;
-        let mut normalized_segments = Vec::new();
+    detect_shell_syntax(raw_command, &mut categories, &mut reasons);
 
-        detect_shell_syntax(&input.raw_command, &mut categories, &mut reasons);
+    for connector in connectors {
+        add_reason(&mut reasons, format!("connector detected: {connector}"));
+        add_category(&mut categories, CommandCategory::Unknown);
+    }
 
-        for connector in connectors {
-            add_reason(&mut reasons, format!("connector detected: {connector}"));
-            add_category(&mut categories, CommandCategory::Unknown);
+    for segment in segments {
+        let tokens = tokenize_segment(&segment);
+        if tokens.is_empty() {
+            continue;
         }
 
-        for segment in segments {
-            let tokens = tokenize_segment(&segment);
-            if tokens.is_empty() {
-                continue;
+        let segment_insight = classify_segment(&tokens, &mut categories, &mut reasons);
+        match segment_insight {
+            Some((executable, normalized_segment)) => {
+                if primary_executable.is_none() {
+                    primary_executable = Some(executable.clone());
+                }
+                normalized_segments.push(normalized_segment);
             }
-
-            let segment_insight = classify_segment(&tokens, &mut categories, &mut reasons);
-            match segment_insight {
-                Some((executable, normalized_segment)) => {
-                    if primary_executable.is_none() {
-                        primary_executable = Some(executable.clone());
-                    }
-                    normalized_segments.push(normalized_segment);
-                }
-                None => {
-                    add_category(&mut categories, CommandCategory::Unknown);
-                    add_reason(&mut reasons, "unknown or empty command segment".to_string());
-                }
+            None => {
+                add_category(&mut categories, CommandCategory::Unknown);
+                add_reason(&mut reasons, "unknown or empty command segment".to_string());
             }
         }
+    }
 
-        if categories.is_empty() {
-            add_category(&mut categories, CommandCategory::Unknown);
-            add_reason(&mut reasons, "unknown or empty command segment".to_string());
-        }
+    if categories.is_empty() {
+        add_category(&mut categories, CommandCategory::Unknown);
+        add_reason(&mut reasons, "unknown or empty command segment".to_string());
+    }
 
-        let confidence = if categories.contains(&CommandCategory::Unknown) {
-            CommandConfidence::Low
-        } else if input.raw_command.contains(';')
-            || input.raw_command.contains('&')
-            || input.raw_command.contains("&&")
-            || input.raw_command.contains("||")
-            || input.raw_command.contains('|')
-            || input.raw_command.contains('\n')
-        {
-            CommandConfidence::Medium
+    let confidence = if categories.contains(&CommandCategory::Unknown) {
+        CommandConfidence::Low
+    } else if raw_command.contains(';')
+        || raw_command.contains('&')
+        || raw_command.contains("&&")
+        || raw_command.contains("||")
+        || raw_command.contains('|')
+        || raw_command.contains('\n')
+    {
+        CommandConfidence::Medium
+    } else {
+        CommandConfidence::High
+    };
+
+    CommandInsight {
+        normalized_command: if normalized_segments.is_empty() {
+            raw_command.trim().to_string()
         } else {
-            CommandConfidence::High
-        };
-
-        CommandInsight {
-            normalized_command: if normalized_segments.is_empty() {
-                input.raw_command.trim().to_string()
-            } else {
-                normalized_segments.join(" && ")
-            },
-            primary_executable,
-            categories,
-            reasons,
-            confidence,
-        }
+            normalized_segments.join(" && ")
+        },
+        primary_executable,
+        categories,
+        reasons,
+        confidence,
     }
 }
 

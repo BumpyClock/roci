@@ -308,8 +308,6 @@ where
             }
 
             let completion = manager.complete_pkce(&session_id, &code).await?;
-            // Never log the authorization code.
-            let _ = code;
             writeln!(stdout, "{} login successful!", completion.provider)?;
         }
     }
@@ -462,7 +460,6 @@ mod tests {
         login_steps: Mutex<VecDeque<Result<HostAuthStep, AuthError>>>,
         poll_results: Mutex<VecDeque<Result<HostAuthPollResult, AuthError>>>,
         pkce_codes: Mutex<Vec<String>>,
-        pkce_provider: Mutex<String>,
     }
 
     #[derive(Debug, Clone)]
@@ -514,11 +511,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| {
-                    Ok(HostAuthStep::ImportedAndComplete {
-                        provider: "demo".into(),
-                    })
-                });
+                .expect("unexpected start_login call");
             async move { step }
         }
 
@@ -531,7 +524,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(Ok(HostAuthPollResult::Pending));
+                .expect("unexpected poll_device_code call");
             async move { result }
         }
 
@@ -541,13 +534,11 @@ mod tests {
             code: &str,
         ) -> impl Future<Output = Result<HostAuthCompletion, AuthError>> + Send {
             self.pkce_codes.lock().unwrap().push(code.to_string());
-            let provider = self.pkce_provider.lock().unwrap().clone();
-            let provider = if provider.is_empty() {
-                "anthropic".to_string()
-            } else {
-                provider
-            };
-            async move { Ok(HostAuthCompletion { provider }) }
+            async move {
+                Ok(HostAuthCompletion {
+                    provider: "anthropic".into(),
+                })
+            }
         }
     }
 
@@ -681,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn status_and_providers_delegate_and_json_is_secret_free() {
+    fn status_and_providers_delegate_and_serialize_manager_status() {
         let status = sample_status(
             "openai-compatible",
             ProviderAuthState::SignedIn {
@@ -695,19 +686,16 @@ mod tests {
         assert_eq!(*manager.list_calls.lock().unwrap(), 1);
         let status_json: Vec<ProviderAuthStatus> = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(status_json, vec![status.clone()]);
-        let status_text = String::from_utf8(stdout.clone()).unwrap();
-        assert!(!status_text.contains(SENTINEL_SECRET));
 
         stdout.clear();
         run_providers(&manager, true, &mut stdout).unwrap();
         assert_eq!(*manager.list_calls.lock().unwrap(), 2);
         let providers_json: Vec<ProviderAuthStatus> = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(providers_json, vec![status]);
-        assert!(!String::from_utf8(stdout).unwrap().contains(SENTINEL_SECRET));
     }
 
     #[test]
-    fn status_human_output_has_no_secret_material() {
+    fn status_human_output_names_provider_state_and_availability() {
         let manager = FakeManager::with_status(sample_status(
             "anthropic",
             ProviderAuthState::SignedIn {
@@ -717,9 +705,10 @@ mod tests {
         let mut stdout = Vec::new();
         run_status(&manager, false, &mut stdout).unwrap();
         let text = String::from_utf8(stdout).unwrap();
-        assert!(text.contains("anthropic"));
-        assert!(text.contains("Signed in"));
-        assert!(!text.contains(SENTINEL_SECRET));
+        assert_eq!(
+            text,
+            "Authentication Status\n\n  anthropic (anthropic): Signed in [launch: available]\n"
+        );
     }
 
     #[test]
@@ -845,7 +834,7 @@ mod tests {
         assert_eq!(manager.poll_results.lock().unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn login_device_slow_down_updates_interval_then_authorizes() {
         let manager = FakeManager::default();
         manager
@@ -861,7 +850,7 @@ mod tests {
             }));
         {
             let mut polls = manager.poll_results.lock().unwrap();
-            polls.push_back(Ok(HostAuthPollResult::SlowDown { interval_secs: 0 }));
+            polls.push_back(Ok(HostAuthPollResult::SlowDown { interval_secs: 5 }));
             polls.push_back(Ok(HostAuthPollResult::Authorized {
                 provider: "codex".into(),
             }));
@@ -870,6 +859,7 @@ mod tests {
         let mut stdin = b"".as_slice();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let started = tokio::time::Instant::now();
         run_login(
             &manager,
             "codex",
@@ -881,6 +871,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
         let out = String::from_utf8(stdout).unwrap();
         assert!(out.contains("codex login successful"));
         assert!(manager.poll_results.lock().unwrap().is_empty());
@@ -897,7 +888,6 @@ mod tests {
                 authorization_url: "https://example.com/auth".into(),
                 session_id: LoginSessionId::new("sess-pkce"),
             }));
-        *manager.pkce_provider.lock().unwrap() = "anthropic".into();
 
         let stdin = format!("{SENTINEL_SECRET}\n").into_bytes();
         let mut stdout = Vec::new();

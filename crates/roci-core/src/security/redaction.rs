@@ -245,11 +245,7 @@ fn kind_priority(kind: &SecretKind) -> u8 {
 
 fn join_json_pointer(parent: &str, token: &str) -> String {
     let escaped = token.replace('~', "~0").replace('/', "~1");
-    if parent.is_empty() {
-        format!("/{escaped}")
-    } else {
-        format!("{parent}/{escaped}")
-    }
+    format!("{parent}/{escaped}")
 }
 
 #[cfg(test)]
@@ -272,12 +268,12 @@ mod tests {
 
     #[test]
     fn redacts_text_with_utf8_byte_offsets() {
-        let report = SecretRedactor::new_default().redact_text("token=sk-abc123 café");
+        let report = SecretRedactor::new_default().redact_text("café token=sk-abc123 café");
 
-        assert_eq!(report.redacted, "token=[REDACTED_API_KEY] café");
+        assert_eq!(report.redacted, "café token=[REDACTED_API_KEY] café");
         assert_eq!(
             report.matches[0].location,
-            SecretLocation::TextRange { start: 6, end: 15 }
+            SecretLocation::TextRange { start: 12, end: 21 }
         );
     }
 
@@ -306,35 +302,45 @@ mod tests {
                 "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
                 SecretKind::PrivateKey,
                 "[REDACTED_PRIVATE_KEY]",
+                "[REDACTED_PRIVATE_KEY]",
             ),
             (
                 "Authorization: Basic abc123",
                 SecretKind::AuthHeader,
+                "[REDACTED_AUTH_HEADER]",
                 "[REDACTED_AUTH_HEADER]",
             ),
             (
                 "Bearer abcdef123456",
                 SecretKind::BearerToken,
                 "[REDACTED_TOKEN]",
+                "[REDACTED_TOKEN]",
             ),
-            ("sk-abc123", SecretKind::ApiKey, "[REDACTED_API_KEY]"),
+            (
+                "sk-abc123",
+                SecretKind::ApiKey,
+                "[REDACTED_API_KEY]",
+                "[REDACTED_API_KEY]",
+            ),
             (
                 "OPENAI_API_KEY=plain-secret",
                 SecretKind::EnvSecret,
                 "[REDACTED_SECRET]",
+                "OPENAI_API_KEY=[REDACTED_SECRET]",
             ),
             (
                 "password=plain-secret",
                 SecretKind::GenericSecret,
                 "[REDACTED_SECRET]",
+                "password=[REDACTED_SECRET]",
             ),
         ];
 
-        for (input, kind, token) in cases {
+        for (input, kind, token, expected) in cases {
             let report = redactor.redact_text(input);
             assert_eq!(report.matches[0].kind, kind);
             assert_eq!(report.matches[0].replacement, token);
-            assert!(report.redacted.contains(token));
+            assert_eq!(report.redacted, expected, "input: {input}");
         }
     }
 
@@ -370,104 +376,192 @@ mod tests {
         // matches so future regex tweaks cannot silently widen scope.
         struct Row {
             input: &'static str,
-            expected: Option<(SecretKind, &'static str)>,
+            expected: Option<(SecretKind, &'static str, &'static str)>,
         }
         let redactor = SecretRedactor::new_default();
         let rows: &[Row] = &[
             // PrivateKey: PEM blocks of multiple flavors.
             Row {
                 input: "-----BEGIN PRIVATE KEY-----\nABCD\n-----END PRIVATE KEY-----",
-                expected: Some((SecretKind::PrivateKey, "[REDACTED_PRIVATE_KEY]")),
+                expected: Some((
+                    SecretKind::PrivateKey,
+                    "[REDACTED_PRIVATE_KEY]",
+                    "[REDACTED_PRIVATE_KEY]",
+                )),
             },
             Row {
                 input: "-----BEGIN RSA PRIVATE KEY-----\nXYZ\n-----END RSA PRIVATE KEY-----",
-                expected: Some((SecretKind::PrivateKey, "[REDACTED_PRIVATE_KEY]")),
+                expected: Some((
+                    SecretKind::PrivateKey,
+                    "[REDACTED_PRIVATE_KEY]",
+                    "[REDACTED_PRIVATE_KEY]",
+                )),
             },
             Row {
                 input: "-----BEGIN OPENSSH PRIVATE KEY-----\nQQ\n-----END OPENSSH PRIVATE KEY-----",
-                expected: Some((SecretKind::PrivateKey, "[REDACTED_PRIVATE_KEY]")),
+                expected: Some((
+                    SecretKind::PrivateKey,
+                    "[REDACTED_PRIVATE_KEY]",
+                    "[REDACTED_PRIVATE_KEY]",
+                )),
             },
             // AuthHeader: bearer/basic variants are higher priority than the
             // bare BearerToken / ApiKey patterns nested inside them.
             Row {
                 input: "Authorization: Bearer abcdef123456",
-                expected: Some((SecretKind::AuthHeader, "[REDACTED_AUTH_HEADER]")),
+                expected: Some((
+                    SecretKind::AuthHeader,
+                    "[REDACTED_AUTH_HEADER]",
+                    "[REDACTED_AUTH_HEADER]",
+                )),
             },
             Row {
                 input: "authorization: basic dXNlcjpwYXNz",
-                expected: Some((SecretKind::AuthHeader, "[REDACTED_AUTH_HEADER]")),
+                expected: Some((
+                    SecretKind::AuthHeader,
+                    "[REDACTED_AUTH_HEADER]",
+                    "[REDACTED_AUTH_HEADER]",
+                )),
             },
             // BearerToken: standalone bearer prefix outside an Authorization header.
             Row {
                 input: "token=Bearer abcdef123456",
-                expected: Some((SecretKind::BearerToken, "[REDACTED_TOKEN]")),
+                expected: Some((
+                    SecretKind::BearerToken,
+                    "[REDACTED_TOKEN]",
+                    "token=[REDACTED_TOKEN]",
+                )),
             },
             // ApiKey: all default vendor prefixes.
             Row {
                 input: "sk-abc123def",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             Row {
                 input: "rk-abc123def",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             Row {
                 input: "pk-abc123def",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             Row {
                 input: "ghp-abc123def456",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             Row {
                 input: "xoxb-1234-abcdef",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             Row {
                 input: "xoxa-1234-abcdef",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             Row {
                 input: "xoxp-1234-abcdef",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             Row {
                 input: "xoxr-1234-abcdef",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             Row {
                 input: "xoxs-1234-abcdef",
-                expected: Some((SecretKind::ApiKey, "[REDACTED_API_KEY]")),
+                expected: Some((
+                    SecretKind::ApiKey,
+                    "[REDACTED_API_KEY]",
+                    "[REDACTED_API_KEY]",
+                )),
             },
             // EnvSecret: assorted *_KEY/_TOKEN/_SECRET assignments with quoting variants.
             Row {
                 input: "OPENAI_API_KEY=plain-secret",
-                expected: Some((SecretKind::EnvSecret, "[REDACTED_SECRET]")),
+                expected: Some((
+                    SecretKind::EnvSecret,
+                    "[REDACTED_SECRET]",
+                    "OPENAI_API_KEY=[REDACTED_SECRET]",
+                )),
             },
             Row {
                 input: "AWS_SECRET_ACCESS_KEY=\"plain-secret\"",
-                expected: Some((SecretKind::EnvSecret, "[REDACTED_SECRET]")),
+                expected: Some((
+                    SecretKind::EnvSecret,
+                    "[REDACTED_SECRET]",
+                    "AWS_SECRET_ACCESS_KEY=\"[REDACTED_SECRET]\"",
+                )),
             },
             Row {
                 input: "GITHUB_TOKEN: ghs_value",
-                expected: Some((SecretKind::EnvSecret, "[REDACTED_SECRET]")),
+                expected: Some((
+                    SecretKind::EnvSecret,
+                    "[REDACTED_SECRET]",
+                    "GITHUB_TOKEN: [REDACTED_SECRET]",
+                )),
             },
             Row {
                 input: "DEPLOY_PRIVATE_KEY='inline-secret'",
-                expected: Some((SecretKind::EnvSecret, "[REDACTED_SECRET]")),
+                expected: Some((
+                    SecretKind::EnvSecret,
+                    "[REDACTED_SECRET]",
+                    "DEPLOY_PRIVATE_KEY='[REDACTED_SECRET]'",
+                )),
             },
             // GenericSecret: password/passwd/pwd.
             Row {
                 input: "password=hunter2",
-                expected: Some((SecretKind::GenericSecret, "[REDACTED_SECRET]")),
+                expected: Some((
+                    SecretKind::GenericSecret,
+                    "[REDACTED_SECRET]",
+                    "password=[REDACTED_SECRET]",
+                )),
             },
             Row {
                 input: "passwd: hunter2",
-                expected: Some((SecretKind::GenericSecret, "[REDACTED_SECRET]")),
+                expected: Some((
+                    SecretKind::GenericSecret,
+                    "[REDACTED_SECRET]",
+                    "passwd: [REDACTED_SECRET]",
+                )),
             },
             Row {
                 input: "pwd=\"hunter2\"",
-                expected: Some((SecretKind::GenericSecret, "[REDACTED_SECRET]")),
+                expected: Some((
+                    SecretKind::GenericSecret,
+                    "[REDACTED_SECRET]",
+                    "pwd=\"[REDACTED_SECRET]\"",
+                )),
             },
             // Negative cases: must not redact innocuous text. These guard
             // against future regex broadening.
@@ -496,7 +590,7 @@ mod tests {
         for row in rows {
             let report = redactor.redact_text(row.input);
             match &row.expected {
-                Some((expected_kind, expected_token)) => {
+                Some((expected_kind, expected_token, expected_output)) => {
                     assert_eq!(
                         report.matches.len(),
                         1,
@@ -515,13 +609,7 @@ mod tests {
                         "wrong replacement for {:?}",
                         row.input
                     );
-                    assert!(
-                        report.redacted.contains(expected_token),
-                        "redacted output {:?} missing token {} for {:?}",
-                        report.redacted,
-                        expected_token,
-                        row.input
-                    );
+                    assert_eq!(report.redacted, *expected_output, "input: {}", row.input);
                 }
                 None => {
                     assert!(

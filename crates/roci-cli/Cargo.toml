@@ -16,7 +16,6 @@ roci = { path = "../..", features = [
   "github-copilot",
 ] }
 roci-tools = { path = "../roci-tools", features = ["agent"] }
-base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -32,4 +31,5 @@ openai-compatible = ["roci/openai-compatible"]
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 wiremock = "0.6"

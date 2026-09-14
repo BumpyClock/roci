@@ -119,7 +119,7 @@ impl StreamToolCallState {
                 emitted.push(tool_call);
                 continue;
             }
-            if self.emitted_calls.contains(&call_id) || force {
+            if force {
                 self.next_emit_index += 1;
                 continue;
             }

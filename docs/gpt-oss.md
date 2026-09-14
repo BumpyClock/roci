@@ -120,7 +120,6 @@ async fn main() -> anyhow::Result<()> {
         &provider,
         messages,
         GenerationSettings::default(),
-        &[],
     )
     .await?;
 
@@ -152,7 +151,6 @@ async fn main() -> anyhow::Result<()> {
         &provider,
         messages,
         GenerationSettings::default(),
-        &[],
     )
     .await?;
 
@@ -250,7 +248,7 @@ let settings = GenerationSettings {
     ..Default::default()
 };
 
-let result = generate_text(&provider, messages, settings, &[]).await?;
+let result = generate_text(&provider, messages, settings).await?;
 println!("{}", result.text);
 println!("Tokens used: {:?}", result.usage);
 ```
@@ -368,7 +366,7 @@ let provider = OllamaProvider::new(
     OllamaModel::Custom("gpt-oss-120b:q4_k_m".into()),
     "http://localhost:11434".into(),
 );
-let result = generate_text(&provider, messages, settings, &[]).await?;
+let result = generate_text(&provider, messages, settings).await?;
 ```
 
 ## Related Documentation

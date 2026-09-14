@@ -11,28 +11,13 @@ use super::usage::Usage;
 pub struct GenerateTextResult {
     /// Final generated text.
     pub text: String,
-    /// All generation steps (multi-step if tools were used).
-    pub steps: Vec<GenerationStep>,
-    /// Full message history including tool interactions.
-    pub messages: Vec<ModelMessage>,
-    /// Aggregated usage across all steps.
-    pub usage: Usage,
-    /// Why the final step finished.
-    pub finish_reason: Option<FinishReason>,
-}
-
-/// A single generation step (one model call).
-#[derive(Debug, Clone)]
-pub struct GenerationStep {
-    /// Text generated in this step.
-    pub text: String,
-    /// Tool calls made in this step, if any.
+    /// Tool calls returned by the provider; these are not executed.
     pub tool_calls: Vec<super::message::AgentToolCall>,
-    /// Tool results returned in this step, if any.
-    pub tool_results: Vec<super::message::AgentToolResult>,
-    /// Token usage for this step.
+    /// Input messages sent to the provider.
+    pub messages: Vec<ModelMessage>,
+    /// Token usage for this call.
     pub usage: Usage,
-    /// Finish reason for this step.
+    /// Why generation finished.
     pub finish_reason: Option<FinishReason>,
 }
 

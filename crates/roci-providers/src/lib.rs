@@ -12,101 +12,102 @@ pub mod models;
 pub mod overflow;
 pub mod provider;
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use std::sync::Arc;
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use overflow::OverflowClassifyingFactory;
 
 /// Register all enabled built-in provider factories with the given registry.
 ///
-/// Each factory is wrapped with [`OverflowClassifyingFactory`] so every
+/// Each factory is wrapped with [`overflow::OverflowClassifyingFactory`] so every
 /// provider instance gains text-based overflow classification without
 /// editing individual provider implementations.
-#[allow(unused_variables)]
-pub fn register_default_providers(registry: &mut roci_core::provider::ProviderRegistry) {
+pub fn register_default_providers(_registry: &mut roci_core::provider::ProviderRegistry) {
     #[cfg(feature = "openai")]
     {
-        registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+        _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
             factories::OpenAiFactory,
         )));
-        registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+        _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
             factories::CodexFactory,
         )));
     }
 
     #[cfg(feature = "anthropic")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::AnthropicFactory,
     )));
 
     #[cfg(feature = "google")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::GoogleFactory,
     )));
 
     #[cfg(feature = "grok")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::GrokFactory,
     )));
 
     #[cfg(feature = "groq")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::GroqFactory,
     )));
 
     #[cfg(feature = "mistral")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::MistralFactory,
     )));
 
     #[cfg(feature = "ollama")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::OllamaFactory,
     )));
 
     #[cfg(feature = "lmstudio")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::LmStudioFactory,
     )));
 
     #[cfg(feature = "openai-compatible")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::OpenAiCompatibleFactory,
     )));
 
     #[cfg(feature = "github-copilot")]
     {
-        registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+        _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
             factories::GitHubCopilotFactory,
         )));
     }
 
     #[cfg(feature = "anthropic-compatible")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::AnthropicCompatibleFactory,
     )));
 
     #[cfg(feature = "azure")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::AzureFactory,
     )));
 
     #[cfg(feature = "openrouter")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::OpenRouterFactory,
     )));
 
     #[cfg(feature = "together")]
-    registry.register(OverflowClassifyingFactory::wrap(Arc::new(
+    _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::TogetherFactory,
     )));
 }
 
 /// Register all built-in auth backends with the given auth service.
-pub fn register_default_auth_backends(service: &mut roci_core::auth::AuthService) {
+pub fn register_default_auth_backends(_service: &mut roci_core::auth::AuthService) {
     #[cfg(feature = "github-copilot")]
-    service.register_backend(Arc::new(auth::GitHubCopilotBackend));
+    _service.register_backend(Arc::new(auth::GitHubCopilotBackend));
     #[cfg(feature = "openai")]
-    service.register_backend(Arc::new(auth::OpenAiCodexBackend));
+    _service.register_backend(Arc::new(auth::OpenAiCodexBackend));
     #[cfg(feature = "anthropic")]
-    service.register_backend(Arc::new(auth::ClaudeCodeBackend));
+    _service.register_backend(Arc::new(auth::ClaudeCodeBackend));
 }

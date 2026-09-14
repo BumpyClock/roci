@@ -15,7 +15,7 @@ pub async fn generate(
 ) -> Result<String, RociError> {
     let messages = vec![ModelMessage::user(prompt)];
     let result =
-        super::text::generate_text(provider, messages, GenerationSettings::default(), &[]).await?;
+        super::text::generate_text(provider, messages, GenerationSettings::default()).await?;
     Ok(result.text)
 }
 

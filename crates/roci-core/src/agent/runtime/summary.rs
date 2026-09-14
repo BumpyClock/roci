@@ -39,9 +39,8 @@ impl AgentRuntime {
             .candidates
             .try_lock()
             .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?
-            .first()
-            .cloned()
-            .ok_or_else(|| RociError::Configuration("model candidates cannot be empty".into()))?;
+            .primary()
+            .clone();
         let messages = self
             .messages
             .try_lock()
@@ -94,9 +93,8 @@ impl AgentRuntime {
             .candidates
             .try_lock()
             .map_err(|_| RociError::InvalidState("Agent is busy (model lock contended)".into()))?
-            .first()
-            .cloned()
-            .ok_or_else(|| RociError::Configuration("model candidates cannot be empty".into()))?;
+            .primary()
+            .clone();
         let existing_messages = self
             .messages
             .try_lock()

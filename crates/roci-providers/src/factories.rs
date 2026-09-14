@@ -1,12 +1,28 @@
 //! ProviderFactory implementations for each built-in provider.
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use futures::future::BoxFuture;
-use roci_core::auth::{CredentialFlow, ProviderDescriptor};
+#[cfg(any(test, feature = "openai", feature = "anthropic", feature = "google"))]
+use roci_core::auth::CredentialFlow;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
+use roci_core::auth::ProviderDescriptor;
+#[cfg(any(test, feature = "openai", feature = "anthropic", feature = "google"))]
 use roci_core::config::RociConfig;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use roci_core::error::RociError;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use roci_core::models::{ModelCatalog, ModelListOptions, ProviderKey};
+#[cfg(any(
+    feature = "google",
+    feature = "grok",
+    feature = "groq",
+    feature = "mistral"
+))]
+use roci_core::provider::require_api_key;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use roci_core::provider::{ModelProvider, ProviderFactory};
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 fn catalog_future<'a>(
     provider_key: &'a str,
     options: &'a ModelListOptions,
@@ -21,23 +37,12 @@ fn catalog_future<'a>(
     })
 }
 
-/// Resolve an API key from config for the given provider.
-fn require_api_key(
-    config: &RociConfig,
-    provider: ProviderKey,
-    missing_message: &'static str,
-) -> Result<String, RociError> {
-    roci_core::provider::require_api_key(config, provider, missing_message)
-}
-
-#[cfg_attr(
-    not(any(feature = "openrouter", feature = "together", test)),
-    allow(dead_code)
-)]
+#[cfg(any(feature = "openrouter", feature = "together", test))]
 fn optional_api_key(config: &RociConfig, provider: &str) -> String {
     config.get_api_key(provider).unwrap_or_default()
 }
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 fn explicit_descriptor(
     canonical_key: &'static str,
     display_name: &'static str,

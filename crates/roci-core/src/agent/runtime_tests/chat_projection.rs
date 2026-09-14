@@ -34,7 +34,6 @@ fn approval_request(id: &str) -> ApprovalRequest {
         allow_session: true,
         reason: Some("run shell".to_string()),
         payload: serde_json::json!({ "tool_name": "shell" }),
-        suggested_policy_change: None,
     }
 }
 
@@ -226,7 +225,6 @@ fn approval_lifecycle_projects_required_resolved_and_canceled_snapshots() {
         allow_session: true,
         reason: Some("run shell".to_string()),
         payload: serde_json::json!({ "tool_name": "shell" }),
-        suggested_policy_change: None,
     };
 
     let required = projector
@@ -280,7 +278,6 @@ fn cancel_turn_marks_pending_approvals_canceled() {
         allow_session: true,
         reason: Some("run shell".to_string()),
         payload: serde_json::json!({ "tool_name": "shell" }),
-        suggested_policy_change: None,
     };
     projector
         .require_approval(queued.turn_id, request)

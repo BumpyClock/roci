@@ -12,7 +12,7 @@ use crate::agent_loop::runner::{
 use crate::agent_loop::ApprovalPolicy;
 use crate::agent_loop::{RunHandle, RunRequest, RunResult, RunStatus, Runner};
 use crate::error::RociError;
-use crate::models::{ModelCandidates, ModelHealthTracker};
+use crate::models::ModelHealthTracker;
 use crate::tools::catalog::{ToolCatalog, ToolOrigin};
 use crate::tools::dynamic::{DynamicToolAdapter, DynamicToolProvider};
 use crate::tools::tool::Tool;
@@ -21,6 +21,12 @@ use crate::types::{
 };
 #[cfg(feature = "agent")]
 use crate::{agent::subagents::project_main_agent_profile, tools::catalog::ToolVisibilityPolicy};
+
+enum TerminalTurnOutcome {
+    Completed,
+    Failed(String),
+    Canceled,
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct TurnRunOptions {
@@ -31,26 +37,30 @@ pub(super) struct TurnRunOptions {
 
 impl AgentRuntime {
     async fn complete_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
-        self.terminal_chat_turn(turn_id, TurnStatus::Completed, None)
+        self.terminal_chat_turn(turn_id, TerminalTurnOutcome::Completed)
             .await
     }
 
     async fn fail_chat_turn(&self, turn_id: TurnId, error: String) -> Result<(), RociError> {
-        self.terminal_chat_turn(turn_id, TurnStatus::Failed, Some(error))
+        self.terminal_chat_turn(turn_id, TerminalTurnOutcome::Failed(error))
             .await
     }
 
     async fn cancel_chat_turn(&self, turn_id: TurnId) -> Result<(), RociError> {
-        self.terminal_chat_turn(turn_id, TurnStatus::Canceled, None)
+        self.terminal_chat_turn(turn_id, TerminalTurnOutcome::Canceled)
             .await
     }
 
     async fn terminal_chat_turn(
         &self,
         turn_id: TurnId,
-        status: TurnStatus,
-        error: Option<String>,
+        outcome: TerminalTurnOutcome,
     ) -> Result<(), RociError> {
+        let status = match outcome {
+            TerminalTurnOutcome::Completed => TurnStatus::Completed,
+            TerminalTurnOutcome::Failed(_) => TurnStatus::Failed,
+            TerminalTurnOutcome::Canceled => TurnStatus::Canceled,
+        };
         let events: Result<Vec<_>, AgentRuntimeError> = (|| {
             let mut projector =
                 self.chat_projector
@@ -66,18 +76,10 @@ impl AgentRuntime {
             if status == TurnStatus::Canceled {
                 events.extend(projector.cancel_pending_human_interactions(turn_id)?);
             }
-            let event = match status {
-                TurnStatus::Completed => projector.complete_turn(turn_id),
-                TurnStatus::Failed => projector.fail_turn(
-                    turn_id,
-                    error.expect("failed terminal projection carries error"),
-                ),
-                TurnStatus::Canceled => projector.cancel_turn(turn_id),
-                TurnStatus::Queued | TurnStatus::Running => {
-                    Err(AgentRuntimeError::ProjectionFailed {
-                        message: format!("non-terminal status requested: {status:?}"),
-                    })
-                }
+            let event = match outcome {
+                TerminalTurnOutcome::Completed => projector.complete_turn(turn_id),
+                TerminalTurnOutcome::Failed(error) => projector.fail_turn(turn_id, error),
+                TerminalTurnOutcome::Canceled => projector.cancel_turn(turn_id),
             };
             events.push(event?);
             Ok::<_, AgentRuntimeError>(events)
@@ -271,10 +273,7 @@ impl AgentRuntime {
                             crate::human_interaction::HumanInteractionRequest::from_user_input(
                                 request.clone(),
                             );
-                        let rx = coordinator
-                            .create_request(human_request.clone())
-                            .await
-                            .map_err(crate::tools::UserInputError::from)?;
+                        let rx = coordinator.create_request(human_request.clone()).await;
                         sink(crate::agent_loop::AgentEvent::HumanInteractionRequested {
                             request: human_request,
                         });
@@ -304,7 +303,6 @@ impl AgentRuntime {
         };
 
         let candidates = self.candidates.lock().await.clone();
-        let candidates = ModelCandidates::new(candidates)?;
         let primary_model = candidates.primary().clone();
 
         let tools = match self.resolve_tools_for_run().await {

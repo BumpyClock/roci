@@ -251,18 +251,29 @@ mod tests {
     }
 
     #[test]
-    fn assemble_computes_positive_token_counts() {
-        let result = assemble_summary_compaction(
-            &make_system_prefix(),
-            &make_prepared_no_split(),
-            "summary".to_string(),
-            ModelMessage::user("summary"),
-            FileOperationSnapshot::default(),
-            CompactionSuffix::default(),
-        );
+    fn assemble_counts_all_segments_before_and_after_replacement() {
+        // Heuristic costs: system=9, summary=6, old question/answer=7/9,
+        // recent question/answer=8/10, mid question/partial=7/9.
+        for (prepared, before, after) in [
+            (make_prepared_no_split(), 43, 33),
+            (make_prepared_with_split(), 42, 41),
+        ] {
+            let result = assemble_summary_compaction(
+                &make_system_prefix(),
+                &prepared,
+                "summary".to_string(),
+                ModelMessage::user("summary"),
+                FileOperationSnapshot::default(),
+                CompactionSuffix::default(),
+            );
 
-        assert!(result.tokens_before > 0, "tokens_before should be positive");
-        assert!(result.tokens_after > 0, "tokens_after should be positive");
+            assert_eq!(
+                result.tokens_before, before,
+                "split={}",
+                prepared.split_turn
+            );
+            assert_eq!(result.tokens_after, after, "split={}", prepared.split_turn);
+        }
     }
 
     #[test]

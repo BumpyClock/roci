@@ -316,16 +316,17 @@ mod tests {
 
         let serialized = serialize_pi_mono_summary(&summary);
 
-        assert!(serialized.contains("## Goal"));
-        assert!(serialized.contains("## Constraints"));
-        assert!(serialized.contains("## Progress"));
-        assert!(serialized.contains("## Decisions"));
-        assert!(serialized.contains("## Next Steps"));
-        assert!(serialized.contains("## Critical Context"));
-        assert!(serialized.contains("### Read Files"));
-        assert!(serialized.contains("- src/a.rs"));
-        assert!(serialized.contains("### Modified Files"));
-        assert!(serialized.contains("- src/b.rs"));
+        assert_eq!(
+            serialized,
+            "## Goal\n- Ship compaction\n\n\
+             ## Constraints\n- No settings loading in this task\n\n\
+             ## Progress\n- Added utility layer\n\n\
+             ## Decisions\n- Use summary message variants\n\n\
+             ## Next Steps\n- Wire execution hooks\n\n\
+             ## Critical Context\n- Do not cut at tool results\n\n\
+             ### Read Files\n- src/a.rs\n\n\
+             ### Modified Files\n- src/b.rs"
+        );
     }
 
     #[test]

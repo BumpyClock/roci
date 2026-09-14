@@ -250,13 +250,10 @@ impl UiElicitationSchema {
     ///
     /// # Errors
     ///
-    /// Returns [`UiElicitationValidationError`] when the schema is not a flat
-    /// object or its `required` list references an unknown field.
+    /// Returns [`UiElicitationValidationError`] when the `required` list
+    /// references an unknown field. Deserialization restricts the schema to
+    /// a flat object with supported primitive fields.
     pub fn validate(&self) -> Result<(), UiElicitationValidationError> {
-        if self.schema_type != UiElicitationSchemaType::Object {
-            return Err(UiElicitationValidationError::UnsupportedSchemaRoot);
-        }
-
         for field_name in &self.required {
             if !self.properties.contains_key(field_name) {
                 return Err(UiElicitationValidationError::UnknownRequiredField(
@@ -378,8 +375,6 @@ pub enum UiElicitationValidationError {
     UnsupportedMode(UiElicitationMode),
     /// Form mode request did not include `requestedSchema`.
     MissingRequestedSchema,
-    /// Schema root is not a supported object.
-    UnsupportedSchemaRoot,
     /// Required list references a field not present in `properties`.
     UnknownRequiredField(String),
 }
@@ -395,9 +390,6 @@ impl std::fmt::Display for UiElicitationValidationError {
                     formatter,
                     "UI elicitation form request missing requestedSchema"
                 )
-            }
-            Self::UnsupportedSchemaRoot => {
-                write!(formatter, "UI elicitation schema must be an object")
             }
             Self::UnknownRequiredField(field_name) => {
                 write!(
@@ -454,8 +446,7 @@ impl ToolPermissionSessionKey {
     /// Build an exact cache key for a tool permission request.
     #[must_use]
     pub fn for_tool_call(kind: ToolPermissionKind, call: &AgentToolCall) -> Self {
-        let arguments =
-            serde_json::to_string(&call.arguments).unwrap_or_else(|_| "null".to_string());
+        let arguments = call.arguments.to_string();
         Self(format!(
             "{kind:?}|{}|{}|{}",
             call.recipient.as_deref().unwrap_or_default(),
@@ -677,18 +668,18 @@ impl HumanInteractionCoordinator {
     pub async fn create_request(
         &self,
         request: HumanInteractionRequest,
-    ) -> Result<PendingHumanInteraction, HumanInteractionError> {
+    ) -> PendingHumanInteraction {
         let (tx, rx) = oneshot::channel();
         let request_id = request.request_id;
 
         let mut pending = self.pending.lock().await;
         pending.insert(request_id, PendingHumanInteractionRecord { request, tx });
 
-        Ok(PendingHumanInteraction {
+        PendingHumanInteraction {
             coordinator: self.clone(),
             request_id,
             rx,
-        })
+        }
     }
 
     /// Submit a response for a pending request.
@@ -729,10 +720,9 @@ impl HumanInteractionCoordinator {
     pub async fn create_user_input_request(
         &self,
         request: UserInputRequest,
-    ) -> Result<PendingHumanInteraction, UserInputError> {
+    ) -> PendingHumanInteraction {
         self.create_request(HumanInteractionRequest::from_user_input(request))
             .await
-            .map_err(Into::into)
     }
 
     /// Submit current ask_user response shape through the shared coordinator.
@@ -754,15 +744,6 @@ impl HumanInteractionCoordinator {
         self.submit_error(request_id, HumanInteractionError::from(error))
             .await
             .map_err(|err| UnknownUserInputRequest(err.0))
-    }
-
-    /// Register a tool permission request through the shared coordinator.
-    #[cfg(feature = "agent")]
-    pub async fn create_tool_permission_request(
-        &self,
-        request: HumanInteractionRequest,
-    ) -> Result<PendingHumanInteraction, HumanInteractionError> {
-        self.create_request(request).await
     }
 
     /// Submit a tool permission decision through the shared coordinator.
@@ -884,15 +865,12 @@ impl PendingHumanInteraction {
                     request_id,
                     result: response.result,
                 }),
-                HumanInteractionResponsePayload::Canceled => {
-                    Err(UserInputError::Canceled { request_id })
-                }
                 _ => Err(UserInputError::InteractivePromptUnavailable {
                     request_id,
                     reason: "human interaction response was not ask_user".to_string(),
                 }),
             },
-            Err(error) => Err(error.into_user_input_error()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -907,9 +885,6 @@ impl PendingHumanInteraction {
             Ok(response) => match response.payload {
                 HumanInteractionResponsePayload::ToolPermission(response) => Ok(response.decision),
                 HumanInteractionResponsePayload::Declined => Ok(ToolPermissionDecision::Deny),
-                HumanInteractionResponsePayload::Canceled => {
-                    Err(HumanInteractionError::Canceled { request_id })
-                }
                 _ => Err(HumanInteractionError::Unavailable {
                     request_id,
                     reason: "human interaction response was not tool_permission".to_string(),
@@ -939,17 +914,15 @@ impl From<UserInputError> for HumanInteractionError {
 
 impl From<HumanInteractionError> for UserInputError {
     fn from(value: HumanInteractionError) -> Self {
-        value.into_user_input_error()
-    }
-}
-
-impl HumanInteractionError {
-    fn into_user_input_error(self) -> UserInputError {
-        match self {
-            Self::UnknownRequest { request_id } => UserInputError::UnknownRequest { request_id },
-            Self::Timeout { request_id } => UserInputError::Timeout { request_id },
-            Self::Canceled { request_id } => UserInputError::Canceled { request_id },
-            Self::Unavailable { request_id, reason } => {
+        match value {
+            HumanInteractionError::UnknownRequest { request_id } => {
+                UserInputError::UnknownRequest { request_id }
+            }
+            HumanInteractionError::Timeout { request_id } => UserInputError::Timeout { request_id },
+            HumanInteractionError::Canceled { request_id } => {
+                UserInputError::Canceled { request_id }
+            }
+            HumanInteractionError::Unavailable { request_id, reason } => {
                 UserInputError::InteractivePromptUnavailable { request_id, reason }
             }
         }
@@ -1149,8 +1122,7 @@ mod tests {
         let request_id = Uuid::new_v4();
         let pending = coordinator
             .create_user_input_request(user_input_request(request_id))
-            .await
-            .unwrap();
+            .await;
 
         coordinator
             .submit_user_input_response(UserInputResponse {
@@ -1176,11 +1148,12 @@ mod tests {
         let request_id = Uuid::new_v4();
         let pending = coordinator
             .create_user_input_request(user_input_request(request_id))
-            .await
-            .unwrap();
+            .await;
 
         let result = pending.wait_user_input(Some(10)).await;
-        assert!(matches!(result, Err(UserInputError::Timeout { .. })));
+        assert!(
+            matches!(result, Err(UserInputError::Timeout { request_id: actual }) if actual == request_id)
+        );
 
         let late = coordinator
             .submit_user_input_response(UserInputResponse {
@@ -1190,21 +1163,35 @@ mod tests {
                 },
             })
             .await;
-        assert!(matches!(late, Err(UnknownUserInputRequest(_))));
+        assert!(matches!(late, Err(UnknownUserInputRequest(actual)) if actual == request_id));
     }
 
     #[tokio::test]
-    async fn cancel_all_unblocks_waiter() {
-        let coordinator = HumanInteractionCoordinator::new();
-        let request_id = Uuid::new_v4();
-        let pending = coordinator
-            .create_user_input_request(user_input_request(request_id))
-            .await
-            .unwrap();
+    async fn cancellation_unblocks_waiter_and_removes_request() {
+        for explicit_response in [false, true] {
+            let coordinator = HumanInteractionCoordinator::new();
+            let request_id = Uuid::new_v4();
+            let pending = coordinator
+                .create_user_input_request(user_input_request(request_id))
+                .await;
 
-        coordinator.cancel_all().await;
+            if explicit_response {
+                coordinator
+                    .submit_user_input_response(UserInputResponse {
+                        request_id,
+                        result: UserInputResult::Canceled,
+                    })
+                    .await
+                    .unwrap();
+            } else {
+                coordinator.cancel_all().await;
+            }
 
-        let result = pending.wait_user_input(None).await;
-        assert!(matches!(result, Err(UserInputError::Canceled { .. })));
+            let result = pending.wait_user_input(None).await;
+            assert!(
+                matches!(result, Err(UserInputError::Canceled { request_id: actual }) if actual == request_id)
+            );
+            assert!(!coordinator.is_pending(request_id).await);
+        }
     }
 }
