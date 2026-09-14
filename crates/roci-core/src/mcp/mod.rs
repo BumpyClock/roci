@@ -26,8 +26,5 @@ pub use instructions::{
     merge_mcp_instructions, MCPInstructionMergePolicy, MCPInstructionSource, MCPResourceIdentity,
     MCPServerKind, MCPServerMetadata,
 };
-pub use server::{
-    McpCallToolResult, McpServerCore, McpServerListedTool, McpServerToolIdentity, McpToolIdentity,
-    McpToolSchema,
-};
+pub use server::{McpCallToolResult, McpServerCore, McpToolIdentity, McpToolSchema};
 pub use transport::MCPRemoteReconnectPolicy;

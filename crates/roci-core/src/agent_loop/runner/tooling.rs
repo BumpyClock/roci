@@ -451,24 +451,6 @@ pub(super) fn append_tool_result(
     iteration_failures: &mut usize,
     messages: &mut Vec<ModelMessage>,
 ) -> AgentToolResult {
-    append_final_tool_result(
-        emitter,
-        agent_emitter,
-        call,
-        result,
-        iteration_failures,
-        messages,
-    )
-}
-
-fn append_final_tool_result(
-    emitter: &RunEventEmitter,
-    agent_emitter: &AgentEventEmitter,
-    call: &AgentToolCall,
-    result: AgentToolResult,
-    iteration_failures: &mut usize,
-    messages: &mut Vec<ModelMessage>,
-) -> AgentToolResult {
     if result.is_error {
         *iteration_failures = iteration_failures.saturating_add(1);
     }
@@ -511,7 +493,7 @@ pub(super) async fn append_skipped_tool_call(
     emit_tool_execution_start(agent_emitter, call);
     let skipped_result = finalize_tool_result(hooks, call, tool, skipped_result).await;
     emit_tool_execution_end(agent_emitter, call, &skipped_result);
-    append_final_tool_result(
+    append_tool_result(
         emitter,
         agent_emitter,
         call,

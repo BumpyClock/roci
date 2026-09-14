@@ -216,12 +216,42 @@ fn headers_error_when_no_default_or_request_api_key() {
     assert!(matches!(err, RociError::MissingCredential { .. }));
 }
 
-#[test]
-fn payload_callback_receives_request_payload() {
-    let provider =
-        OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".to_string(), None, None);
-    let captured_model = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let captured_model_for_hook = captured_model.clone();
+#[tokio::test]
+async fn payload_callback_receives_request_payload() {
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Fresh server: the shared HTTP client must not reuse sockets from another test runtime.
+    let server = MockServer::builder().start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .and(body_partial_json(serde_json::json!({"stream": false})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            "status": "completed"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .and(body_partial_json(serde_json::json!({"stream": true})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: [DONE]\n\n"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = OpenAiResponsesProvider::new(
+        OpenAiModel::Gpt5Nano,
+        "test-key".to_string(),
+        Some(server.uri()),
+        None,
+    );
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_for_hook = captured.clone();
     let request = ProviderRequest {
         messages: vec![ModelMessage::user("hello")],
         settings: settings(),
@@ -231,19 +261,30 @@ fn payload_callback_receives_request_payload() {
         headers: reqwest::header::HeaderMap::new(),
         metadata: std::collections::HashMap::new(),
         payload_callback: Some(std::sync::Arc::new(move |payload| {
-            *captured_model_for_hook.lock().expect("capture lock") = payload
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
+            captured_for_hook
+                .lock()
+                .expect("capture lock")
+                .push(payload.clone());
         })),
         session_id: None,
         transport: None,
     };
-    let body = provider.build_request_body(&request, false);
-    provider.emit_payload_callback(&request, &body);
 
-    assert_eq!(
-        captured_model.lock().expect("capture lock").as_deref(),
-        Some("gpt-5-nano")
-    );
+    assert_eq!(provider.generate_text(&request).await.unwrap().text, "ok");
+    let mut stream = provider.stream_text(&request).await.unwrap();
+    while let Some(delta) = stream.next().await {
+        delta.expect("stream should succeed");
+    }
+
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 2);
+    let captured = captured.lock().expect("capture lock");
+    assert_eq!(captured.len(), 2, "one callback per provider request");
+    for (index, request) in sent.iter().enumerate() {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(captured[index], body);
+        assert_eq!(body["model"], "gpt-5-nano");
+        assert_eq!(body["stream"], index == 1);
+        assert_eq!(body["input"][0]["content"], "hello");
+    }
 }

@@ -711,6 +711,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess entry point exercised by cross_process tests"]
     fn session_lock_test_child() {
         if env::var_os("ROCI_SESSION_LOCK_TEST_CHILD").is_none() {
             return;
@@ -917,6 +918,7 @@ mod tests {
         let done = child_marker(root, action, "done");
         Command::new(env::current_exe().expect("test executable"))
             .arg("--exact")
+            .arg("--ignored")
             .arg("session::catalog::tests::session_lock_test_child")
             .env("ROCI_SESSION_LOCK_TEST_CHILD", "1")
             .env("ROCI_SESSION_LOCK_ROOT", root)

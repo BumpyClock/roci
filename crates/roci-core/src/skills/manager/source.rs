@@ -42,10 +42,7 @@ pub(crate) fn parse_source(input: &str, cwd: &Path) -> Result<ManagedSkillSource
 }
 
 fn looks_like_git_url(source: &str) -> bool {
-    source.contains("://")
-        || source.starts_with("git@")
-        || source.starts_with("ssh://")
-        || source.starts_with("git://")
+    source.contains("://") || source.starts_with("git@")
 }
 
 pub(crate) fn materialize_source(

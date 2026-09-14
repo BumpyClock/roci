@@ -1,26 +1,5 @@
 use super::types::{PromptInput, ResolvedAttachment};
 
-/// Renders resolved text attachments into model-visible prompt text.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AttachmentTextRenderer;
-
-impl AttachmentTextRenderer {
-    /// Renders `input.text` followed by text attachments. Images are preserved by
-    /// `ResolvedAttachment` and intentionally skipped by this text renderer.
-    pub fn render_prompt_input_text(
-        &self,
-        input: &PromptInput,
-        resolved: &[ResolvedAttachment],
-    ) -> String {
-        render_prompt_input_text(input, resolved)
-    }
-
-    /// Renders only text attachments. Images return no text.
-    pub fn render_resolved_text(&self, resolved: &[ResolvedAttachment]) -> String {
-        render_resolved_text(resolved)
-    }
-}
-
 /// Renders prompt text plus resolved text attachments.
 pub fn render_prompt_input_text(input: &PromptInput, resolved: &[ResolvedAttachment]) -> String {
     let attachment_text = render_resolved_text(resolved);

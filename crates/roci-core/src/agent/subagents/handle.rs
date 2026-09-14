@@ -158,12 +158,6 @@ mod tests {
     use crate::config::RociConfig;
     use crate::provider::ProviderRegistry;
 
-    #[test]
-    fn handle_accessors_compile() {
-        let id = SubagentId::nil();
-        assert_eq!(id, uuid::Uuid::nil());
-    }
-
     fn make_handle(status_value: SubagentStatus) -> SubagentHandle {
         make_handle_with_completion(status_value).0
     }

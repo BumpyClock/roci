@@ -9,7 +9,7 @@ use super::device_code::DeviceCodeSession;
 use super::error::AuthError;
 use super::host::LoginSessionId;
 
-const DEFAULT_PENDING_LOGIN_CAPACITY: usize = 32;
+const MAX_PENDING_LOGINS: usize = 32;
 const PKCE_SESSION_LIFETIME_MINUTES: i64 = 10;
 
 /// Internal pending login material that must never cross the manager boundary.
@@ -60,7 +60,6 @@ struct PendingLoginEntry {
 
 pub(crate) struct PendingLoginStore {
     entries: Mutex<HashMap<String, PendingLoginEntry>>,
-    capacity: usize,
 }
 
 /// Exclusive, cancellation-safe claim on one pending login.
@@ -94,7 +93,6 @@ impl PendingLoginStore {
     pub(crate) fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            capacity: DEFAULT_PENDING_LOGIN_CAPACITY,
         }
     }
 
@@ -114,7 +112,7 @@ impl PendingLoginStore {
     ) -> Result<(), AuthError> {
         let mut entries = self.entries.lock().expect("pending login map");
         entries.retain(|_, entry| entry.pending.expires_at() > now);
-        if entries.len() >= self.capacity {
+        if entries.len() >= MAX_PENDING_LOGINS {
             return Err(AuthError::PendingLoginLimit);
         }
         entries.insert(
@@ -188,61 +186,53 @@ mod tests {
         }
     }
 
+    fn fill_sessions(store: &PendingLoginStore, count: usize, now: DateTime<Utc>) {
+        for index in 0..count {
+            store
+                .insert_at(
+                    &LoginSessionId::new(format!("existing-{index}")),
+                    pkce(now + Duration::minutes(10)),
+                    now,
+                )
+                .expect("session should fit within the fixed cap");
+        }
+    }
+
     #[test]
     fn hard_cap_rejects_new_session_without_exceeding_bound() {
-        let store = PendingLoginStore {
-            entries: Mutex::new(HashMap::new()),
-            capacity: 2,
-        };
+        let store = PendingLoginStore::new();
         let now = Utc::now();
-        store
-            .insert_at(
-                &LoginSessionId::new("one"),
-                pkce(now + Duration::minutes(1)),
-                now,
-            )
-            .unwrap();
-        store
-            .insert_at(
-                &LoginSessionId::new("two"),
-                pkce(now + Duration::minutes(1)),
-                now,
-            )
-            .unwrap();
+        fill_sessions(&store, 32, now);
 
         assert!(matches!(
             store.insert_at(
-                &LoginSessionId::new("three"),
-                pkce(now + Duration::minutes(1)),
+                &LoginSessionId::new("overflow"),
+                pkce(now + Duration::minutes(10)),
                 now
             ),
             Err(AuthError::PendingLoginLimit)
         ));
-        assert_eq!(store.entries.lock().unwrap().len(), 2);
+        assert_eq!(store.entries.lock().unwrap().len(), 32);
     }
 
     #[test]
     fn expiry_sweep_frees_capacity_and_drops_stale_session() {
-        let store = PendingLoginStore {
-            entries: Mutex::new(HashMap::new()),
-            capacity: 1,
-        };
+        let store = PendingLoginStore::new();
         let now = Utc::now();
+        fill_sessions(&store, 31, now);
         let stale_id = LoginSessionId::new("stale");
         store
             .insert_at(&stale_id, pkce(now + Duration::seconds(1)), now)
             .unwrap();
         let later = now + Duration::seconds(2);
+        let fresh_id = LoginSessionId::new("fresh");
         store
-            .insert_at(
-                &LoginSessionId::new("fresh"),
-                pkce(later + Duration::seconds(1)),
-                later,
-            )
+            .insert_at(&fresh_id, pkce(later + Duration::minutes(10)), later)
             .unwrap();
 
         assert!(store.claim(&stale_id).is_err());
-        assert_eq!(store.entries.lock().unwrap().len(), 1);
+        assert!(store.claim(&fresh_id).is_ok());
+        assert_eq!(store.entries.lock().unwrap().len(), 32);
     }
 
     #[test]
@@ -297,34 +287,32 @@ mod tests {
 
     #[test]
     fn claimed_session_counts_toward_capacity_and_expiry_is_not_restored() {
-        let store = PendingLoginStore {
-            entries: Mutex::new(HashMap::new()),
-            capacity: 1,
-        };
+        let store = PendingLoginStore::new();
         let now = Utc::now();
+        fill_sessions(&store, 31, now);
         let claimed_id = LoginSessionId::new("claimed");
         store
-            .insert_at(&claimed_id, pkce(now + Duration::seconds(1)), now)
+            .insert_at(&claimed_id, pkce(now + Duration::minutes(1)), now)
             .unwrap();
         let claim = store.claim(&claimed_id).unwrap();
 
         assert!(matches!(
             store.insert_at(
                 &LoginSessionId::new("other"),
-                pkce(now + Duration::minutes(1)),
+                pkce(now + Duration::minutes(10)),
                 now,
             ),
             Err(AuthError::PendingLoginLimit)
         ));
-        store.release(claimed_id.as_str(), now + Duration::seconds(2));
+        store.release(claimed_id.as_str(), now + Duration::minutes(2));
         drop(claim);
 
         assert!(store.claim(&claimed_id).is_err());
         assert!(store
             .insert_at(
                 &LoginSessionId::new("other"),
-                pkce(now + Duration::minutes(1)),
-                now + Duration::seconds(2),
+                pkce(now + Duration::minutes(10)),
+                now + Duration::minutes(2),
             )
             .is_ok());
     }

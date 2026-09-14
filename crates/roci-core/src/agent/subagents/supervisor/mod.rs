@@ -266,10 +266,7 @@ impl SubagentSupervisor {
 
         // 6. Launch child runtime seeded with the full initial messages.
         //    System prompt is in the messages, not in the runtime config.
-        let launched = self
-            .launcher
-            .launch(id, initial_messages, child_config)
-            .await?;
+        let launched = self.launcher.launch(initial_messages, child_config).await?;
         let handle_runtime = launched.runtime.clone();
 
         // 7. Shared status

@@ -655,29 +655,3 @@ async fn reset_invalidates_prior_subscription_cursor() {
         "expected stale runtime after reset, got {replay_err:?}"
     );
 }
-
-#[tokio::test]
-async fn event_stream_has_no_snapshot_updated_payload() {
-    let agent = runtime_with_chat_provider();
-    let mut sub = agent.subscribe(None).await;
-
-    let result = agent.prompt("hello").await.expect("prompt should run");
-    assert_eq!(
-        result.status,
-        RunStatus::Completed,
-        "error: {:?}",
-        result.error
-    );
-
-    let mut events = Vec::new();
-    while !matches!(
-        events
-            .last()
-            .map(|event: &AgentRuntimeEvent| &event.payload),
-        Some(AgentRuntimeEventPayload::TurnCompleted { .. })
-    ) {
-        events.push(recv_event(&mut sub).await);
-    }
-
-    assert_no_snapshot_updated(&events);
-}

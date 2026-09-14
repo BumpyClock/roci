@@ -33,7 +33,6 @@ pub struct SubagentRoutingController {
     event_tx: broadcast::Sender<SubagentEvent>,
     critical_event_sink: Option<CriticalSubagentEventSink>,
     event_order: Arc<StdMutex<()>>,
-    max_depth: u32,
 }
 
 #[derive(Default)]
@@ -46,8 +45,7 @@ struct ChildRoutingRecord {
     profile: SubagentProfileRef,
     label: Option<String>,
     model: Option<LanguageModel>,
-    status: SubagentStatus,
-    handle: Option<Arc<SubagentHandle>>,
+    handle: Arc<SubagentHandle>,
     cached_result: Option<DelegateSubagentResult>,
     parent_tool_call_id: Option<String>,
     child_thread_id: Option<ThreadId>,
@@ -147,13 +145,7 @@ impl SubagentRoutingController {
             event_tx,
             critical_event_sink,
             event_order,
-            max_depth: 0,
         }
-    }
-
-    /// Configured maximum recursive delegation depth for future recursive routing.
-    pub fn max_depth(&self) -> u32 {
-        self.max_depth
     }
 
     /// Subscribe to controller-scoped sub-agent events.
@@ -275,8 +267,7 @@ impl SubagentRoutingController {
                     profile: profile.clone(),
                     label: label.clone(),
                     model: model.clone(),
-                    status: SubagentStatus::Running,
-                    handle: Some(handle.clone()),
+                    handle: handle.clone(),
                     cached_result: None,
                     parent_tool_call_id,
                     child_thread_id,
@@ -326,7 +317,6 @@ impl SubagentRoutingController {
                         record.profile.clone(),
                         record.label.clone(),
                         record.model.clone(),
-                        record.status,
                         record.handle.clone(),
                     )
                 })
@@ -334,12 +324,8 @@ impl SubagentRoutingController {
         };
 
         let mut children = Vec::with_capacity(records.len());
-        for (id, profile, label, model, fallback_status, handle) in records {
-            let status = if let Some(handle) = handle {
-                handle.status().await
-            } else {
-                fallback_status
-            };
+        for (id, profile, label, model, handle) in records {
+            let status = handle.status().await;
             children.push(SubagentKnownChild {
                 subagent_id: id,
                 profile_id: profile,
@@ -368,9 +354,7 @@ impl SubagentRoutingController {
             if let Some(result) = &record.cached_result {
                 return Ok(result.clone());
             }
-            let handle = record.handle.clone().ok_or_else(|| {
-                RociError::InvalidState(format!("subagent {id} has no active handle"))
-            })?;
+            let handle = record.handle.clone();
             (record.profile.clone(), handle, record.child_thread_id)
         };
 
@@ -400,9 +384,7 @@ impl SubagentRoutingController {
                     canceled: false,
                 });
             }
-            let handle = record.handle.clone().ok_or_else(|| {
-                RociError::InvalidState(format!("subagent {id} has no active handle"))
-            })?;
+            let handle = record.handle.clone();
             (record.profile.clone(), handle, record.child_thread_id)
         };
 
@@ -459,14 +441,12 @@ impl SubagentRoutingController {
                 .children
                 .get(&id)
                 .ok_or_else(|| RociError::Configuration(format!("subagent {id} not found")))?;
-            if record.cached_result.is_some() || is_terminal(record.status) {
+            if record.cached_result.is_some() {
                 return Err(RociError::Configuration(format!(
                     "cannot send message to terminal subagent {id}"
                 )));
             }
-            record.handle.clone().ok_or_else(|| {
-                RociError::InvalidState(format!("subagent {id} has no active handle"))
-            })?
+            record.handle.clone()
         };
 
         let status = handle.status().await;
@@ -510,7 +490,6 @@ impl SubagentRoutingController {
     async fn cache_result(&self, id: SubagentId, result: DelegateSubagentResult) {
         let mut state = self.state.lock().await;
         if let Some(record) = state.children.get_mut(&id) {
-            record.status = result.status;
             record.cached_result = Some(result);
         }
     }

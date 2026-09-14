@@ -207,7 +207,6 @@ fn observe_retry_exhausted(request: &RunRequest, category: FailureCategory) {
         return;
     };
     health.observe(HealthSignal::RetryExhausted {
-        candidate_index: request.active_candidate_index,
         key: ModelHealthKey::from_model(request.active_model()),
         category,
         observed_at_ms: now_ms(),
@@ -535,7 +534,6 @@ impl Runner for LoopRunner {
                                 let from = request.active_model().clone();
                                 observe_retry_exhausted(&request, failure_category);
                                 request.active_candidate_index = to_index;
-                                let to = request.active_model().clone();
                                 emit_candidate_advancing(
                                     &request,
                                     &emitter,
@@ -545,16 +543,6 @@ impl Runner for LoopRunner {
                                     failure_category,
                                     partial_output_seen,
                                 );
-                                if let Some(health) = request.model_health.as_ref() {
-                                    health.observe(HealthSignal::CandidateAdvanced {
-                                        from_index,
-                                        to_index,
-                                        from: ModelHealthKey::from_model(&from),
-                                        to: ModelHealthKey::from_model(&to),
-                                        reason: failure_category,
-                                        observed_at_ms: now_ms(),
-                                    });
-                                }
                                 retry_started_at = Instant::now();
                                 active_provider = None;
                                 continue 'inner;

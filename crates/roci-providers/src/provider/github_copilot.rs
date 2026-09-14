@@ -338,7 +338,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_copilot_models_parses_dynamic_success() {
-        let server = MockServer::start().await;
+        // Fresh server: the shared HTTP client must not reuse sockets from another test runtime.
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
             .and(header("authorization", "Bearer test-token"))
@@ -359,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_copilot_models_maps_404_to_unsupported() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
@@ -376,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn list_copilot_models_maps_auth_errors_to_authentication() {
         for status in [401, 403] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
                 .respond_with(ResponseTemplate::new(status).set_body_string("auth failed"))
@@ -393,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_copilot_models_maps_5xx_to_api_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))

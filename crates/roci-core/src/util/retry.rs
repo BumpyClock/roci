@@ -37,7 +37,6 @@ impl RetryPolicy {
         Fut: Future<Output = Result<T, RociError>>,
     {
         let mut backoff = self.initial_backoff;
-        let mut last_error = None;
 
         for attempt in 0..self.max_attempts {
             match operation().await {
@@ -64,13 +63,12 @@ impl RetryPolicy {
                         (backoff.as_secs_f64() * self.multiplier)
                             .min(self.max_backoff.as_secs_f64()),
                     );
-
-                    last_error = Some(e);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| RociError::Timeout(0)))
+        // Every nonempty attempt sequence returns from the loop above.
+        Err(RociError::Timeout(0))
     }
 }
 

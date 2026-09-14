@@ -853,7 +853,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_emits_reasoning_fields_separately_from_assistant_text() {
-        let server = MockServer::start().await;
+        // Fresh server: the shared HTTP client must not reuse sockets from another test runtime.
+        let server = MockServer::builder().start().await;
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"reasoning\":\"more \"},\"finish_reason\":null}]}\n\n",
@@ -1034,35 +1035,66 @@ mod tests {
             .contains("/tmp/"));
     }
 
-    #[test]
-    fn payload_callback_receives_openai_chat_request_payload() {
-        let provider = OpenAiProvider::new(OpenAiModel::Gpt4o, "test-key".to_string(), None, None);
-        let captured_model = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-        let captured_model_for_hook = captured_model.clone();
-        let request = ProviderRequest {
-            messages: vec![ModelMessage::user("hello")],
-            settings: GenerationSettings::default(),
-            tools: None,
-            response_format: None,
-            api_key_override: None,
-            headers: reqwest::header::HeaderMap::new(),
-            metadata: std::collections::HashMap::new(),
-            payload_callback: Some(std::sync::Arc::new(move |payload| {
-                *captured_model_for_hook.lock().expect("capture lock") = payload
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
-            })),
-            session_id: None,
-            transport: None,
-        };
-        let body = provider.build_request_body(&request, false);
-        provider.emit_payload_callback(&request, &body);
-
-        assert_eq!(
-            captured_model.lock().expect("capture lock").as_deref(),
-            Some("gpt-4o")
+    #[tokio::test]
+    async fn payload_callback_receives_openai_chat_request_payload() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"stream": false}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"stream": true}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(
+            OpenAiModel::Gpt4o,
+            "test-key".to_string(),
+            Some(server.uri()),
+            None,
         );
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_hook = captured.clone();
+        let mut request = request_with_headers(None, HeaderMap::new());
+        request.payload_callback = Some(std::sync::Arc::new(move |payload| {
+            captured_for_hook
+                .lock()
+                .expect("capture lock")
+                .push(payload.clone());
+        }));
+
+        assert_eq!(provider.generate_text(&request).await.unwrap().text, "ok");
+        let mut stream = provider.stream_text(&request).await.unwrap();
+        while let Some(delta) = stream.next().await {
+            delta.expect("stream should succeed");
+        }
+
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 2);
+        let captured = captured.lock().expect("capture lock");
+        assert_eq!(captured.len(), 2, "one callback per provider request");
+        for (index, request) in sent.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(captured[index], body);
+            assert_eq!(body["model"], "gpt-4o");
+            assert_eq!(body["stream"], index == 1);
+            assert_eq!(body["messages"][0]["content"], "hello");
+        }
     }
 
     #[test]

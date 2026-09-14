@@ -1,5 +1,6 @@
 use super::*;
 use rmcp::model::{BooleanSchema, IntegerSchema, StringSchema};
+use rmcp::ServiceExt;
 use serde_json::{json, Map};
 use tokio::time::{sleep, timeout, Duration};
 
@@ -67,13 +68,30 @@ async fn handler_does_not_advertise_elicitation_without_coordinator() {
 
 #[tokio::test]
 async fn create_elicitation_maps_request_and_accept_response() {
+    struct ElicitingServer;
+    impl rmcp::ServerHandler for ElicitingServer {}
+
     let coordinator = Arc::new(HumanInteractionCoordinator::new());
     let handler = MCPClientHandler::new(ProtocolVersion::LATEST)
         .with_ui_elicitation("alpha".to_string(), coordinator.clone());
-    let task = tokio::spawn(async move {
-        handler
-            .handle_create_elicitation(form_params(simple_schema()))
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn(async move {
+        ElicitingServer
+            .serve(server_transport)
             .await
+            .expect("server should initialize")
+    });
+    let client = handler
+        .serve(client_transport)
+        .await
+        .expect("client should initialize");
+    let server = server_task.await.expect("server task should join");
+    let peer = server.peer().clone();
+    let task = tokio::spawn(async move {
+        peer.send_request(rmcp::model::ServerRequest::CreateElicitationRequest(
+            rmcp::model::CreateElicitationRequest::new(form_params(simple_schema())),
+        ))
+        .await
     });
 
     let request = next_pending_request(&coordinator).await;
@@ -108,11 +126,16 @@ async fn create_elicitation_maps_request_and_accept_response() {
         .expect("response should submit");
 
     let result = task.await.expect("task should join").expect("MCP result");
+    let rmcp::model::ClientResult::CreateElicitationResult(result) = result else {
+        panic!("peer should receive an elicitation result");
+    };
     assert_eq!(result.action, ElicitationAction::Accept);
     assert_eq!(
         result.content,
         Some(json!({"environment": "staging", "dry_run": true}))
     );
+    client.cancel().await.expect("client should close");
+    server.cancel().await.expect("server should close");
 }
 
 #[tokio::test]

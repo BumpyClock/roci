@@ -220,12 +220,25 @@ mod tests {
             exported_at: Utc::now(),
         };
 
-        let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
 
-        assert!(json.contains("files/notes.txt"));
-        assert!(json.contains("\"len\":12"));
-        assert!(!json.contains("hello world"));
-        assert!(!json.contains("bytes"));
-        assert!(!json.contains("payload"));
+        assert_eq!(
+            json["resources"],
+            serde_json::json!({
+                "plan": null,
+                "workspace": null,
+                "artifacts": [],
+                "temp_files": [],
+                "checkpoints": [],
+                "files": [{
+                    "namespace": "files",
+                    "logical_path": "notes.txt",
+                    "storage_path": "files/notes.txt",
+                    "len": 12,
+                    "updated_at": null,
+                    "available": true
+                }]
+            })
+        );
     }
 }

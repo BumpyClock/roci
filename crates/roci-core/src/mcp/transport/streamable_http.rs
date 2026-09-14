@@ -608,34 +608,31 @@ mod tests {
         assert_eq!(received["id"], 1);
     }
 
-    #[tokio::test]
-    async fn streamable_http_request_timeout_is_deterministic() {
-        let mut transport =
-            StreamableHttpTransport::new("http://localhost:3000/mcp").request_timeout_ms(1);
-        let (mock, _send_calls, _close_calls) =
-            MockInnerTransport::with_delays(Vec::new(), Some(25), None);
-        transport.inner = Some(Box::new(mock));
+    #[tokio::test(start_paused = true)]
+    async fn streamable_http_send_uses_request_timeout_with_connect_timeout_as_fallback() {
+        for (request_timeout_ms, connect_timeout_ms, expected_timeout_ms) in [
+            (Some(1), None, 1),
+            (None, Some(1), 1),
+            (Some(5), Some(1), 5),
+        ] {
+            let mut transport =
+                StreamableHttpTransport::from_config(StreamableHttpTransportConfig {
+                    url: "http://localhost:3000/mcp".into(),
+                    request_timeout_ms,
+                    connect_timeout_ms,
+                    ..Default::default()
+                });
+            let (mock, send_calls, _close_calls) =
+                MockInnerTransport::with_send_delay(Vec::new(), 25);
+            transport.inner = Some(Box::new(mock));
 
-        let err = transport
-            .send(test_client_request())
-            .await
-            .expect_err("delayed send should timeout");
-        assert!(matches!(err, RociError::Timeout(1)));
-    }
-
-    #[tokio::test]
-    async fn streamable_http_connect_timeout_applies_on_first_operation() {
-        let mut transport =
-            StreamableHttpTransport::new("http://localhost:3000/mcp").connect_timeout_ms(1);
-        let (mock, _send_calls, _close_calls) =
-            MockInnerTransport::with_delays(Vec::new(), Some(25), None);
-        transport.inner = Some(Box::new(mock));
-
-        let err = transport
-            .send(test_client_request())
-            .await
-            .expect_err("first send should honor connect timeout");
-        assert!(matches!(err, RociError::Timeout(1)));
+            let err = transport
+                .send(test_client_request())
+                .await
+                .expect_err("delayed send should honor the selected operation timeout");
+            assert!(matches!(err, RociError::Timeout(ms) if ms == expected_timeout_ms));
+            assert_eq!(send_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     fn mcp_result_for(method: &str, id: serde_json::Value) -> serde_json::Value {

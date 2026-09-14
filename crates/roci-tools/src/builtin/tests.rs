@@ -935,20 +935,44 @@ async fn ask_user_parses_all_semantic_prompt_kinds() {
     }
 
     let seen = seen.lock().expect("seen lock");
-    assert!(matches!(
-        seen[0],
-        roci::tools::AskUserPrompt::Question { .. }
-    ));
-    assert!(matches!(
-        seen[1],
-        roci::tools::AskUserPrompt::Confirm { .. }
-    ));
-    assert!(matches!(seen[2], roci::tools::AskUserPrompt::Choice { .. }));
-    assert!(matches!(
-        seen[3],
-        roci::tools::AskUserPrompt::MultiChoice { .. }
-    ));
-    assert!(matches!(seen[4], roci::tools::AskUserPrompt::Form { .. }));
+    assert_eq!(
+        serde_json::to_value(seen.as_slice()).unwrap(),
+        serde_json::json!([
+            {
+                "kind": "question", "id": "input", "question": "Name?",
+                "placeholder": null, "default": null, "multiline": false
+            },
+            {
+                "kind": "confirm", "id": "input", "question": "Continue?",
+                "default": true
+            },
+            {
+                "kind": "choice", "id": "input", "question": "Unit?",
+                "choices": [{"id": "c", "label": "Celsius", "description": null}],
+                "default": null
+            },
+            {
+                "kind": "multi_choice", "id": "input", "question": "Tools?",
+                "choices": [{"id": "fmt", "label": "Format", "description": null}],
+                "default": ["fmt"], "min_selected": null, "max_selected": null
+            },
+            {
+                "kind": "form", "id": "input", "title": "Profile",
+                "fields": [
+                    {
+                        "id": "name", "label": "Name", "input_kind": "text",
+                        "required": true, "placeholder": null, "default": null,
+                        "choices": []
+                    },
+                    {
+                        "id": "unit", "label": "Unit", "input_kind": "choice",
+                        "required": false, "placeholder": null, "default": null,
+                        "choices": [{"id": "c", "label": "Celsius", "description": null}]
+                    }
+                ]
+            }
+        ])
+    );
 }
 
 #[cfg(feature = "agent")]

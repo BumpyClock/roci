@@ -176,12 +176,6 @@ impl From<AudioFormatArg> for AudioFormat {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
-
-    use tempfile::tempdir;
-    use tokio::sync::Mutex;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn infer_mime_type_from_supported_extensions() {
@@ -227,104 +221,5 @@ mod tests {
     fn unsupported_extension_requires_explicit_mime_type() {
         let error = resolve_mime_type(&PathBuf::from("sample.bin"), None).unwrap_err();
         assert!(error.to_string().contains("pass --mime-type"));
-    }
-
-    #[tokio::test]
-    async fn transcribe_audio_uses_openai_audio_endpoint() {
-        let _guard = env_lock().lock().await;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/audio/transcriptions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "application/json")
-                    .set_body_raw(
-                        r#"{"text":"hello from audio","language":"en","duration":1.2}"#,
-                        "application/json",
-                    ),
-            )
-            .mount(&server)
-            .await;
-
-        let temp = tempdir().unwrap();
-        let input = temp.path().join("clip.wav");
-        fs::write(&input, b"fake-wav-audio").unwrap();
-        let _key = set_env_var("OPENAI_API_KEY", "test-key");
-        let _base = set_env_var("OPENAI_BASE_URL", server.uri());
-
-        let result = transcribe_audio(&TranscribeArgs {
-            input,
-            mime_type: None,
-            language: Some("en".to_string()),
-            model: "whisper-1".to_string(),
-            json: false,
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(result.text, "hello from audio");
-        assert_eq!(result.language.as_deref(), Some("en"));
-    }
-
-    #[tokio::test]
-    async fn handle_speak_writes_audio_file_from_openai_endpoint() {
-        let _guard = env_lock().lock().await;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/audio/speech"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "audio/mpeg")
-                    .set_body_bytes(b"mp3-audio-bytes".to_vec()),
-            )
-            .mount(&server)
-            .await;
-
-        let temp = tempdir().unwrap();
-        let output = temp.path().join("speech.mp3");
-        let _key = set_env_var("OPENAI_API_KEY", "test-key");
-        let _base = set_env_var("OPENAI_BASE_URL", server.uri());
-
-        handle_speak(SpeakArgs {
-            output: output.clone(),
-            voice: "alloy".to_string(),
-            format: AudioFormatArg::Mp3,
-            speed: None,
-            model: "tts-1".to_string(),
-            text: "hello world".to_string(),
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(fs::read(output).unwrap(), b"mp3-audio-bytes");
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn set_env_var(key: &str, value: impl Into<String>) -> EnvVarGuard {
-        let previous = std::env::var(key).ok();
-        std::env::set_var(key, value.into());
-        EnvVarGuard {
-            key: key.to_string(),
-            previous,
-        }
-    }
-
-    struct EnvVarGuard {
-        key: String,
-        previous: Option<String>,
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                std::env::set_var(&self.key, previous);
-            } else {
-                std::env::remove_var(&self.key);
-            }
-        }
     }
 }

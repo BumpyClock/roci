@@ -61,13 +61,7 @@ pub(crate) async fn run_list(
     }
 
     writeln!(writer, "PROVIDER\tMODEL\tCONTEXT\tTOOLS\tVISION\tSOURCE")?;
-    let mut models = catalog.models().iter().collect::<Vec<_>>();
-    models.sort_by(|left, right| {
-        left.provider_key
-            .cmp(&right.provider_key)
-            .then_with(|| left.model_id.cmp(&right.model_id))
-    });
-    for model in models {
+    for model in catalog.models() {
         writeln!(
             writer,
             "{}\t{}\t{}\t{}\t{}\t{}",

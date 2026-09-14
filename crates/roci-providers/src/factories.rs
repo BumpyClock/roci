@@ -1211,7 +1211,8 @@ mod tests {
 
         #[tokio::test]
         async fn include_dynamic_false_skips_http_and_returns_static() {
-            let server = MockServer::start().await;
+            // Fresh server: the shared HTTP client must not reuse sockets from another test runtime.
+            let server = MockServer::builder().start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1267,7 +1268,7 @@ mod tests {
 
         #[tokio::test]
         async fn unsupported_models_endpoint_falls_back_to_static() {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
                 .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
@@ -1290,7 +1291,7 @@ mod tests {
         #[tokio::test]
         async fn authentication_errors_do_not_fallback_to_static() {
             for status in [401, 403] {
-                let server = MockServer::start().await;
+                let server = MockServer::builder().start().await;
                 Mock::given(method("GET"))
                     .and(path("/models"))
                     .respond_with(ResponseTemplate::new(status).set_body_string("auth failed"))
@@ -1309,7 +1310,7 @@ mod tests {
 
         #[tokio::test]
         async fn server_errors_fallback_to_static_with_warning_metadata() {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
                 .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))

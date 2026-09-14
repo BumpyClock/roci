@@ -17,7 +17,6 @@ use crate::error::RociError;
 pub(super) struct MockInnerTransport {
     receive_queue: VecDeque<Option<RxJsonRpcMessage<RoleClient>>>,
     send_delay_ms: Option<u64>,
-    receive_delay_ms: Option<u64>,
     send_calls: Arc<AtomicUsize>,
     close_calls: Arc<AtomicUsize>,
 }
@@ -32,7 +31,6 @@ impl MockInnerTransport {
             Self {
                 receive_queue: receive_queue.into(),
                 send_delay_ms: None,
-                receive_delay_ms: None,
                 send_calls: Arc::clone(&send_calls),
                 close_calls: Arc::clone(&close_calls),
             },
@@ -41,14 +39,12 @@ impl MockInnerTransport {
         )
     }
 
-    pub(super) fn with_delays(
+    pub(super) fn with_send_delay(
         receive_queue: Vec<Option<RxJsonRpcMessage<RoleClient>>>,
-        send_delay_ms: Option<u64>,
-        receive_delay_ms: Option<u64>,
+        send_delay_ms: u64,
     ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let (mut mock, send_calls, close_calls) = Self::new(receive_queue);
-        mock.send_delay_ms = send_delay_ms;
-        mock.receive_delay_ms = receive_delay_ms;
+        mock.send_delay_ms = Some(send_delay_ms);
         (mock, send_calls, close_calls)
     }
 }
@@ -64,9 +60,6 @@ impl DynRoleClientTransport for MockInnerTransport {
     }
 
     async fn receive(&mut self) -> Result<Option<RxJsonRpcMessage<RoleClient>>, RociError> {
-        if let Some(delay_ms) = self.receive_delay_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
         Ok(self.receive_queue.pop_front().unwrap_or(None))
     }
 

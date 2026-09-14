@@ -16,12 +16,6 @@ use super::types::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ResolvedSubagentModel {
-    pub model: LanguageModel,
-    pub reasoning_effort: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResolvedSubagentCandidates {
     pub candidates: Vec<LanguageModel>,
     pub reasoning_effort: Option<String>,
@@ -191,20 +185,15 @@ impl SubagentProfileRegistry {
         registry: &ProviderRegistry,
         config: &RociConfig,
     ) -> Result<LanguageModel, RociError> {
-        Ok(self
-            .resolve_model_candidate_without_base_config(profile, registry, config)?
-            .model)
-    }
-
-    #[cfg(test)]
-    pub(super) fn resolve_model_candidate(
-        &self,
-        profile: &SubagentProfile,
-        registry: &ProviderRegistry,
-        config: &RociConfig,
-        base_config: &AgentConfig,
-    ) -> Result<ResolvedSubagentModel, RociError> {
-        self.resolve_model_candidate_with_auth(profile, registry, config, Some(base_config))
+        let candidate = profile
+            .models
+            .iter()
+            .find(|candidate| is_viable_model_candidate(candidate, registry, config, None))
+            .ok_or_else(|| RociError::Configuration("no viable model candidate".into()))?;
+        Ok(LanguageModel::Known {
+            provider_key: candidate.provider.clone(),
+            model_id: candidate.model.clone(),
+        })
     }
 
     pub(super) fn resolve_model_candidates_with_auth(
@@ -247,36 +236,6 @@ impl SubagentProfileRegistry {
                 .collect(),
             reasoning_effort: first.reasoning_effort.clone(),
         })
-    }
-
-    fn resolve_model_candidate_without_base_config(
-        &self,
-        profile: &SubagentProfile,
-        registry: &ProviderRegistry,
-        config: &RociConfig,
-    ) -> Result<ResolvedSubagentModel, RociError> {
-        self.resolve_model_candidate_with_auth(profile, registry, config, None)
-    }
-
-    fn resolve_model_candidate_with_auth(
-        &self,
-        profile: &SubagentProfile,
-        registry: &ProviderRegistry,
-        config: &RociConfig,
-        base_config: Option<&AgentConfig>,
-    ) -> Result<ResolvedSubagentModel, RociError> {
-        for candidate in &profile.models {
-            if is_viable_model_candidate(candidate, registry, config, base_config) {
-                return Ok(ResolvedSubagentModel {
-                    model: LanguageModel::Known {
-                        provider_key: candidate.provider.clone(),
-                        model_id: candidate.model.clone(),
-                    },
-                    reasoning_effort: candidate.reasoning_effort.clone(),
-                });
-            }
-        }
-        Err(RociError::Configuration("no viable model candidate".into()))
     }
 
     // -- internal -----------------------------------------------------------
@@ -1553,15 +1512,32 @@ inherits = "parent"
         let config = RociConfig::default().with_token_store(None);
 
         let resolved = reg
-            .resolve_model_candidate_without_base_config(&profile, &provider_reg, &config)
+            .resolve_model_candidates_with_auth(
+                &profile,
+                &provider_reg,
+                &config,
+                &AgentConfig::default(),
+            )
             .unwrap();
 
         assert_eq!(
-            resolved.model,
+            resolved
+                .candidates
+                .iter()
+                .map(LanguageModel::model_id)
+                .collect::<Vec<_>>(),
+            ["local-model"]
+        );
+        assert_eq!(
+            resolved.candidates[0],
             LanguageModel::Known {
                 provider_key: "lmstudio".into(),
                 model_id: "local-model".into()
             }
+        );
+        assert_eq!(
+            reg.resolve_model(&profile, &provider_reg, &config).unwrap(),
+            resolved.candidates[0]
         );
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
     }
@@ -1595,11 +1571,19 @@ inherits = "parent"
         };
 
         let resolved = reg
-            .resolve_model_candidate(&profile, &provider_reg, &config, &base_config)
+            .resolve_model_candidates_with_auth(&profile, &provider_reg, &config, &base_config)
             .unwrap();
 
         assert_eq!(
-            resolved.model,
+            resolved
+                .candidates
+                .iter()
+                .map(LanguageModel::model_id)
+                .collect::<Vec<_>>(),
+            ["claude-sonnet-4.5", "local-model"]
+        );
+        assert_eq!(
+            resolved.candidates[0],
             LanguageModel::Known {
                 provider_key: "anthropic".into(),
                 model_id: "claude-sonnet-4.5".into()
@@ -1639,11 +1623,19 @@ inherits = "parent"
         };
 
         let resolved = reg
-            .resolve_model_candidate(&profile, &provider_reg, &config, &base_config)
+            .resolve_model_candidates_with_auth(&profile, &provider_reg, &config, &base_config)
             .unwrap();
 
         assert_eq!(
-            resolved.model,
+            resolved
+                .candidates
+                .iter()
+                .map(LanguageModel::model_id)
+                .collect::<Vec<_>>(),
+            ["claude-sonnet-4.5", "local-model"]
+        );
+        assert_eq!(
+            resolved.candidates[0],
             LanguageModel::Known {
                 provider_key: "anthropic".into(),
                 model_id: "claude-sonnet-4.5".into()
@@ -1675,11 +1667,19 @@ inherits = "parent"
         };
 
         let resolved = reg
-            .resolve_model_candidate(&profile, &provider_reg, &config, &base_config)
+            .resolve_model_candidates_with_auth(&profile, &provider_reg, &config, &base_config)
             .unwrap();
 
         assert_eq!(
-            resolved.model,
+            resolved
+                .candidates
+                .iter()
+                .map(LanguageModel::model_id)
+                .collect::<Vec<_>>(),
+            ["claude-sonnet-4.5"]
+        );
+        assert_eq!(
+            resolved.candidates[0],
             LanguageModel::Known {
                 provider_key: "anthropic".into(),
                 model_id: "claude-sonnet-4.5".into()
@@ -1760,11 +1760,24 @@ inherits = "parent"
         let config = RociConfig::default();
 
         let resolved = reg
-            .resolve_model_candidate(&profile, &provider_reg, &config, &AgentConfig::default())
+            .resolve_model_candidates_with_auth(
+                &profile,
+                &provider_reg,
+                &config,
+                &AgentConfig::default(),
+            )
             .unwrap();
 
         assert_eq!(
-            resolved.model,
+            resolved
+                .candidates
+                .iter()
+                .map(LanguageModel::model_id)
+                .collect::<Vec<_>>(),
+            ["local-model", "llama3.2"]
+        );
+        assert_eq!(
+            resolved.candidates[0],
             LanguageModel::Known {
                 provider_key: "lmstudio".into(),
                 model_id: "local-model".into()

@@ -134,6 +134,11 @@ async fn exhausted_transient_candidate_advances_to_next_candidate() {
         shared_health.snapshot(&source_key).status,
         crate::models::ModelHealthStatus::Unhealthy
     );
+    let destination_key = crate::models::ModelHealthKey::from_model(&model("ok"));
+    assert_eq!(
+        shared_health.snapshot(&destination_key).status,
+        crate::models::ModelHealthStatus::Healthy
+    );
 }
 
 #[tokio::test]

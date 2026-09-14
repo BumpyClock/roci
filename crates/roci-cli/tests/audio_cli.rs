@@ -1,29 +1,27 @@
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use tempfile::tempdir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary_path() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_roci-agent")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/debug/roci-agent"))
-}
 
 fn run_roci_audio_command(
     args: &[&str],
     envs: &[(&str, &str)],
     input: Option<&[u8]>,
 ) -> std::process::Output {
-    let mut command = Command::new(binary_path());
+    let home = tempdir().expect("isolated audio command home");
+    std::fs::write(home.path().join(".env"), b"").expect("isolate dotenv lookup");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_roci-agent"));
+    command.current_dir(home.path()).env("HOME", home.path());
     command.args(args);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
     if input.is_some() {
         command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
     }
 
     for (key, value) in envs {
@@ -52,6 +50,7 @@ async fn audio_transcribe_command_hits_local_openai_endpoint() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/audio/transcriptions"))
+        .and(header("authorization", "Bearer test-key"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/json")
@@ -60,6 +59,7 @@ async fn audio_transcribe_command_hits_local_openai_endpoint() {
                     "application/json",
                 ),
         )
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -86,58 +86,79 @@ async fn audio_transcribe_command_hits_local_openai_endpoint() {
         None,
     );
 
-    assert!(output.status.success());
-    let stdout = output_string(&output.stdout);
-    assert!(stdout.contains("\"text\": \"transcribed by mock\""));
-    assert!(stdout.contains("\"language\": \"en\""));
+    assert!(output.status.success(), "{}", output_string(&output.stderr));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["text"], "transcribed by mock");
+    assert_eq!(result["language"], "en");
+    assert_eq!(result["duration_seconds"], 1.5);
     assert_eq!(output_string(&output.stderr), "");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8(requests[0].body.clone()).unwrap();
+    assert!(body.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"));
+    assert!(body.contains("name=\"language\"\r\n\r\nen\r\n"));
+    assert!(body.contains("Content-Type: audio/wav\r\n\r\nfake-wav-bytes\r\n"));
 }
 
 #[tokio::test]
 async fn audio_speak_command_writes_output_file_from_local_endpoint() {
-    let server = MockServer::start().await;
-    let audio_payload = b"mock mp3 bytes";
-    Mock::given(method("POST"))
-        .and(path("/audio/speech"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "audio/mpeg")
-                .set_body_bytes(audio_payload.to_vec()),
-        )
-        .mount(&server)
-        .await;
+    for (voice, speed, text) in [
+        ("alloy", None, "hello world"),
+        ("nova", Some("1.25"), "Hello from CLI"),
+    ] {
+        let server = MockServer::start().await;
+        let audio_payload = b"mock mp3 bytes";
+        let mut expected = serde_json::json!({
+            "model": "tts-1",
+            "input": text,
+            "voice": voice,
+            "response_format": "mp3"
+        });
+        if speed.is_some() {
+            expected["speed"] = serde_json::json!(1.25);
+        }
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .and(header("authorization", "Bearer test-key"))
+            .and(body_json(expected))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(audio_payload.to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
 
-    let root = tempdir().expect("create temp dir");
-    let output = root.path().join("speech.mp3");
+        let root = tempdir().expect("create temp dir");
+        let output = root.path().join("speech.mp3");
+        let path = output.to_str().unwrap();
+        let mut args = vec![
+            "audio", "speak", "--output", path, "--voice", voice, "--format", "mp3",
+        ];
+        if let Some(speed) = speed {
+            args.extend(["--speed", speed]);
+        }
+        args.push(text);
+        let process = run_roci_audio_command(
+            &args,
+            &[
+                ("OPENAI_API_KEY", "test-key"),
+                ("OPENAI_BASE_URL", server.uri().as_str()),
+            ],
+            None,
+        );
 
-    let process = run_roci_audio_command(
-        &[
-            "audio",
-            "speak",
-            "--output",
-            output.to_string_lossy().as_ref(),
-            "--voice",
-            "nova",
-            "--speed",
-            "1.25",
-            "--format",
-            "mp3",
-            "Hello from CLI",
-        ],
-        &[
-            ("OPENAI_API_KEY", "test-key"),
-            ("OPENAI_BASE_URL", server.uri().as_str()),
-        ],
-        None,
-    );
-
-    assert!(process.status.success());
-    assert_eq!(
-        output_string(&process.stdout).trim(),
-        output.display().to_string()
-    );
-    assert_eq!(std::fs::read(&output).expect("read output"), audio_payload);
-    assert_eq!(output_string(&process.stderr), "");
+        assert!(
+            process.status.success(),
+            "{}",
+            output_string(&process.stderr)
+        );
+        assert_eq!(output_string(&process.stdout).trim(), path);
+        assert_eq!(std::fs::read(&output).expect("read output"), audio_payload);
+        assert_eq!(output_string(&process.stderr), "");
+    }
 }
 
 #[tokio::test]

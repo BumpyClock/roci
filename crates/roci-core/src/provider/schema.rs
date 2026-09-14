@@ -43,15 +43,7 @@ fn ensure_properties_additional_false(schema: &Value) -> Value {
     if let Value::Object(properties) = schema {
         let mut normalized = serde_json::Map::new();
         for (key, value) in properties {
-            let mut prop = ensure_additional_properties_false(value);
-            if is_object_schema(value) {
-                if let Value::Object(prop_obj) = &mut prop {
-                    prop_obj
-                        .entry("additionalProperties")
-                        .or_insert(Value::Bool(false));
-                }
-            }
-            normalized.insert(key.clone(), prop);
+            normalized.insert(key.clone(), ensure_additional_properties_false(value));
         }
         Value::Object(normalized)
     } else {
@@ -95,12 +87,39 @@ mod tests {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "ok": {"type": "boolean"}
+                "ok": {"type": "boolean"},
+                "properties": {
+                    "type": "object",
+                    "properties": {"nested": {"type": "object"}}
+                },
+                "rows": {"type": "array", "items": {"type": "object"}},
+                "open": {"type": "object", "additionalProperties": true}
             },
             "required": ["ok"]
         });
-        let normalized = normalize_schema_for_provider(&schema, "openai");
-        assert_eq!(normalized["additionalProperties"], false);
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "properties": {
+                    "type": "object",
+                    "properties": {
+                        "nested": {"type": "object", "additionalProperties": false}
+                    },
+                    "additionalProperties": false
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {"type": "object", "additionalProperties": false}
+                },
+                "open": {"type": "object", "additionalProperties": true}
+            },
+            "required": ["ok"],
+            "additionalProperties": false
+        });
+        for provider in ["openai", "openai-compatible"] {
+            assert_eq!(normalize_schema_for_provider(&schema, provider), expected);
+        }
     }
 
     #[test]
@@ -108,12 +127,31 @@ mod tests {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "ok": {"type": "boolean"}
+                "ok": {"type": "boolean"},
+                "rows": {
+                    "type": "array",
+                    "items": {"type": "object", "additionalProperties": true}
+                },
+                "choice": {"anyOf": [
+                    {"type": "object", "additionalProperties": false},
+                    {"type": "null"}
+                ]}
             },
             "required": ["ok"],
             "additionalProperties": false
         });
         let normalized = normalize_schema_for_provider(&schema, "google");
-        assert!(normalized.get("additionalProperties").is_none());
+        assert_eq!(
+            normalized,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "rows": {"type": "array", "items": {"type": "object"}},
+                    "choice": {"anyOf": [{"type": "object"}, {"type": "null"}]}
+                },
+                "required": ["ok"]
+            })
+        );
     }
 }

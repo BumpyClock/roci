@@ -5,8 +5,8 @@ pub use crate::attachments::{
     render_resolved_text, Attachment, AttachmentContentKind, AttachmentDisplayMetadata,
     AttachmentMetadata, AttachmentPreflightError, AttachmentPreflightReport,
     AttachmentResolveOptions, AttachmentResolver, AttachmentSource, AttachmentSourceKind,
-    AttachmentTextRenderer, BlobAttachment, CompiledPromptInput, DefaultAttachmentResolver,
-    FileAttachment, PromptInput, ResolvedAttachment, SelectionAttachment,
+    BlobAttachment, CompiledPromptInput, DefaultAttachmentResolver, FileAttachment, PromptInput,
+    ResolvedAttachment, SelectionAttachment,
 };
 pub use crate::config::RociConfig;
 pub use crate::error::{Result, RociError};

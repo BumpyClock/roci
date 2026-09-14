@@ -1,8 +1,4 @@
 use super::super::openai_errors::status_to_openai_error;
-use super::response::{
-    ResponsesApiResponse, ResponsesChoice, ResponsesChoiceMessage, ResponsesOutputContent,
-    ResponsesOutputItem, ResponsesToolCall, ResponsesToolCallFunction,
-};
 use super::*;
 use roci_core::provider::ToolDefinition;
 
@@ -80,92 +76,84 @@ fn tool_parameters_are_normalized_for_responses_api() {
 
 #[test]
 fn response_parses_function_call_output_item() {
-    let response = ResponsesApiResponse {
-        output: Some(vec![ResponsesOutputItem {
-            r#type: "function_call".to_string(),
-            content: None,
-            call_id: Some("call_1".to_string()),
-            name: Some("get_date".to_string()),
-            arguments: Some(r#"{"date":"today"}"#.to_string()),
-            tool_call: None,
-        }]),
-        choices: None,
-        status: Some("completed".to_string()),
-        usage: None,
-    };
+    let response = serde_json::from_value(serde_json::json!({
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_date",
+            "arguments": r#"{"date":"today"}"#
+        }],
+        "status": "completed"
+    }))
+    .unwrap();
 
     let parsed = OpenAiResponsesProvider::parse_response(response).unwrap();
+    assert!(parsed.text.is_empty());
     assert_eq!(parsed.tool_calls.len(), 1);
+    assert_eq!(parsed.tool_calls[0].id, "call_1");
     assert_eq!(parsed.tool_calls[0].name, "get_date");
+    assert_eq!(
+        parsed.tool_calls[0].arguments,
+        serde_json::json!({"date": "today"})
+    );
     assert_eq!(parsed.finish_reason, Some(FinishReason::ToolCalls));
 }
 
 #[test]
 fn response_parses_message_tool_call_content() {
-    let tool_call = ResponsesToolCall {
-        id: "call_1".to_string(),
-        function: ResponsesToolCallFunction {
-            name: "get_date".to_string(),
-            arguments: r#"{"date":"today"}"#.to_string(),
-        },
-    };
-    let response = ResponsesApiResponse {
-        output: Some(vec![ResponsesOutputItem {
-            r#type: "message".to_string(),
-            content: Some(vec![
-                ResponsesOutputContent {
-                    r#type: "output_text".to_string(),
-                    text: Some("ok".to_string()),
-                    tool_call: None,
-                },
-                ResponsesOutputContent {
-                    r#type: "tool_call".to_string(),
-                    text: None,
-                    tool_call: Some(tool_call),
-                },
-            ]),
-            call_id: None,
-            name: None,
-            arguments: None,
-            tool_call: None,
-        }]),
-        choices: None,
-        status: Some("completed".to_string()),
-        usage: None,
-    };
+    let response = serde_json::from_value(serde_json::json!({
+        "output": [{
+            "type": "message",
+            "content": [
+                {"type": "output_text", "text": "ok"},
+                {"type": "tool_call", "tool_call": {
+                    "id": "call_1",
+                    "function": {"name": "get_date", "arguments": r#"{"date":"today"}"#}
+                }}
+            ]
+        }],
+        "status": "completed"
+    }))
+    .unwrap();
 
     let parsed = OpenAiResponsesProvider::parse_response(response).unwrap();
     assert_eq!(parsed.text, "ok");
     assert_eq!(parsed.tool_calls.len(), 1);
+    assert_eq!(parsed.tool_calls[0].id, "call_1");
     assert_eq!(parsed.tool_calls[0].name, "get_date");
+    assert_eq!(
+        parsed.tool_calls[0].arguments,
+        serde_json::json!({"date": "today"})
+    );
+    assert_eq!(parsed.finish_reason, Some(FinishReason::ToolCalls));
 }
 
 #[test]
 fn response_parses_choices_fallback() {
-    let tool_call = ResponsesToolCall {
-        id: "call_1".to_string(),
-        function: ResponsesToolCallFunction {
-            name: "get_date".to_string(),
-            arguments: r#"{"date":"today"}"#.to_string(),
-        },
-    };
-    let response = ResponsesApiResponse {
-        output: None,
-        choices: Some(vec![ResponsesChoice {
-            message: ResponsesChoiceMessage {
-                content: Some("ok".to_string()),
-                tool_calls: Some(vec![tool_call]),
+    let response = serde_json::from_value(serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": "ok",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {"name": "get_date", "arguments": r#"{"date":"today"}"#}
+                }]
             },
-            finish_reason: Some("stop".to_string()),
-        }]),
-        status: None,
-        usage: None,
-    };
+            "finish_reason": "stop"
+        }]
+    }))
+    .unwrap();
 
     let parsed = OpenAiResponsesProvider::parse_response(response).unwrap();
     assert_eq!(parsed.text, "ok");
     assert_eq!(parsed.tool_calls.len(), 1);
+    assert_eq!(parsed.tool_calls[0].id, "call_1");
     assert_eq!(parsed.tool_calls[0].name, "get_date");
+    assert_eq!(
+        parsed.tool_calls[0].arguments,
+        serde_json::json!({"date": "today"})
+    );
+    assert_eq!(parsed.finish_reason, Some(FinishReason::ToolCalls));
 }
 
 #[test]

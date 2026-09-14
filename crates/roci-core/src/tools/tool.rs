@@ -501,7 +501,7 @@ pub trait Tool: Send + Sync {
     /// Human-readable description.
     fn description(&self) -> &str;
 
-    /// Canonical-name aliases accepted by future catalog/dispatch layers.
+    /// Alternate names accepted by catalog visibility policies and tool dispatch.
     fn aliases(&self) -> &[String] {
         &[]
     }

@@ -228,7 +228,6 @@ impl MockLauncher {
 impl SubagentLauncher for MockLauncher {
     async fn launch(
         &self,
-        _id: SubagentId,
         initial_messages: Vec<ModelMessage>,
         config: AgentConfig,
     ) -> Result<LaunchedChild, crate::error::RociError> {
@@ -364,9 +363,6 @@ async fn spawn_prompt_only_seeds_system_and_user() {
         .spawn_with_context(spec, SubagentContext::default())
         .await
         .unwrap();
-
-    // Give the background task a moment to launch.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let msgs = captured.lock().await;
     assert_eq!(msgs.len(), 2, "expected [System, User(task)]");
@@ -669,8 +665,6 @@ async fn spawn_snapshot_only_succeeds_without_caller_task() {
     // This previously failed with "no task prompt in SubagentInput".
     let handle = supervisor.spawn_with_context(spec, context).await.unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let msgs = captured.lock().await;
     // Expect: [System, User(summary), User(continuation prompt)]
     assert_eq!(
@@ -708,8 +702,6 @@ async fn spawn_prompt_with_snapshot_seeds_context_before_task() {
 
     let handle = supervisor.spawn_with_context(spec, context).await.unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let msgs = captured.lock().await;
     // Expect: [System, User(summary), User(task)]
     assert_eq!(msgs.len(), 3, "prompt+snapshot: [System, summary, task]");
@@ -741,8 +733,6 @@ async fn system_prompt_appears_exactly_once() {
         .await
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let msgs = captured.lock().await;
     let system_count = msgs.iter().filter(|m| m.role == Role::System).count();
     assert_eq!(system_count, 1, "system prompt must appear exactly once");
@@ -767,8 +757,6 @@ async fn spawn_without_context_uses_default() {
     };
 
     let handle = supervisor.spawn(spec).await.unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let msgs = captured.lock().await;
     assert_eq!(msgs.len(), 2);
@@ -845,8 +833,6 @@ async fn spawn_full_snapshot_preserves_conversation() {
     };
 
     let handle = supervisor.spawn_with_context(spec, context).await.unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let msgs = captured.lock().await;
     // Expect: [System, User(question), Asst(answer), User(follow-up), User(continuation)]

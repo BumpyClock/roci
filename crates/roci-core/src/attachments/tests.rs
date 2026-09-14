@@ -314,10 +314,18 @@ fn compile_prompt_input_encodes_images_when_model_supports_vision() {
 
     let compiled = compile_prompt_input(&input, &caps).expect("image should compile");
 
-    assert!(matches!(
-        &compiled.message.content[1],
-        ContentPart::Image(image) if image.mime_type == "image/png" && !image.data.is_empty()
-    ));
+    assert_eq!(
+        compiled.message.content,
+        vec![
+            ContentPart::Text {
+                text: "Describe".to_string()
+            },
+            ContentPart::Image(crate::types::ImageContent {
+                mime_type: "image/png".to_string(),
+                data: "iVBORw==".to_string(),
+            }),
+        ]
+    );
     let metadata = compiled.message.metadata.as_ref().expect("metadata");
     assert_eq!(
         metadata.attachments[0].source_kind,

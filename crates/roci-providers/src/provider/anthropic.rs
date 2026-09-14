@@ -689,6 +689,7 @@ mod tests {
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
+                temperature: Some(0.7),
                 anthropic: Some(AnthropicOptions {
                     thinking: Some(ThinkingMode::Enabled {
                         budget_tokens: 10000,

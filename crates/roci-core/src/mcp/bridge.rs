@@ -75,7 +75,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
-    use std::collections::VecDeque;
 
     use crate::mcp::client::{MCPReadResourceResult, MCPResourceSchema, MCPToolCallResult};
     use crate::mcp::transport::MCPTransport;
@@ -107,43 +106,28 @@ mod tests {
         }
     }
 
-    struct MockClientOps {
-        initialize_error: Option<String>,
-        list_tools_result: Result<Vec<MCPToolSchema>, String>,
-        call_tool_results: VecDeque<Result<MCPToolCallResult, RociError>>,
-    }
+    struct ToolFailureClient;
 
     #[async_trait]
-    impl MCPClientOps for MockClientOps {
+    impl MCPClientOps for ToolFailureClient {
         async fn initialize(&mut self) -> Result<(), RociError> {
-            match &self.initialize_error {
-                Some(message) => Err(RociError::UnsupportedOperation(message.clone())),
-                None => Ok(()),
-            }
+            Ok(())
         }
 
         async fn list_tools(&mut self) -> Result<Vec<MCPToolSchema>, RociError> {
-            match &self.list_tools_result {
-                Ok(tools) => Ok(tools.clone()),
-                Err(message) => Err(RociError::Provider {
-                    provider: "mcp".into(),
-                    message: message.clone(),
-                }),
-            }
+            panic!("tool execution should not list tools")
         }
 
         async fn instructions(&mut self) -> Result<Option<String>, RociError> {
-            Ok(None)
+            panic!("tool execution should not read instructions")
         }
 
         async fn list_resources(&mut self) -> Result<Vec<MCPResourceSchema>, RociError> {
-            Ok(Vec::new())
+            panic!("tool execution should not list resources")
         }
 
-        async fn read_resource(&mut self, uri: &str) -> Result<MCPReadResourceResult, RociError> {
-            Err(RociError::InvalidArgument(format!(
-                "Unknown resource '{uri}'"
-            )))
+        async fn read_resource(&mut self, _uri: &str) -> Result<MCPReadResourceResult, RociError> {
+            panic!("tool execution should not read resources")
         }
 
         async fn call_tool(
@@ -151,9 +135,10 @@ mod tests {
             _name: &str,
             _arguments: serde_json::Value,
         ) -> Result<MCPToolCallResult, RociError> {
-            self.call_tool_results
-                .pop_front()
-                .unwrap_or_else(|| Err(RociError::Stream("missing mock call_tool result".into())))
+            Err(RociError::ToolExecution {
+                tool_name: "search".into(),
+                message: "downstream tool failure".into(),
+            })
         }
     }
 
@@ -205,14 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_tool_propagates_tool_error_without_panic() {
-        let adapter = MCPToolAdapter::from_client_ops(Box::new(MockClientOps {
-            initialize_error: None,
-            list_tools_result: Ok(Vec::new()),
-            call_tool_results: VecDeque::from([Err(RociError::ToolExecution {
-                tool_name: "search".into(),
-                message: "downstream tool failure".into(),
-            })]),
-        }));
+        let adapter = MCPToolAdapter::from_client_ops(Box::new(ToolFailureClient));
 
         let err = adapter
             .execute_tool(

@@ -46,17 +46,8 @@ pub enum HealthSignal {
         observed_at_ms: u64,
     },
     RetryExhausted {
-        candidate_index: usize,
         key: ModelHealthKey,
         category: FailureCategory,
-        observed_at_ms: u64,
-    },
-    CandidateAdvanced {
-        from_index: usize,
-        to_index: usize,
-        from: ModelHealthKey,
-        to: ModelHealthKey,
-        reason: FailureCategory,
         observed_at_ms: u64,
     },
     Canceled {
@@ -185,7 +176,6 @@ impl ModelHealthTracker {
                 key,
                 category,
                 observed_at_ms,
-                ..
             } => self.update_snapshot(key, |snapshot| {
                 snapshot.last_failure_category = Some(category);
                 snapshot.last_failure_at_ms = Some(observed_at_ms);
@@ -210,11 +200,6 @@ impl ModelHealthTracker {
                 snapshot.last_failure_category = Some(FailureCategory::Canceled);
                 snapshot.last_failure_at_ms = Some(observed_at_ms);
             }),
-            HealthSignal::CandidateAdvanced { from, to, .. } => {
-                // Touch both endpoints so session-local snapshots can fall back to shared state.
-                let _ = self.snapshot(&from);
-                let _ = self.snapshot(&to);
-            }
         }
     }
 
@@ -362,7 +347,6 @@ mod tests {
         let key = key();
 
         tracker.observe(HealthSignal::RetryExhausted {
-            candidate_index: 0,
             key: key.clone(),
             category: FailureCategory::RateLimit,
             observed_at_ms: 5,
@@ -411,28 +395,5 @@ mod tests {
 
         assert_eq!(snapshot.status, ModelHealthStatus::Healthy);
         assert_eq!(snapshot.last_success_at_ms, Some(10));
-    }
-
-    #[test]
-    fn candidate_advanced_preserves_endpoint_snapshots() {
-        let shared = Arc::new(SharedModelHealthRegistry::default());
-        let tracker = ModelHealthTracker::new_session(shared);
-        let from = key();
-        let to = ModelHealthKey {
-            provider: "anthropic".to_string(),
-            model_id: "claude".to_string(),
-        };
-
-        tracker.observe(HealthSignal::CandidateAdvanced {
-            from_index: 0,
-            to_index: 1,
-            from: from.clone(),
-            to: to.clone(),
-            reason: FailureCategory::Timeout,
-            observed_at_ms: 7,
-        });
-
-        assert_eq!(tracker.snapshot(&from).status, ModelHealthStatus::Unknown);
-        assert_eq!(tracker.snapshot(&to).status, ModelHealthStatus::Unknown);
     }
 }

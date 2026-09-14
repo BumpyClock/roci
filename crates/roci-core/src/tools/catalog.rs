@@ -517,15 +517,33 @@ mod tests {
         )
         .unwrap();
 
-        let allow = ToolVisibilityPolicy::allow_only(["read_file"]);
-        assert_eq!(catalog.resolve_descriptors(&allow)[0].name, "read_file");
-
-        let exclude = ToolVisibilityPolicy::exclude(["write_file"]);
-        assert_eq!(catalog.resolve_descriptors(&exclude)[0].name, "read_file");
-
-        assert!(catalog
-            .resolve_descriptors(&ToolVisibilityPolicy::no_tools())
-            .is_empty());
+        for (policy, expected) in [
+            (
+                ToolVisibilityPolicy::allow_only(["read_file"]),
+                vec!["read_file"],
+            ),
+            (
+                ToolVisibilityPolicy::exclude(["write_file"]),
+                vec!["read_file"],
+            ),
+            (ToolVisibilityPolicy::no_tools(), vec![]),
+        ] {
+            let descriptors = catalog.resolve_descriptors(&policy);
+            let tools = catalog.resolve(&policy);
+            assert_eq!(
+                descriptors
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "visible descriptors for {policy:?}"
+            );
+            assert_eq!(
+                tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+                expected,
+                "executable tools for {policy:?}"
+            );
+        }
     }
 
     #[test]

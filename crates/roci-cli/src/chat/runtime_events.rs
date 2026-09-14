@@ -42,7 +42,7 @@ pub(crate) struct RuntimeEventRenderer {
     command_tx: mpsc::Sender<TerminalCommand>,
     shutdown: Arc<AtomicBool>,
     subscription_handle: Option<TaskJoinHandle<()>>,
-    terminal_handle: Option<JoinHandle<()>>,
+    terminal_handle: JoinHandle<()>,
 }
 
 impl RuntimeEventRenderer {
@@ -52,14 +52,6 @@ impl RuntimeEventRenderer {
             default_prompt_fn(),
             default_approval_prompt_fn(),
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn spawn_with_prompt_fn(
-        coordinator: Arc<HumanInteractionCoordinator>,
-        prompt_fn: PromptFn,
-    ) -> Self {
-        Self::spawn_with_prompt_fns(coordinator, prompt_fn, default_approval_prompt_fn())
     }
 
     fn spawn_with_prompt_fns(
@@ -86,7 +78,7 @@ impl RuntimeEventRenderer {
             command_tx,
             shutdown,
             subscription_handle: None,
-            terminal_handle: Some(terminal_handle),
+            terminal_handle,
         }
     }
 
@@ -145,9 +137,7 @@ impl RuntimeEventRenderer {
             let _ = handle.await;
         }
 
-        if let Some(handle) = self.terminal_handle.take() {
-            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
-        }
+        let _ = tokio::task::spawn_blocking(move || self.terminal_handle.join()).await;
     }
 }
 
@@ -1271,7 +1261,7 @@ mod tests {
             .await
             .unwrap();
         let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let renderer = RuntimeEventRenderer::spawn_with_prompt_fn(
+        let renderer = RuntimeEventRenderer::spawn_with_prompt_fns(
             coordinator.clone(),
             Arc::new({
                 let prompt_calls = prompt_calls.clone();
@@ -1285,6 +1275,7 @@ mod tests {
                     }))
                 }
             }),
+            default_approval_prompt_fn(),
         );
 
         let sink = renderer.build_agent_sink();

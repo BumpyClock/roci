@@ -17,7 +17,7 @@ use crate::tools::dynamic::{DynamicToolProvider, ScopedDynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::types::{ModelMessage, ReasoningEffort};
 
-use super::types::{SubagentId, ToolPolicy};
+use super::types::ToolPolicy;
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -41,7 +41,6 @@ pub(super) struct LaunchedChild {
 pub(super) trait SubagentLauncher: Send + Sync {
     async fn launch(
         &self,
-        id: SubagentId,
         initial_messages: Vec<ModelMessage>,
         config: AgentConfig,
     ) -> Result<LaunchedChild, RociError>;
@@ -61,7 +60,6 @@ pub(super) struct InProcessLauncher {
 impl SubagentLauncher for InProcessLauncher {
     async fn launch(
         &self,
-        _id: SubagentId,
         initial_messages: Vec<ModelMessage>,
         config: AgentConfig,
     ) -> Result<LaunchedChild, RociError> {
@@ -284,10 +282,7 @@ mod tests {
             ..AgentConfig::default()
         };
 
-        let error = match launcher
-            .launch(SubagentId::new_v4(), Vec::new(), config)
-            .await
-        {
+        let error = match launcher.launch(Vec::new(), config).await {
             Ok(_) => panic!("missing inherited workspace must fail child launch"),
             Err(error) => error,
         };

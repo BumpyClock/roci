@@ -88,6 +88,6 @@ mod tests {
         let model = ModelSelector::parse("openai:gpt-4o").unwrap();
         let s = model.to_string();
         let parsed: LanguageModel = s.parse().unwrap();
-        assert_eq!(parsed.model_id(), "gpt-4o");
+        assert_eq!(parsed, model);
     }
 }

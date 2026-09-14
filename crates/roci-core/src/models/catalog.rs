@@ -186,23 +186,22 @@ mod tests {
 
     #[test]
     fn model_catalog_dedupes_dynamic_over_static() {
-        let mut catalog = ModelCatalog::default();
-        catalog.insert(model("openai", "gpt-4o", ModelCatalogSource::Static));
-        catalog.insert(model(
+        let static_model = model("openai", "gpt-4o", ModelCatalogSource::Static);
+        let dynamic_model = model(
             "openai",
             "gpt-4o",
             ModelCatalogSource::Dynamic {
                 endpoint: "/models".to_string(),
             },
-        ));
+        );
 
-        let models = catalog.into_models();
-
-        assert_eq!(models.len(), 1);
-        assert!(matches!(
-            models[0].source,
-            ModelCatalogSource::Dynamic { .. }
-        ));
+        for entries in [
+            [static_model.clone(), dynamic_model.clone()],
+            [dynamic_model.clone(), static_model],
+        ] {
+            let catalog = ModelCatalog::from_models(entries);
+            assert_eq!(catalog.models(), std::slice::from_ref(&dynamic_model));
+        }
     }
 
     #[test]
@@ -229,8 +228,7 @@ mod tests {
         let json = serde_json::to_string(&catalog).unwrap();
         let decoded: ModelCatalog = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(decoded.models().len(), 1);
-        assert_eq!(decoded.models()[0].provider_key, "openai");
+        assert_eq!(decoded, catalog);
     }
 
     #[test]

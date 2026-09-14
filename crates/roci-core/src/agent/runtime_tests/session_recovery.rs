@@ -47,16 +47,6 @@ fn event_record(event: AgentRuntimeEvent) -> String {
     .to_string()
 }
 
-fn default_thread_after_other() -> (ThreadId, ThreadId) {
-    loop {
-        let default_thread_id = ThreadId::new();
-        let other_thread_id = ThreadId::new();
-        if default_thread_id.to_string() > other_thread_id.to_string() {
-            return (default_thread_id, other_thread_id);
-        }
-    }
-}
-
 async fn create_recoverable_session(
     store: &LocalSessionStore,
     id: SessionId,
@@ -462,7 +452,9 @@ async fn recovery_import_uses_artifact_default_thread_for_multithread_provider_c
     let sessions = tempdir().expect("session tempdir should be created");
     let store = LocalSessionStore::new(sessions.path());
     let source_id = session_id("recover-multithread-source");
-    let (default_thread_id, other_thread_id) = default_thread_after_other();
+    // The default thread deliberately sorts after the other thread.
+    let default_thread_id = ThreadId::from(uuid::Uuid::from_u128(2));
+    let other_thread_id = ThreadId::from(uuid::Uuid::from_u128(1));
     let state = store
         .create(CreateSessionOptions {
             id: Some(source_id.clone()),

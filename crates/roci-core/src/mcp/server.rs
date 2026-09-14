@@ -274,11 +274,6 @@ impl McpServerCore {
     }
 }
 
-/// Back-compat alias for older internal name.
-pub type McpServerToolIdentity = McpToolIdentity;
-/// Back-compat alias for older internal name.
-pub type McpServerListedTool = McpToolSchema;
-
 #[cfg(test)]
 mod tests {
     use super::*;
