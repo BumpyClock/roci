@@ -89,17 +89,6 @@ fn default_registry_contains_codex() {
     );
 }
 
-#[test]
-fn default_registry_has_multiple_providers() {
-    let registry = roci::default_registry();
-    let keys = registry.provider_keys();
-    assert!(
-        keys.len() >= 4,
-        "expected at least 4 default providers, got {}",
-        keys.len()
-    );
-}
-
 // ---------------------------------------------------------------------------
 // default_auth_service()
 // ---------------------------------------------------------------------------
@@ -113,100 +102,29 @@ fn temp_store() -> (TempDir, Arc<dyn roci::auth::TokenStore>) {
 }
 
 #[test]
-fn default_auth_service_has_three_backends() {
+fn default_auth_service_includes_enabled_backends() {
     let (_dir, store) = temp_store();
     let svc = roci::default_auth_service(store);
-
+    let registry = roci::default_registry();
+    // Dependency features may be unified by another workspace member (the CLI).
+    let mut expected: Vec<_> = [
+        ("github-copilot", "GitHub Copilot"),
+        ("codex", "Codex"),
+        ("anthropic", "Claude"),
+    ]
+    .into_iter()
+    .filter_map(|(provider, backend)| registry.has_provider(provider).then_some(backend))
+    .collect();
     let statuses = svc.all_statuses();
-    assert_eq!(
-        statuses.len(),
-        3,
-        "expected 3 auth backends, got {}",
-        statuses.len()
-    );
-}
-
-#[test]
-fn default_auth_service_includes_copilot_backend() {
-    let (_dir, store) = temp_store();
-    let svc = roci::default_auth_service(store);
-
-    let names: Vec<&str> = svc
-        .all_statuses()
-        .iter()
-        .map(|(name, _, _)| *name)
-        .collect();
-    assert!(
-        names.contains(&"GitHub Copilot"),
-        "expected GitHub Copilot backend, got {names:?}"
-    );
-}
-
-#[test]
-fn default_auth_service_includes_codex_backend() {
-    let (_dir, store) = temp_store();
-    let svc = roci::default_auth_service(store);
-
-    let names: Vec<&str> = svc
-        .all_statuses()
-        .iter()
-        .map(|(name, _, _)| *name)
-        .collect();
-    assert!(
-        names.contains(&"Codex"),
-        "expected Codex backend, got {names:?}"
-    );
-}
-
-#[test]
-fn default_auth_service_includes_claude_backend() {
-    let (_dir, store) = temp_store();
-    let svc = roci::default_auth_service(store);
-
-    let names: Vec<&str> = svc
-        .all_statuses()
-        .iter()
-        .map(|(name, _, _)| *name)
-        .collect();
-    assert!(
-        names.contains(&"Claude"),
-        "expected Claude backend, got {names:?}"
-    );
+    let mut names: Vec<_> = statuses.iter().map(|(name, _, _)| *name).collect();
+    expected.sort_unstable();
+    names.sort_unstable();
+    assert_eq!(names, expected);
 }
 
 // ---------------------------------------------------------------------------
 // Feature flag behavior
 // ---------------------------------------------------------------------------
-
-#[cfg(feature = "openai")]
-#[test]
-fn openai_feature_enables_openai_in_registry() {
-    let registry = roci::default_registry();
-    assert!(
-        registry.has_provider("openai"),
-        "openai feature enabled but not in registry"
-    );
-}
-
-#[cfg(feature = "anthropic")]
-#[test]
-fn anthropic_feature_enables_anthropic_in_registry() {
-    let registry = roci::default_registry();
-    assert!(
-        registry.has_provider("anthropic"),
-        "anthropic feature enabled but not in registry"
-    );
-}
-
-#[cfg(feature = "google")]
-#[test]
-fn google_feature_enables_google_in_registry() {
-    let registry = roci::default_registry();
-    assert!(
-        registry.has_provider("google"),
-        "google feature enabled but not in registry"
-    );
-}
 
 #[cfg(feature = "grok")]
 #[test]

@@ -7,7 +7,6 @@
 //!
 //! - [`ContextBudget`] — configuration for per-turn and per-session token limits
 //! - [`BudgetSnapshot`] — preflight view of budget consumption for a pending request
-//! - [`BudgetDecision`] — action to take when budget is evaluated
 
 use crate::types::ModelMessage;
 
@@ -22,8 +21,8 @@ use super::tokens::estimate_message_tokens;
 /// Separates input and output budgets and supports per-turn and per-session
 /// limits. The context window size can be overridden from the provider default.
 ///
-/// Runtime enforcement is not yet wired — this type defines the configuration
-/// surface that later compaction and overflow logic will consume.
+/// The agent loop checks a budget snapshot before each provider request and
+/// uses the output reserve when handling context overflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBudget {
     /// Override the provider-reported context window size.
@@ -196,36 +195,6 @@ impl BudgetSnapshot {
         }
         false
     }
-}
-
-// ---------------------------------------------------------------------------
-// Budget decision
-// ---------------------------------------------------------------------------
-
-/// Action to take after evaluating the current budget state.
-///
-/// Produced by budget-evaluation logic (not yet wired). Downstream consumers
-/// (compaction, overflow, request pipeline) will pattern-match on this to
-/// decide how to proceed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BudgetDecision {
-    /// Budget is within limits; proceed normally.
-    Proceed,
-    /// Context should be compacted to the target size.
-    Compact {
-        /// Target total input tokens after compaction.
-        target_tokens: usize,
-    },
-    /// Reduce the max output tokens for this turn.
-    ReduceMaxTokens {
-        /// New max_tokens value to request from the provider.
-        new_max_tokens: u32,
-    },
-    /// Reject the request entirely.
-    Reject {
-        /// Human-readable reason for rejection.
-        reason: String,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -498,43 +467,6 @@ mod tests {
         };
         let snap = budget.snapshot(1000, 501, 0, 0);
         assert!(snap.is_over_budget());
-    }
-
-    // -- BudgetDecision --
-
-    #[test]
-    fn budget_decision_variants_construct() {
-        let _ = BudgetDecision::Proceed;
-        let _ = BudgetDecision::Compact {
-            target_tokens: 50_000,
-        };
-        let _ = BudgetDecision::ReduceMaxTokens {
-            new_max_tokens: 2048,
-        };
-        let _ = BudgetDecision::Reject {
-            reason: "session limit exceeded".to_string(),
-        };
-    }
-
-    #[test]
-    fn budget_decision_eq() {
-        assert_eq!(BudgetDecision::Proceed, BudgetDecision::Proceed);
-        assert_eq!(
-            BudgetDecision::Compact {
-                target_tokens: 1000
-            },
-            BudgetDecision::Compact {
-                target_tokens: 1000
-            },
-        );
-        assert_ne!(
-            BudgetDecision::Compact {
-                target_tokens: 1000
-            },
-            BudgetDecision::Compact {
-                target_tokens: 2000
-            },
-        );
     }
 
     // -- Existing message-selection tests --

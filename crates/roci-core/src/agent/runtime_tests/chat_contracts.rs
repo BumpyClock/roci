@@ -78,63 +78,170 @@ fn stale_runtime_error_reports_requested_and_oldest_seq() {
 }
 
 #[test]
-fn semantic_payload_set_matches_target_contract() {
-    let payload_names = [
-        AgentRuntimeEventPayload::turn_queued_name(),
-        AgentRuntimeEventPayload::turn_started_name(),
-        AgentRuntimeEventPayload::message_started_name(),
-        AgentRuntimeEventPayload::message_updated_name(),
-        AgentRuntimeEventPayload::message_completed_name(),
-        AgentRuntimeEventPayload::tool_started_name(),
-        AgentRuntimeEventPayload::tool_updated_name(),
-        AgentRuntimeEventPayload::tool_completed_name(),
-        AgentRuntimeEventPayload::approval_required_name(),
-        AgentRuntimeEventPayload::approval_resolved_name(),
-        AgentRuntimeEventPayload::approval_canceled_name(),
-        AgentRuntimeEventPayload::reasoning_updated_name(),
-        AgentRuntimeEventPayload::plan_updated_name(),
-        AgentRuntimeEventPayload::diff_updated_name(),
-        AgentRuntimeEventPayload::plan_written_name(),
-        AgentRuntimeEventPayload::workspace_updated_name(),
-        AgentRuntimeEventPayload::artifact_created_name(),
-        AgentRuntimeEventPayload::temp_file_written_name(),
-        AgentRuntimeEventPayload::checkpoint_created_name(),
-        AgentRuntimeEventPayload::session_file_written_name(),
-        AgentRuntimeEventPayload::session_file_deleted_name(),
-        AgentRuntimeEventPayload::turn_completed_name(),
-        AgentRuntimeEventPayload::turn_failed_name(),
-        AgentRuntimeEventPayload::turn_canceled_name(),
-    ];
+fn semantic_payloads_serialize_with_stable_tags() {
+    use super::chat::{
+        ApprovalSnapshot, ApprovalStatus, DiffSnapshot, MessageSnapshot, PlanSnapshot,
+        ReasoningSnapshot, ToolExecutionSnapshot, ToolStatus,
+    };
+    use crate::agent_loop::{ApprovalKind, ApprovalRequest};
+    use crate::types::ModelMessage;
 
-    assert_eq!(
-        payload_names,
-        [
+    let thread_id = ThreadId::nil();
+    let turn = test_turn(thread_id);
+    let turn_id = turn.turn_id;
+    let now = turn.queued_at;
+    let message = MessageSnapshot {
+        message_id: MessageId::new(thread_id, 0, 1),
+        thread_id,
+        turn_id,
+        status: MessageStatus::Completed,
+        payload: ModelMessage::assistant("answer"),
+        created_at: now,
+        completed_at: Some(now),
+    };
+    let tool = ToolExecutionSnapshot {
+        tool_call_id: "call-1".into(),
+        thread_id,
+        turn_id,
+        tool_name: "read".into(),
+        args: serde_json::json!({"path": "notes.txt"}),
+        status: ToolStatus::Running,
+        partial_result: None,
+        final_result: None,
+        started_at: now,
+        completed_at: None,
+    };
+    let approval = ApprovalSnapshot {
+        request: ApprovalRequest {
+            id: "approval-1".into(),
+            kind: ApprovalKind::Other,
+            allow_session: true,
+            reason: None,
+            payload: serde_json::json!({}),
+            suggested_policy_change: None,
+        },
+        thread_id,
+        turn_id,
+        status: ApprovalStatus::Pending,
+        decision: None,
+        requested_at: now,
+        resolved_at: None,
+    };
+    let cases = [
+        (
+            AgentRuntimeEventPayload::TurnQueued { turn: turn.clone() },
             "turn_queued",
+        ),
+        (
+            AgentRuntimeEventPayload::TurnStarted { turn: turn.clone() },
             "turn_started",
-            "message_started",
-            "message_updated",
-            "message_completed",
-            "tool_started",
-            "tool_updated",
-            "tool_completed",
-            "approval_required",
-            "approval_resolved",
-            "approval_canceled",
-            "reasoning_updated",
-            "plan_updated",
-            "diff_updated",
-            "plan_written",
-            "workspace_updated",
-            "artifact_created",
-            "temp_file_written",
-            "checkpoint_created",
-            "session_file_written",
-            "session_file_deleted",
+        ),
+        (
+            AgentRuntimeEventPayload::TurnCompleted { turn: turn.clone() },
             "turn_completed",
+        ),
+        (
+            AgentRuntimeEventPayload::TurnFailed {
+                turn: turn.clone(),
+                error: "failure".into(),
+            },
             "turn_failed",
+        ),
+        (
+            AgentRuntimeEventPayload::TurnCanceled { turn: turn.clone() },
             "turn_canceled",
-        ]
-    );
+        ),
+        (
+            AgentRuntimeEventPayload::MessageStarted {
+                message: message.clone(),
+            },
+            "message_started",
+        ),
+        (
+            AgentRuntimeEventPayload::MessageUpdated {
+                message: message.clone(),
+            },
+            "message_updated",
+        ),
+        (
+            AgentRuntimeEventPayload::MessageCompleted {
+                message: message.clone(),
+            },
+            "message_completed",
+        ),
+        (
+            AgentRuntimeEventPayload::ToolStarted { tool: tool.clone() },
+            "tool_started",
+        ),
+        (
+            AgentRuntimeEventPayload::ToolUpdated { tool: tool.clone() },
+            "tool_updated",
+        ),
+        (
+            AgentRuntimeEventPayload::ToolCompleted { tool: tool.clone() },
+            "tool_completed",
+        ),
+        (
+            AgentRuntimeEventPayload::ApprovalRequired {
+                approval: approval.clone(),
+            },
+            "approval_required",
+        ),
+        (
+            AgentRuntimeEventPayload::ApprovalResolved {
+                approval: approval.clone(),
+            },
+            "approval_resolved",
+        ),
+        (
+            AgentRuntimeEventPayload::ApprovalCanceled {
+                approval: approval.clone(),
+            },
+            "approval_canceled",
+        ),
+        (
+            AgentRuntimeEventPayload::ReasoningUpdated {
+                reasoning: ReasoningSnapshot {
+                    thread_id,
+                    turn_id,
+                    message_id: Some(message.message_id),
+                    text: "considering".into(),
+                    updated_at: now,
+                },
+                delta: "considering".into(),
+            },
+            "reasoning_updated",
+        ),
+        (
+            AgentRuntimeEventPayload::PlanUpdated {
+                plan: PlanSnapshot {
+                    thread_id,
+                    turn_id,
+                    plan: "read notes".into(),
+                    updated_at: now,
+                },
+            },
+            "plan_updated",
+        ),
+        (
+            AgentRuntimeEventPayload::DiffUpdated {
+                diff: DiffSnapshot {
+                    thread_id,
+                    turn_id,
+                    diff: "+note".into(),
+                    updated_at: now,
+                },
+            },
+            "diff_updated",
+        ),
+    ];
+    for (payload, expected) in cases {
+        let encoded = serde_json::to_value(&payload).expect("payload serializes");
+        assert_eq!(encoded["type"], expected);
+        let decoded: AgentRuntimeEventPayload =
+            serde_json::from_value(encoded).expect("payload deserializes");
+        assert_eq!(decoded, payload);
+    }
 }
 
 #[test]

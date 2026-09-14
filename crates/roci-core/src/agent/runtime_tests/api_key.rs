@@ -1,59 +1,7 @@
 use super::support::*;
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-fn key_test_model() -> LanguageModel {
-    "openai:gpt-4o".parse().unwrap()
-}
-
-#[tokio::test]
-async fn get_api_key_callback_returns_resolved_key() {
-    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = call_count.clone();
-
-    let get_key: GetApiKeyFn = Arc::new(move |_model| {
-        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async { Ok("sk-live-rotated-key".to_string()) })
-    });
-
-    let key = get_key(key_test_model()).await.unwrap();
-    assert_eq!(key, "sk-live-rotated-key");
-    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-    let key2 = get_key(key_test_model()).await.unwrap();
-    assert_eq!(key2, "sk-live-rotated-key");
-    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn static_key_works_without_callback() {
-    let config = AgentConfig {
-        get_api_key: None,
-        ..test_agent_config()
-    };
-    let agent = AgentRuntime::new(test_registry(), test_config(), config);
-
-    assert!(agent.config.get_api_key.is_none());
-    assert_eq!(agent.state().await, AgentState::Idle);
-}
-
-#[tokio::test]
-async fn get_api_key_error_propagates() {
-    let get_key: GetApiKeyFn = Arc::new(|_model| {
-        Box::pin(async {
-            Err(RociError::Authentication(
-                "Token refresh failed".to_string(),
-            ))
-        })
-    });
-
-    let result = get_key(key_test_model()).await;
-    assert!(result.is_err());
-    assert!(matches!(
-        result.unwrap_err(),
-        RociError::Authentication(msg) if msg == "Token refresh failed"
-    ));
-}
 
 #[tokio::test]
 async fn prompt_get_api_key_error_restores_idle_state() {
@@ -93,92 +41,81 @@ async fn prompt_get_api_key_error_restores_idle_state() {
 }
 
 #[tokio::test]
-async fn agent_runtime_uses_config_api_key_by_default() {
-    let roci_config = RociConfig::new().with_token_store(None);
-    roci_config.set_api_key("openai", "sk-from-config".to_string());
+async fn prompt_resolves_keys_in_request_config_callback_order() {
+    for (config_key, override_key, with_callback, expected) in [
+        (Some("sk-config"), None, false, "sk-config"),
+        (Some("sk-config"), None, true, "sk-config"),
+        (Some("sk-config"), Some("sk-override"), true, "sk-override"),
+        (None, Some("sk-override"), true, "sk-override"),
+        (None, None, true, "sk-callback"),
+    ] {
+        let (registry, requests) = registry_with_recorded_requests();
+        let roci_config = RociConfig::new().with_token_store(None);
+        if let Some(key) = config_key {
+            roci_config.set_api_key("stub", key.into());
+        }
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = callback_calls.clone();
+        let get_key: GetApiKeyFn = Arc::new(move |model| {
+            assert_eq!(model.provider_name(), "stub");
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("sk-callback".into()) })
+        });
+        let agent = AgentRuntime::new(
+            registry,
+            roci_config,
+            AgentConfig {
+                candidates: vec!["stub:api-key".parse().unwrap()],
+                api_key_override: override_key.map(String::from),
+                get_api_key: with_callback.then_some(get_key),
+                ..test_agent_config()
+            },
+        );
 
-    let agent_config = AgentConfig {
-        get_api_key: None,
-        ..test_agent_config()
-    };
-    let agent = AgentRuntime::new(test_registry(), roci_config, agent_config);
-
-    assert!(agent.config.get_api_key.is_none());
-    assert_eq!(agent.state().await, AgentState::Idle);
+        let result = agent.prompt("hello").await.unwrap();
+        assert_eq!(result.status, RunStatus::Completed);
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1.as_deref(), Some(expected));
+        assert_eq!(
+            callback_calls.load(Ordering::SeqCst),
+            usize::from(expected == "sk-callback")
+        );
+    }
 }
 
 #[tokio::test]
-async fn get_api_key_callback_is_skipped_when_config_key_exists() {
-    let roci_config = RociConfig::new().with_token_store(None);
-    roci_config.set_api_key("openai", "sk-from-config".to_string());
-    let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let callback_calls_for_hook = callback_calls.clone();
+async fn prompt_resolves_rotated_callback_key_for_each_run() {
+    let (registry, requests) = registry_with_recorded_requests();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
     let get_key: GetApiKeyFn = Arc::new(move |_model| {
-        let callback_calls_for_hook = callback_calls_for_hook.clone();
-        Box::pin(async move {
-            callback_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("sk-from-callback".to_string())
-        })
+        let index = counter.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(format!("sk-key-{index}")) })
     });
-
     let agent = AgentRuntime::new(
-        test_registry(),
-        roci_config,
+        registry,
+        RociConfig::new().with_token_store(None),
         AgentConfig {
+            candidates: vec!["stub:api-key".parse().unwrap()],
             get_api_key: Some(get_key),
             ..test_agent_config()
         },
     );
 
-    let _ = agent.prompt("hello").await;
+    for _ in 0..3 {
+        assert_eq!(
+            agent.prompt("hello").await.unwrap().status,
+            RunStatus::Completed
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let requests = requests.lock().expect("requests lock");
     assert_eq!(
-        callback_calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "config key should take precedence over callback"
+        requests
+            .iter()
+            .map(|(_, key)| key.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("sk-key-0"), Some("sk-key-1"), Some("sk-key-2")]
     );
-}
-
-#[tokio::test]
-async fn get_api_key_callback_is_skipped_when_request_override_exists() {
-    let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let callback_calls_for_hook = callback_calls.clone();
-    let get_key: GetApiKeyFn = Arc::new(move |_model| {
-        let callback_calls_for_hook = callback_calls_for_hook.clone();
-        Box::pin(async move {
-            callback_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("sk-from-callback".to_string())
-        })
-    });
-
-    let agent = AgentRuntime::new(
-        test_registry(),
-        test_config(),
-        AgentConfig {
-            api_key_override: Some("sk-request-override".to_string()),
-            get_api_key: Some(get_key),
-            ..test_agent_config()
-        },
-    );
-
-    let _ = agent.prompt("hello").await;
-    assert_eq!(
-        callback_calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "request override should take precedence over callback"
-    );
-}
-
-#[tokio::test]
-async fn get_api_key_callback_can_rotate_keys() {
-    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter_clone = counter.clone();
-
-    let get_key: GetApiKeyFn = Arc::new(move |_model| {
-        let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async move { Ok(format!("sk-key-{}", n)) })
-    });
-
-    assert_eq!(get_key(key_test_model()).await.unwrap(), "sk-key-0");
-    assert_eq!(get_key(key_test_model()).await.unwrap(), "sk-key-1");
-    assert_eq!(get_key(key_test_model()).await.unwrap(), "sk-key-2");
 }

@@ -808,10 +808,23 @@ mod tests {
     }
 
     #[test]
-    fn config_new_defaults_to_in_memory_credential_store_under_tests() {
-        let config = RociConfig::new().with_token_store(None);
-        let debug = format!("{config:?}");
-        assert!(debug.contains("provider_credential_store: Some(\"configured\")"));
+    fn config_new_defaults_to_isolated_credential_stores_under_tests() {
+        let first = RociConfig::new().with_token_store(None);
+        let second = RociConfig::new().with_token_store(None);
+        let first_store = first.provider_credential_store().expect("default store");
+        let second_store = second.provider_credential_store().expect("default store");
+        let provider = format!("test-isolation-{}", uuid::Uuid::new_v4());
+        let record = ProviderCredentialRecord::new(ProviderApiKey::new("test-key"), None);
+
+        first_store
+            .save(&provider, &record)
+            .expect("save credential");
+        let first_record = first_store.load(&provider);
+        let second_record = second_store.load(&provider);
+        first_store.clear(&provider).expect("clear test credential");
+
+        assert_eq!(first_record.expect("load saved credential"), Some(record));
+        assert_eq!(second_record.expect("load independent store"), None);
     }
 
     #[cfg(unix)]

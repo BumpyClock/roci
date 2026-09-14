@@ -202,31 +202,28 @@ async fn transition_to_running_fails_when_not_idle() {
 
 #[tokio::test]
 async fn prompt_with_system_prepends_system_message() {
-    let config = AgentConfig {
-        system_prompt: Some("You are helpful.".into()),
-        ..test_agent_config()
-    };
-    let agent = AgentRuntime::new(test_registry(), test_config(), config);
+    let (registry, requests) = registry_with_recorded_requests();
+    let agent = AgentRuntime::new(
+        registry,
+        test_config(),
+        AgentConfig {
+            candidates: vec!["stub:system-prompt".parse().unwrap()],
+            system_prompt: Some("You are helpful.".into()),
+            ..test_agent_config()
+        },
+    );
 
-    // We can't actually run the loop (no real provider), but we can verify
-    // the transition_to_running guard works and then manually check message assembly.
-    // Directly test the message assembly logic:
-    {
-        let system_prompt = agent.system_prompt.lock().await.clone();
-        let mut msgs = agent.messages.lock().await;
-        if let Some(ref sys) = system_prompt {
-            if msgs.is_empty() {
-                msgs.push(ModelMessage::system(sys.clone()));
-            }
-        }
-        msgs.push(ModelMessage::user("hello"));
-    }
+    let result = agent.prompt("hello").await.unwrap();
+    assert_eq!(result.status, RunStatus::Completed);
 
-    let msgs = agent.messages().await;
-    assert_eq!(msgs.len(), 2);
-    // First message should be the system prompt.
-    assert_eq!(msgs[0].role, crate::types::Role::System);
-    assert_eq!(msgs[1].role, crate::types::Role::User);
+    let requests = requests.lock().expect("requests lock");
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].0.messages;
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, crate::types::Role::System);
+    assert_eq!(messages[0].text(), "You are helpful.");
+    assert_eq!(messages[1].role, crate::types::Role::User);
+    assert_eq!(messages[1].text(), "hello");
 }
 
 #[tokio::test]
@@ -340,19 +337,18 @@ async fn reset_clears_queued_steering_and_follow_up_messages() {
 }
 
 #[tokio::test]
-async fn watch_state_reflects_manual_transitions() {
+async fn watch_state_reflects_transition_to_running() {
     let agent = AgentRuntime::new(test_registry(), test_config(), test_agent_config());
     let mut rx = agent.watch_state();
 
     assert_eq!(*rx.borrow(), AgentState::Idle);
 
-    {
-        let mut state = agent.state.lock().await;
-        *state = AgentState::Running;
-        let _ = agent.state_tx.send(AgentState::Running);
-    }
+    agent.transition_to_running().unwrap();
 
-    rx.changed().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), rx.changed())
+        .await
+        .expect("state transition should notify watchers")
+        .unwrap();
     assert_eq!(*rx.borrow(), AgentState::Running);
 }
 

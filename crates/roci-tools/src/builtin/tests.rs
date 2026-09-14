@@ -7,10 +7,8 @@ use roci::prelude::{LocalSessionFs, LogicalPath};
 use roci::security::command::classify_shell_command;
 use roci::tools::arguments::ToolArguments;
 use roci::tools::tool::{
-    AgentTool, Tool, ToolActionFloor, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan,
-    ToolSafetySummary,
+    ToolActionFloor, ToolExecutionContext, ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary,
 };
-use roci::tools::types::AgentToolParameters;
 
 use super::common::{truncate_utf8, READ_FILE_MAX_BYTES, SHELL_OUTPUT_MAX_BYTES};
 use super::*;
@@ -34,20 +32,21 @@ fn args(json: serde_json::Value) -> ToolArguments {
 // ── all_tools ──────────────────────────────────────────────────────
 
 #[test]
-fn all_tools_returns_six_tools() {
+fn all_tools_contains_exactly_the_builtin_tools() {
     let tools = all_tools();
-    assert_eq!(tools.len(), 6);
-}
-
-#[test]
-fn all_tools_contains_expected_names() {
-    let tools = all_tools();
-    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-    assert!(names.contains(&"shell"));
-    assert!(names.contains(&"read_file"));
-    assert!(names.contains(&"write_file"));
-    assert!(names.contains(&"list_directory"));
-    assert!(names.contains(&"grep"));
+    let mut names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "ask_user",
+            "grep",
+            "list_directory",
+            "read_file",
+            "shell",
+            "write_file"
+        ]
+    );
 }
 
 #[test]
@@ -255,52 +254,30 @@ async fn shell_fails_on_missing_command_argument() {
     assert!(result.is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn shell_times_out_on_long_running_command() {
-    let tool = Arc::new(AgentTool::new(
-        "shell_short_timeout",
-        "shell with short timeout for testing",
-        AgentToolParameters::object()
-            .string("command", "The shell command to execute", true)
-            .build(),
-        |args_val, _ctx: ToolExecutionContext| async move {
-            let command = args_val.get_str("command")?;
-            let timeout = Duration::from_millis(100);
-            let result = tokio::time::timeout(
-                timeout,
-                tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .output(),
-            )
-            .await;
+    // The file keeps the real process pending regardless of OS scheduling.
+    // TempDir cleanup releases it on success or panic, including a missing timer.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("timeout-gate"), b"").unwrap();
+    let ctx = ToolExecutionContext {
+        workspace_root: Some(dir.path().to_path_buf()),
+        ..default_ctx()
+    };
+    let tool = shell_tool();
+    let arguments = args(serde_json::json!({
+        "command": "while [ -f timeout-gate ]; do sleep 0.01; done"
+    }));
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(31), tool.execute(&arguments, &ctx))
+        .await
+        .expect("the shell tool must enforce its own timeout")
+        .expect_err("the pending shell command must time out");
 
-            match result {
-                Ok(Ok(output)) => Ok(serde_json::json!({"exit_code": output.status.code()})),
-                Ok(Err(e)) => Err(RociError::ToolExecution {
-                    tool_name: "shell".into(),
-                    message: e.to_string(),
-                }),
-                Err(_) => Err(RociError::ToolExecution {
-                    tool_name: "shell".into(),
-                    message: "command timed out".into(),
-                }),
-            }
-        },
-    ));
-
-    let result = tool
-        .execute(
-            &args(serde_json::json!({"command": "sleep 10"})),
-            &default_ctx(),
-        )
-        .await;
-
-    assert!(result.is_err());
-    let err_msg = result.unwrap_err().to_string();
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
     assert!(
-        err_msg.contains("timed out"),
-        "expected timeout error, got: {err_msg}"
+        error.to_string().contains("command timed out after 30s"),
+        "unexpected error: {error}"
     );
 }
 
@@ -354,7 +331,7 @@ async fn session_shell_rejects_obvious_escape_commands() {
 // ── read_file ──────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn read_file_returns_file_contents() {
+async fn read_file_returns_host_absolute_file_contents_without_session_context() {
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("hello.txt");
     std::fs::write(&file_path, "hello world").unwrap();
@@ -375,12 +352,11 @@ async fn read_file_returns_file_contents() {
 
 #[tokio::test]
 async fn read_file_returns_error_for_nonexistent_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.txt");
     let tool = read_file_tool();
     let result = tool
-        .execute(
-            &args(serde_json::json!({"path": "/tmp/roci_nonexistent_file_abc123"})),
-            &default_ctx(),
-        )
+        .execute(&args(serde_json::json!({"path": missing})), &default_ctx())
         .await;
 
     assert!(result.is_err());
@@ -425,24 +401,6 @@ async fn read_file_uses_session_cwd_when_present() {
         .unwrap();
 
     assert_eq!(result["content"], "hello");
-}
-
-#[tokio::test]
-async fn read_file_keeps_host_absolute_paths_without_session_context() {
-    let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("absolute.txt");
-    std::fs::write(&file_path, "host").unwrap();
-
-    let tool = read_file_tool();
-    let result = tool
-        .execute(
-            &args(serde_json::json!({"path": file_path.to_str().unwrap()})),
-            &default_ctx(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(result["content"], "host");
 }
 
 // ── write_file ─────────────────────────────────────────────────────
@@ -841,7 +799,11 @@ async fn ask_user_rejects_missing_kind() {
     let result = tool
         .execute(&args(serde_json::json!({})), &default_ctx())
         .await;
-    assert!(result.is_err());
+    let error = result.expect_err("invalid prompt should fail validation");
+    assert!(
+        matches!(&error, RociError::InvalidArgument(message) if message == "kind is required"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]
@@ -850,7 +812,11 @@ async fn ask_user_rejects_unsupported_kind() {
     let result = tool
         .execute(&args(serde_json::json!({"kind": "mode"})), &default_ctx())
         .await;
-    assert!(result.is_err());
+    let error = result.expect_err("invalid prompt should fail validation");
+    assert!(
+        matches!(&error, RociError::InvalidArgument(message) if message == "unsupported ask_user kind: mode"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]
@@ -862,7 +828,11 @@ async fn ask_user_rejects_missing_question() {
             &default_ctx(),
         )
         .await;
-    assert!(result.is_err());
+    let error = result.expect_err("invalid prompt should fail validation");
+    assert!(
+        matches!(&error, RociError::InvalidArgument(message) if message == "question is required"),
+        "unexpected error: {error}"
+    );
 }
 
 #[cfg(feature = "agent")]

@@ -62,36 +62,6 @@ impl RuntimeEventRenderer {
         Self::spawn_with_prompt_fns(coordinator, prompt_fn, default_approval_prompt_fn())
     }
 
-    #[cfg(test)]
-    pub(crate) fn spawn_with_prompt_fns(
-        coordinator: Arc<HumanInteractionCoordinator>,
-        prompt_fn: PromptFn,
-        approval_prompt_fn: ApprovalPromptFn,
-    ) -> Self {
-        let (command_tx, command_rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = shutdown.clone();
-        let handle = tokio::runtime::Handle::current();
-        let terminal_handle = std::thread::spawn(move || {
-            drive_terminal(
-                command_rx,
-                coordinator,
-                prompt_fn,
-                approval_prompt_fn,
-                handle,
-                thread_shutdown,
-            );
-        });
-
-        Self {
-            command_tx,
-            shutdown,
-            subscription_handle: None,
-            terminal_handle: Some(terminal_handle),
-        }
-    }
-
-    #[cfg(not(test))]
     fn spawn_with_prompt_fns(
         coordinator: Arc<HumanInteractionCoordinator>,
         prompt_fn: PromptFn,

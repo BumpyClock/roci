@@ -273,13 +273,6 @@ impl AgentRuntime {
         &self,
         event: AgentRuntimeEvent,
     ) -> Result<RuntimeCursor, AgentRuntimeError> {
-        self.publish_runtime_event_to(event).await
-    }
-
-    pub(super) async fn publish_runtime_event_to(
-        &self,
-        event: AgentRuntimeEvent,
-    ) -> Result<RuntimeCursor, AgentRuntimeError> {
         self.ensure_runtime_event_publisher().await;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         {

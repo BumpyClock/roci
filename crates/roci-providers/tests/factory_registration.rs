@@ -19,59 +19,47 @@ use roci_core::provider::ProviderRegistry;
 // ---------------------------------------------------------------------------
 
 #[test]
-fn register_default_providers_registers_openai_key() {
+fn register_default_providers_matches_enabled_features() {
+    let expected: &[&str] = &[
+        #[cfg(feature = "openai")]
+        "openai",
+        #[cfg(feature = "openai")]
+        "codex",
+        #[cfg(feature = "anthropic")]
+        "anthropic",
+        #[cfg(feature = "google")]
+        "google",
+        #[cfg(feature = "grok")]
+        "grok",
+        #[cfg(feature = "groq")]
+        "groq",
+        #[cfg(feature = "mistral")]
+        "mistral",
+        #[cfg(feature = "ollama")]
+        "ollama",
+        #[cfg(feature = "lmstudio")]
+        "lmstudio",
+        #[cfg(feature = "openai-compatible")]
+        "openai-compatible",
+        #[cfg(feature = "github-copilot")]
+        "github-copilot",
+        #[cfg(feature = "anthropic-compatible")]
+        "anthropic-compatible",
+        #[cfg(feature = "azure")]
+        "azure",
+        #[cfg(feature = "openrouter")]
+        "openrouter",
+        #[cfg(feature = "together")]
+        "together",
+    ];
     let mut registry = ProviderRegistry::new();
     roci_providers::register_default_providers(&mut registry);
 
-    assert!(
-        registry.has_provider("openai"),
-        "expected openai to be registered"
-    );
-}
-
-#[test]
-fn register_default_providers_registers_anthropic_key() {
-    let mut registry = ProviderRegistry::new();
-    roci_providers::register_default_providers(&mut registry);
-
-    assert!(
-        registry.has_provider("anthropic"),
-        "expected anthropic to be registered"
-    );
-}
-
-#[test]
-fn register_default_providers_registers_google_key() {
-    let mut registry = ProviderRegistry::new();
-    roci_providers::register_default_providers(&mut registry);
-
-    assert!(
-        registry.has_provider("google"),
-        "expected google to be registered"
-    );
-}
-
-#[test]
-fn register_default_providers_registers_codex_key() {
-    let mut registry = ProviderRegistry::new();
-    roci_providers::register_default_providers(&mut registry);
-
-    assert!(
-        registry.has_provider("codex"),
-        "expected codex to be registered"
-    );
-}
-
-#[cfg(feature = "github-copilot")]
-#[test]
-fn register_default_providers_registers_github_copilot_when_feature_enabled() {
-    let mut registry = ProviderRegistry::new();
-    roci_providers::register_default_providers(&mut registry);
-
-    assert!(
-        registry.has_provider("github-copilot"),
-        "expected github-copilot to be registered"
-    );
+    let mut actual = registry.provider_keys();
+    actual.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
 }
 
 #[cfg(feature = "github-copilot")]
@@ -94,43 +82,6 @@ async fn explicit_github_copilot_catalog_falls_back_without_credentials() {
         .models()
         .iter()
         .all(|model| model.provider_key == "github-copilot"));
-}
-
-#[test]
-fn register_default_providers_populates_multiple_keys() {
-    let mut registry = ProviderRegistry::new();
-    roci_providers::register_default_providers(&mut registry);
-
-    let keys = registry.provider_keys();
-    assert!(
-        keys.len() >= 4,
-        "expected at least 4 keys, got {}",
-        keys.len()
-    );
-}
-
-#[cfg(feature = "grok")]
-#[test]
-fn register_default_providers_registers_grok_when_feature_enabled() {
-    let mut registry = ProviderRegistry::new();
-    roci_providers::register_default_providers(&mut registry);
-    assert!(registry.has_provider("grok"));
-}
-
-#[cfg(feature = "groq")]
-#[test]
-fn register_default_providers_registers_groq_when_feature_enabled() {
-    let mut registry = ProviderRegistry::new();
-    roci_providers::register_default_providers(&mut registry);
-    assert!(registry.has_provider("groq"));
-}
-
-#[cfg(feature = "ollama")]
-#[test]
-fn register_default_providers_registers_ollama_when_feature_enabled() {
-    let mut registry = ProviderRegistry::new();
-    roci_providers::register_default_providers(&mut registry);
-    assert!(registry.has_provider("ollama"));
 }
 
 #[cfg(feature = "ollama")]
@@ -218,8 +169,8 @@ fn register_default_auth_backends_includes_claude() {
 }
 
 #[cfg(feature = "github-copilot")]
-#[tokio::test]
-async fn copilot_alias_resolves_after_registration() {
+#[test]
+fn copilot_alias_resolves_after_registration() {
     let (_dir, mut svc) = temp_auth_service();
     roci_providers::register_default_auth_backends(&mut svc);
 
@@ -228,8 +179,8 @@ async fn copilot_alias_resolves_after_registration() {
 }
 
 #[cfg(feature = "anthropic")]
-#[tokio::test]
-async fn claude_alias_resolves_after_registration() {
+#[test]
+fn claude_alias_resolves_after_registration() {
     let (_dir, mut svc) = temp_auth_service();
     roci_providers::register_default_auth_backends(&mut svc);
 

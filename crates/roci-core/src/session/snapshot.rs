@@ -145,7 +145,7 @@ pub struct RuntimeSnapshotCache {
     pub generated_at: DateTime<Utc>,
 }
 
-/// Placeholder session write lease for resume state ownership.
+/// Session write lease that preserves exclusive runtime ownership.
 #[derive(Debug)]
 pub struct SessionLease {
     #[cfg(feature = "agent")]
@@ -167,7 +167,6 @@ impl SessionLease {
 }
 
 /// Prepared local state used to resume a runtime.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionResumeState {
     pub session_config: SessionConfig,
@@ -179,34 +178,8 @@ pub struct SessionResumeState {
     pub events: Vec<AgentRuntimeEvent>,
     pub event_cursors: Vec<RuntimeCursor>,
     pub provider_ledger_seq: u64,
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
     pub(crate) lease: Arc<SessionLease>,
-}
-
-#[allow(dead_code)]
-impl SessionResumeState {
-    #[must_use]
-    #[cfg(feature = "agent")]
-    pub(crate) fn new(
-        session_config: SessionConfig,
-        metadata: SessionMetadata,
-        default_thread_id: ThreadId,
-        runtime: RuntimeSnapshot,
-    ) -> Self {
-        let lease = SessionLease::acquire(&session_config.root, &session_config.id)
-            .expect("new resume state should acquire session lease");
-        Self {
-            session_config,
-            metadata,
-            default_thread_id,
-            runtime,
-            model_messages: Vec::new(),
-            resources: SessionResourceManifest::default(),
-            events: Vec::new(),
-            event_cursors: Vec::new(),
-            provider_ledger_seq: 0,
-            lease,
-        }
-    }
 }
 
 #[cfg(test)]

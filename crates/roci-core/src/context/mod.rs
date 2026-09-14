@@ -7,7 +7,7 @@
 //! # Module layout
 //!
 //! - [`tokens`] — heuristic token counting, `TokenCounter` trait, typed `TokenCount`
-//! - [`budget`] — token budget configuration, snapshots, and decision types
+//! - [`budget`] — token budget configuration, snapshots, and message selection
 //! - [`overflow`] — overflow detection and classification contracts
 //! - [`recovery`] — overflow recovery policy, decision types, and event contracts
 //! - [`compaction`] — compaction-preparation helpers and types
@@ -19,7 +19,7 @@ pub mod recovery;
 pub mod tokens;
 
 pub use self::budget::{
-    select_messages_with_token_budget_newest_first, BudgetDecision, BudgetSnapshot, ContextBudget,
+    select_messages_with_token_budget_newest_first, BudgetSnapshot, ContextBudget,
 };
 pub use self::compaction::{
     assemble_summary_compaction, collect_entries_between_branches, compact_micro,

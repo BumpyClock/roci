@@ -994,19 +994,6 @@ mod tests {
         assert_eq!(d1.detect(&input), d2.detect(&input));
     }
 
-    #[test]
-    fn builtin_overflow_detector_fn_creates_composite() {
-        let detector = builtin_overflow_detector();
-        let err = make_typed_error(
-            ErrorCode::ContextLengthExceeded,
-            "context_length_exceeded",
-            "overflow",
-        );
-        let input = input_for_error("openai", "gpt-4o", &err);
-
-        assert!(detector.detect(&input).is_some());
-    }
-
     // ======================================================================
     // Case insensitivity
     // ======================================================================

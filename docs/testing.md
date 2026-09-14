@@ -2,9 +2,12 @@
 
 ## Default suite (hermetic)
 
-- Command: `cargo test`
+- Command: `cargo test --workspace`
 - Network: no external calls
 - Runs tests across all workspace crates
+
+For all provider and capability features, run `cargo test --workspace --all-features`.
+Use the workspace MSRV (Rust 1.96.1 or newer).
 
 ### Per-crate testing
 
@@ -14,7 +17,7 @@ cargo test -p roci-core --features agent "agent::runtime::tests::"  # AgentRunti
 cargo test -p roci-providers  # Provider transports
 cargo test -p roci            # Meta-crate integration tests
 cargo test -p roci-cli        # CLI tests (arg parsing, error formatting, session commands)
-cargo test -p roci-tools      # Tool tests (25 tests covering all tools)
+cargo test -p roci-tools      # Built-in and workspace tool contracts
 ```
 
 ## Integration and feature-gated tests

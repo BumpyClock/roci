@@ -761,3 +761,84 @@ pub(super) fn registry_with_plan_json_provider(
     }));
     Arc::new(registry)
 }
+
+/// Capture requests at the provider boundary, including the key a provider resolves.
+pub(super) type RecordedRequests = Arc<Mutex<Vec<(ProviderRequest, Option<String>)>>>;
+
+pub(super) fn registry_with_recorded_requests() -> (Arc<ProviderRegistry>, RecordedRequests) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RequestRecordingFactory {
+        requests: requests.clone(),
+    }));
+    (Arc::new(registry), requests)
+}
+
+struct RequestRecordingFactory {
+    requests: RecordedRequests,
+}
+
+impl ProviderFactory for RequestRecordingFactory {
+    fn provider_keys(&self) -> &[&str] {
+        &["stub"]
+    }
+
+    fn create(
+        &self,
+        config: &RociConfig,
+        provider_key: &str,
+        model_id: &str,
+    ) -> Result<Box<dyn ModelProvider>, RociError> {
+        Ok(Box::new(RequestRecordingProvider {
+            inner: StreamingTextProvider {
+                provider_key: provider_key.into(),
+                model_id: model_id.into(),
+                input_tokens: 8,
+                output_tokens: 3,
+                capabilities: ModelCapabilities::default(),
+            },
+            config_key: config.get_api_key(provider_key),
+            requests: self.requests.clone(),
+        }))
+    }
+}
+
+struct RequestRecordingProvider {
+    inner: StreamingTextProvider,
+    config_key: Option<String>,
+    requests: RecordedRequests,
+}
+
+#[async_trait]
+impl ModelProvider for RequestRecordingProvider {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn capabilities(&self) -> &ModelCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn generate_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, RociError> {
+        self.inner.generate_text(request).await
+    }
+
+    async fn stream_text(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
+        self.requests.lock().expect("requests lock").push((
+            request.clone(),
+            request
+                .api_key_override
+                .clone()
+                .or_else(|| self.config_key.clone()),
+        ));
+        self.inner.stream_text(request).await
+    }
+}

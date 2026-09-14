@@ -2139,7 +2139,6 @@ dependencies = [
  "chrono",
  "directories",
  "futures",
- "pretty_assertions",
  "reqwest 0.12.28",
  "roci-core",
  "serde",

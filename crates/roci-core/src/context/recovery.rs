@@ -391,20 +391,8 @@ pub enum RecoveryEvent {
 ///
 /// There is no public configuration surface. The ladder is locked to the
 /// constants defined in this module.
-#[derive(Debug, Clone)]
-pub struct OverflowRecoveryPolicy {
-    max_compaction_attempts: u8,
-    min_progress_tokens: usize,
-}
-
-impl Default for OverflowRecoveryPolicy {
-    fn default() -> Self {
-        Self {
-            max_compaction_attempts: MAX_COMPACTION_ATTEMPTS,
-            min_progress_tokens: MIN_PROGRESS_TOKENS,
-        }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct OverflowRecoveryPolicy {}
 
 impl OverflowRecoveryPolicy {
     /// Create a policy with the fixed recovery ladder.
@@ -414,22 +402,12 @@ impl OverflowRecoveryPolicy {
 
     /// Maximum compaction attempts per episode (fixed at 2).
     pub fn max_compaction_attempts(&self) -> u8 {
-        self.max_compaction_attempts
+        MAX_COMPACTION_ATTEMPTS
     }
 
     /// Minimum tokens a compaction must free to justify another attempt.
     pub fn min_progress_tokens(&self) -> usize {
-        self.min_progress_tokens
-    }
-
-    /// Test-only constructor for verifying edge cases with non-default
-    /// ladder parameters.
-    #[cfg(test)]
-    fn with_test_config(max_compaction_attempts: u8, min_progress_tokens: usize) -> Self {
-        Self {
-            max_compaction_attempts,
-            min_progress_tokens,
-        }
+        MIN_PROGRESS_TOKENS
     }
 
     /// Determine the next recovery action given the overflow signal and
@@ -453,7 +431,7 @@ impl OverflowRecoveryPolicy {
         }
 
         // 3. Compaction ladder — check limit before allowing any attempt.
-        if state.compaction_attempts >= self.max_compaction_attempts {
+        if state.compaction_attempts >= MAX_COMPACTION_ATTEMPTS {
             return RecoveryDecision::from_reason(RecoveryReason::CompactionAttemptsExhausted);
         }
 
@@ -470,7 +448,7 @@ impl OverflowRecoveryPolicy {
             let has_progress = state
                 .last_compaction_progress
                 .as_ref()
-                .is_some_and(|p| p.meets_threshold(self.min_progress_tokens));
+                .is_some_and(|p| p.meets_threshold(MIN_PROGRESS_TOKENS));
 
             if has_progress {
                 RecoveryDecision::from_reason(RecoveryReason::CompactionProgressSufficient)
@@ -795,12 +773,6 @@ mod tests {
         assert_eq!(d.reason(), RecoveryReason::CompactionRequired);
     }
 
-    #[test]
-    fn input_overflow_skips_output_reduction() {
-        let d = policy().next_action(&input_overflow_signal(), &RecoveryState::new());
-        assert_ne!(d.action(), RecoveryAction::ReduceOutputBudget);
-    }
-
     // -- Policy: compaction progress gating ---------------------------------
 
     #[test]
@@ -847,34 +819,6 @@ mod tests {
         let d = policy().next_action(&input_overflow_signal(), &state);
         assert_eq!(d.action(), RecoveryAction::Abort);
         assert_eq!(d.reason(), RecoveryReason::CompactionProgressInsufficient);
-    }
-
-    // -- Policy: test-only config knobs -------------------------------------
-
-    #[test]
-    fn custom_progress_threshold_is_respected() {
-        let p = OverflowRecoveryPolicy::with_test_config(2, 5_000);
-        let mut state = RecoveryState::new();
-        // Free 2000 — above default 500 but below test threshold 5000.
-        state.record_compaction(progress_with_freed(2_000));
-        let d = p.next_action(&input_overflow_signal(), &state);
-        assert_eq!(d.action(), RecoveryAction::Abort);
-        assert_eq!(d.reason(), RecoveryReason::CompactionProgressInsufficient);
-    }
-
-    #[test]
-    fn zero_max_compactions_aborts_before_any_compaction() {
-        let p = OverflowRecoveryPolicy::with_test_config(0, MIN_PROGRESS_TOKENS);
-        let d = p.next_action(&input_overflow_signal(), &RecoveryState::new());
-        assert_eq!(d.action(), RecoveryAction::Abort);
-        assert_eq!(d.reason(), RecoveryReason::CompactionAttemptsExhausted);
-    }
-
-    #[test]
-    fn zero_max_compactions_still_allows_output_reduction() {
-        let p = OverflowRecoveryPolicy::with_test_config(0, MIN_PROGRESS_TOKENS);
-        let d = p.next_action(&output_overflow_signal(), &RecoveryState::new());
-        assert_eq!(d.action(), RecoveryAction::ReduceOutputBudget);
     }
 
     // -- Policy: full episode traces ----------------------------------------
