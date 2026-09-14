@@ -326,6 +326,17 @@ impl AgentRuntime {
         mut config: AgentConfig,
         state: SessionResumeState,
     ) -> Result<Self, RociError> {
+        let account = state
+            .metadata
+            .credential_account
+            .as_deref()
+            .unwrap_or("default");
+        if account != roci_config.account() {
+            return Err(RociError::InvalidState(format!(
+                "session uses credential account '{account}', but configuration selected '{}'",
+                roci_config.account()
+            )));
+        }
         if state.session_config.id != state.metadata.id {
             return Err(RociError::InvalidState(
                 "resume state session id does not match metadata id".to_string(),

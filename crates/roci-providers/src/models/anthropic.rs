@@ -68,6 +68,7 @@ impl AnthropicModel {
             supports_json_mode: false,
             supports_json_schema: false,
             supports_reasoning: self.supports_extended_thinking(),
+            supported_speeds: Vec::new(),
             reasoning_effort: Default::default(),
             supports_system_messages: true,
             context_length: ctx,

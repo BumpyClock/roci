@@ -139,6 +139,7 @@ impl GitHubCopilotAuth {
         let payload: GitHubDeviceTokenResponse = resp.json().await?;
         if let Some(access_token) = payload.access_token {
             let token = Token {
+                provider_metadata: None,
                 access_token,
                 refresh_token: None,
                 id_token: None,

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
 use roci_core::models::{ModelCapabilities, ModelInputCapabilities, ReasoningEffortCapabilities};
-use roci_core::types::ReasoningEffort;
+use roci_core::types::{GenerationSpeed, ReasoningEffort};
 
 /// OpenAI models.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Display, EnumString)]
@@ -291,6 +291,11 @@ impl OpenAiModel {
             supports_json_mode: true,
             supports_json_schema: json_schema,
             supports_reasoning: reasoning,
+            supported_speeds: if codex || self.uses_responses_api() {
+                vec![GenerationSpeed::Standard, GenerationSpeed::Fast]
+            } else {
+                Vec::new()
+            },
             reasoning_effort: self.reasoning_effort_capabilities(codex),
             supports_system_messages: !self.is_reasoning()
                 || matches!(self, Self::O3 | Self::O3Mini | Self::O4Mini),
@@ -474,7 +479,21 @@ fn reasoning_efforts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roci_core::types::ReasoningEffort;
+    use roci_core::types::{GenerationSpeed, ReasoningEffort};
+
+    #[test]
+    fn speed_capabilities_follow_responses_and_codex_routes() {
+        let both = vec![GenerationSpeed::Standard, GenerationSpeed::Fast];
+        assert_eq!(OpenAiModel::Gpt5Nano.capabilities().supported_speeds, both);
+        assert_eq!(
+            OpenAiModel::Gpt4o.codex_capabilities().supported_speeds,
+            both
+        );
+        assert!(OpenAiModel::Gpt4o
+            .capabilities()
+            .supported_speeds
+            .is_empty());
+    }
 
     #[test]
     fn gpt4o_has_vision_input_capabilities() {

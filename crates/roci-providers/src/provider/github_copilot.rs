@@ -13,7 +13,6 @@ use roci_core::types::TextStreamDelta;
 
 use super::openai_compatible::OpenAiCompatibleProvider;
 use crate::models::openai::OpenAiModel;
-use roci_core::provider::http::{bearer_headers, shared_client};
 use roci_core::provider::{ModelProvider, ProviderRequest, ProviderResponse};
 
 const COPILOT_EDITOR_VERSION: &str = "vscode/1.96.2";
@@ -21,6 +20,7 @@ const COPILOT_EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
 const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
 const COPILOT_API_VERSION: &str = "2025-04-01";
+const MAX_COPILOT_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct GitHubCopilotProvider {
     inner: OpenAiCompatibleProvider,
@@ -61,11 +61,10 @@ pub(crate) fn parse_copilot_models_response(
     body: &str,
     provider_key: &str,
 ) -> Result<ModelCatalog, RociError> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).map_err(|error| RociError::Provider {
-            provider: provider_key.to_string(),
-            message: format!("failed to parse Copilot models response: {error}"),
-        })?;
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| RociError::Provider {
+        provider: provider_key.to_string(),
+        message: "failed to parse Copilot models response".to_string(),
+    })?;
     let models = match &value {
         serde_json::Value::Array(models) => models,
         serde_json::Value::Object(object) => object
@@ -148,30 +147,76 @@ pub(crate) async fn list_copilot_models(
     base_url: &str,
     provider_key: &str,
 ) -> Result<ModelCatalog, RociError> {
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let mut headers = bearer_headers(api_key);
-    headers.extend(copilot_headers());
+    let failure = |message: &str| RociError::Provider {
+        provider: provider_key.to_string(),
+        message: message.to_string(),
+    };
+    if api_key.trim().is_empty() {
+        return Err(RociError::Authentication(
+            "Copilot model discovery requires credentials".to_string(),
+        ));
+    }
+    let mut url =
+        reqwest::Url::parse(base_url).map_err(|_| failure("invalid Copilot models endpoint"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(failure("invalid Copilot models endpoint"));
+    }
+    url.set_path(&format!("{}/models", url.path().trim_end_matches('/')));
+    url.set_fragment(None);
+    let mut source_url = url.clone();
+    source_url.set_query(None);
+    let mut headers = copilot_headers();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-
-    let response = shared_client()
-        .get(url)
-        .headers(headers)
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .referer(false)
         .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| failure("could not initialize Copilot model discovery"))?;
+    let mut response = client
+        .get(url)
+        .bearer_auth(api_key)
+        .headers(headers)
         .send()
         .await
-        .map_err(RociError::Network)?;
+        .map_err(|_| failure("Copilot model discovery request failed"))?;
     let status = response.status();
-    let body = response.text().await.map_err(RociError::Network)?;
-    match status.as_u16() {
-        200..=299 => parse_copilot_models_response(&body, provider_key),
-        401 | 403 => Err(RociError::Authentication(body)),
-        404 | 405 => Err(RociError::UnsupportedOperation(format!(
-            "Copilot models endpoint unsupported: status {}",
-            status.as_u16()
-        ))),
-        500..=599 => Err(RociError::api(status.as_u16(), body)),
-        other => Err(RociError::api(other, body)),
+    if !status.is_success() {
+        return Err(RociError::api(
+            status.as_u16(),
+            "Copilot model discovery returned an HTTP error",
+        ));
     }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_COPILOT_CATALOG_BYTES as u64)
+    {
+        return Err(failure("Copilot models response exceeded size limit"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| failure("could not read Copilot models response"))?
+    {
+        if chunk.len() > MAX_COPILOT_CATALOG_BYTES - body.len() {
+            return Err(failure("Copilot models response exceeded size limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body =
+        std::str::from_utf8(&body).map_err(|_| failure("Copilot models response was not UTF-8"))?;
+    let mut catalog = parse_copilot_models_response(body, provider_key)?;
+    catalog.update_models(|model| {
+        model.source = ModelCatalogSource::Dynamic {
+            endpoint: source_url.to_string(),
+        };
+    });
+    Ok(catalog)
 }
 
 #[async_trait]
@@ -206,7 +251,7 @@ impl ModelProvider for GitHubCopilotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -338,7 +383,6 @@ mod tests {
 
     #[tokio::test]
     async fn list_copilot_models_parses_dynamic_success() {
-        // Fresh server: the shared HTTP client must not reuse sockets from another test runtime.
         let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
@@ -359,52 +403,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_copilot_models_maps_404_to_unsupported() {
+    async fn list_copilot_models_preserves_query_but_redacts_source() {
         let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
-            .and(path("/models"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .and(path("/v1/models"))
+            .and(query_param("key", "query-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "future-model"}]
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
-        let err = list_copilot_models("test-token", &server.uri(), "github-copilot")
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, RociError::UnsupportedOperation(_)));
+        let catalog = list_copilot_models(
+            "test-token",
+            &format!("{}/v1/?key=query-secret#fragment-secret", server.uri()),
+            "github-copilot",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            catalog.models()[0].source,
+            ModelCatalogSource::Dynamic {
+                endpoint: format!("{}/v1/models", server.uri()),
+            }
+        );
     }
 
     #[tokio::test]
-    async fn list_copilot_models_maps_auth_errors_to_authentication() {
-        for status in [401, 403] {
+    async fn list_copilot_models_preserves_status_without_response_secrets() {
+        for status in [401, 403, 404, 405, 429, 503] {
             let server = MockServer::builder().start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
-                .respond_with(ResponseTemplate::new(status).set_body_string("auth failed"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("body-secret"))
                 .mount(&server)
                 .await;
 
-            let err = list_copilot_models("bad-token", &server.uri(), "github-copilot")
+            let err = list_copilot_models("token-secret", &server.uri(), "github-copilot")
                 .await
                 .unwrap_err();
 
-            assert!(matches!(err, RociError::Authentication(_)));
+            assert!(matches!(err, RociError::Api { status: actual, .. } if actual == status));
+            assert!(!format!("{err:?}").contains("secret"));
         }
     }
 
     #[tokio::test]
-    async fn list_copilot_models_maps_5xx_to_api_error() {
+    async fn list_copilot_models_does_not_follow_redirects() {
         let server = MockServer::builder().start().await;
+        Mock::given(path("/redirected"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/models"))
-            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/redirected", server.uri())),
+            )
             .mount(&server)
             .await;
 
         let err = list_copilot_models("test-token", &server.uri(), "github-copilot")
             .await
             .unwrap_err();
+        assert!(matches!(err, RociError::Api { status: 302, .. }));
+    }
 
-        assert!(matches!(err, RociError::Api { status: 503, .. }));
+    #[tokio::test]
+    async fn list_copilot_models_rejects_oversized_and_malformed_responses() {
+        for (body, expected) in [
+            (
+                " ".repeat(MAX_COPILOT_CATALOG_BYTES + 1),
+                "exceeded size limit",
+            ),
+            ("body-secret".to_string(), "failed to parse"),
+        ] {
+            let server = MockServer::builder().start().await;
+            Mock::given(path("/models"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+            let err = list_copilot_models("test-token", &server.uri(), "github-copilot")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+            assert!(!format!("{err:?}").contains("body-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn list_copilot_models_redacts_invalid_urls_and_credentials() {
+        for endpoint in [
+            "invalid-url-secret",
+            "https://user:password-secret@example.invalid",
+            "file:///secret",
+        ] {
+            let err = list_copilot_models("token-secret", endpoint, "github-copilot")
+                .await
+                .unwrap_err();
+            assert!(!format!("{err:?}").contains("secret"));
+        }
+        let err = list_copilot_models(
+            "token-secret\ninvalid-header",
+            "https://example.invalid?key=query-secret",
+            "github-copilot",
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{err:?}").contains("secret"));
     }
 }

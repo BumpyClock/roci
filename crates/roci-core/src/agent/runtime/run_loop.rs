@@ -397,8 +397,15 @@ impl AgentRuntime {
         if let Some(ref convert) = self.config.convert_to_llm {
             request = request.with_convert_to_llm(convert.clone());
         }
-        if let Some(ref id) = self.config.session_id {
-            request = request.with_session_id(id.clone());
+        // Durable sessions must retain provider continuity after reopening. The
+        // thread UUID also separates independent sessions with the same name.
+        let provider_session_id = self.config.session_id.clone().or_else(|| {
+            self.session_config
+                .as_ref()
+                .map(|session| format!("{}:{}", session.id, turn_id.thread_id()))
+        });
+        if let Some(id) = provider_session_id {
+            request = request.with_session_id(id);
         }
         if let Some(ref transport) = self.config.transport {
             request = request.with_transport(transport.clone());
@@ -436,7 +443,10 @@ impl AgentRuntime {
             let active_model = request.active_model().clone();
             let active_provider = active_model.provider_name().to_string();
             if request.active_api_key_override().is_none()
-                && self.roci_config.get_api_key(&active_provider).is_none()
+                && self
+                    .roci_config
+                    .resolve_provider_credential(&active_provider)?
+                    .is_none()
             {
                 if let Some(ref get_key) = request.get_api_key {
                     let key = get_key(active_model).await?;

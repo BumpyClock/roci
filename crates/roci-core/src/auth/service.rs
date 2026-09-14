@@ -17,6 +17,13 @@ use super::token::Token;
 /// the user to a PKCE authorize URL).
 #[derive(Debug, Clone)]
 pub enum AuthStep {
+    /// Browser authorization with polling; secret session data stays in the manager.
+    BrowserPoll {
+        authorization_url: String,
+        interval: Duration,
+        expires_at: DateTime<Utc>,
+        session_data: serde_json::Value,
+    },
     /// Device-code flow: show the URL and user code, then poll.
     DeviceCode {
         verification_url: String,
@@ -83,6 +90,31 @@ impl AuthService {
         backend.start_login(&self.store).await
     }
 
+    /// Import external credentials explicitly, preserving missing-file and error outcomes.
+    pub fn import_credentials(&self, provider: &str) -> Result<Option<Token>, AuthError> {
+        self.find_backend(provider)?.import_credentials(&self.store)
+    }
+
+    pub async fn start_login_with_flow(
+        &self,
+        provider: &str,
+        flow: super::descriptor::CredentialFlow,
+    ) -> Result<AuthStep, AuthError> {
+        self.find_backend(provider)?
+            .start_login_with_flow(&self.store, flow)
+            .await
+    }
+
+    pub async fn poll_browser(
+        &self,
+        provider: &str,
+        session_data: &serde_json::Value,
+    ) -> Result<AuthPollResult, AuthError> {
+        self.find_backend(provider)?
+            .poll_browser(&self.store, session_data)
+            .await
+    }
+
     /// Poll a device-code session for authorization status.
     pub async fn poll_device_code(
         &self,
@@ -93,32 +125,16 @@ impl AuthService {
         backend.poll_device_code(&self.store, session).await
     }
 
-    /// Complete a PKCE authorization-code exchange.
+    /// Complete a PKCE exchange with the opaque session data from `start_login`.
     pub async fn complete_pkce(
         &self,
         provider: &str,
         code: &str,
         state: &str,
+        session_data: &serde_json::Value,
     ) -> Result<Token, AuthError> {
-        let backend = self.find_backend(provider)?;
-        backend.complete_pkce(&self.store, code, state).await
-    }
-
-    /// Complete a PKCE authorization-code exchange with preserved session data.
-    ///
-    /// `session_data` carries the opaque state produced by `start_login`
-    /// (e.g. the PKCE `code_verifier`). Pass `None` only for backends that
-    /// do not require it.
-    pub async fn complete_pkce_with_session(
-        &self,
-        provider: &str,
-        code: &str,
-        state: &str,
-        session_data: Option<&serde_json::Value>,
-    ) -> Result<Token, AuthError> {
-        let backend = self.find_backend(provider)?;
-        backend
-            .complete_pkce_with_session(&self.store, code, state, session_data)
+        self.find_backend(provider)?
+            .complete_pkce(&self.store, code, state, session_data)
             .await
     }
 
@@ -136,9 +152,17 @@ impl AuthService {
 
     /// Remove stored credentials for a provider.
     pub fn logout(&self, provider: &str) -> Result<(), AuthError> {
-        match self.find_backend(provider) {
-            Ok(backend) => backend.logout(&self.store),
-            Err(_) => self.store.clear(provider, "default"),
+        let backend = self.find_backend(provider).ok();
+        let runtime_key = backend.map_or(provider, |backend| backend.runtime_store_key());
+        let _lease = self
+            .store
+            .try_acquire_refresh_lease(runtime_key, "default")?
+            .ok_or(AuthError::RateLimited {
+                retry_after_ms: Some(100),
+            })?;
+        match backend {
+            Some(backend) => backend.logout(&self.store),
+            None => self.store.clear(provider, "default"),
         }
     }
 
@@ -151,6 +175,11 @@ impl AuthService {
                 (b.display_name(), b.store_key(), result)
             })
             .collect()
+    }
+
+    /// Bind registered backends to the manager-selected account facade.
+    pub(crate) fn set_store(&mut self, store: Arc<dyn TokenStore>) {
+        self.store = store;
     }
 
     /// Access the underlying token store.
@@ -203,6 +232,7 @@ mod tests {
 
     fn sample_token() -> Token {
         Token {
+            provider_metadata: None,
             access_token: "test-access-token".to_string(),
             refresh_token: Some("test-refresh".to_string()),
             id_token: None,

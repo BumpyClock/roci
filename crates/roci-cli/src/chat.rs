@@ -34,7 +34,10 @@ use subagents::{load_cli_subagent_profiles, print_agent_profiles, select_session
 
 pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ChatArgs {
+        reasoning_effort,
+        speed,
         model: model_arg,
+        account,
         candidate_models,
         retry_mode,
         max_retry_attempts,
@@ -76,7 +79,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         print_agent_profiles(&subagent_profiles.registry, &mut stdout)?;
         return Ok(());
     }
-    let config = RociConfig::from_env();
+    let mut config = RociConfig::from_env();
     let registry = Arc::new(roci::default_registry());
 
     let model: roci::models::LanguageModel = model_arg.parse().map_err(|_| {
@@ -135,7 +138,11 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
         MCPInstructionMergePolicy::AppendBlock,
     );
 
-    let mut settings = roci::types::GenerationSettings::default();
+    let mut settings = roci::types::GenerationSettings {
+        reasoning_effort,
+        speed,
+        ..Default::default()
+    };
     if let Some(t) = temperature {
         settings.temperature = Some(t);
     }
@@ -192,6 +199,20 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
     } else {
         None
     };
+    let selected_account = account
+        .as_deref()
+        .or_else(|| {
+            session_state
+                .as_ref()
+                .and_then(|state| state.metadata.credential_account.as_deref())
+        })
+        .unwrap_or("default");
+    config = config.with_account(selected_account)?;
+    settings.reasoning_effort = reasoning_effort.or_else(|| {
+        session_state
+            .as_ref()
+            .and_then(|state| state.metadata.reasoning_effort)
+    });
     let selected_agent_profile =
         select_session_agent_profile(agent.as_deref(), persisted_agent_profile.as_deref());
     let subagent_profiles = load_cli_subagent_profiles(&cwd, selected_agent_profile.clone())?;
@@ -205,6 +226,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             session_state = Some(
                 store
                     .create(CreateSessionOptions {
+                        credential_account: Some(config.account().to_owned()),
                         id: Some(session_config.id.clone()),
                         title: None,
                         host_cwd: Some(cwd.clone()),
@@ -212,6 +234,7 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
                         default_thread_id: None,
                         model_preferences: SessionModelPreferences {
                             agent_profile: selected_agent_profile,
+                            reasoning_effort,
                             ..SessionModelPreferences::default()
                         },
                     })

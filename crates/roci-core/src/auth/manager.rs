@@ -59,11 +59,19 @@ impl ProviderAuthManager {
     /// token store becomes the config's OAuth source so login, status, and
     /// provider launch always observe the same credentials.
     pub fn new_shared(
-        auth: AuthService,
+        mut auth: AuthService,
         registry: Arc<ProviderRegistry>,
         config: RociConfig,
     ) -> Result<Self, AuthError> {
+        // AuthService chooses the backing storage; config chooses the account.
+        // Unwrap any previous account facade before applying that selection.
         let config = config.with_token_store(Some(auth.store().clone()));
+        auth.set_store(
+            config
+                .token_store()
+                .expect("auth store was just configured")
+                .clone(),
+        );
         let mut descriptors: HashMap<String, ProviderDescriptor> = HashMap::new();
         let mut key_index: HashMap<String, String> = HashMap::new();
         let mut login_aliases: HashMap<String, String> = HashMap::new();
@@ -90,14 +98,15 @@ impl ProviderAuthManager {
                 )));
             }
 
-            let flow = backend.oauth_flow();
             let entry = descriptors.entry(canonical.clone()).or_insert_with(|| {
                 registry
                     .factory(&canonical)
                     .map(|f| f.descriptor())
                     .unwrap_or_else(|| ProviderDescriptor::third_party_default(&canonical, true))
             });
-            *entry = entry.clone().with_flow(flow);
+            for flow in backend.oauth_flows() {
+                *entry = entry.clone().with_flow(flow);
+            }
 
             key_index.insert(canonical.clone(), canonical.clone());
             for alias in backend.aliases() {
@@ -159,8 +168,9 @@ impl ProviderAuthManager {
             .cloned()
             .ok_or_else(|| AuthError::UnknownProvider(provider.to_string()))?;
 
-        let configured_sources = self.configured_sources(&canonical);
-        let auth_state = self.auth_state(&configured_sources);
+        let token = self.oauth_token(&canonical)?;
+        let configured_sources = self.configured_sources(&canonical, token.is_some())?;
+        let auth_state = self.auth_state(&configured_sources, token.as_ref());
         let launch_available = self
             .registry
             .is_available(&canonical, &self.config)
@@ -183,8 +193,43 @@ impl ProviderAuthManager {
             .collect()
     }
 
+    /// Explicitly import external credentials and return only a host-safe receipt.
+    pub fn import_credentials(&self, provider: &str) -> Result<HostAuthCompletion, AuthError> {
+        let canonical = self.resolve_canonical(provider)?;
+        let alias = self.login_aliases.get(canonical.as_str()).ok_or_else(|| {
+            AuthError::Unsupported(format!(
+                "provider '{canonical}' has no credential import backend"
+            ))
+        })?;
+        self.auth.import_credentials(alias)?.ok_or_else(|| {
+            AuthError::InvalidResponse(format!(
+                "no existing credentials found to import for '{canonical}'"
+            ))
+        })?;
+        Ok(HostAuthCompletion {
+            provider: canonical,
+        })
+    }
+
     /// Start a login flow; secrets stay in the pending map.
     pub async fn start_login(&self, provider: &str) -> Result<HostAuthStep, AuthError> {
+        self.start_login_selected(provider, None).await
+    }
+
+    /// Select a supported OAuth flow while retaining secrets inside the manager.
+    pub async fn start_login_with_flow(
+        &self,
+        provider: &str,
+        flow: CredentialFlow,
+    ) -> Result<HostAuthStep, AuthError> {
+        self.start_login_selected(provider, Some(flow)).await
+    }
+
+    async fn start_login_selected(
+        &self,
+        provider: &str,
+        flow: Option<CredentialFlow>,
+    ) -> Result<HostAuthStep, AuthError> {
         let canonical = self.resolve_canonical(provider)?;
         let alias = self
             .login_aliases
@@ -194,7 +239,34 @@ impl ProviderAuthManager {
                 AuthError::Unsupported(format!("provider '{canonical}' has no OAuth login backend"))
             })?;
 
-        match self.auth.start_login(&alias).await? {
+        let step = match flow {
+            Some(flow) => self.auth.start_login_with_flow(&alias, flow).await?,
+            None => self.auth.start_login(&alias).await?,
+        };
+        match step {
+            AuthStep::BrowserPoll {
+                authorization_url,
+                interval,
+                expires_at,
+                session_data,
+            } => {
+                let session_id = new_session_id();
+                self.pending.insert(
+                    &session_id,
+                    PendingLogin::BrowserPoll {
+                        provider_alias: alias,
+                        canonical,
+                        session_data,
+                        expires_at,
+                    },
+                )?;
+                Ok(HostAuthStep::BrowserPoll {
+                    authorization_url,
+                    interval_secs: duration_secs(interval),
+                    expires_at,
+                    session_id,
+                })
+            }
             AuthStep::Imported { token: _ } => Ok(HostAuthStep::ImportedAndComplete {
                 provider: canonical,
             }),
@@ -240,26 +312,43 @@ impl ProviderAuthManager {
         }
     }
 
-    /// Poll a device-code login by opaque session id.
-    pub async fn poll_device_code(
+    /// Advance a browser or device-code login using its opaque session ID.
+    ///
+    /// The manager selects the provider operation from the stored session. PKCE
+    /// sessions require an authorization code and use [`Self::complete_pkce`].
+    /// Pending and retryable failures preserve the session; terminal results
+    /// consume it. Canceling this future releases its exclusive claim.
+    pub async fn advance_login(
         &self,
         session_id: &LoginSessionId,
     ) -> Result<HostAuthPollResult, AuthError> {
         let claim = self.pending.claim(session_id)?;
-        let (alias, canonical, session) = match claim.pending() {
+        let (canonical, result) = match claim.pending() {
+            PendingLogin::BrowserPoll {
+                provider_alias,
+                canonical,
+                session_data,
+                ..
+            } => (
+                canonical,
+                self.auth.poll_browser(provider_alias, session_data).await,
+            ),
             PendingLogin::DeviceCode {
                 provider_alias,
                 canonical,
                 session,
-            } => (provider_alias, canonical, session),
+            } => (
+                canonical,
+                self.auth.poll_device_code(provider_alias, session).await,
+            ),
             PendingLogin::Pkce { .. } => {
                 return Err(AuthError::Unsupported(
-                    "session is a PKCE login; use complete_pkce".into(),
+                    "PKCE login requires an authorization code".into(),
                 ));
             }
         };
 
-        let result = match self.auth.poll_device_code(alias, session).await {
+        let result = match result {
             Ok(result) => result,
             Err(error @ (AuthError::Network(_) | AuthError::RateLimited { .. })) => {
                 return Err(error);
@@ -305,16 +394,14 @@ impl ProviderAuthManager {
                 session_data,
                 ..
             } => (provider_alias, canonical, state, session_data),
-            PendingLogin::DeviceCode { .. } => {
-                return Err(AuthError::Unsupported(
-                    "session is a device-code login; use poll_device_code".into(),
-                ));
+            PendingLogin::DeviceCode { .. } | PendingLogin::BrowserPoll { .. } => {
+                return Err(AuthError::Unsupported("session is not a PKCE login".into()));
             }
         };
 
         match self
             .auth
-            .complete_pkce_with_session(alias, code, state, Some(session_data))
+            .complete_pkce(alias, code, state, session_data)
             .await
         {
             Ok(_) => {
@@ -444,46 +531,66 @@ impl ProviderAuthManager {
         Err(AuthError::UnknownProvider(provider.to_string()))
     }
 
-    fn configured_sources(&self, canonical: &str) -> Vec<ConfiguredSource> {
+    fn configured_sources(
+        &self,
+        canonical: &str,
+        has_token: bool,
+    ) -> Result<Vec<ConfiguredSource>, AuthError> {
         let mut sources = Vec::new();
         if self.config.has_explicit_api_key(canonical) {
             sources.push(ConfiguredSource::ExternallyConfigured);
         }
-        if self.config.has_stored_api_key(canonical) {
-            sources.push(ConfiguredSource::StoredApiKey);
+        if let Some(store) = self.config.provider_credential_store() {
+            if store
+                .load(canonical)
+                .map_err(|_| AuthError::Io("provider credential store could not be read".into()))?
+                .is_some()
+            {
+                sources.push(ConfiguredSource::StoredApiKey);
+            }
         }
-        if self.oauth_token_present(canonical) {
+        if has_token {
             sources.push(ConfiguredSource::OAuthToken);
         }
-        sources
+        Ok(sources)
     }
 
-    fn oauth_token_present(&self, canonical: &str) -> bool {
+    fn oauth_token(&self, canonical: &str) -> Result<Option<super::Token>, AuthError> {
         for backend in self.auth.backends() {
-            if backend.canonical_provider_key() != canonical {
-                continue;
-            }
-            let has_valid_token = backend
-                .get_status(self.auth.store())
-                .ok()
-                .flatten()
-                .is_some_and(|token| token.is_valid());
-            if has_valid_token {
-                return true;
+            if backend.canonical_provider_key() == canonical {
+                if let Some(token) = backend.get_status(self.auth.store())? {
+                    return Ok(Some(token));
+                }
             }
         }
-        false
+        Ok(None)
     }
 
-    fn auth_state(&self, sources: &[ConfiguredSource]) -> ProviderAuthState {
-        if sources.contains(&ConfiguredSource::OAuthToken)
-            || sources.contains(&ConfiguredSource::StoredApiKey)
-        {
+    fn auth_state(
+        &self,
+        sources: &[ConfiguredSource],
+        token: Option<&super::Token>,
+    ) -> ProviderAuthState {
+        if sources.contains(&ConfiguredSource::StoredApiKey) {
             ProviderAuthState::SignedIn {
-                label: "Signed in".to_string(),
+                label: "Signed in".into(),
             }
         } else if sources.contains(&ConfiguredSource::ExternallyConfigured) {
             ProviderAuthState::ExternallyConfigured
+        } else if let Some(token) = token {
+            if token.is_valid() {
+                ProviderAuthState::SignedIn {
+                    label: "Signed in".into(),
+                }
+            } else if token
+                .refresh_token
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                ProviderAuthState::RefreshNeeded
+            } else {
+                ProviderAuthState::ReauthRequired
+            }
         } else {
             ProviderAuthState::SignedOut
         }
@@ -588,60 +695,8 @@ mod tests {
         device_poll_release: Option<Arc<Notify>>,
     }
 
-    #[async_trait]
-    impl AuthBackend for StubBackend {
-        fn aliases(&self) -> &[&str] {
-            self.aliases
-        }
-
-        fn display_name(&self) -> &str {
-            self.canonical
-        }
-
-        fn store_key(&self) -> &str {
-            self.store_key
-        }
-
-        fn canonical_provider_key(&self) -> &str {
-            self.canonical
-        }
-
-        fn oauth_flow(&self) -> CredentialFlow {
-            self.flow
-        }
-
-        async fn start_login(&self, _store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
-            if self.flow == CredentialFlow::DeviceCode {
-                return Ok(AuthStep::DeviceCode {
-                    verification_url: "https://example.com/device".into(),
-                    user_code: "TEST-CODE".into(),
-                    interval: std::time::Duration::from_secs(1),
-                    expires_at: Utc::now() + chrono::Duration::minutes(5),
-                    session: DeviceCodeSession {
-                        provider: self.canonical.into(),
-                        verification_url: "https://example.com/device".into(),
-                        user_code: "TEST-CODE".into(),
-                        device_code: "device-secret".into(),
-                        interval_secs: 1,
-                        expires_at: Utc::now() + chrono::Duration::minutes(5),
-                    },
-                });
-            }
-            Ok(AuthStep::Pkce {
-                authorize_url: "https://example.com/authorize".into(),
-                state: "state-secret".into(),
-                session_data: serde_json::json!({
-                    "code_verifier": "verifier-secret",
-                    "access_token": "should-not-leak",
-                }),
-            })
-        }
-
-        async fn poll_device_code(
-            &self,
-            _store: &Arc<dyn TokenStore>,
-            _session: &DeviceCodeSession,
-        ) -> Result<AuthPollResult, AuthError> {
+    impl StubBackend {
+        async fn poll_result(&self) -> Result<AuthPollResult, AuthError> {
             let Some(behavior) = self.device_poll_behavior else {
                 return Err(AuthError::Unsupported("not device code".into()));
             };
@@ -676,13 +731,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[async_trait]
+    impl AuthBackend for StubBackend {
+        fn import_credentials(
+            &self,
+            store: &Arc<dyn TokenStore>,
+        ) -> Result<Option<Token>, AuthError> {
+            let token = store.load("external-import", "default")?;
+            if let Some(token) = &token {
+                store.save(self.store_key, "default", token)?;
+            }
+            Ok(token)
+        }
+
+        fn aliases(&self) -> &[&str] {
+            self.aliases
+        }
+
+        fn display_name(&self) -> &str {
+            self.canonical
+        }
+
+        fn store_key(&self) -> &str {
+            self.store_key
+        }
+
+        fn canonical_provider_key(&self) -> &str {
+            self.canonical
+        }
+
+        fn oauth_flow(&self) -> CredentialFlow {
+            self.flow
+        }
+
+        async fn start_login(&self, _store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
+            if self.flow == CredentialFlow::BrowserPoll {
+                return Ok(AuthStep::BrowserPoll {
+                    authorization_url: "https://example.com/browser?challenge=public".into(),
+                    interval: std::time::Duration::from_secs(1),
+                    expires_at: Utc::now() + chrono::Duration::minutes(5),
+                    session_data: serde_json::json!({ "verifier": "browser-secret" }),
+                });
+            }
+            if self.flow == CredentialFlow::DeviceCode {
+                return Ok(AuthStep::DeviceCode {
+                    verification_url: "https://example.com/device".into(),
+                    user_code: "TEST-CODE".into(),
+                    interval: std::time::Duration::from_secs(1),
+                    expires_at: Utc::now() + chrono::Duration::minutes(5),
+                    session: DeviceCodeSession {
+                        provider: self.canonical.into(),
+                        verification_url: "https://example.com/device".into(),
+                        user_code: "TEST-CODE".into(),
+                        device_code: "device-secret".into(),
+                        interval_secs: 1,
+                        expires_at: Utc::now() + chrono::Duration::minutes(5),
+                    },
+                });
+            }
+            Ok(AuthStep::Pkce {
+                authorize_url: "https://example.com/authorize".into(),
+                state: "state-secret".into(),
+                session_data: serde_json::json!({
+                    "code_verifier": "verifier-secret",
+                    "access_token": "should-not-leak",
+                }),
+            })
+        }
+
+        async fn poll_browser(
+            &self,
+            _store: &Arc<dyn TokenStore>,
+            session_data: &serde_json::Value,
+        ) -> Result<AuthPollResult, AuthError> {
+            assert_eq!(session_data["verifier"], "browser-secret");
+            self.poll_result().await
+        }
+
+        async fn poll_device_code(
+            &self,
+            _store: &Arc<dyn TokenStore>,
+            _session: &DeviceCodeSession,
+        ) -> Result<AuthPollResult, AuthError> {
+            self.poll_result().await
+        }
 
         async fn complete_pkce(
             &self,
             _store: &Arc<dyn TokenStore>,
             _code: &str,
-            _state: &str,
+            state: &str,
+            session_data: &serde_json::Value,
         ) -> Result<Token, AuthError> {
+            assert_eq!(state, "state-secret");
+            assert_eq!(session_data["code_verifier"], "verifier-secret");
             let call = self
                 .complete_pkce_calls
                 .as_ref()
@@ -726,6 +870,7 @@ mod tests {
 
     fn sample_token() -> Token {
         Token {
+            provider_metadata: None,
             access_token: "access-secret".into(),
             refresh_token: Some("refresh-secret".into()),
             id_token: Some("id-secret".into()),
@@ -742,6 +887,28 @@ mod tests {
             dir.path().to_path_buf(),
         )));
         (dir, store)
+    }
+
+    #[test]
+    fn explicit_import_returns_canonical_receipt_and_missing_is_an_error() {
+        let (_dir, store) = temp_store();
+        let manager = anthropic_manager(store.clone());
+        assert!(manager
+            .import_credentials("claude")
+            .unwrap_err()
+            .to_string()
+            .contains("no existing credentials"));
+        store
+            .save("external-import", "default", &sample_token())
+            .unwrap();
+        let receipt = manager.import_credentials("claude").unwrap();
+        assert_eq!(receipt.provider, "anthropic");
+        assert!(!format!("{receipt:?}").contains("secret"));
+        assert!(store.load("claude-code", "default").unwrap().is_some());
+        assert!(matches!(
+            manager.import_credentials("missing"),
+            Err(AuthError::UnknownProvider(_))
+        ));
     }
 
     struct FailingCredentialStore;
@@ -856,24 +1023,38 @@ mod tests {
         calls: Arc<AtomicUsize>,
         gate: DevicePollGate,
     ) -> (TempDir, Arc<ProviderAuthManager>) {
+        polling_manager(behavior, calls, gate, CredentialFlow::DeviceCode)
+    }
+
+    fn polling_manager(
+        behavior: DevicePollBehavior,
+        calls: Arc<AtomicUsize>,
+        gate: DevicePollGate,
+        flow: CredentialFlow,
+    ) -> (TempDir, Arc<ProviderAuthManager>) {
         let (started, release) = match gate {
             DevicePollGate::Open => (None, None),
             DevicePollGate::BlockFirst { started, release } => (Some(started), Some(release)),
         };
+        let keys: &'static [&'static str] = if flow == CredentialFlow::BrowserPoll {
+            &["browser"]
+        } else {
+            &["device"]
+        };
         let (dir, store) = temp_store();
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(LaunchFactory {
-            keys: &["device"],
+            keys,
             display: "Device",
             flows: vec![CredentialFlow::ApiKey],
             endpoint: false,
         }));
         let mut auth = AuthService::new(store.clone());
         auth.register_backend(Arc::new(StubBackend {
-            aliases: &["device"],
-            canonical: "device",
-            flow: CredentialFlow::DeviceCode,
-            store_key: "device",
+            aliases: keys,
+            canonical: keys[0],
+            flow,
+            store_key: keys[0],
             fail_logout: false,
             complete_pkce_failure: Mutex::new(CompletePkceFailure::None),
             complete_pkce_calls: None,
@@ -991,10 +1172,7 @@ mod tests {
         assert!(both
             .configured_sources
             .contains(&ConfiguredSource::OAuthToken));
-        assert!(matches!(
-            both.auth_state,
-            ProviderAuthState::SignedIn { ref label } if label == "Signed in"
-        ));
+        assert_eq!(both.auth_state, ProviderAuthState::ExternallyConfigured);
         assert!(both.launch_available);
         // No secret leakage in status debug/serde.
         let debug = format!("{both:?}");
@@ -1015,9 +1193,11 @@ mod tests {
 
         let status = manager.status("anthropic").unwrap();
 
-        assert!(status.configured_sources.is_empty());
-        assert_eq!(status.auth_state, ProviderAuthState::SignedOut);
-        assert!(!status.launch_available);
+        assert_eq!(
+            status.configured_sources,
+            vec![ConfiguredSource::OAuthToken]
+        );
+        assert_eq!(status.auth_state, ProviderAuthState::RefreshNeeded);
     }
 
     #[tokio::test]
@@ -1088,10 +1268,15 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(
-            manager.config().get_api_key("anthropic"),
-            Some("external-secret".into())
-        );
+        let credential = manager
+            .config()
+            .resolve_provider_credential("anthropic")
+            .unwrap()
+            .unwrap();
+        let crate::auth::CredentialMaterial::ApiKey(key) = credential.material else {
+            panic!("expected configured API key");
+        };
+        assert_eq!(key.expose_secret(), "external-secret");
         let rendered = error.to_string();
         assert!(!rendered.contains("external-secret"));
         assert!(!rendered.contains("new-secret"));
@@ -1129,13 +1314,18 @@ mod tests {
             /*fail_logout*/ false,
             CompletePkceFailure::None,
         );
+        let credential = restarted
+            .config()
+            .resolve_provider_credential("anthropic")
+            .unwrap()
+            .unwrap();
+        let crate::auth::CredentialMaterial::ApiKey(key) = credential.material else {
+            panic!("expected configured API key");
+        };
+        assert_eq!(key.expose_secret(), "stored-secret");
         assert_eq!(
-            restarted.config().get_api_key("anthropic"),
-            Some("stored-secret".into())
-        );
-        assert_eq!(
-            restarted.config().get_base_url("anthropic"),
-            Some("https://stored.example".into())
+            credential.endpoint.unwrap().as_str(),
+            "https://stored.example"
         );
         let status = restarted.status("anthropic").unwrap();
         assert_eq!(
@@ -1176,10 +1366,15 @@ mod tests {
             .load("claude-code", "default")
             .unwrap()
             .is_none());
-        assert_eq!(
-            manager.config().get_api_key("anthropic"),
-            Some("external-secret".into())
-        );
+        let credential = manager
+            .config()
+            .resolve_provider_credential("anthropic")
+            .unwrap()
+            .unwrap();
+        let crate::auth::CredentialMaterial::ApiKey(key) = credential.material else {
+            panic!("expected configured API key");
+        };
+        assert_eq!(key.expose_secret(), "external-secret");
         let status = manager.status("anthropic").unwrap();
         assert_eq!(
             status.configured_sources,
@@ -1265,10 +1460,15 @@ mod tests {
             ProviderAuthState::SignedIn { .. }
         ));
         assert!(status.launch_available);
-        assert_eq!(
-            manager.config().get_api_key("anthropic"),
-            Some("access-secret".to_string())
-        );
+        let credential = manager
+            .config()
+            .resolve_provider_credential("anthropic")
+            .unwrap()
+            .unwrap();
+        let crate::auth::CredentialMaterial::OAuth(token) = credential.material else {
+            panic!("expected OAuth credential");
+        };
+        assert_eq!(token.access_token, "access-secret");
     }
 
     #[tokio::test]
@@ -1345,11 +1545,11 @@ mod tests {
         let first = tokio::spawn({
             let manager = manager.clone();
             let session_id = session_id.clone();
-            async move { manager.poll_device_code(&session_id).await }
+            async move { manager.advance_login(&session_id).await }
         });
         started.notified().await;
 
-        let second = manager.poll_device_code(&session_id).await;
+        let second = manager.advance_login(&session_id).await;
         release.notify_one();
         let first = first.await.unwrap();
 
@@ -1374,8 +1574,8 @@ mod tests {
             let (_dir, manager) = device_manager(behavior, calls.clone(), DevicePollGate::Open);
             let session_id = start_device_session(&manager).await;
 
-            let _ = manager.poll_device_code(&session_id).await;
-            let second = manager.poll_device_code(&session_id).await;
+            let _ = manager.advance_login(&session_id).await;
+            let second = manager.advance_login(&session_id).await;
 
             assert!(!matches!(
                 second,
@@ -1395,8 +1595,8 @@ mod tests {
             let (_dir, manager) = device_manager(behavior, calls.clone(), DevicePollGate::Open);
             let session_id = start_device_session(&manager).await;
 
-            let _ = manager.poll_device_code(&session_id).await;
-            let second = manager.poll_device_code(&session_id).await;
+            let _ = manager.advance_login(&session_id).await;
+            let second = manager.advance_login(&session_id).await;
 
             assert!(matches!(
                 second,
@@ -1471,6 +1671,10 @@ mod tests {
             HostAuthStep::Pkce { session_id, .. } => session_id,
             other => panic!("expected Pkce, got {other:?}"),
         };
+        assert!(matches!(
+            manager.advance_login(&session_id).await,
+            Err(AuthError::Unsupported(_))
+        ));
         let done = manager
             .complete_pkce(&session_id, "auth-code")
             .await
@@ -1482,5 +1686,167 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn browser_poll_keeps_secrets_inside_manager_and_consumes_success() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_dir, manager) = polling_manager(
+            DevicePollBehavior::Authorized,
+            calls.clone(),
+            DevicePollGate::Open,
+            CredentialFlow::BrowserPoll,
+        );
+        let step = manager.start_login("browser").await.unwrap();
+        for output in [format!("{step:?}"), serde_json::to_string(&step).unwrap()] {
+            assert!(!output.contains("browser-secret"));
+            assert!(!output.contains("session_data"));
+            assert!(!output.contains("verifier"));
+        }
+        let HostAuthStep::BrowserPoll { session_id, .. } = step else {
+            panic!("expected browser flow")
+        };
+        // Calling the wrong flow must not discard the pending session.
+        assert!(matches!(
+            manager.complete_pkce(&session_id, "code").await,
+            Err(AuthError::Unsupported(_))
+        ));
+        let result = manager.advance_login(&session_id).await.unwrap();
+        assert!(
+            matches!(result, HostAuthPollResult::Authorized { ref provider } if provider == "browser")
+        );
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("access_token"));
+        assert!(manager.advance_login(&session_id).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_browser_poll_releases_exclusive_claim() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let (_dir, manager) = polling_manager(
+            DevicePollBehavior::Authorized,
+            calls.clone(),
+            DevicePollGate::BlockFirst {
+                started: started.clone(),
+                release: Arc::new(Notify::new()),
+            },
+            CredentialFlow::BrowserPoll,
+        );
+        let HostAuthStep::BrowserPoll { session_id, .. } =
+            manager.start_login("browser").await.unwrap()
+        else {
+            panic!("expected browser flow")
+        };
+        let first = tokio::spawn({
+            let manager = manager.clone();
+            let session_id = session_id.clone();
+            async move { manager.advance_login(&session_id).await }
+        });
+        started.notified().await;
+        assert!(
+            matches!(manager.advance_login(&session_id).await, Err(AuthError::InvalidResponse(ref message)) if message == "login session is already in progress")
+        );
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            manager.advance_login(&session_id).await,
+            Ok(HostAuthPollResult::Authorized { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn browser_poll_releases_retryable_results_and_consumes_terminal_results() {
+        for (behavior, retryable) in [
+            (DevicePollBehavior::Pending, true),
+            (DevicePollBehavior::SlowDown, true),
+            (DevicePollBehavior::Network, true),
+            (DevicePollBehavior::RateLimited, true),
+            (DevicePollBehavior::Denied, false),
+            (DevicePollBehavior::Expired, false),
+            (DevicePollBehavior::InvalidResponse, false),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (_dir, manager) = polling_manager(
+                behavior,
+                calls.clone(),
+                DevicePollGate::Open,
+                CredentialFlow::BrowserPoll,
+            );
+            let HostAuthStep::BrowserPoll { session_id, .. } =
+                manager.start_login("browser").await.unwrap()
+            else {
+                panic!("expected browser flow")
+            };
+            let _ = manager.advance_login(&session_id).await;
+            let _ = manager.advance_login(&session_id).await;
+            assert_eq!(calls.load(Ordering::SeqCst), if retryable { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn manager_rebinds_raw_or_previously_scoped_auth_store_to_selected_account() {
+        for auth_account in ["default", "personal"] {
+            let (_dir, raw) = temp_store();
+            let mut default_token = sample_token();
+            default_token.access_token = "default-token".into();
+            let mut work_token = sample_token();
+            work_token.access_token = "work-token".into();
+            let mut personal_token = sample_token();
+            personal_token.access_token = "personal-token".into();
+            raw.save("claude-code", "default", &default_token).unwrap();
+            raw.save("claude-code", "work", &work_token).unwrap();
+            raw.save("claude-code", "personal", &personal_token)
+                .unwrap();
+            let mut original = anthropic_manager(raw.clone());
+            let selected = original.config.clone().with_account("work").unwrap();
+            let auth_store = if auth_account == "default" {
+                raw.clone()
+            } else {
+                original
+                    .config
+                    .clone()
+                    .with_account(auth_account)
+                    .unwrap()
+                    .token_store()
+                    .unwrap()
+                    .clone()
+            };
+            original.auth.set_store(auth_store);
+            let manager =
+                ProviderAuthManager::new_shared(original.auth, original.registry, selected)
+                    .unwrap();
+            assert_eq!(manager.config().account(), "work");
+            assert!(Arc::ptr_eq(
+                manager.auth.store(),
+                manager.config().token_store().unwrap()
+            ));
+            assert_eq!(
+                manager.auth.store().load("claude-code", "default").unwrap(),
+                Some(work_token)
+            );
+            let credential = manager
+                .config()
+                .resolve_provider_credential("anthropic")
+                .unwrap()
+                .unwrap();
+            let crate::auth::CredentialMaterial::OAuth(token) = credential.material else {
+                panic!("expected selected account OAuth credential");
+            };
+            assert_eq!(token.access_token, "work-token");
+            manager.logout("anthropic").unwrap();
+            assert!(raw.load("claude-code", "work").unwrap().is_none());
+            assert_eq!(
+                raw.load("claude-code", "default").unwrap(),
+                Some(default_token)
+            );
+            assert_eq!(
+                raw.load("claude-code", "personal").unwrap(),
+                Some(personal_token)
+            );
+        }
     }
 }

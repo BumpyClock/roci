@@ -88,6 +88,7 @@ async fn local_session_store_create_writes_metadata_once_and_open_preserves_it()
         .create(CreateSessionOptions {
             id: Some(id.clone()),
             title: Some("Store test".to_string()),
+            credential_account: None,
             host_cwd: Some(PathBuf::from("/tmp/project")),
             import_source: None,
             model_preferences: Default::default(),
@@ -218,6 +219,101 @@ async fn resume_session_seeds_runtime_snapshot_and_provider_ledger() {
         .expect("session resumes");
 
     assert_eq!(agent.messages().await, vec![persisted]);
+}
+
+#[tokio::test]
+async fn durable_provider_session_identity_survives_resume_and_isolates_roots() {
+    let sessions = tempdir().unwrap();
+    let other_sessions = tempdir().unwrap();
+    let (registry, requests) = registry_with_recorded_requests();
+    let config = AgentConfig {
+        candidates: vec!["stub:session".parse().unwrap()],
+        ..test_agent_config()
+    };
+    let id = session_id("provider-continuity");
+    let store = LocalSessionStore::new(sessions.path());
+    let state = store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let agent =
+        AgentRuntime::resume_session(registry.clone(), test_config(), config.clone(), state)
+            .await
+            .unwrap();
+    assert_eq!(
+        agent.prompt("first turn").await.unwrap().status,
+        RunStatus::Completed
+    );
+    drop(agent);
+
+    let resumed = AgentRuntime::resume_session(
+        registry.clone(),
+        test_config(),
+        config.clone(),
+        store.open(id.clone()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resumed.prompt("second turn").await.unwrap().status,
+        RunStatus::Completed
+    );
+    drop(resumed);
+
+    // Names are local to the session root; a separately created session must
+    // never inherit the first session's remote conversation.
+    let other_store = LocalSessionStore::new(other_sessions.path());
+    let state = other_store
+        .create(CreateSessionOptions {
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let other =
+        AgentRuntime::resume_session(registry.clone(), test_config(), config.clone(), state)
+            .await
+            .unwrap();
+    assert_eq!(
+        other.prompt("independent turn").await.unwrap().status,
+        RunStatus::Completed
+    );
+    drop(other);
+
+    let overridden = AgentRuntime::resume_session(
+        registry,
+        test_config(),
+        AgentConfig {
+            session_id: Some("explicit-provider-session".into()),
+            ..config
+        },
+        store.open(id).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        overridden.prompt("override turn").await.unwrap().status,
+        RunStatus::Completed
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    let first_id = requests[0]
+        .0
+        .session_id
+        .as_deref()
+        .expect("durable identity reaches provider");
+    assert!(!first_id.is_empty());
+    assert_eq!(requests[1].0.session_id.as_deref(), Some(first_id));
+    assert_ne!(requests[2].0.session_id.as_deref(), Some(first_id));
+    assert!(requests[2].0.session_id.is_some());
+    assert_eq!(
+        requests[3].0.session_id.as_deref(),
+        Some("explicit-provider-session")
+    );
 }
 
 #[tokio::test]
@@ -695,4 +791,29 @@ async fn runtime_resource_methods_write_files_events_and_snapshot() {
         .resources
         .files
         .is_empty());
+}
+
+#[tokio::test]
+async fn resume_rejects_different_credential_account() {
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::session::LocalSessionStore::new(root.path());
+    let state = store
+        .create(crate::session::CreateSessionOptions {
+            credential_account: Some("work".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let result = crate::agent::AgentRuntime::resume_session(
+        std::sync::Arc::new(crate::provider::ProviderRegistry::new()),
+        crate::config::RociConfig::new()
+            .with_account("personal")
+            .unwrap(),
+        crate::agent::AgentConfig::default(),
+        state,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(crate::error::RociError::InvalidState(message)) if message.contains("credential account 'work'"))
+    );
 }

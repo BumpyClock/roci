@@ -19,27 +19,52 @@ const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub struct GoogleProvider {
     model: GoogleModel,
     api_key: String,
+    base_url: String,
     capabilities: ModelCapabilities,
 }
 
 impl GoogleProvider {
-    pub fn new(model: GoogleModel, api_key: String) -> Self {
+    pub fn new(model: GoogleModel, api_key: String, base_url: Option<String>) -> Self {
         let capabilities = model.capabilities();
         Self {
             model,
             api_key,
+            base_url: base_url
+                .unwrap_or_else(|| BASE_URL.into())
+                .trim_end_matches('/')
+                .to_owned(),
             capabilities,
         }
     }
 
-    fn api_model_id(&self) -> &str {
+    fn request_url(&self, stream: bool) -> Result<reqwest::Url, RociError> {
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .map_err(|_| RociError::Configuration("invalid Google endpoint".into()))?;
+        let operation = if stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
+        url.set_path(&format!(
+            "{}/models/{}:{operation}",
+            url.path().trim_end_matches('/'),
+            self.api_model_id()
+        ));
+        url.query_pairs_mut().append_pair("key", &self.api_key);
+        if stream {
+            url.query_pairs_mut().append_pair("alt", "sse");
+        }
+        Ok(url)
+    }
+
+    pub(crate) fn api_model_id(&self) -> &str {
         match self.model {
             GoogleModel::Gemini3Flash => "gemini-3-flash-preview",
             _ => self.model.as_str(),
         }
     }
 
-    fn validate_settings(&self, settings: &GenerationSettings) -> Result<(), RociError> {
+    pub(crate) fn validate_settings(&self, settings: &GenerationSettings) -> Result<(), RociError> {
         let has_google_thinking_config = settings
             .google
             .as_ref()
@@ -59,7 +84,7 @@ impl GoogleProvider {
         Ok(())
     }
 
-    fn build_request_body(&self, request: &ProviderRequest) -> serde_json::Value {
+    pub(crate) fn build_request_body(&self, request: &ProviderRequest) -> serde_json::Value {
         let mut system_instruction_parts = Vec::new();
         let mut contents = Vec::new();
         let mut tool_name_map = std::collections::HashMap::new();
@@ -283,16 +308,11 @@ impl ModelProvider for GoogleProvider {
     ) -> Result<ProviderResponse, RociError> {
         self.validate_settings(&request.settings)?;
         let body = self.build_request_body(request);
-        let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            BASE_URL,
-            self.api_model_id(),
-            self.api_key
-        );
+        let url = self.request_url(false)?;
 
         debug!(model = self.model.as_str(), "Google generate_text");
 
-        let resp = shared_client().post(&url).json(&body).send().await?;
+        let resp = shared_client().post(url).json(&body).send().await?;
 
         let status = resp.status().as_u16();
         if status != 200 {
@@ -368,16 +388,11 @@ impl ModelProvider for GoogleProvider {
     ) -> Result<BoxStream<'static, Result<TextStreamDelta, RociError>>, RociError> {
         self.validate_settings(&request.settings)?;
         let body = self.build_request_body(request);
-        let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-            BASE_URL,
-            self.api_model_id(),
-            self.api_key
-        );
+        let url = self.request_url(true)?;
 
         debug!(model = self.model.as_str(), "Google stream_text");
 
-        let resp = shared_client().post(&url).json(&body).send().await?;
+        let resp = shared_client().post(url).json(&body).send().await?;
 
         let status = resp.status().as_u16();
         if status != 200 {
@@ -567,6 +582,7 @@ mod tests {
             frequency_penalty: None,
             seed: None,
             reasoning_effort: None,
+            speed: None,
             text_verbosity: None,
             response_format: None,
             openai_responses: None,
@@ -580,8 +596,11 @@ mod tests {
 
     #[test]
     fn build_request_body_includes_thought_signature_and_call_id() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let tool_call = AgentToolCall {
             id: "call_1".to_string(),
             name: "get_weather".to_string(),
@@ -618,8 +637,11 @@ mod tests {
 
     #[test]
     fn build_request_body_includes_function_response_id() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let tool_call = AgentToolCall {
             id: "call_1".to_string(),
             name: "get_weather".to_string(),
@@ -663,8 +685,11 @@ mod tests {
 
     #[test]
     fn build_request_body_concatenates_system_messages_in_order() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let request = ProviderRequest {
             messages: vec![
                 ModelMessage::system("base system"),
@@ -697,8 +722,11 @@ mod tests {
 
     #[test]
     fn build_request_body_includes_response_json_schema() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("Return JSON")],
             settings: GenerationSettings {
@@ -738,8 +766,11 @@ mod tests {
 
     #[test]
     fn build_request_body_defaults_generation_config() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: settings(None, None, None, None),
@@ -764,8 +795,11 @@ mod tests {
 
     #[test]
     fn build_request_body_respects_generation_config_overrides() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: settings(Some(1200), Some(0.3), Some(0.5), Some(12)),
@@ -790,7 +824,7 @@ mod tests {
 
     #[test]
     fn build_request_body_includes_thinking_config() {
-        let provider = GoogleProvider::new(GoogleModel::Gemini25Pro, "test-key".to_string());
+        let provider = GoogleProvider::new(GoogleModel::Gemini25Pro, "test-key".to_string(), None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
@@ -828,8 +862,11 @@ mod tests {
 
     #[test]
     fn build_request_body_includes_thinking_level() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
@@ -861,7 +898,7 @@ mod tests {
 
     #[test]
     fn build_request_body_maps_generic_reasoning_effort_to_gemini_thinking_level() {
-        let provider = GoogleProvider::new(GoogleModel::Gemini3Flash, "test-key".to_string());
+        let provider = GoogleProvider::new(GoogleModel::Gemini3Flash, "test-key".to_string(), None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
@@ -888,7 +925,8 @@ mod tests {
 
     #[test]
     fn build_request_body_maps_gemini_2_5_flash_none_to_zero_thinking_budget() {
-        let provider = GoogleProvider::new(GoogleModel::Gemini25Flash, "test-key".to_string());
+        let provider =
+            GoogleProvider::new(GoogleModel::Gemini25Flash, "test-key".to_string(), None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
@@ -915,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn generation_and_streaming_reject_unsupported_gemini_2_5_pro_none_effort() {
-        let provider = GoogleProvider::new(GoogleModel::Gemini25Pro, "test-key".to_string());
+        let provider = GoogleProvider::new(GoogleModel::Gemini25Pro, "test-key".to_string(), None);
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
@@ -947,8 +985,11 @@ mod tests {
 
     #[test]
     fn build_request_body_includes_safety_settings() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let request = ProviderRequest {
             messages: vec![ModelMessage::user("hello")],
             settings: GenerationSettings {
@@ -975,8 +1016,11 @@ mod tests {
 
     #[test]
     fn provider_attachment_payload_google_maps_text_and_image_parts() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let request = ProviderRequest {
             messages: vec![ModelMessage {
                 role: Role::User,
@@ -1020,8 +1064,11 @@ mod tests {
 
     #[test]
     fn provider_attachment_payload_google_preserves_unsupported_media_marker_text() {
-        let provider =
-            GoogleProvider::new(GoogleModel::Gemini3FlashPreview, "test-key".to_string());
+        let provider = GoogleProvider::new(
+            GoogleModel::Gemini3FlashPreview,
+            "test-key".to_string(),
+            None,
+        );
         let marker =
             "User attached unsupported media: private.txt (text/plain, 42 bytes). Content omitted.";
         let request = ProviderRequest {

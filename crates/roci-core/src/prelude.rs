@@ -37,6 +37,6 @@ pub use crate::session::{
 };
 pub use crate::tools::{AgentTool, AgentToolParameters, Tool, ToolArguments};
 pub use crate::types::{
-    ContentPart, FinishReason, GenerateTextResult, GenerationSettings, ModelMessage,
-    ModelMessageMetadata, Role, StreamEventType, TextStreamDelta, Usage,
+    ContentPart, FinishReason, GenerateTextResult, GenerationSettings, GenerationSpeed,
+    ModelMessage, ModelMessageMetadata, Role, StreamEventType, TextStreamDelta, Usage,
 };

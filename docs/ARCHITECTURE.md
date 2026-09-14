@@ -92,6 +92,13 @@ Re-exports `roci_core::*` so import paths like `roci::prelude::*`,
 
 Provider creation and model discovery are split:
 - `ProviderFactory` owns concrete provider construction (`create`) and model source discovery (`list_models`).
+- `RociConfig::resolve_provider_credential` owns credential-source precedence and
+  returns typed API-key or OAuth material together with its selected endpoint.
+  Storage errors propagate; expired OAuth tokens retain their refresh state.
+  Factories use that same selection contract for construction and discovery,
+  keeping credential modes, endpoint defaults, and OAuth renewal inside providers.
+  Key-only getters are absent. `resolve_provider_endpoint` serves providers that
+  do not require credentials; authenticated callers use the paired endpoint.
 - `ProviderRegistry` aggregates catalog responses from all registered factories, then applies host-side filtering and dedupe.
 
 Pure library crate. No provider implementations, no `clap`, no terminal I/O.
@@ -220,12 +227,26 @@ behind a feature flag.
 
 Provider-specific model enums (`OpenAiModel`, `AnthropicModel`, etc.) live in
 `roci-providers` and are used internally. They do not appear in the core API.
-`roci-providers` is the source of static catalog metadata for built-in providers.
+Built-in model lists come from live provider discovery; enums supply capability
+defaults and transport rules without restricting returned IDs.
 
-Catalog behavior now follows:
-- Static catalog entries are produced from provider enum/capability definitions.
-- GitHub Copilot attempts dynamic `/models` discovery first when auth is present.
-- Copilot dynamic failures (missing/expired auth or endpoint errors) fall back to static catalog entries.
+Catalog behavior follows these boundaries:
+
+- Factories query the selected account's provider endpoint. Provider-returned IDs
+  are authoritative, including IDs not yet represented by SDK enums.
+- Catalog errors and empty results never fall back to bundled model names.
+  `include_dynamic=false` returns an empty built-in catalog. Static sources remain
+  available to custom factories through the provider-neutral catalog API.
+- OpenAI-compatible services use `/models`; Codex uses its authenticated,
+  client-versioned backend catalog. Anthropic, Gemini API-key, Copilot, Cursor,
+  Ollama, and LM Studio discovery retain their provider-specific protocols.
+- Azure deployment discovery requires management credentials outside the current
+  provider configuration. Native Gemini Code Assist and xAI OAuth have no verified
+  model-list endpoint. These paths report unsupported discovery explicitly;
+  callers can still select an explicit model ID.
+- Cursor derives family choices from the selected account's advertised variants.
+  The SDK retains the original IDs; CLI listings hide raw variants by default
+  and expose them with `--include-variants`.
 
 ### `roci-cli` -- CLI Binary
 

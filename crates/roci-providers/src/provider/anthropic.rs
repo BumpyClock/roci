@@ -25,6 +25,7 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     capabilities: ModelCapabilities,
+    oauth: bool,
 }
 
 impl AnthropicProvider {
@@ -35,7 +36,15 @@ impl AnthropicProvider {
             model,
             api_key,
             capabilities,
+            oauth: false,
         }
+    }
+
+    /// Construct a provider using a Claude OAuth bearer credential.
+    pub fn new_oauth(model: AnthropicModel, token: String, base_url: Option<String>) -> Self {
+        let mut provider = Self::new(model, token, base_url);
+        provider.oauth = true;
+        provider
     }
 
     /// Check if thinking mode is enabled in the request settings.
@@ -69,6 +78,19 @@ impl AnthropicProvider {
             API_VERSION,
             Some(BETA_FLAGS),
         );
+        // An explicit request API key keeps API-key semantics even on an OAuth-backed instance.
+        if self.oauth && request.api_key_override.is_none() {
+            headers.remove("x-api-key");
+            let bearer = reqwest::header::HeaderValue::from_str(&format!(
+                "Bearer {}",
+                self.resolved_api_key(request)?
+            ))
+            .map_err(|_| RociError::Authentication("invalid OAuth credential".into()))?;
+            headers.insert(reqwest::header::AUTHORIZATION, bearer);
+            headers.insert("anthropic-beta", reqwest::header::HeaderValue::from_static(
+                "oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+            ));
+        }
         for (name, value) in request.headers.iter() {
             headers.insert(name, value.clone());
         }

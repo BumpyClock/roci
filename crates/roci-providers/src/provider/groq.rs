@@ -19,14 +19,14 @@ pub struct GroqProvider {
 }
 
 impl GroqProvider {
-    pub fn new(model: GroqModel, api_key: String) -> Self {
+    pub fn new(model: GroqModel, api_key: String, base_url: Option<String>) -> Self {
         let capabilities = model.capabilities();
         let openai_model = OpenAiModel::Custom(model.as_str().to_string());
         Self {
             inner: OpenAiProvider::new(
                 openai_model,
                 api_key,
-                Some("https://api.groq.com/openai/v1".to_string()),
+                Some(base_url.unwrap_or_else(|| "https://api.groq.com/openai/v1".into())),
                 None,
             ),
             capabilities,
@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn llama_3_3_70b_provider_is_text_only() {
-        let provider = GroqProvider::new(GroqModel::Llama3370bVersatile, String::new());
+        let provider = GroqProvider::new(GroqModel::Llama3370bVersatile, String::new(), None);
         let caps = provider.capabilities();
 
         assert!(caps.input.image.is_none());

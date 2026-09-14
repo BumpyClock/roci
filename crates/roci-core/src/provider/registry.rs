@@ -74,6 +74,10 @@ impl ProviderRegistry {
     }
 
     /// List models for one provider or all registered providers.
+    ///
+    /// Aggregation skips providers that explicitly report unsupported discovery.
+    /// Explicit provider requests preserve that diagnostic; discovery failures
+    /// such as authentication and transport errors are always returned.
     pub async fn list_models(
         &self,
         config: &RociConfig,
@@ -105,6 +109,7 @@ impl ProviderRegistry {
 
             match factory.list_models(config, provider_key, options).await {
                 Ok(provider_catalog) => catalog.extend(provider_catalog),
+                Err(RociError::ModelDiscoveryUnsupported { .. }) => {}
                 Err(
                     RociError::MissingCredential { .. } | RociError::MissingConfiguration { .. },
                 ) if !options.include_unavailable => {}
@@ -183,6 +188,7 @@ mod tests {
                     supports_json_schema: false,
                     supports_reasoning: false,
                     reasoning_effort: Default::default(),
+                    supported_speeds: Vec::new(),
                     supports_system_messages: true,
                     context_length: 4096,
                     max_output_tokens: None,
@@ -300,6 +306,7 @@ mod tests {
                     supports_json_schema: false,
                     supports_reasoning: false,
                     reasoning_effort: Default::default(),
+                    supported_speeds: Vec::new(),
                     supports_system_messages: true,
                     context_length: 4096,
                     max_output_tokens: None,
@@ -481,6 +488,7 @@ mod tests {
                     supports_json_schema: false,
                     supports_reasoning: false,
                     reasoning_effort: Default::default(),
+                    supported_speeds: Vec::new(),
                     supports_system_messages: true,
                     context_length: 4096,
                     max_output_tokens: None,
@@ -586,6 +594,79 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn unsupported_discovery_is_skipped_only_for_aggregate_requests() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(UnsupportedDiscoveryFactory));
+        registry.register(Arc::new(LocalCatalogFactory));
+        let config = RociConfig::new().with_token_store(None);
+
+        for include_unavailable in [false, true] {
+            let catalog = registry
+                .list_models(
+                    &config,
+                    &ModelListOptions {
+                        include_unavailable,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(catalog.models().len(), 1);
+            assert_eq!(catalog.models()[0].provider_key, "local-catalog");
+        }
+
+        let error = registry
+            .list_models(
+                &config,
+                &ModelListOptions {
+                    provider_key: Some("no-discovery".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RociError::ModelDiscoveryUnsupported { provider, .. }
+            if provider == "no-discovery")
+        );
+    }
+
+    struct UnsupportedDiscoveryFactory;
+
+    impl ProviderFactory for UnsupportedDiscoveryFactory {
+        fn provider_keys(&self) -> &[&str] {
+            &["no-discovery"]
+        }
+
+        fn requires_credentials(&self, _provider_key: &str) -> bool {
+            false
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _config: &'a RociConfig,
+            provider_key: &'a str,
+            _options: &'a ModelListOptions,
+        ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
+            Box::pin(async move {
+                Err(RociError::ModelDiscoveryUnsupported {
+                    provider: provider_key.into(),
+                    reason: "This account has no catalog API".into(),
+                })
+            })
+        }
+
+        fn create(
+            &self,
+            config: &RociConfig,
+            provider_key: &str,
+            model_id: &str,
+        ) -> Result<Box<dyn ModelProvider>, RociError> {
+            StubFactory.create(config, provider_key, model_id)
+        }
+    }
+
     #[test]
     fn alias_keys_resolve_to_same_factory_output() {
         let mut registry = ProviderRegistry::new();
@@ -629,6 +710,7 @@ mod tests {
                     supports_json_schema: false,
                     supports_reasoning: false,
                     reasoning_effort: Default::default(),
+                    supported_speeds: Vec::new(),
                     supports_system_messages: false,
                     context_length: 1024,
                     max_output_tokens: None,
@@ -718,7 +800,7 @@ mod tests {
             options: &'a ModelListOptions,
         ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
             Box::pin(async move {
-                if !options.include_unavailable && config.get_api_key(provider_key).is_none() {
+                if !options.include_unavailable && !config.has_credentials(provider_key) {
                     return Err(RociError::MissingCredential {
                         provider: provider_key.to_string(),
                     });
@@ -750,7 +832,9 @@ mod tests {
         }
 
         fn is_available(&self, config: &RociConfig, provider_key: &str) -> bool {
-            config.get_base_url(provider_key).is_some()
+            config
+                .resolve_provider_endpoint(provider_key)
+                .is_ok_and(|endpoint| endpoint.is_some())
         }
 
         fn check_available(
@@ -759,7 +843,7 @@ mod tests {
             provider_key: &str,
         ) -> Result<(), RociError> {
             config
-                .get_base_url(provider_key)
+                .resolve_provider_endpoint(provider_key)?
                 .map(|_| ())
                 .ok_or_else(|| RociError::MissingConfiguration {
                     key: "endpoint".to_string(),

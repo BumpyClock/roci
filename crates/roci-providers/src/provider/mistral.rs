@@ -19,14 +19,14 @@ pub struct MistralProvider {
 }
 
 impl MistralProvider {
-    pub fn new(model: MistralModel, api_key: String) -> Self {
+    pub fn new(model: MistralModel, api_key: String, base_url: Option<String>) -> Self {
         let capabilities = model.capabilities();
         let openai_model = OpenAiModel::Custom(model.as_str().to_string());
         Self {
             inner: OpenAiProvider::new(
                 openai_model,
                 api_key,
-                Some("https://api.mistral.ai/v1".to_string()),
+                Some(base_url.unwrap_or_else(|| "https://api.mistral.ai/v1".into())),
                 None,
             ),
             capabilities,
@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn mistral_large_provider_supports_image_input() {
-        let provider = MistralProvider::new(MistralModel::MistralLarge, String::new());
+        let provider = MistralProvider::new(MistralModel::MistralLarge, String::new(), None);
         let caps = provider.capabilities();
 
         assert!(caps.supports_vision);
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn mistral_medium_provider_supports_image_input() {
-        let provider = MistralProvider::new(MistralModel::MistralMedium, String::new());
+        let provider = MistralProvider::new(MistralModel::MistralMedium, String::new(), None);
         let caps = provider.capabilities();
 
         assert!(caps.supports_vision);
@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn mistral_small_provider_supports_image_input() {
-        let provider = MistralProvider::new(MistralModel::MistralSmall, String::new());
+        let provider = MistralProvider::new(MistralModel::MistralSmall, String::new(), None);
         let caps = provider.capabilities();
 
         assert!(caps.supports_vision);
@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn codestral_provider_is_text_only() {
-        let provider = MistralProvider::new(MistralModel::Codestral, String::new());
+        let provider = MistralProvider::new(MistralModel::Codestral, String::new(), None);
         let caps = provider.capabilities();
 
         assert!(!caps.supports_vision);

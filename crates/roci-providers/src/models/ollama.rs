@@ -45,6 +45,7 @@ impl OllamaModel {
             supports_json_mode: true,
             supports_json_schema: false,
             supports_reasoning: matches!(self, Self::DeepseekR1),
+            supported_speeds: Vec::new(),
             reasoning_effort: Default::default(),
             supports_system_messages: true,
             context_length: 128_000,

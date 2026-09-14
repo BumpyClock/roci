@@ -603,6 +603,7 @@ impl MCPToolAggregator {
             | RociError::Provider { .. }
             | RociError::ModelNotFound(_)
             | RociError::UnsupportedOperation(_)
+            | RociError::ModelDiscoveryUnsupported { .. }
             | RociError::RateLimited { .. } => MCPServerFailureCategory::Provider,
             RociError::Serialization(_)
             | RociError::InvalidArgument(_)

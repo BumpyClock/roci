@@ -1,6 +1,7 @@
 //! Provider-specific model enums.
 
-pub mod catalog;
+#[cfg(feature = "openai")]
+pub mod codex_catalog;
 
 #[cfg(feature = "openai")]
 pub mod openai;
@@ -25,3 +26,11 @@ pub mod ollama;
 
 #[cfg(feature = "lmstudio")]
 pub mod lmstudio;
+
+pub(crate) mod remote;
+
+#[cfg(feature = "anthropic")]
+pub(crate) mod anthropic_catalog;
+
+#[cfg(feature = "google")]
+pub(crate) mod google_catalog;

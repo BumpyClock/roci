@@ -18,6 +18,8 @@ use crate::{models::LanguageModel, types::ReasoningEffort};
 pub struct SessionMetadata {
     /// Stable durable session ID.
     pub id: SessionId,
+    /// Credential namespace bound to this session. Legacy sessions use default.
+    pub credential_account: Option<String>,
     /// Optional human-readable title.
     pub title: Option<String>,
     /// Session creation timestamp.
@@ -43,6 +45,8 @@ pub struct SessionMetadata {
 #[derive(Deserialize)]
 struct SessionMetadataWire {
     id: SessionId,
+    #[serde(default)]
+    credential_account: Option<String>,
     title: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -68,6 +72,7 @@ impl<'de> Deserialize<'de> for SessionMetadata {
         let wire = SessionMetadataWire::deserialize(deserializer)?;
         Ok(Self {
             id: wire.id,
+            credential_account: wire.credential_account,
             title: wire.title,
             created_at: wire.created_at,
             updated_at: wire.updated_at,
@@ -89,6 +94,7 @@ impl SessionMetadata {
         let now = Utc::now();
         Self {
             id,
+            credential_account: None,
             title: None,
             created_at: now,
             updated_at: now,

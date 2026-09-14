@@ -49,6 +49,13 @@ impl From<String> for LoginSessionId {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostAuthStep {
+    /// Open the URL and poll the opaque session; no code entry is required.
+    BrowserPoll {
+        authorization_url: String,
+        interval_secs: u64,
+        expires_at: DateTime<Utc>,
+        session_id: LoginSessionId,
+    },
     /// Credentials were imported; login is already complete.
     ImportedAndComplete {
         /// Canonical provider key.
@@ -72,6 +79,18 @@ pub enum HostAuthStep {
 impl fmt::Debug for HostAuthStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BrowserPoll {
+                authorization_url,
+                interval_secs,
+                expires_at,
+                session_id,
+            } => f
+                .debug_struct("BrowserPoll")
+                .field("authorization_url", authorization_url)
+                .field("interval_secs", interval_secs)
+                .field("expires_at", expires_at)
+                .field("session_id", session_id)
+                .finish(),
             Self::ImportedAndComplete { provider } => f
                 .debug_struct("ImportedAndComplete")
                 .field("provider", provider)
@@ -202,5 +221,27 @@ mod tests {
                 "session_id": "sess-2"
             })
         );
+    }
+
+    #[test]
+    fn host_browser_poll_serializes_only_host_fields() {
+        let step = HostAuthStep::BrowserPoll {
+            authorization_url: "https://example.com/browser".into(),
+            interval_secs: 1,
+            expires_at: "2026-09-14T12:00:00Z".parse().unwrap(),
+            session_id: LoginSessionId::new("opaque-session"),
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "browser_poll",
+                "authorization_url": "https://example.com/browser",
+                "interval_secs": 1,
+                "expires_at": "2026-09-14T12:00:00Z",
+                "session_id": "opaque-session"
+            })
+        );
+        assert_eq!(serde_json::from_value::<HostAuthStep>(json).unwrap(), step);
     }
 }

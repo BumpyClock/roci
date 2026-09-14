@@ -111,6 +111,9 @@ fn default_auth_service_includes_enabled_backends() {
         ("github-copilot", "GitHub Copilot"),
         ("codex", "Codex"),
         ("anthropic", "Claude"),
+        ("cursor", "Cursor"),
+        ("google", "Gemini"),
+        ("grok", "Grok"),
     ]
     .into_iter()
     .filter_map(|(provider, backend)| registry.has_provider(provider).then_some(backend))

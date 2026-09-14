@@ -22,6 +22,10 @@ pub enum ConfiguredSource {
 pub enum ProviderAuthState {
     /// No known credentials for this provider.
     SignedOut,
+    /// Access token expired; runtime can renew the owned session.
+    RefreshNeeded,
+    /// Saved credential expired without a refresh token.
+    ReauthRequired,
     /// Only external/env/in-process configuration is present.
     ExternallyConfigured,
     /// Roci-owned stored API key or OAuth session is present.

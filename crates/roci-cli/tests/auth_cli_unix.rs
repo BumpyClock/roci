@@ -235,3 +235,59 @@ fn configure_then_status_share_auth_json_under_temp_home() {
         reread.len()
     );
 }
+
+#[test]
+fn named_account_configure_status_and_logout_are_isolated_across_processes() {
+    let home = TempDir::new().unwrap();
+    fs::write(home.path().join(".env"), "").unwrap();
+    let configured = run_auth(
+        home.path(),
+        &[
+            "auth",
+            "--account",
+            "work",
+            "configure",
+            PROVIDER,
+            "--endpoint",
+            ENDPOINT,
+            "--api-key-stdin",
+        ],
+        Some(API_KEY.as_bytes()),
+    );
+    assert!(configured.status.success(), "{}", utf8(&configured.stderr));
+    let available = |account: &str| {
+        let result = run_auth(
+            home.path(),
+            &["auth", "--account", account, "status", "--json"],
+            None,
+        );
+        assert!(result.status.success(), "{}", utf8(&result.stderr));
+        let text = utf8(&result.stdout);
+        assert_no_secret("status", &text);
+        let rows: Value = serde_json::from_str(&text).unwrap();
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["descriptor"]["canonical_key"] == PROVIDER)
+            .unwrap()["launch_available"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(available("work"));
+    assert!(!available("personal"));
+    assert!(!available("default"));
+    let logout = run_auth(
+        home.path(),
+        &["auth", "--account", "personal", "logout", PROVIDER],
+        None,
+    );
+    assert!(logout.status.success());
+    assert!(available("work"));
+    let logout = run_auth(
+        home.path(),
+        &["auth", "--account", "work", "logout", PROVIDER],
+        None,
+    );
+    assert!(logout.status.success());
+    assert!(!available("work"));
+}

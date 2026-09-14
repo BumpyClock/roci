@@ -758,7 +758,14 @@ impl ProviderFactory for RequestRecordingFactory {
                 output_tokens: 3,
                 capabilities: ModelCapabilities::default(),
             },
-            config_key: config.get_api_key(provider_key),
+            config_key: config
+                .resolve_provider_credential(provider_key)?
+                .map(|credential| match credential.material {
+                    crate::auth::CredentialMaterial::ApiKey(key) => key.expose_secret().to_owned(),
+                    crate::auth::CredentialMaterial::OAuth(_) => {
+                        panic!("stub expects API key credentials")
+                    }
+                }),
             requests: self.requests.clone(),
         }))
     }

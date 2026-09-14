@@ -14,22 +14,20 @@ use crate::cli::{
 };
 
 pub async fn handle_models(args: ModelsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let config = RociConfig::from_env().with_account(args.account)?;
     match args.command {
         ModelsCommands::List(args) => {
             let registry = Arc::new(roci::default_registry());
-            let config = RociConfig::from_env();
             let mut stdout = std::io::stdout();
             run_list(args, registry, config, &mut stdout).await?;
         }
         ModelsCommands::SwitchSmoke(args) => {
             let registry = Arc::new(roci::default_registry());
-            let config = RociConfig::from_env();
             let mut stdout = std::io::stdout();
             run_switch_smoke(args, registry, config, &mut stdout).await?;
         }
         ModelsCommands::SwitchChatSmoke(args) => {
             let registry = Arc::new(roci::default_registry());
-            let config = RociConfig::from_env();
             let mut stdout = std::io::stdout();
             run_switch_chat_smoke(args, registry, config, &mut stdout).await?;
         }
@@ -49,28 +47,57 @@ pub(crate) async fn run_list(
     };
     let catalog = registry.list_models(&config, &options).await?;
 
+    let models: Vec<_> = catalog
+        .models()
+        .iter()
+        .filter(|model| {
+            args.include_variants
+                || model
+                    .metadata
+                    .get("cursor_explicit_variant")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+        })
+        .collect();
     if args.json {
         writeln!(
             writer,
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "models": catalog.models(),
+                "models": models,
             }))?
         )?;
         return Ok(());
     }
 
-    writeln!(writer, "PROVIDER\tMODEL\tCONTEXT\tTOOLS\tVISION\tSOURCE")?;
-    for model in catalog.models() {
+    writeln!(
+        writer,
+        "PROVIDER\tMODEL\tCONTEXT\tTOOLS\tVISION\tSOURCE\tREASONING\tSPEED"
+    )?;
+    for model in models {
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             model.provider_key,
             model.model_id,
             model.capabilities.context_length,
             yes_no(model.capabilities.supports_tools),
             yes_no(model.capabilities.supports_vision),
-            source_label(model)
+            source_label(model),
+            model
+                .capabilities
+                .reasoning_effort_options()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            model
+                .capabilities
+                .supported_speeds
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
         )?;
     }
 
@@ -209,6 +236,7 @@ mod tests {
 
     #[derive(Default)]
     struct StubFactory {
+        models: Option<Vec<ModelInfo>>,
         calls: Arc<Mutex<Vec<RecordedCall>>>,
     }
 
@@ -238,12 +266,15 @@ mod tests {
             let calls = self.calls.clone();
             let provider_key = provider_key.to_string();
             let requested_provider = options.provider_key.clone();
+            let models = self.models.clone();
             Box::pin(async move {
                 calls.lock().expect("calls lock").push(RecordedCall {
                     provider_key: provider_key.clone(),
                     requested_provider,
                 });
-                Ok(ModelCatalog::from_models([sentinel_model(&provider_key)]))
+                Ok(ModelCatalog::from_models(
+                    models.unwrap_or_else(|| vec![sentinel_model(&provider_key)]),
+                ))
             })
         }
 
@@ -291,12 +322,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_hides_variants_and_opt_in_preserves_them() {
+        let mut family = sentinel_model("cursor");
+        family.model_id = "gpt-5.6-terra".into();
+        family.capabilities.reasoning_effort.supported = vec![roci::types::ReasoningEffort::High];
+        family.capabilities.supported_speeds = vec![
+            roci::types::GenerationSpeed::Standard,
+            roci::types::GenerationSpeed::Fast,
+        ];
+        family
+            .metadata
+            .insert("cursor_family".into(), serde_json::json!(true));
+        let mut variant = family.clone();
+        variant.model_id = "gpt-5.6-terra-high-fast".into();
+        variant
+            .metadata
+            .insert("cursor_explicit_variant".into(), serde_json::json!(true));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(StubFactory {
+            models: Some(vec![family, variant, sentinel_model("sentinel")]),
+            ..Default::default()
+        }));
+        let registry = Arc::new(registry);
+        for (json, include_variants) in [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let mut output = Vec::new();
+            run_list(
+                ModelsListArgs {
+                    include_variants,
+                    provider: None,
+                    json,
+                },
+                registry.clone(),
+                RociConfig::new().with_token_store(None),
+                &mut output,
+            )
+            .await
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("gpt-5.6-terra"));
+            assert!(output.contains("sentinel-model"));
+            assert_eq!(output.contains("gpt-5.6-terra-high-fast"), include_variants);
+            assert!(output.contains("high"));
+            assert!(output.contains("fast"));
+        }
+    }
+
+    #[tokio::test]
     async fn run_list_json_wraps_models_and_uses_registry_list_models() {
         let (registry, calls) = registry_with_stub();
         let mut output = Vec::new();
 
         run_list(
             ModelsListArgs {
+                include_variants: false,
                 provider: Some("sentinel".to_string()),
                 json: true,
             },
@@ -326,6 +405,7 @@ mod tests {
 
         run_list(
             ModelsListArgs {
+                include_variants: false,
                 provider: None,
                 json: false,
             },
@@ -337,7 +417,9 @@ mod tests {
         .unwrap();
 
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("PROVIDER\tMODEL\tCONTEXT\tTOOLS\tVISION\tSOURCE"));
+        assert!(
+            output.contains("PROVIDER\tMODEL\tCONTEXT\tTOOLS\tVISION\tSOURCE\tREASONING\tSPEED")
+        );
         assert!(
             output.contains("sentinel\tsentinel-model\t123456\tyes\tyes\tdynamic:/sentinel/models")
         );
@@ -382,6 +464,7 @@ mod tests {
 
         let err = run_list(
             ModelsListArgs {
+                include_variants: false,
                 provider: Some("missing".to_string()),
                 json: false,
             },

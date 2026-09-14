@@ -76,6 +76,9 @@ mod fallback_runtime_types {
 /// Options for creating a durable local session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CreateSessionOptions {
+    /// Named credential account, persisted and checked when resuming.
+    #[serde(default)]
+    pub credential_account: Option<String>,
     pub id: Option<super::SessionId>,
     pub title: Option<String>,
     pub host_cwd: Option<PathBuf>,

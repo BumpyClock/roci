@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roci::auth::{
-    AuthError, FileTokenStore, HostAuthPollResult, HostAuthStep, LoginSessionId, ProviderApiKey,
-    ProviderAuthManager, ProviderAuthState, ProviderAuthStatus, ProviderEndpoint, TokenStore,
+    AuthError, CredentialFlow, FileTokenStore, HostAuthPollResult, HostAuthStep, LoginSessionId,
+    ProviderApiKey, ProviderAuthManager, ProviderAuthState, ProviderAuthStatus, ProviderEndpoint,
+    TokenStore,
 };
 use roci::config::RociConfig;
 
@@ -23,6 +24,12 @@ const MAX_SECRET_INPUT_BYTES: usize = 16 * 1024;
 /// on a multi-threaded Tokio runtime. Keep this trait crate-private; production
 /// code uses [`ProviderAuthManager`], while tests inject a fake.
 pub(crate) trait AuthManagerPort: Send + Sync {
+    /// Explicitly import external credentials and expose only the canonical provider.
+    fn import_credentials(
+        &self,
+        provider: &str,
+    ) -> Result<roci::auth::HostAuthCompletion, AuthError>;
+
     /// Persist an API key and optional endpoint for a known provider.
     fn configure_api_key(
         &self,
@@ -43,8 +50,16 @@ pub(crate) trait AuthManagerPort: Send + Sync {
         provider: &str,
     ) -> impl Future<Output = Result<HostAuthStep, AuthError>> + Send;
 
-    /// Poll a device-code login by opaque session id.
-    fn poll_device_code(
+    fn start_login_with_flow(
+        &self,
+        provider: &str,
+        _flow: CredentialFlow,
+    ) -> impl Future<Output = Result<HostAuthStep, AuthError>> + Send {
+        self.start_login(provider)
+    }
+
+    /// Advance a polling login without exposing provider session material.
+    fn advance_login(
         &self,
         session_id: &LoginSessionId,
     ) -> impl Future<Output = Result<HostAuthPollResult, AuthError>> + Send;
@@ -58,6 +73,20 @@ pub(crate) trait AuthManagerPort: Send + Sync {
 }
 
 impl AuthManagerPort for ProviderAuthManager {
+    fn start_login_with_flow(
+        &self,
+        provider: &str,
+        flow: CredentialFlow,
+    ) -> impl Future<Output = Result<HostAuthStep, AuthError>> + Send {
+        ProviderAuthManager::start_login_with_flow(self, provider, flow)
+    }
+    fn import_credentials(
+        &self,
+        provider: &str,
+    ) -> Result<roci::auth::HostAuthCompletion, AuthError> {
+        ProviderAuthManager::import_credentials(self, provider)
+    }
+
     fn configure_api_key(
         &self,
         provider: &str,
@@ -82,11 +111,11 @@ impl AuthManagerPort for ProviderAuthManager {
         ProviderAuthManager::start_login(self, provider)
     }
 
-    fn poll_device_code(
+    fn advance_login(
         &self,
         session_id: &LoginSessionId,
     ) -> impl Future<Output = Result<HostAuthPollResult, AuthError>> + Send {
-        ProviderAuthManager::poll_device_code(self, session_id)
+        ProviderAuthManager::advance_login(self, session_id)
     }
 
     fn complete_pkce(
@@ -145,24 +174,34 @@ impl From<serde_json::Error> for AuthCliError {
 }
 
 /// Build production manager: shared file token store, env config, default credentials.
-pub(crate) fn build_default_manager() -> Result<ProviderAuthManager, AuthCliError> {
+fn build_manager(account: &str) -> Result<ProviderAuthManager, AuthCliError> {
     let store: Arc<FileTokenStore> = Arc::new(FileTokenStore::new_default());
     let token_store: Arc<dyn TokenStore> = store.clone();
-    let auth = roci::default_auth_service(token_store.clone());
     let registry = roci::default_registry();
     // Keep the shared FileTokenStore override; provider credentials use the
     // platform RociConfig default (Unix auth.json / non-Unix OS store).
-    let config = RociConfig::from_env().with_token_store(Some(token_store));
+    let config = RociConfig::from_env()
+        .with_token_store(Some(token_store))
+        .with_account(account)?;
+    let scoped_store = config
+        .token_store()
+        .cloned()
+        .ok_or_else(|| AuthError::InvalidResponse("missing configured token store".into()))?;
+    let auth = roci::default_auth_service(scoped_store);
     ProviderAuthManager::new(auth, registry, config).map_err(AuthCliError::from)
 }
 
 /// Handle `roci-agent auth login <provider>`.
-pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = build_default_manager()?;
+pub async fn handle_login(
+    provider: &str,
+    account: &str,
+    flow: Option<CredentialFlow>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = build_manager(account)?;
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
-    run_login(
+    run_login_with_flow(
         &manager,
         provider,
         &mut stdin,
@@ -170,21 +209,48 @@ pub async fn handle_login(provider: &str) -> Result<(), Box<dyn std::error::Erro
         &mut stderr,
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
+        flow,
     )
     .await
     .map_err(Into::into)
 }
 
+/// Handle `roci-agent auth import <provider>` without starting an OAuth flow.
+pub async fn handle_import(
+    provider: &str,
+    account: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = build_manager(account)?;
+    run_import(&manager, provider, &mut io::stdout()).map_err(Into::into)
+}
+
+pub(crate) fn run_import<M: AuthManagerPort, W: Write>(
+    manager: &M,
+    provider: &str,
+    stdout: &mut W,
+) -> Result<(), AuthCliError> {
+    let completion = manager.import_credentials(provider)?;
+    writeln!(
+        stdout,
+        "Imported existing credentials for {}",
+        completion.provider
+    )?;
+    Ok(())
+}
+
 /// Handle `roci-agent auth status [--json]`.
-pub async fn handle_status(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = build_default_manager()?;
+pub async fn handle_status(json: bool, account: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = build_manager(account)?;
     let mut stdout = io::stdout();
     run_status(&manager, json, &mut stdout).map_err(Into::into)
 }
 
 /// Handle `roci-agent auth logout <provider>`.
-pub async fn handle_logout(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = build_default_manager()?;
+pub async fn handle_logout(
+    provider: &str,
+    account: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = build_manager(account)?;
     let mut stdout = io::stdout();
     run_logout(&manager, provider, &mut stdout).map_err(Into::into)
 }
@@ -193,8 +259,9 @@ pub async fn handle_logout(provider: &str) -> Result<(), Box<dyn std::error::Err
 pub async fn handle_configure(
     provider: &str,
     endpoint: Option<&str>,
+    account: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = build_default_manager()?;
+    let manager = build_manager(account)?;
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
     run_configure(
@@ -209,12 +276,13 @@ pub async fn handle_configure(
 }
 
 /// Handle `roci-agent auth providers [--json]`.
-pub async fn handle_providers(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = build_default_manager()?;
+pub async fn handle_providers(json: bool, account: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = build_manager(account)?;
     let mut stdout = io::stdout();
     run_providers(&manager, json, &mut stdout).map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) async fn run_login<M, R, W, E>(
     manager: &M,
     provider: &str,
@@ -230,7 +298,41 @@ where
     W: Write,
     E: Write,
 {
-    match manager.start_login(provider).await? {
+    run_login_with_flow(
+        manager,
+        provider,
+        stdin,
+        stdout,
+        stderr,
+        stdin_is_tty,
+        stdout_is_tty,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_login_with_flow<M, R, W, E>(
+    manager: &M,
+    provider: &str,
+    stdin: &mut R,
+    stdout: &mut W,
+    stderr: &mut E,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    flow: Option<CredentialFlow>,
+) -> Result<(), AuthCliError>
+where
+    M: AuthManagerPort,
+    R: Read,
+    W: Write,
+    E: Write,
+{
+    let step = match flow {
+        Some(flow) => manager.start_login_with_flow(provider, flow).await?,
+        None => manager.start_login(provider).await?,
+    };
+    match step {
         HostAuthStep::ImportedAndComplete {
             provider: canonical,
         } => {
@@ -248,51 +350,74 @@ where
             writeln!(stdout, "Waiting for authorization...")?;
             stdout.flush()?;
 
-            let mut interval = Duration::from_secs(interval_secs.max(1));
-            loop {
-                let remaining = expires_at
-                    .signed_duration_since(chrono::Utc::now())
-                    .to_std()
-                    .unwrap_or_default();
-                if !remaining.is_zero() {
-                    tokio::time::sleep(interval.min(remaining)).await;
-                }
-                if chrono::Utc::now() >= expires_at {
-                    writeln!(stderr, "Device code expired; please try again")?;
-                    return Err(AuthCliError::Message(
-                        "Device code expired; please try again".into(),
-                    ));
-                }
-                match manager.poll_device_code(&session_id).await? {
-                    HostAuthPollResult::Pending => continue,
-                    HostAuthPollResult::SlowDown { interval_secs } => {
-                        interval = Duration::from_secs(interval_secs.max(1));
-                    }
-                    HostAuthPollResult::Authorized {
-                        provider: canonical,
-                    } => {
-                        writeln!(stdout, "{canonical} login successful!")?;
-                        return Ok(());
-                    }
-                    HostAuthPollResult::Denied => {
-                        writeln!(stderr, "Authorization denied")?;
-                        return Err(AuthCliError::Message("Authorization denied".into()));
-                    }
-                    HostAuthPollResult::Expired => {
-                        writeln!(stderr, "Device code expired; please try again")?;
-                        return Err(AuthCliError::Message(
-                            "Device code expired; please try again".into(),
-                        ));
-                    }
-                }
-            }
+            poll_login(
+                interval_secs,
+                expires_at,
+                "Device code expired; please try again",
+                stdout,
+                stderr,
+                || manager.advance_login(&session_id),
+            )
+            .await?;
+        }
+        HostAuthStep::BrowserPoll {
+            authorization_url,
+            interval_secs,
+            expires_at,
+            session_id,
+        } => {
+            writeln!(stdout, "Visit: {authorization_url}")?;
+            writeln!(stdout, "Waiting for authorization...")?;
+            stdout.flush()?;
+            poll_login(
+                interval_secs,
+                expires_at,
+                "Browser login expired; please try again",
+                stdout,
+                stderr,
+                || manager.advance_login(&session_id),
+            )
+            .await?;
         }
         HostAuthStep::Pkce {
             authorization_url,
             session_id,
         } => {
+            let receiver = if stdin_is_tty {
+                match super::auth_callback::LoopbackCallback::bind(&authorization_url).await {
+                    Ok(receiver) => receiver,
+                    Err(_) => {
+                        writeln!(stderr, "Local callback unavailable; paste the complete redirected URL to finish.")?;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             writeln!(stdout, "Visit: {authorization_url}")?;
-            writeln!(stdout, "After authorizing, paste the response code below:")?;
+            let received = match receiver {
+                Some(receiver) => {
+                    writeln!(stdout, "Waiting for the browser callback...")?;
+                    stdout.flush()?;
+                    match receiver.receive().await {
+                        Ok(callback) => Some(callback),
+                        Err(_) => {
+                            writeln!(
+                                stderr,
+                                "No browser callback received; paste the complete redirected URL."
+                            )?;
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            if received.is_none() {
+                writeln!(
+                    stdout,
+                    "After authorizing, paste the response code or complete redirected URL below:"
+                )?;
+            }
             if stdin_is_tty && stdout_is_tty {
                 write!(stdout, "> ")?;
                 stdout.flush()?;
@@ -300,7 +425,10 @@ where
                 stdout.flush()?;
             }
 
-            let code = read_secret_line(stdin)?;
+            let code = match received {
+                Some(callback) => callback,
+                None => read_secret_line(stdin)?,
+            };
             if code.is_empty() {
                 return Err(AuthCliError::Message(
                     "No authorization code provided".into(),
@@ -312,6 +440,55 @@ where
         }
     }
     Ok(())
+}
+
+/// Both polling flows share timing and terminal outcomes, but dispatch through
+/// their own opaque manager operation.
+async fn poll_login<W, E, P, F>(
+    interval_secs: u64,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    expiry_message: &str,
+    stdout: &mut W,
+    stderr: &mut E,
+    mut poll: P,
+) -> Result<(), AuthCliError>
+where
+    W: Write,
+    E: Write,
+    P: FnMut() -> F,
+    F: Future<Output = Result<HostAuthPollResult, AuthError>>,
+{
+    let remaining = expires_at
+        .signed_duration_since(chrono::Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + remaining;
+    let mut interval = Duration::from_secs(interval_secs.max(1));
+    loop {
+        tokio::time::sleep_until((tokio::time::Instant::now() + interval).min(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            writeln!(stderr, "{expiry_message}")?;
+            return Err(AuthCliError::Message(expiry_message.into()));
+        }
+        match poll().await? {
+            HostAuthPollResult::Pending => {}
+            HostAuthPollResult::SlowDown { interval_secs } => {
+                interval = Duration::from_secs(interval_secs.max(1));
+            }
+            HostAuthPollResult::Authorized { provider } => {
+                writeln!(stdout, "{provider} login successful!")?;
+                return Ok(());
+            }
+            HostAuthPollResult::Denied => {
+                writeln!(stderr, "Authorization denied")?;
+                return Err(AuthCliError::Message("Authorization denied".into()));
+            }
+            HostAuthPollResult::Expired => {
+                writeln!(stderr, "{expiry_message}")?;
+                return Err(AuthCliError::Message(expiry_message.into()));
+            }
+        }
+    }
 }
 
 pub(crate) fn run_status<M, W>(manager: &M, json: bool, stdout: &mut W) -> Result<(), AuthCliError>
@@ -401,6 +578,8 @@ fn write_statuses<W: Write>(
         let key = &status.descriptor.canonical_key;
         let name = &status.descriptor.display_name;
         let state = match &status.auth_state {
+            ProviderAuthState::RefreshNeeded => "Refresh needed".to_string(),
+            ProviderAuthState::ReauthRequired => "Login required".to_string(),
             ProviderAuthState::SignedOut => "Signed out".to_string(),
             ProviderAuthState::ExternallyConfigured => "Externally configured".to_string(),
             ProviderAuthState::SignedIn { label } => label.clone(),
@@ -453,6 +632,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeManager {
+        import_results: Mutex<VecDeque<Result<HostAuthCompletion, AuthError>>>,
+        import_calls: Mutex<Vec<String>>,
         configure_calls: Mutex<Vec<ConfigureCall>>,
         logout_calls: Mutex<Vec<String>>,
         list_calls: Mutex<u32>,
@@ -460,6 +641,7 @@ mod tests {
         login_steps: Mutex<VecDeque<Result<HostAuthStep, AuthError>>>,
         poll_results: Mutex<VecDeque<Result<HostAuthPollResult, AuthError>>>,
         pkce_codes: Mutex<Vec<String>>,
+        advanced_sessions: Mutex<Vec<String>>,
     }
 
     #[derive(Debug, Clone)]
@@ -477,7 +659,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_import_prints_receipt_without_starting_login() {
+        let manager = FakeManager::default();
+        manager
+            .import_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostAuthCompletion {
+                provider: "codex".into(),
+            }));
+        let mut output = Vec::new();
+        run_import(&manager, "openai-codex", &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Imported existing credentials for codex\n"
+        );
+        assert_eq!(*manager.import_calls.lock().unwrap(), ["openai-codex"]);
+        assert!(manager.login_steps.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_import_does_not_print_success_or_fall_back_to_login() {
+        let manager = FakeManager::default();
+        manager
+            .import_results
+            .lock()
+            .unwrap()
+            .push_back(Err(AuthError::Io("cannot read source".into())));
+        let mut output = Vec::new();
+        assert!(run_import(&manager, "codex", &mut output).is_err());
+        assert!(output.is_empty());
+    }
+
     impl AuthManagerPort for FakeManager {
+        fn import_credentials(&self, provider: &str) -> Result<HostAuthCompletion, AuthError> {
+            self.import_calls.lock().unwrap().push(provider.into());
+            self.import_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected import call")
+        }
         fn configure_api_key(
             &self,
             provider: &str,
@@ -515,16 +738,20 @@ mod tests {
             async move { step }
         }
 
-        fn poll_device_code(
+        fn advance_login(
             &self,
-            _session_id: &LoginSessionId,
+            session_id: &LoginSessionId,
         ) -> impl Future<Output = Result<HostAuthPollResult, AuthError>> + Send {
+            self.advanced_sessions
+                .lock()
+                .unwrap()
+                .push(session_id.as_str().into());
             let result = self
                 .poll_results
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("unexpected poll_device_code call");
+                .expect("unexpected advance_login call");
             async move { result }
         }
 
@@ -982,5 +1209,116 @@ mod tests {
             "launch_available": false
         }]);
         assert_eq!(value, expected);
+    }
+
+    struct NoCodeInput;
+
+    impl Read for NoCodeInput {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            panic!("browser polling must not request a code");
+        }
+    }
+
+    fn browser_manager(expires_at: chrono::DateTime<chrono::Utc>) -> FakeManager {
+        let manager = FakeManager::default();
+        manager
+            .login_steps
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostAuthStep::BrowserPoll {
+                authorization_url: "https://example.com/cursor/login".into(),
+                interval_secs: 1,
+                expires_at,
+                session_id: LoginSessionId::new("opaque-browser-session"),
+            }));
+        manager
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn browser_login_displays_url_and_polls_without_code_entry() {
+        let manager = browser_manager(chrono::Utc::now() + chrono::Duration::minutes(5));
+        manager.poll_results.lock().unwrap().extend([
+            Ok(HostAuthPollResult::Pending),
+            Ok(HostAuthPollResult::SlowDown { interval_secs: 4 }),
+            Ok(HostAuthPollResult::Authorized {
+                provider: "cursor".into(),
+            }),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let started = tokio::time::Instant::now();
+        run_login(
+            &manager,
+            "cursor",
+            &mut NoCodeInput,
+            &mut stdout,
+            &mut stderr,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Visit: https://example.com/cursor/login"));
+        assert!(output.contains("Waiting for authorization"));
+        assert!(output.contains("cursor login successful!"));
+        assert!(!output.contains("code"));
+        assert!(!output.contains("opaque-browser-session"));
+        assert!(stderr.is_empty());
+        assert_eq!(
+            *manager.advanced_sessions.lock().unwrap(),
+            vec!["opaque-browser-session"; 3]
+        );
+        assert!(manager.pkce_codes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn browser_login_reports_denial_and_expiry() {
+        for result in [HostAuthPollResult::Denied, HostAuthPollResult::Expired] {
+            let manager = browser_manager(chrono::Utc::now() + chrono::Duration::minutes(5));
+            let expected = if matches!(result, HostAuthPollResult::Denied) {
+                "Authorization denied"
+            } else {
+                "Browser login expired; please try again"
+            };
+            manager.poll_results.lock().unwrap().push_back(Ok(result));
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let error = run_login(
+                &manager,
+                "cursor",
+                &mut NoCodeInput,
+                &mut stdout,
+                &mut stderr,
+                false,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert!(String::from_utf8(stderr).unwrap().contains(expected));
+            assert!(!String::from_utf8(stdout).unwrap().contains("successful"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn browser_login_stops_at_deadline_before_polling() {
+        let manager = browser_manager(chrono::Utc::now() + chrono::Duration::milliseconds(100));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = run_login(
+            &manager,
+            "cursor",
+            &mut NoCodeInput,
+            &mut stdout,
+            &mut stderr,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Browser login expired"));
+        assert!(manager.advanced_sessions.lock().unwrap().is_empty());
     }
 }

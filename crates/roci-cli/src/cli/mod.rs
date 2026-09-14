@@ -1,6 +1,7 @@
 //! CLI argument definitions for Roci.
 
 pub mod auth;
+mod auth_callback;
 
 use std::path::PathBuf;
 
@@ -67,6 +68,9 @@ pub enum ToolContractsSmokeCaseArg {
 /// Arguments for the `auth` subcommand group.
 #[derive(Parser, Debug)]
 pub struct AuthArgs {
+    /// Named Roci credential account
+    #[arg(long, global = true, default_value = "default")]
+    pub account: String,
     #[command(subcommand)]
     pub command: AuthCommands,
 }
@@ -76,6 +80,8 @@ pub struct AuthArgs {
 pub enum AuthCommands {
     /// Login to a provider
     Login(LoginArgs),
+    /// Explicitly import credentials from an existing provider CLI login
+    Import(ImportArgs),
     /// Show authentication status
     Status(StatusArgs),
     /// Logout from a provider
@@ -90,6 +96,33 @@ pub enum AuthCommands {
 #[derive(Parser, Debug)]
 pub struct LoginArgs {
     /// Provider to login to (github-copilot, codex, anthropic, ...)
+    pub provider: String,
+    /// OAuth flow (defaults to the provider's preferred flow)
+    #[arg(long, value_enum)]
+    pub flow: Option<LoginFlowArg>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum LoginFlowArg {
+    DeviceCode,
+    Pkce,
+    BrowserPoll,
+}
+
+impl From<LoginFlowArg> for roci::auth::CredentialFlow {
+    fn from(flow: LoginFlowArg) -> Self {
+        match flow {
+            LoginFlowArg::DeviceCode => Self::DeviceCode,
+            LoginFlowArg::Pkce => Self::Pkce,
+            LoginFlowArg::BrowserPoll => Self::BrowserPoll,
+        }
+    }
+}
+
+/// Arguments for `roci-agent auth import`.
+#[derive(Parser, Debug)]
+pub struct ImportArgs {
+    /// Provider whose existing CLI credential should be copied (codex, anthropic)
     pub provider: String,
 }
 
@@ -245,6 +278,15 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 /// Arguments for the `chat` subcommand.
 #[derive(Parser, Debug)]
 pub struct ChatArgs {
+    /// Reasoning effort (none, minimal, low, medium, high, xhigh, max, ultra)
+    #[arg(long)]
+    pub reasoning_effort: Option<roci::types::ReasoningEffort>,
+    /// Generation speed for supported providers (standard or fast)
+    #[arg(long)]
+    pub speed: Option<roci::types::GenerationSpeed>,
+    /// Named credential account (resume inherits the saved account when omitted)
+    #[arg(long)]
+    pub account: Option<String>,
     /// Model to use (format: provider:model, e.g., openai:gpt-4o or codex:gpt-5.3-codex-spark)
     #[arg(short, long, default_value = "openai:gpt-4o")]
     pub model: String,
@@ -417,6 +459,9 @@ pub enum ChatRetryModeArg {
 /// Arguments for the `models` subcommand group.
 #[derive(Parser, Debug)]
 pub struct ModelsArgs {
+    /// Named Roci credential account
+    #[arg(long, default_value = "default")]
+    pub account: String,
     #[command(subcommand)]
     pub command: ModelsCommands,
 }
@@ -437,6 +482,9 @@ pub enum ModelsCommands {
 /// Arguments for `roci-agent models list`.
 #[derive(Parser, Debug)]
 pub struct ModelsListArgs {
+    /// Include raw Cursor variants alongside model families
+    #[arg(long)]
+    pub include_variants: bool,
     /// Provider key to list models for
     #[arg(long, value_name = "PROVIDER")]
     pub provider: Option<String>,
@@ -702,6 +750,35 @@ pub struct UpdateSkillsArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_parses_explicit_import_and_selected_flow_account() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "auth",
+            "login",
+            "codex",
+            "--flow",
+            "pkce",
+            "--account",
+            "work",
+        ])
+        .unwrap();
+        let Commands::Auth(auth) = cli.command else {
+            panic!("expected auth")
+        };
+        assert_eq!(auth.account, "work");
+        let AuthCommands::Login(login) = auth.command else {
+            panic!("expected login")
+        };
+        assert_eq!(login.flow, Some(LoginFlowArg::Pkce));
+        let cli = Cli::try_parse_from(["roci-agent", "auth", "import", "codex"]).unwrap();
+        let Commands::Auth(auth) = cli.command else {
+            panic!("expected auth")
+        };
+        assert_eq!(auth.account, "default");
+        assert!(matches!(auth.command, AuthCommands::Import(_)));
+    }
     use clap::Parser;
 
     #[test]
@@ -856,6 +933,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_chat_generation_controls() {
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "chat",
+            "--model",
+            "cursor:gpt-5.6-terra",
+            "--reasoning-effort",
+            "high",
+            "--speed",
+            "fast",
+        ])
+        .unwrap();
+        let Commands::Chat(args) = cli.command else {
+            panic!("expected chat")
+        };
+        assert_eq!(
+            args.reasoning_effort,
+            Some(roci::types::ReasoningEffort::High)
+        );
+        assert_eq!(args.speed, Some(roci::types::GenerationSpeed::Fast));
+        assert!(Cli::try_parse_from(["roci-agent", "chat", "--speed", "turbo"]).is_err());
+        let cli = Cli::try_parse_from([
+            "roci-agent",
+            "models",
+            "--account",
+            "work",
+            "list",
+            "--provider",
+            "cursor",
+            "--include-variants",
+        ])
+        .unwrap();
+        let Commands::Models(models) = cli.command else {
+            panic!("expected models")
+        };
+        let ModelsCommands::List(args) = models.command else {
+            panic!("expected list")
+        };
+        assert!(args.include_variants);
+    }
+
+    #[test]
     fn parse_chat_with_defaults() {
         let cli = Cli::try_parse_from(["roci-agent", "chat"]).unwrap();
         match cli.command {
@@ -904,6 +1023,7 @@ mod tests {
             Commands::Models(models) => match models.command {
                 ModelsCommands::List(args) => {
                     assert!(args.provider.is_none());
+                    assert!(!args.include_variants);
                     assert!(!args.json);
                 }
                 other => panic!("expected List, got {other:?}"),

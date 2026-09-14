@@ -36,6 +36,10 @@ pub enum RociError {
     #[error("Unsupported operation: {0}")]
     UnsupportedOperation(String),
 
+    /// The selected provider/account supports inference but has no model-list API.
+    #[error("Model discovery unsupported for {provider}: {reason}")]
+    ModelDiscoveryUnsupported { provider: String, reason: String },
+
     #[error("Authentication error: {0}")]
     Authentication(String),
 

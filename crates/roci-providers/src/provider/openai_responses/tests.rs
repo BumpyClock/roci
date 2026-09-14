@@ -11,6 +11,7 @@ fn settings() -> GenerationSettings {
         frequency_penalty: None,
         seed: None,
         reasoning_effort: None,
+        speed: None,
         text_verbosity: None,
         response_format: None,
         openai_responses: None,
@@ -620,4 +621,153 @@ fn codex_request_body_includes_prompt_cache_key() {
 
     let body = provider.build_request_body(&request, false);
     assert_eq!(body["prompt_cache_key"], session_id);
+}
+
+#[test]
+fn responses_and_codex_speed_map_to_service_tier_without_changing_reasoning() {
+    for endpoint in [
+        None,
+        Some("https://chatgpt.com/backend-api/codex".to_string()),
+    ] {
+        let provider =
+            OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".into(), endpoint, None);
+        assert_eq!(
+            provider.capabilities().supported_speeds,
+            vec![GenerationSpeed::Standard, GenerationSpeed::Fast]
+        );
+        let mut request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings {
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..Default::default()
+            },
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: Default::default(),
+            metadata: Default::default(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+        assert!(provider
+            .build_request_body(&request, true)
+            .get("service_tier")
+            .is_none());
+        for (speed, tier) in [
+            (GenerationSpeed::Standard, "default"),
+            (GenerationSpeed::Fast, "priority"),
+        ] {
+            request.settings.speed = Some(speed);
+            provider.validate_settings(&request.settings).unwrap();
+            for stream in [false, true] {
+                let body = provider.build_request_body(&request, stream);
+                assert_eq!(body["service_tier"], tier);
+                assert_eq!(body["reasoning"]["effort"], "high");
+                assert_eq!(body["stream"], stream);
+            }
+        }
+    }
+}
+
+#[test]
+fn speed_rejects_conflicting_explicit_service_tier() {
+    let provider =
+        OpenAiResponsesProvider::new(OpenAiModel::Gpt5Nano, "test-key".into(), None, None);
+    for speed in [GenerationSpeed::Standard, GenerationSpeed::Fast] {
+        for tier in [
+            OpenAiServiceTier::Auto,
+            OpenAiServiceTier::Default,
+            OpenAiServiceTier::Flex,
+            OpenAiServiceTier::Priority,
+        ] {
+            let settings = GenerationSettings {
+                speed: Some(speed),
+                openai_responses: Some(OpenAiResponsesOptions {
+                    service_tier: Some(tier),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let compatible = matches!(
+                (speed, tier),
+                (GenerationSpeed::Standard, OpenAiServiceTier::Default)
+                    | (GenerationSpeed::Fast, OpenAiServiceTier::Priority)
+            );
+            assert_eq!(provider.validate_settings(&settings).is_ok(), compatible);
+        }
+    }
+}
+
+#[test]
+fn unlisted_codex_models_forward_explicit_reasoning_without_guessing_defaults() {
+    for model in ["gpt-6-astra", "account-future-model"] {
+        let provider = OpenAiResponsesProvider::new(
+            OpenAiModel::Custom(model.into()),
+            "test-token".into(),
+            Some("https://chatgpt.com/backend-api/codex".into()),
+            Some("account".into()),
+        );
+        let mut request = ProviderRequest {
+            messages: vec![ModelMessage::user("hello")],
+            settings: GenerationSettings::default(),
+            tools: None,
+            response_format: None,
+            api_key_override: None,
+            headers: Default::default(),
+            metadata: Default::default(),
+            payload_callback: None,
+            session_id: None,
+            transport: None,
+        };
+        assert!(provider.validate_settings(&request.settings).is_ok());
+        assert!(provider
+            .build_request_body(&request, true)
+            .get("reasoning")
+            .is_none());
+        request.settings.reasoning_effort = Some(ReasoningEffort::High);
+        assert!(provider.validate_settings(&request.settings).is_ok());
+        for streaming in [false, true] {
+            let body = provider.build_request_body(&request, streaming);
+            assert_eq!(body["model"], model);
+            assert_eq!(body["reasoning"], serde_json::json!({"effort":"high"}));
+        }
+        assert!(provider
+            .capabilities()
+            .reasoning_effort
+            .supported
+            .is_empty());
+        assert_eq!(provider.capabilities().default_reasoning_effort(), None);
+    }
+}
+
+#[test]
+fn unlisted_codex_exception_keeps_known_and_public_model_validation() {
+    let unsupported = GenerationSettings {
+        reasoning_effort: Some(ReasoningEffort::None),
+        ..Default::default()
+    };
+    let known_codex = OpenAiResponsesProvider::new(
+        OpenAiModel::Gpt55,
+        "token".into(),
+        Some("https://chatgpt.com/backend-api/codex".into()),
+        None,
+    );
+    assert!(matches!(
+        known_codex.validate_settings(&unsupported),
+        Err(RociError::InvalidArgument(_))
+    ));
+    let public_unknown = OpenAiResponsesProvider::new(
+        OpenAiModel::Custom("gpt-6-astra".into()),
+        "token".into(),
+        None,
+        None,
+    );
+    assert!(matches!(
+        public_unknown.validate_settings(&GenerationSettings {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        }),
+        Err(RociError::InvalidArgument(_))
+    ));
 }

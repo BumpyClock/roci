@@ -138,7 +138,8 @@ impl OpenAiProvider {
         auth_mode: AuthMode,
         auth_required: bool,
     ) -> Self {
-        let capabilities = model.capabilities();
+        let mut capabilities = model.capabilities();
+        capabilities.supported_speeds.clear();
         Self {
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             model,
@@ -819,6 +820,7 @@ mod tests {
             frequency_penalty,
             seed: None,
             reasoning_effort: None,
+            speed: None,
             text_verbosity: None,
             response_format: None,
             openai_responses: None,

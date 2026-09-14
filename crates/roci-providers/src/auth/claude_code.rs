@@ -14,10 +14,9 @@ use roci_core::auth::TokenStore;
 const CLAUDE_CLI_REL_PATH: &str = ".claude/.credentials.json";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 const CLAUDE_SCOPES: &str = "org:create_api_key user:profile user:inference";
-const REFRESH_GRACE_PERIOD_MINUTES: i64 = 5;
 
 /// PKCE authorization session returned by [`ClaudeCodeAuth::start_auth`].
 ///
@@ -57,6 +56,7 @@ pub struct PkceSession {
 /// let auth = ClaudeCodeAuth::new(Arc::new(store));
 /// # Ok::<(), roci_core::auth::AuthError>(())
 /// ```
+#[derive(Clone)]
 pub struct ClaudeCodeAuth {
     client: reqwest::Client,
     token_store: Arc<dyn TokenStore>,
@@ -91,18 +91,20 @@ impl ClaudeCodeAuth {
             .is_some())
     }
 
+    /// Load the current credential, coordinating renewal with provider calls and logout.
     pub async fn get_token(&self) -> Result<Token, AuthError> {
-        let mut token = self
-            .token_store
-            .load("claude-code", &self.profile)?
-            .ok_or(AuthError::NotLoggedIn)?;
-        if needs_refresh(&token) && token.refresh_token.is_some() {
-            let refreshed = self.refresh_token(&token).await?;
-            self.token_store
-                .save("claude-code", &self.profile, &refreshed)?;
-            token = refreshed;
-        }
-        Ok(token)
+        let auth = self.clone();
+        let refresh: super::runtime::Refresh = Arc::new(move |token| {
+            let auth = auth.clone();
+            Box::pin(async move {
+                auth.refresh_token(&token.ok_or(AuthError::NotLoggedIn)?)
+                    .await
+            })
+        });
+        super::runtime::OAuthSession::new(self.token_store.clone(), "claude-code", refresh, false)
+            .with_profile(&self.profile)
+            .token(None)
+            .await
     }
 
     /// Begin an interactive PKCE authorization flow.
@@ -137,35 +139,31 @@ impl ClaudeCodeAuth {
 
     /// Exchange an authorization code for tokens.
     ///
-    /// `auth_response` may be `"code#state"` (from the redirect) or just
-    /// the bare `"code"`. When state is present it is verified against the
-    /// session.
+    /// `auth_response` may be the full hosted callback URL, `"code#state"`,
+    /// or a bare code. Returned state is checked against the pending session;
+    /// the session state is always included in the token exchange.
     pub async fn exchange_code(
         &self,
         session: &PkceSession,
         auth_response: &str,
     ) -> Result<Token, AuthError> {
-        let (code, state) = parse_auth_response(auth_response);
-        if let Some(returned_state) = state {
-            if returned_state != session.state {
-                return Err(AuthError::InvalidResponse(format!(
-                    "OAuth state mismatch: expected {}, got {returned_state}",
-                    session.state
-                )));
-            }
+        let code = parse_auth_response(auth_response, &session.state)?;
+        if session.state.is_empty() || session.code_verifier.is_empty() {
+            return Err(AuthError::InvalidResponse("Incomplete PKCE session".into()));
         }
 
         let resp = self
             .client
             .post(&self.token_url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("client_id", CLAUDE_CLIENT_ID),
-                ("code", code),
-                ("redirect_uri", CLAUDE_REDIRECT_URI),
-                ("code_verifier", session.code_verifier.as_str()),
-            ])
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({
+                "grant_type": "authorization_code",
+                "client_id": CLAUDE_CLIENT_ID,
+                "code": code,
+                "redirect_uri": CLAUDE_REDIRECT_URI,
+                "code_verifier": session.code_verifier,
+                "state": session.state,
+            }))
             .send()
             .await?;
 
@@ -193,12 +191,12 @@ impl ClaudeCodeAuth {
         let resp = self
             .client
             .post(&self.token_url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("client_id", CLAUDE_CLIENT_ID),
-                ("refresh_token", refresh_token.as_str()),
-            ])
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({
+                "grant_type": "refresh_token",
+                "client_id": CLAUDE_CLIENT_ID,
+                "refresh_token": refresh_token,
+            }))
             .send()
             .await?;
 
@@ -210,9 +208,18 @@ impl ClaudeCodeAuth {
         }
 
         let payload: TokenExchangeResponse = resp.json().await?;
-        let refreshed = token_from_exchange_response(payload);
-        self.token_store
-            .save("claude-code", &self.profile, &refreshed)?;
+        let mut refreshed = token_from_exchange_response(payload);
+        if refreshed.access_token.trim().is_empty() {
+            return Err(AuthError::InvalidResponse(
+                "empty refreshed access token".into(),
+            ));
+        }
+        refreshed.refresh_token = refreshed
+            .refresh_token
+            .filter(|value| !value.is_empty())
+            .or_else(|| token.refresh_token.clone());
+        refreshed.account_id = token.account_id.clone();
+        refreshed.provider_metadata = token.provider_metadata.clone();
         Ok(refreshed)
     }
 
@@ -235,6 +242,7 @@ impl ClaudeCodeAuth {
         let expires_at = DateTime::<Utc>::from(std::time::UNIX_EPOCH)
             + chrono::Duration::seconds(oauth.expires_at / 1000);
         let token = Token {
+            provider_metadata: None,
             access_token: oauth.access_token,
             refresh_token: oauth.refresh_token,
             id_token: None,
@@ -276,19 +284,12 @@ struct ClaudeOauthPayload {
     expires_at: i64,
 }
 
-fn needs_refresh(token: &Token) -> bool {
-    let Some(expires_at) = token.expires_at else {
-        return false;
-    };
-    let grace = Duration::minutes(REFRESH_GRACE_PERIOD_MINUTES);
-    Utc::now() >= expires_at - grace
-}
-
 fn token_from_exchange_response(payload: TokenExchangeResponse) -> Token {
     let expires_at = payload
         .expires_in
         .map(|secs| Utc::now() + Duration::seconds(secs));
     Token {
+        provider_metadata: None,
         access_token: payload.access_token,
         refresh_token: payload.refresh_token,
         id_token: None,
@@ -299,11 +300,50 @@ fn token_from_exchange_response(payload: TokenExchangeResponse) -> Token {
     }
 }
 
-fn parse_auth_response(input: &str) -> (&str, Option<&str>) {
-    match input.split_once('#') {
-        Some((code, state)) => (code, Some(state)),
-        None => (input, None),
+fn parse_auth_response(input: &str, expected_state: &str) -> Result<String, AuthError> {
+    let invalid = || AuthError::InvalidResponse("Invalid OAuth callback response".into());
+    let input = input.trim();
+    let (code, state) = if input.contains("://") {
+        let url = reqwest::Url::parse(input).map_err(|_| invalid())?;
+        let redirect = reqwest::Url::parse(CLAUDE_REDIRECT_URI).expect("valid hosted callback");
+        if url.origin() != redirect.origin()
+            || url.path() != redirect.path()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(invalid());
+        }
+        let params: Vec<_> = url.query_pairs().collect();
+        let values = |key: &str| {
+            params
+                .iter()
+                .filter(|(name, _)| name == key)
+                .map(|(_, value)| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        let codes = values("code");
+        let states = values("state");
+        if codes.len() != 1 || states.len() != 1 || !values("error").is_empty() {
+            return Err(invalid());
+        }
+        (codes[0].clone(), Some(states[0].clone()))
+    } else {
+        match input.split_once('#') {
+            Some((code, state)) => (code.to_owned(), Some(state.to_owned())),
+            None => (input.to_owned(), None),
+        }
+    };
+    if code.trim().is_empty() {
+        return Err(invalid());
     }
+    if state
+        .as_deref()
+        .is_some_and(|state| state != expected_state)
+    {
+        return Err(AuthError::InvalidResponse("OAuth state mismatch".into()));
+    }
+    Ok(code)
 }
 
 fn random_hex(byte_count: usize) -> String {
@@ -375,4 +415,120 @@ fn user_home_dir() -> PathBuf {
     directories::UserDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roci_core::auth::{FileTokenStore, TokenStoreConfig};
+    use serde_json::json;
+    use wiremock::{
+        matchers::{body_json, header, method},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn fixture() -> (tempfile::TempDir, Arc<dyn TokenStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+            dir.path().into(),
+        )));
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn exchange_sends_json_with_session_state_and_parsed_callback() {
+        let (_dir, store) = fixture();
+        let server = MockServer::start().await;
+        let auth = ClaudeCodeAuth::new(store.clone()).with_token_url(server.uri());
+        let session = auth.start_auth().unwrap();
+        Mock::given(method("POST"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({
+                "grant_type": "authorization_code",
+                "client_id": CLAUDE_CLIENT_ID,
+                "code": "test-code",
+                "redirect_uri": CLAUDE_REDIRECT_URI,
+                "code_verifier": session.code_verifier,
+                "state": session.state,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "test-access", "refresh_token": "test-refresh", "expires_in": 3600
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        for response in [
+            "test-code".to_string(),
+            format!("test-code#{}", session.state),
+            format!(
+                "{CLAUDE_REDIRECT_URI}?code=test-code&state={}",
+                session.state
+            ),
+        ] {
+            auth.exchange_code(&session, &response).await.unwrap();
+        }
+        assert_eq!(
+            store
+                .load("claude-code", "default")
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "test-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_callback_is_rejected_without_network_or_secret_echo() {
+        let (_dir, store) = fixture();
+        let server = MockServer::start().await;
+        let auth = ClaudeCodeAuth::new(store).with_token_url(server.uri());
+        let session = auth.start_auth().unwrap();
+        for response in [
+            "test-code#wrong-state".to_string(),
+            format!("{CLAUDE_REDIRECT_URI}?code=test-code&state=wrong-state"),
+            format!(
+                "{CLAUDE_REDIRECT_URI}?code=test-code&state={}&state=wrong",
+                session.state
+            ),
+            format!("{CLAUDE_REDIRECT_URI}?code=&state={}", session.state),
+            format!(
+                "https://evil.test/callback?code=test-code&state={}",
+                session.state
+            ),
+            format!("{CLAUDE_REDIRECT_URI}?code=test-code"),
+            String::new(),
+        ] {
+            let error = auth.exchange_code(&session, &response).await.unwrap_err();
+            assert!(!error.to_string().contains("test-code"));
+            assert!(!error.to_string().contains(&session.state));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_json_and_retains_omitted_rotation_fields() {
+        let (_dir, store) = fixture();
+        let server = MockServer::start().await;
+        let auth = ClaudeCodeAuth::new(store).with_token_url(server.uri());
+        Mock::given(method("POST"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({
+                "grant_type": "refresh_token", "client_id": CLAUDE_CLIENT_ID,
+                "refresh_token": "test-refresh"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "renewed-access", "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let token = token_from_exchange_response(TokenExchangeResponse {
+            access_token: "old-access".into(),
+            refresh_token: Some("test-refresh".into()),
+            expires_in: Some(3600),
+        });
+        let refreshed = auth.refresh_token(&token).await.unwrap();
+        assert_eq!(refreshed.access_token, "renewed-access");
+        assert_eq!(refreshed.refresh_token, token.refresh_token);
+    }
 }

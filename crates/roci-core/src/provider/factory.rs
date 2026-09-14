@@ -62,6 +62,11 @@ pub trait ProviderFactory: Send + Sync {
     }
 
     /// List models for the given provider key.
+    ///
+    /// Return [`RociError::ModelDiscoveryUnsupported`] when the selected
+    /// credential mode can launch models but cannot discover them. Aggregate
+    /// registry listings skip this result while explicit listings preserve it.
+    /// Return other failures normally so hosts can diagnose failed discovery.
     fn list_models<'a>(
         &'a self,
         config: &'a RociConfig,

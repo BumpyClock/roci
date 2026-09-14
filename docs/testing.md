@@ -73,6 +73,14 @@ Preferred local provider smoke test:
 
 Model catalog smoke (required for model listing changes):
 
+Built-in listings must query the selected provider/account and return only live
+IDs (plus derived Cursor families). An empty live catalog stays empty; missing
+credentials, unavailable endpoints and unsupported discovery must not return
+preset model IDs. Inspect the `source` field in JSON and verify arbitrary newly
+advertised IDs survive parsing. For the complete example CLI provider set, build
+with `cargo build -p roci-cli --features roci/all-providers`.
+
+
 ```bash
 tmux new-session -d -s roci-model-catalog \
   'cd /path/to/roci && \
@@ -107,7 +115,7 @@ tmux new-session -d -s roci-model-switch \
 echo "attach: tmux attach -t roci-model-switch"
 ```
 
-Copilot catalog smoke (authenticated, with static fallback):
+Copilot catalog smoke (authenticated; discovery errors must be surfaced):
 
 ```bash
 tmux new-session -d -s roci-model-catalog-copilot \
@@ -115,11 +123,6 @@ tmux new-session -d -s roci-model-catalog-copilot \
    set -o pipefail; \
    cargo run -q -p roci-cli -- models list --provider github-copilot --json; \
    code=$?; printf "\n[github-copilot models list exit=%s]\n" "$code"; \
-   if [ "$code" -ne 0 ]; then \
-     echo "[copilot dynamic unavailable] falling back to all-provider/static catalog smoke"; \
-     cargo run -q -p roci-cli -- models list --json; \
-     code=$?; printf "\n[models list --json exit=%s]\n" "$code"; \
-   fi; \
    exec zsh'
 echo "attach: tmux attach -t roci-model-catalog-copilot"
 ```
@@ -371,6 +374,66 @@ Acceptance: log contains `[subagent] started`, `[subagent] ... completed`,
 `roci-subagent-live-ok`, and `[roci subagent live exit=0]`.
 
 ## Environment
+
+### Native Cursor verification
+
+Focused hermetic coverage:
+
+```bash
+cargo test -p roci-providers --features cursor cursor
+```
+
+This includes an actual local HTTP/2 duplex server: the client must answer
+blob/context requests before text can arrive, and a recreated provider restores
+its persisted checkpoint and blob state for a follow-up. Separate tests check
+cross-process lock exclusion, private file modes, history/account isolation,
+tool-result preservation and duplicate-ID suppression, bounded Connect frames,
+browser polling, and refresh-token retention. Mock/local protocol tests do not
+establish compatibility with the current live Cursor service.
+
+For live verification, start an interactive session and show the attach command
+before requesting browser authorization:
+
+```bash
+tmux new-session -d -s roci-cursor-live -c /path/to/roci
+tmux attach -t roci-cursor-live
+```
+
+Inside that terminal:
+
+```bash
+cargo run -q -p roci-cli -- auth login cursor
+cargo run -q -p roci-cli -- models list --provider cursor --json
+cargo run -q -p roci-cli -- chat --no-skills --no-tools \
+  --model 'cursor:<returned-model-id>' \
+  --session-root /tmp/roci-cursor-live --session-id cursor-live \
+  'Reply exactly: roci-cursor-native-ok'
+```
+
+For model family/speed changes, verify that the default list shows families
+without raw Cursor variants, then use `--include-variants` to inspect the original
+upstream IDs alongside them. Make a family request with `--reasoning-effort medium`,
+then an advertised fast family request with `--speed fast`. For example, when advertised:
+
+```bash
+roci-agent models --account live-test list --provider cursor --json
+roci-agent models --account live-test list --provider cursor --include-variants --json
+roci-agent chat --account live-test --no-skills --no-tools \
+  --model cursor:claude-4.6-sonnet --reasoning-effort medium "Reply exactly: family-ok"
+roci-agent chat --account live-test --no-skills --no-tools \
+  --model cursor:gpt-5.6-terra --reasoning-effort high --speed fast "Reply exactly: fast-ok"
+```
+
+Repeat the durable chat command in a new CLI process with the same session ID
+and a follow-up prompt. Compare sanitized state metadata: same checkpoint filename
+and conversation ID, advancing input-message count/checkpoint, private file modes.
+Do not print checkpoints or blobs. Also run an SDK tool round trip when tool
+capability is under test. Capture commands, provider/model,
+response text and exit statuses. Do not add `--temperature`, `--max-tokens`, or
+structured-output settings: unsupported Cursor controls deliberately error.
+Current limitation: tool-result continuation after the original HTTP/2 stream
+closes uses complete SDK history; it does not resume an upstream execution
+callback from a checkpoint. Plain completed text turns can reuse checkpoints.
 
 Use `.env` for local secrets and `.env.example` as the template.
 

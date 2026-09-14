@@ -49,6 +49,9 @@ pub fn register_default_providers(_registry: &mut roci_core::provider::ProviderR
         factories::GrokFactory,
     )));
 
+    #[cfg(feature = "cursor")]
+    _registry.register(std::sync::Arc::new(auth::factory::CursorFactory));
+
     #[cfg(feature = "groq")]
     _registry.register(OverflowClassifyingFactory::wrap(Arc::new(
         factories::GroqFactory,
@@ -110,4 +113,10 @@ pub fn register_default_auth_backends(_service: &mut roci_core::auth::AuthServic
     _service.register_backend(Arc::new(auth::OpenAiCodexBackend));
     #[cfg(feature = "anthropic")]
     _service.register_backend(Arc::new(auth::ClaudeCodeBackend));
+    #[cfg(feature = "grok")]
+    _service.register_backend(Arc::new(auth::xai::XaiBackend));
+    #[cfg(feature = "google")]
+    _service.register_backend(Arc::new(auth::gemini::GeminiBackend));
+    #[cfg(feature = "cursor")]
+    _service.register_backend(std::sync::Arc::new(auth::cursor::CursorBackend));
 }

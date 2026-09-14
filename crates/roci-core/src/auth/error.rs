@@ -35,7 +35,7 @@ pub enum AuthError {
 
 impl From<reqwest::Error> for AuthError {
     fn from(error: reqwest::Error) -> Self {
-        Self::Network(error.to_string())
+        Self::Network(error.without_url().to_string())
     }
 }
 

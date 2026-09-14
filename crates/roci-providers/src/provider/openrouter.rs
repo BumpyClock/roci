@@ -17,13 +17,13 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    pub fn new(model_id: String, api_key: String) -> Self {
+    pub fn new(model_id: String, api_key: String, base_url: Option<String>) -> Self {
         let model = OpenAiModel::Custom(model_id);
         Self {
             inner: OpenAiProvider::new(
                 model,
                 api_key,
-                Some("https://openrouter.ai/api/v1".to_string()),
+                Some(base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".into())),
                 None,
             ),
         }

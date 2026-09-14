@@ -43,6 +43,14 @@ impl LocalSessionStore {
     ///
     /// Returns an error if the session already exists or files cannot be written.
     pub async fn create(&self, options: CreateSessionOptions) -> SessionResult<SessionResumeState> {
+        if let Some(account) = &options.credential_account {
+            crate::auth::account::validate_account(account).map_err(|error| {
+                SessionError::InvalidMetadata {
+                    path: self.root.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+        }
         let id = options.id.unwrap_or_else(super::SessionId::new_v4);
         let root = ensure_store_root(&self.root)?;
         let lease = SessionLease::acquire(&root, &id)?;
@@ -56,6 +64,7 @@ impl LocalSessionStore {
 
         let mut metadata = SessionMetadata::new(id, options.host_cwd, options.import_source);
         metadata.title = options.title;
+        metadata.credential_account = options.credential_account;
         metadata.set_model_preferences(options.model_preferences);
         metadata.write_new_to_path(conventions.metadata_file())?;
         write_empty_file(&conventions.events_file())?;
@@ -120,6 +129,7 @@ impl LocalSessionStore {
         };
         let mut state = self
             .create(CreateSessionOptions {
+                credential_account: snapshot.metadata.credential_account.clone(),
                 id: Some(target_id.clone()),
                 title: snapshot.metadata.title.clone(),
                 host_cwd: snapshot.metadata.host_cwd.clone(),

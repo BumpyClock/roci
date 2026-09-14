@@ -229,7 +229,9 @@ async fn resolve_active_provider_api_key(
 ) -> Result<(), crate::error::RociError> {
     let model = request.active_model().clone();
     let provider = model.provider_name().to_string();
-    if request.active_api_key_override().is_some() || config.get_api_key(&provider).is_some() {
+    if request.active_api_key_override().is_some()
+        || config.resolve_provider_credential(&provider)?.is_some()
+    {
         return Ok(());
     }
     let Some(get_key) = request.get_api_key.clone() else {

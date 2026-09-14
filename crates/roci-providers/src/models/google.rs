@@ -66,6 +66,7 @@ impl GoogleModel {
             supports_json_mode: true,
             supports_json_schema: true,
             supports_reasoning: !reasoning_effort.supported.is_empty(),
+            supported_speeds: Vec::new(),
             reasoning_effort,
             supports_system_messages: true,
             context_length: ctx,

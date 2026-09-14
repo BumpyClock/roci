@@ -21,12 +21,15 @@ use crate::models::ProviderKey;
 /// Resolution order for API keys and endpoints:
 /// 1. Explicit in-process/environment maps
 /// 2. Protected [`ProviderCredentialStore`] records
-/// 3. OAuth tokens from `TokenStore` aliases (API key only)
+/// 3. OAuth tokens from `TokenStore` aliases (identity and refresh state preserved)
 #[derive(Clone)]
 pub struct RociConfig {
     api_keys: Arc<RwLock<HashMap<String, String>>>,
     base_urls: Arc<RwLock<HashMap<String, String>>>,
     account_ids: Arc<RwLock<HashMap<String, String>>>,
+    account: String,
+    raw_token_store: Option<Arc<dyn TokenStore>>,
+    raw_credential_store: Option<Arc<dyn ProviderCredentialStore>>,
     token_store: Option<Arc<dyn TokenStore>>,
     provider_credential_store: Option<Arc<dyn ProviderCredentialStore>>,
 }
@@ -111,21 +114,109 @@ fn default_provider_credential_store() -> Option<Arc<dyn ProviderCredentialStore
 }
 
 impl RociConfig {
+    /// Select credentials without discarding OAuth identity or expired refreshable tokens.
+    /// Storage failures stop resolution rather than falling through to another source.
+    pub fn resolve_provider_credential(
+        &self,
+        provider: &str,
+    ) -> Result<Option<crate::auth::ResolvedProviderCredential>, crate::auth::AuthError> {
+        use crate::auth::{
+            AuthError, CredentialMaterial, ProviderApiKey, ProviderEndpoint,
+            ResolvedProviderCredential,
+        };
+        let key = ProviderKey::parse(provider);
+        let explicit_endpoint =
+            get_from_map(&self.base_urls, provider, key).map(ProviderEndpoint::new);
+        if let Some(api_key) = get_from_map(&self.api_keys, provider, key) {
+            return Ok(Some(ResolvedProviderCredential {
+                material: CredentialMaterial::ApiKey(ProviderApiKey::new(api_key)),
+                endpoint: explicit_endpoint,
+            }));
+        }
+        if let Some(record) = self
+            .stored_credential(provider)
+            .map_err(|_| AuthError::Io("provider credential store could not be read".into()))?
+        {
+            return Ok(Some(ResolvedProviderCredential {
+                material: CredentialMaterial::ApiKey(record.api_key),
+                endpoint: explicit_endpoint.or(record.endpoint),
+            }));
+        }
+        let Some(store_key) = key.and_then(ProviderKey::token_store_key) else {
+            return Ok(None);
+        };
+        let Some(store) = self.token_store.as_ref() else {
+            return Ok(None);
+        };
+        Ok(store
+            .load(store_key, "default")?
+            .map(|token| ResolvedProviderCredential {
+                material: CredentialMaterial::OAuth(token),
+                endpoint: explicit_endpoint,
+            }))
+    }
+
     /// Create empty config with default file-backed token store.
     pub fn new() -> Self {
+        let token_store: Option<Arc<dyn TokenStore>> =
+            Some(Arc::new(crate::auth::store::FileTokenStore::new_default()));
+        let credential_store = default_provider_credential_store();
         Self {
+            account: "default".into(),
+            raw_token_store: token_store.clone(),
+            raw_credential_store: credential_store.clone(),
             api_keys: Arc::new(RwLock::new(HashMap::new())),
             base_urls: Arc::new(RwLock::new(HashMap::new())),
             account_ids: Arc::new(RwLock::new(HashMap::new())),
-            token_store: Some(Arc::new(crate::auth::store::FileTokenStore::new_default())),
-            provider_credential_store: default_provider_credential_store(),
+            token_store,
+            provider_credential_store: credential_store,
         }
     }
 
     /// Create config with a specific token store (or `None` to disable fallback).
     pub fn with_token_store(mut self, store: Option<Arc<dyn TokenStore>>) -> Self {
-        self.token_store = store;
+        self.raw_token_store = store.map(|store| store.unscoped_store().unwrap_or(store));
+        self.scope_stores();
         self
+    }
+
+    /// Select a named account for login and execution. No default-account fallback.
+    ///
+    /// Nondefault selection clears environment/in-process keys so another account
+    /// cannot silently shadow this selection. Set explicit overrides afterwards.
+    pub fn with_account(
+        mut self,
+        account: impl Into<String>,
+    ) -> Result<Self, crate::auth::AuthError> {
+        let account = account.into();
+        crate::auth::account::validate_account(&account)?;
+        if account != self.account {
+            self.api_keys = Arc::new(RwLock::new(HashMap::new()));
+            self.account_ids = Arc::new(RwLock::new(HashMap::new()));
+        }
+        self.account = account;
+        self.scope_stores();
+        Ok(self)
+    }
+
+    /// Account namespace selected for this configuration and its agent sessions.
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    fn scope_stores(&mut self) {
+        self.token_store = self.raw_token_store.as_ref().map(|inner| {
+            Arc::new(crate::auth::account::AccountTokenStore {
+                inner: inner.clone(),
+                account: self.account.clone(),
+            }) as Arc<dyn TokenStore>
+        });
+        self.provider_credential_store = self.raw_credential_store.as_ref().map(|inner| {
+            Arc::new(crate::auth::account::AccountCredentialStore {
+                inner: inner.clone(),
+                account: self.account.clone(),
+            }) as Arc<dyn ProviderCredentialStore>
+        });
     }
 
     /// Access the underlying token store (if configured).
@@ -142,7 +233,8 @@ impl RociConfig {
         mut self,
         store: Option<Arc<dyn ProviderCredentialStore>>,
     ) -> Self {
-        self.provider_credential_store = store;
+        self.raw_credential_store = store.map(|store| store.unscoped_store().unwrap_or(store));
+        self.scope_stores();
         self
     }
 
@@ -213,71 +305,6 @@ impl RociConfig {
             .insert(provider.to_string(), key);
     }
 
-    /// Resolve an API key and associated base URL from one credential snapshot.
-    ///
-    /// Checks explicit/environment values, one protected provider-record load,
-    /// then the existing OAuth token-store alias only when no provider record
-    /// exists. A protected-store failure is logged and stops fallback. Provider
-    /// constructors should use this pair API so concurrent record replacement
-    /// cannot mix key and endpoint versions.
-    pub fn get_api_key_and_base_url(&self, provider: &str) -> (Option<String>, Option<String>) {
-        let provider_key = ProviderKey::parse(provider);
-        let explicit_api_key = get_from_map(&self.api_keys, provider, provider_key);
-        let explicit_base_url = get_from_map(&self.base_urls, provider, provider_key);
-        if explicit_api_key.is_some() {
-            return (explicit_api_key, explicit_base_url);
-        }
-
-        let stored = match self.stored_credential(provider) {
-            Ok(stored) => stored,
-            Err(error) => {
-                tracing::warn!(%error, "failed to load protected provider credentials");
-                return (None, explicit_base_url);
-            }
-        };
-        let stored_api_key = stored
-            .as_ref()
-            .map(|record| record.api_key.expose_secret().to_string());
-        let stored_base_url = stored
-            .and_then(|record| record.endpoint)
-            .map(|endpoint| endpoint.as_str().to_string());
-        let oauth_api_key = if stored_api_key.is_some() {
-            None
-        } else {
-            self.token_store.as_ref().and_then(|store| {
-                let store_key = provider_key.and_then(ProviderKey::token_store_key)?;
-                store
-                    .load(store_key, "default")
-                    .ok()
-                    .flatten()
-                    .filter(crate::auth::token::Token::is_valid)
-                    .map(|token| token.access_token)
-            })
-        };
-
-        (
-            stored_api_key.or(oauth_api_key),
-            explicit_base_url.or(stored_base_url),
-        )
-    }
-
-    /// Resolve an API key and associated base URL for a typed provider key.
-    pub fn get_api_key_and_base_url_for(
-        &self,
-        provider: ProviderKey,
-    ) -> (Option<String>, Option<String>) {
-        self.get_api_key_and_base_url(provider.as_str())
-    }
-
-    /// Resolve an API key for a provider.
-    pub fn get_api_key(&self, provider: &str) -> Option<String> {
-        self.get_api_key_and_base_url(provider).0
-    }
-
-    pub fn get_api_key_for(&self, provider: ProviderKey) -> Option<String> {
-        self.get_api_key_and_base_url_for(provider).0
-    }
-
     pub fn set_base_url(&self, provider: &str, url: String) {
         self.base_urls
             .write()
@@ -285,12 +312,26 @@ impl RociConfig {
             .insert(provider.to_string(), url);
     }
 
-    pub fn get_base_url(&self, provider: &str) -> Option<String> {
-        self.get_api_key_and_base_url(provider).1
-    }
-
-    pub fn get_base_url_for(&self, provider: ProviderKey) -> Option<String> {
-        self.get_api_key_and_base_url_for(provider).1
+    /// Resolve an endpoint for a provider that does not require credentials.
+    ///
+    /// Authenticated callers must use the endpoint returned with
+    /// [`Self::resolve_provider_credential`] to keep key and endpoint paired.
+    pub fn resolve_provider_endpoint(
+        &self,
+        provider: &str,
+    ) -> Result<Option<crate::auth::ProviderEndpoint>, crate::auth::AuthError> {
+        let key = ProviderKey::parse(provider);
+        if let Some(endpoint) = get_from_map(&self.base_urls, provider, key) {
+            return Ok(Some(crate::auth::ProviderEndpoint::new(endpoint)));
+        }
+        if get_from_map(&self.api_keys, provider, key).is_some() {
+            return Ok(None);
+        }
+        self.stored_credential(provider)
+            .map(|record| record.and_then(|record| record.endpoint))
+            .map_err(|_| {
+                crate::auth::AuthError::Io("provider credential store could not be read".into())
+            })
     }
 
     pub fn set_account_id(&self, provider: &str, account_id: String) {
@@ -310,7 +351,15 @@ impl RociConfig {
 
     /// Check if a provider has credentials configured (explicit key or token store).
     pub fn has_credentials(&self, provider: &str) -> bool {
-        self.get_api_key(provider).is_some()
+        self.resolve_provider_credential(provider)
+            .ok()
+            .flatten()
+            .is_some_and(|credential| match credential.material {
+                crate::auth::CredentialMaterial::ApiKey(_) => true,
+                crate::auth::CredentialMaterial::OAuth(token) => {
+                    token.is_valid() || token.refresh_token.is_some()
+                }
+            })
     }
 
     /// True when an explicit/env API key is set (ignores all stored fallback).
@@ -342,6 +391,25 @@ impl RociConfig {
         };
         store.load(canonical)
     }
+}
+
+#[cfg(test)]
+fn resolved_secret(config: &RociConfig, provider: &str) -> Option<String> {
+    config
+        .resolve_provider_credential(provider)
+        .unwrap()
+        .map(|credential| match credential.material {
+            crate::auth::CredentialMaterial::ApiKey(key) => key.expose_secret().to_owned(),
+            crate::auth::CredentialMaterial::OAuth(token) => token.access_token,
+        })
+}
+
+#[cfg(test)]
+fn resolved_endpoint(config: &RociConfig, provider: &str) -> Option<String> {
+    config
+        .resolve_provider_endpoint(provider)
+        .unwrap()
+        .map(|url| url.as_str().to_owned())
 }
 
 #[cfg(test)]
@@ -429,6 +497,25 @@ mod tests {
         fn clear(&self, _provider: &str, _profile: &str) -> Result<(), crate::auth::AuthError> {
             Ok(())
         }
+
+        fn save_if_current(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&Token>,
+            _: &Token,
+        ) -> Result<bool, crate::auth::AuthError> {
+            panic!("credential lookup test must not refresh tokens")
+        }
+
+        fn try_acquire_refresh_lease(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<Box<dyn crate::auth::store::TokenRefreshLease>>, crate::auth::AuthError>
+        {
+            panic!("credential lookup test must not acquire leases")
+        }
     }
 
     struct FailingLoadCredentialStore;
@@ -456,6 +543,7 @@ mod tests {
 
     fn make_token(access_token: &str, expires_at: Option<chrono::DateTime<Utc>>) -> Token {
         Token {
+            provider_metadata: None,
             access_token: access_token.to_string(),
             refresh_token: None,
             id_token: None,
@@ -475,7 +563,7 @@ mod tests {
 
         let config = config_with_temp_store(dir.path());
 
-        assert_eq!(config.get_api_key("openai"), None);
+        assert_eq!(resolved_secret(&config, "openai"), None);
     }
 
     #[test]
@@ -488,7 +576,7 @@ mod tests {
         let config = config_with_temp_store(dir.path());
 
         assert_eq!(
-            config.get_api_key("codex"),
+            resolved_secret(&config, "codex"),
             Some("oauth-access-token".to_string()),
         );
     }
@@ -510,9 +598,7 @@ mod tests {
             .with_token_store(Some(token_store))
             .with_provider_credential_store(Some(Arc::new(FailingLoadCredentialStore)));
 
-        let credentials = config.get_api_key_and_base_url("anthropic");
-
-        assert_eq!(credentials, (None, None));
+        assert!(config.resolve_provider_credential("anthropic").is_err());
     }
 
     #[test]
@@ -526,13 +612,13 @@ mod tests {
         config.set_api_key("openai", "env-api-key".to_string());
 
         assert_eq!(
-            config.get_api_key("openai"),
+            resolved_secret(&config, "openai"),
             Some("env-api-key".to_string()),
         );
     }
 
     #[test]
-    fn expired_codex_token_in_store_returns_none() {
+    fn expired_codex_token_retains_oauth_identity() {
         let dir = TempDir::new().unwrap();
         let store = FileTokenStore::new(TokenStoreConfig::new(dir.path().to_path_buf()));
         let expired = Utc::now() - Duration::hours(1);
@@ -541,7 +627,13 @@ mod tests {
 
         let config = config_with_temp_store(dir.path());
 
-        assert_eq!(config.get_api_key("codex"), None);
+        let credential = config
+            .resolve_provider_credential("codex")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(credential.material, crate::auth::CredentialMaterial::OAuth(token) if token.access_token == "stale-token" && token.expires_at == Some(expired))
+        );
     }
 
     #[test]
@@ -554,7 +646,10 @@ mod tests {
 
         let config = config_with_temp_store(dir.path());
 
-        assert_eq!(config.get_api_key("codex"), Some("fresh-token".to_string()),);
+        assert_eq!(
+            resolved_secret(&config, "codex"),
+            Some("fresh-token".to_string()),
+        );
     }
 
     #[test]
@@ -574,7 +669,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = config_with_temp_store(dir.path());
 
-        assert_eq!(config.get_api_key("some-unknown-provider"), None);
+        assert_eq!(resolved_secret(&config, "some-unknown-provider"), None);
     }
 
     #[test]
@@ -583,7 +678,7 @@ mod tests {
             .with_token_store(None)
             .with_provider_credential_store(None);
 
-        assert_eq!(config.get_api_key("openai"), None);
+        assert_eq!(resolved_secret(&config, "openai"), None);
     }
 
     #[test]
@@ -596,7 +691,7 @@ mod tests {
         let config = config_with_temp_store(dir.path());
 
         assert_eq!(
-            config.get_api_key("anthropic"),
+            resolved_secret(&config, "anthropic"),
             Some("claude-oauth-token".to_string()),
         );
     }
@@ -611,7 +706,7 @@ mod tests {
         let config = config_with_temp_store(dir.path());
 
         assert_eq!(
-            config.get_api_key("github-copilot"),
+            resolved_secret(&config, "github-copilot"),
             Some("copilot-token".to_string()),
         );
     }
@@ -631,7 +726,17 @@ mod tests {
         });
         let config = config_with_credential_store(store.clone());
 
-        let credentials = config.get_api_key_and_base_url("anthropic");
+        let credential = config
+            .resolve_provider_credential("anthropic")
+            .unwrap()
+            .unwrap();
+        let crate::auth::CredentialMaterial::ApiKey(key) = credential.material else {
+            panic!("expected API key")
+        };
+        let credentials = (
+            Some(key.expose_secret().to_owned()),
+            credential.endpoint.map(|url| url.as_str().to_owned()),
+        );
 
         assert_eq!(
             credentials,
@@ -659,7 +764,10 @@ mod tests {
             .with_token_store(Some(token_store.clone()))
             .with_provider_credential_store(Some(credential_store));
 
-        assert_eq!(config.get_api_key("anthropic"), Some("stored-key".into()));
+        assert_eq!(
+            resolved_secret(&config, "anthropic"),
+            Some("stored-key".into())
+        );
         assert_eq!(
             token_store.loads.load(std::sync::atomic::Ordering::SeqCst),
             0
@@ -682,9 +790,12 @@ mod tests {
         config.set_api_key("anthropic", "explicit-key".into());
         config.set_base_url("anthropic", "https://explicit.example".into());
 
-        assert_eq!(config.get_api_key("anthropic"), Some("explicit-key".into()));
         assert_eq!(
-            config.get_base_url("anthropic"),
+            resolved_secret(&config, "anthropic"),
+            Some("explicit-key".into())
+        );
+        assert_eq!(
+            resolved_endpoint(&config, "anthropic"),
             Some("https://explicit.example".into())
         );
         assert!(config.has_explicit_api_key("anthropic"));
@@ -706,8 +817,11 @@ mod tests {
         let config = config_with_credential_store(store);
         config.set_api_key("anthropic", "explicit-key".into());
 
-        assert_eq!(config.get_api_key("anthropic"), Some("explicit-key".into()));
-        assert_eq!(config.get_base_url("anthropic"), None);
+        assert_eq!(
+            resolved_secret(&config, "anthropic"),
+            Some("explicit-key".into())
+        );
+        assert_eq!(resolved_endpoint(&config, "anthropic"), None);
     }
 
     #[test]
@@ -730,9 +844,12 @@ mod tests {
             .with_token_store(Some(token_store))
             .with_provider_credential_store(Some(credential_store));
 
-        assert_eq!(config.get_api_key("anthropic"), Some("stored-key".into()));
         assert_eq!(
-            config.get_base_url("anthropic"),
+            resolved_secret(&config, "anthropic"),
+            Some("stored-key".into())
+        );
+        assert_eq!(
+            resolved_endpoint(&config, "anthropic"),
             Some("https://stored.example".into())
         );
     }
@@ -808,7 +925,7 @@ mod tests {
             .with_token_store(None)
             .with_provider_credential_store(Some(Arc::new(store)));
         assert_eq!(
-            config.get_api_key("openai"),
+            resolved_secret(&config, "openai"),
             Some("file-default-secret".into())
         );
         let config_debug = format!("{config:?}");
@@ -824,5 +941,148 @@ mod tests {
 
         let store = OsProviderCredentialStore::new();
         assert_eq!(format!("{store:?}"), "OsProviderCredentialStore(..)");
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use crate::auth::{FileTokenStore, ProviderApiKey, Token, TokenStoreConfig};
+
+    #[test]
+    fn named_accounts_isolate_tokens_keys_logout_and_refresh_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+            dir.path().to_owned(),
+        )));
+        let base = RociConfig::new().with_token_store(Some(tokens));
+        let work = base.clone().with_account("work").unwrap();
+        let personal = base.clone().with_account("personal").unwrap();
+        let token = Token {
+            access_token: "work-token".into(),
+            refresh_token: Some("refresh".into()),
+            id_token: None,
+            expires_at: None,
+            last_refresh: None,
+            scopes: None,
+            account_id: None,
+            provider_metadata: None,
+        };
+        work.token_store()
+            .unwrap()
+            .save("openai-codex", "default", &token)
+            .unwrap();
+        assert!(work.resolve_provider_credential("codex").unwrap().is_some());
+        assert!(personal
+            .resolve_provider_credential("codex")
+            .unwrap()
+            .is_none());
+        assert!(base.resolve_provider_credential("codex").unwrap().is_none());
+        let key = ProviderCredentialRecord::new(ProviderApiKey::new("work-key"), None);
+        work.provider_credential_store()
+            .unwrap()
+            .save("openai", &key)
+            .unwrap();
+        assert!(work.has_credentials("openai"));
+        assert!(!personal.has_credentials("openai"));
+        assert!(!base.has_credentials("openai"));
+        personal
+            .token_store()
+            .unwrap()
+            .clear("openai-codex", "default")
+            .unwrap();
+        assert!(work.has_credentials("codex"));
+        work.token_store()
+            .unwrap()
+            .clear("openai-codex", "default")
+            .unwrap();
+        assert!(!work
+            .token_store()
+            .unwrap()
+            .save_if_current("openai-codex", "default", Some(&token), &token)
+            .unwrap());
+    }
+
+    #[test]
+    fn selecting_missing_account_never_uses_environment_or_another_account() {
+        let config = RociConfig::new()
+            .with_token_store(None)
+            .with_provider_credential_store(None);
+        config.set_api_key("openai", "default-key".into());
+        let work = config.clone().with_account("work").unwrap();
+        assert!(!work.has_credentials("openai"));
+        assert!(config.has_credentials("openai"));
+        for invalid in ["", "../work", "WORK", "work_home", "---", " work"] {
+            assert!(config.clone().with_account(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn reinjected_account_facades_can_be_rebound_without_nested_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_token = |access: &str, _expiry: Option<chrono::DateTime<chrono::Utc>>| {
+            serde_json::from_value::<Token>(serde_json::json!({"access_token":access})).unwrap()
+        };
+        let raw_tokens = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+            dir.path().into(),
+        )));
+        raw_tokens
+            .save("claude-code", "work", &make_token("work-oauth", None))
+            .unwrap();
+        raw_tokens
+            .save(
+                "claude-code",
+                "personal",
+                &make_token("personal-oauth", None),
+            )
+            .unwrap();
+        let raw_credentials = Arc::new(InMemoryProviderCredentialStore::default());
+        raw_credentials
+            .save(
+                "google@work",
+                &ProviderCredentialRecord::new(ProviderApiKey::new("work-key"), None),
+            )
+            .unwrap();
+        raw_credentials
+            .save(
+                "google@personal",
+                &ProviderCredentialRecord::new(ProviderApiKey::new("personal-key"), None),
+            )
+            .unwrap();
+        let work = RociConfig::new()
+            .with_token_store(Some(raw_tokens))
+            .with_provider_credential_store(Some(raw_credentials))
+            .with_account("work")
+            .unwrap();
+        let personal = RociConfig::new()
+            .with_token_store(work.token_store().cloned())
+            .with_provider_credential_store(work.provider_credential_store().cloned())
+            .with_account("personal")
+            .unwrap();
+        assert_eq!(
+            resolved_secret(&work, "anthropic").as_deref(),
+            Some("work-oauth")
+        );
+        assert_eq!(
+            resolved_secret(&personal, "anthropic").as_deref(),
+            Some("personal-oauth")
+        );
+        assert_eq!(
+            resolved_secret(&work, "google").as_deref(),
+            Some("work-key")
+        );
+        assert_eq!(
+            resolved_secret(&personal, "google").as_deref(),
+            Some("personal-key")
+        );
+        assert_ne!(
+            work.token_store()
+                .unwrap()
+                .refresh_coordination_identity("default"),
+            personal
+                .token_store()
+                .unwrap()
+                .refresh_coordination_identity("default")
+        );
     }
 }

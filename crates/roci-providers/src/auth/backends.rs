@@ -13,7 +13,7 @@ use roci_core::auth::{
 
 use super::claude_code::{ClaudeCodeAuth, PkceSession};
 use super::github_copilot::GitHubCopilotAuth;
-use super::openai_codex::OpenAiCodexAuth;
+use super::openai_codex::{CodexPkceSession, OpenAiCodexAuth};
 
 // ---------------------------------------------------------------------------
 // GitHub Copilot
@@ -33,6 +33,10 @@ impl AuthBackend for GitHubCopilotBackend {
 
     fn store_key(&self) -> &str {
         "github-copilot"
+    }
+
+    fn runtime_store_key(&self) -> &str {
+        "github-copilot-api"
     }
 
     fn canonical_provider_key(&self) -> &str {
@@ -68,6 +72,7 @@ impl AuthBackend for GitHubCopilotBackend {
         if let AuthPollResult::Authorized { .. } = &result {
             let copilot_token = auth.exchange_copilot_token().await?;
             let api_token = Token {
+                provider_metadata: None,
                 access_token: copilot_token.token,
                 refresh_token: None,
                 id_token: None,
@@ -87,6 +92,7 @@ impl AuthBackend for GitHubCopilotBackend {
         _store: &Arc<dyn TokenStore>,
         _code: &str,
         _state: &str,
+        _session_data: &serde_json::Value,
     ) -> Result<Token, AuthError> {
         Err(AuthError::Unsupported(
             "GitHub Copilot uses device-code flow, not PKCE".into(),
@@ -127,6 +133,48 @@ pub struct OpenAiCodexBackend;
 
 #[async_trait]
 impl AuthBackend for OpenAiCodexBackend {
+    fn oauth_flows(&self) -> Vec<CredentialFlow> {
+        vec![CredentialFlow::DeviceCode, CredentialFlow::Pkce]
+    }
+
+    async fn start_login_with_flow(
+        &self,
+        store: &Arc<dyn TokenStore>,
+        flow: CredentialFlow,
+    ) -> Result<AuthStep, AuthError> {
+        match flow {
+            CredentialFlow::DeviceCode => self.start_login(store).await,
+            CredentialFlow::Pkce => {
+                let session = OpenAiCodexAuth::new(store.clone()).start_browser_login()?;
+                Ok(AuthStep::Pkce {
+                    authorize_url: session.authorize_url.clone(),
+                    state: session.state.clone(),
+                    session_data: serde_json::to_value(session)?,
+                })
+            }
+            _ => Err(AuthError::Unsupported(
+                "Codex supports device-code and PKCE login".into(),
+            )),
+        }
+    }
+
+    async fn complete_pkce(
+        &self,
+        store: &Arc<dyn TokenStore>,
+        code: &str,
+        state: &str,
+        session_data: &serde_json::Value,
+    ) -> Result<Token, AuthError> {
+        let session: CodexPkceSession = serde_json::from_value(session_data.clone())?;
+        if session.state != state {
+            return Err(AuthError::InvalidResponse(
+                "Codex login session state mismatch".into(),
+            ));
+        }
+        OpenAiCodexAuth::new(store.clone())
+            .complete_browser_login(&session, code)
+            .await
+    }
     fn aliases(&self) -> &[&str] {
         &["chatgpt", "codex", "openai-codex"]
     }
@@ -143,15 +191,16 @@ impl AuthBackend for OpenAiCodexBackend {
         "codex"
     }
 
+    fn import_credentials(&self, store: &Arc<dyn TokenStore>) -> Result<Option<Token>, AuthError> {
+        OpenAiCodexAuth::new(store.clone()).import_codex_auth_json(None)
+    }
+
     fn oauth_flow(&self) -> CredentialFlow {
         CredentialFlow::DeviceCode
     }
 
     async fn start_login(&self, store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
         let auth = OpenAiCodexAuth::new(store.clone());
-        if let Ok(Some(token)) = auth.import_codex_auth_json(None) {
-            return Ok(AuthStep::Imported { token });
-        }
         let session = auth.start_device_code().await?;
         Ok(AuthStep::DeviceCode {
             verification_url: session.verification_url.clone(),
@@ -170,17 +219,6 @@ impl AuthBackend for OpenAiCodexBackend {
         let auth = OpenAiCodexAuth::new(store.clone());
         let result = auth.poll_device_code(session).await?;
         Ok(result)
-    }
-
-    async fn complete_pkce(
-        &self,
-        _store: &Arc<dyn TokenStore>,
-        _code: &str,
-        _state: &str,
-    ) -> Result<Token, AuthError> {
-        Err(AuthError::Unsupported(
-            "OpenAI Codex uses device-code flow, not PKCE".into(),
-        ))
     }
 
     fn get_status(&self, store: &Arc<dyn TokenStore>) -> Result<Option<Token>, AuthError> {
@@ -216,15 +254,16 @@ impl AuthBackend for ClaudeCodeBackend {
         "anthropic"
     }
 
+    fn import_credentials(&self, store: &Arc<dyn TokenStore>) -> Result<Option<Token>, AuthError> {
+        ClaudeCodeAuth::new(store.clone()).import_cli_credentials(None)
+    }
+
     fn oauth_flow(&self) -> CredentialFlow {
         CredentialFlow::Pkce
     }
 
     async fn start_login(&self, store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
         let auth = ClaudeCodeAuth::new(store.clone());
-        if let Ok(Some(token)) = auth.import_cli_credentials(None) {
-            return Ok(AuthStep::Imported { token });
-        }
         let session = auth.start_auth()?;
         Ok(AuthStep::Pkce {
             authorize_url: session.authorize_url.clone(),
@@ -245,27 +284,12 @@ impl AuthBackend for ClaudeCodeBackend {
 
     async fn complete_pkce(
         &self,
-        _store: &Arc<dyn TokenStore>,
-        _code: &str,
-        _state: &str,
-    ) -> Result<Token, AuthError> {
-        Err(AuthError::InvalidResponse(
-            "Claude PKCE requires session_data; use complete_pkce_with_session".into(),
-        ))
-    }
-
-    async fn complete_pkce_with_session(
-        &self,
         store: &Arc<dyn TokenStore>,
         code: &str,
         _state: &str,
-        session_data: Option<&serde_json::Value>,
+        session_data: &serde_json::Value,
     ) -> Result<Token, AuthError> {
-        let session = pkce_session_from_data(session_data.ok_or_else(|| {
-            AuthError::InvalidResponse(
-                "PKCE session_data is required to complete Claude login".into(),
-            )
-        })?)?;
+        let session = pkce_session_from_data(session_data)?;
         let auth = ClaudeCodeAuth::new(store.clone());
         auth.exchange_code(&session, code).await
     }
@@ -327,6 +351,69 @@ fn pkce_session_from_data(data: &serde_json::Value) -> Result<PkceSession, AuthE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn codex_exposes_both_flows_and_explicit_browser_login() {
+        use roci_core::auth::{
+            AuthService, FileTokenStore, HostAuthStep, ProviderAuthManager, TokenStoreConfig,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn TokenStore> = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+            dir.path().into(),
+        )));
+        let mut service = AuthService::new(store);
+        service.register_backend(Arc::new(OpenAiCodexBackend));
+        let mut registry = roci_core::provider::ProviderRegistry::new();
+        crate::register_default_providers(&mut registry);
+        let manager =
+            ProviderAuthManager::new(service, registry, roci_core::config::RociConfig::new())
+                .unwrap();
+        let status = manager.status("codex").unwrap();
+        assert!(status
+            .descriptor
+            .credential_flows
+            .contains(&CredentialFlow::DeviceCode));
+        assert!(status
+            .descriptor
+            .credential_flows
+            .contains(&CredentialFlow::Pkce));
+        let step = manager
+            .start_login_with_flow("openai-codex", CredentialFlow::Pkce)
+            .await
+            .unwrap();
+        assert!(matches!(step, HostAuthStep::Pkce { .. }));
+        assert!(!format!("{step:?}").contains("code_verifier"));
+        assert!(matches!(
+            manager
+                .start_login_with_flow("codex", CredentialFlow::BrowserPoll)
+                .await,
+            Err(AuthError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn copilot_logout_uses_derived_refresh_lease() {
+        use roci_core::auth::{AuthService, FileTokenStore, TokenStoreConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn TokenStore> = Arc::new(FileTokenStore::new(TokenStoreConfig::new(
+            dir.path().into(),
+        )));
+        let mut service = AuthService::new(store.clone());
+        service.register_backend(Arc::new(GitHubCopilotBackend));
+        let lease = store
+            .try_acquire_refresh_lease("github-copilot-api", "default")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            service.logout("copilot"),
+            Err(AuthError::RateLimited {
+                retry_after_ms: Some(100)
+            })
+        ));
+        drop(lease);
+        service.logout("copilot").unwrap();
+    }
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -340,6 +427,7 @@ mod tests {
 
     fn token(access_token: &str) -> Token {
         Token {
+            provider_metadata: None,
             access_token: access_token.to_string(),
             refresh_token: None,
             id_token: None,
@@ -365,6 +453,24 @@ mod tests {
     }
 
     impl TokenStore for FailingClearTokenStore {
+        fn save_if_current(
+            &self,
+            _provider: &str,
+            _profile: &str,
+            _expected: Option<&Token>,
+            _replacement: &Token,
+        ) -> Result<bool, AuthError> {
+            panic!("backend logout test must not refresh tokens")
+        }
+
+        fn try_acquire_refresh_lease(
+            &self,
+            _provider: &str,
+            _profile: &str,
+        ) -> Result<Option<Box<dyn roci_core::auth::TokenRefreshLease>>, AuthError> {
+            panic!("direct backend logout test must not acquire refresh leases")
+        }
+
         fn load(&self, provider: &str, profile: &str) -> Result<Option<Token>, AuthError> {
             Ok(self
                 .tokens
@@ -461,18 +567,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn claude_complete_pkce_requires_session_data() {
+    async fn claude_complete_pkce_rejects_invalid_session_data() {
         let (_dir, store) = temp_store();
         let backend = ClaudeCodeBackend;
         let result = backend
-            .complete_pkce_with_session(&store, "code", "state", None)
+            .complete_pkce(&store, "code", "state", &serde_json::Value::Null)
             .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             AuthError::InvalidResponse(msg) => {
                 assert!(
-                    msg.contains("session_data"),
-                    "error should mention session_data: {msg}"
+                    msg.contains("PKCE session data"),
+                    "error should identify invalid session data: {msg}"
                 );
             }
             other => panic!("expected InvalidResponse, got {other:?}"),

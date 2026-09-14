@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::ReasoningEffort;
+use crate::types::{GenerationSpeed, ReasoningEffort};
 
 const DEFAULT_IMAGE_MAX_IMAGES: usize = 20;
 const DEFAULT_IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
@@ -23,6 +23,9 @@ pub struct ModelCapabilities {
     /// Host-selectable reasoning effort options for this exact model.
     #[serde(default)]
     pub reasoning_effort: ReasoningEffortCapabilities,
+    /// Host-selectable execution speeds; empty when speed selection is unsupported.
+    #[serde(default)]
+    pub supported_speeds: Vec<GenerationSpeed>,
     pub supports_system_messages: bool,
     pub context_length: usize,
     pub max_output_tokens: Option<usize>,
@@ -190,6 +193,7 @@ impl Default for ModelCapabilities {
             supports_json_schema: false,
             supports_reasoning: false,
             reasoning_effort: ReasoningEffortCapabilities::default(),
+            supported_speeds: Vec::new(),
             supports_system_messages: true,
             context_length: 4096,
             max_output_tokens: None,

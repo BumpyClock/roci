@@ -125,6 +125,7 @@ async fn create_session(
     let store = LocalSessionStore::new(root.clone());
     let state = store
         .create(CreateSessionOptions {
+            credential_account: None,
             id,
             title: args.title,
             host_cwd: host_cwd.clone(),

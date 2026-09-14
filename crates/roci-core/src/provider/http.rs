@@ -60,7 +60,8 @@ pub fn parse_sse_data(line: &str) -> Option<&str> {
 /// Extract a retryable error from an HTTP status code.
 pub fn status_to_error(status: u16, body: &str) -> RociError {
     match status {
-        401 | 403 => RociError::Authentication(body.to_string()),
+        // Preserve status so auth recovery cannot confuse permission denial with stale tokens.
+        401 | 403 => RociError::api(status, body),
         429 => RociError::RateLimited {
             retry_after_ms: extract_retry_after(body),
         },

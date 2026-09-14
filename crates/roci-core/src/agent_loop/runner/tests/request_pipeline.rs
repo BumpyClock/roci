@@ -3,6 +3,69 @@ use super::*;
 use crate::tools::ToolPromptMetadata;
 
 #[tokio::test]
+async fn generation_speed_rejects_unsupported_requests_before_provider_call() {
+    use crate::types::GenerationSpeed;
+
+    for speed in [GenerationSpeed::Standard, GenerationSpeed::Fast] {
+        let (runner, requests) = test_runner(ProviderScenario::MissingOptionalFields);
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.settings.speed = Some(speed);
+
+        let result = timeout(
+            Duration::from_secs(2),
+            runner.start(request).await.unwrap().wait(),
+        )
+        .await
+        .expect("validation should terminate promptly");
+
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(result
+            .error
+            .unwrap()
+            .contains(&format!("does not support generation speed {speed}")));
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "unsupported settings must not reach provider"
+        );
+        assert!(result.usage_delta.is_none());
+    }
+}
+
+#[tokio::test]
+async fn generation_speed_forwards_supported_choices_and_unset_default() {
+    use crate::models::ModelCapabilities;
+    use crate::types::GenerationSpeed;
+
+    for speed in [
+        None,
+        Some(GenerationSpeed::Standard),
+        Some(GenerationSpeed::Fast),
+    ] {
+        let (runner, requests) = super::support::test_runner_with_capabilities(
+            ProviderScenario::MissingOptionalFields,
+            ModelCapabilities {
+                supported_speeds: speed.into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        let mut request = RunRequest::new(test_model(), vec![ModelMessage::user("hello")]);
+        request.settings.speed = speed;
+
+        let result = timeout(
+            Duration::from_secs(2),
+            runner.start(request).await.unwrap().wait(),
+        )
+        .await
+        .expect("supported request should complete");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].settings.speed, speed);
+    }
+}
+
+#[tokio::test]
 async fn no_panic_when_stream_optional_fields_missing() {
     let (runner, _requests) = test_runner(ProviderScenario::MissingOptionalFields);
     let (sink, _events) = capture_events();

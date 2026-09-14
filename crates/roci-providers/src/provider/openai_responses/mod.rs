@@ -44,11 +44,12 @@ impl OpenAiResponsesProvider {
     ) -> Self {
         let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let is_codex = base_url.contains("chatgpt.com/backend-api/codex");
-        let capabilities = if is_codex {
+        let mut capabilities = if is_codex {
             model.codex_capabilities()
         } else {
             model.capabilities()
         };
+        capabilities.supported_speeds = vec![GenerationSpeed::Standard, GenerationSpeed::Fast];
         Self {
             base_url,
             model,

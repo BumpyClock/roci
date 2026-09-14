@@ -15,6 +15,12 @@ const PKCE_SESSION_LIFETIME_MINUTES: i64 = 10;
 /// Internal pending login material that must never cross the manager boundary.
 #[derive(Clone)]
 pub(crate) enum PendingLogin {
+    BrowserPoll {
+        provider_alias: String,
+        canonical: String,
+        session_data: serde_json::Value,
+        expires_at: DateTime<Utc>,
+    },
     DeviceCode {
         provider_alias: String,
         canonical: String,
@@ -49,6 +55,7 @@ impl PendingLogin {
         match self {
             Self::DeviceCode { session, .. } => session.expires_at,
             Self::Pkce { expires_at, .. } => *expires_at,
+            Self::BrowserPoll { expires_at, .. } => *expires_at,
         }
     }
 }

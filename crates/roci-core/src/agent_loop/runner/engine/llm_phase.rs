@@ -130,6 +130,19 @@ pub(super) async fn run_llm_phase(args: LlmPhaseArgs<'_>) -> LlmPhaseOutcome {
         retry_started_at,
     } = args;
 
+    if let Some(speed) = request.settings.speed {
+        if !provider.capabilities().supported_speeds.contains(&speed) {
+            return LlmPhaseOutcome::Failed {
+                reason: format!(
+                    "{} does not support generation speed {speed}",
+                    provider.provider_name()
+                ),
+                assistant_message: None,
+                failure_category: FailureCategory::Configuration,
+            };
+        }
+    }
+
     while let Ok(message) = input_rx.try_recv() {
         emit_message_lifecycle(agent_emitter, &message);
         messages.push(message);

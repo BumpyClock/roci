@@ -143,18 +143,6 @@ pub trait ModelProvider: Send + Sync {
     }
 }
 
-/// Resolve an API key from config for the given provider, returning an
-/// authentication error with the specified message on failure.
-pub fn require_api_key(
-    config: &crate::config::RociConfig,
-    provider: crate::models::ProviderKey,
-    missing_message: &'static str,
-) -> Result<String, RociError> {
-    config
-        .get_api_key_for(provider)
-        .ok_or_else(|| RociError::Authentication(missing_message.to_string()))
-}
-
 /// Default typed overflow classification for
 /// [`ModelProvider::classify_overflow`].
 ///

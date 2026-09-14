@@ -13,6 +13,8 @@ pub mod anthropic;
 #[cfg(feature = "google")]
 pub mod google;
 
+#[cfg(feature = "cursor")]
+pub mod cursor;
 #[cfg(feature = "grok")]
 pub mod grok;
 #[cfg(feature = "groq")]
@@ -23,6 +25,8 @@ pub mod lmstudio;
 pub mod mistral;
 #[cfg(feature = "ollama")]
 pub mod ollama;
+#[cfg(feature = "grok")]
+pub mod xai;
 
 #[cfg(feature = "anthropic-compatible")]
 pub mod anthropic_compatible;
@@ -37,3 +41,6 @@ pub mod azure;
 pub mod openrouter;
 #[cfg(feature = "together")]
 pub mod together;
+
+#[cfg(feature = "google")]
+pub mod gemini_cli;

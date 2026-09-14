@@ -17,6 +17,8 @@ pub struct GenerationSettings {
     pub frequency_penalty: Option<f64>,
     pub seed: Option<u64>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Provider execution speed preference; independent of reasoning effort.
+    pub speed: Option<GenerationSpeed>,
     pub text_verbosity: Option<TextVerbosity>,
     pub response_format: Option<ResponseFormat>,
     pub openai_responses: Option<OpenAiResponsesOptions>,
@@ -25,6 +27,15 @@ pub struct GenerationSettings {
     pub tool_choice: Option<ToolChoice>,
     pub user: Option<String>,
     pub stream_idle_timeout_ms: Option<u64>,
+}
+
+/// Execution speed preference for providers that support service tiers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum GenerationSpeed {
+    Standard,
+    Fast,
 }
 
 /// OpenAI Responses API request options.
@@ -194,4 +205,40 @@ pub enum FinishReason {
     ToolCalls,
     ContentFilter,
     Error,
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+
+    #[test]
+    fn generation_speed_preserves_wire_and_cli_values() {
+        for (speed, value) in [
+            (GenerationSpeed::Standard, "standard"),
+            (GenerationSpeed::Fast, "fast"),
+        ] {
+            let settings = GenerationSettings::builder()
+                .speed(speed)
+                .reasoning_effort(ReasoningEffort::High)
+                .build();
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(json["speed"], value);
+            assert_eq!(json["reasoning_effort"], "high");
+            let restored: GenerationSettings = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.speed, Some(speed));
+            assert_eq!(speed.to_string(), value);
+            assert_eq!(value.parse::<GenerationSpeed>().unwrap(), speed);
+        }
+        assert!("priority".parse::<GenerationSpeed>().is_err());
+        let legacy: GenerationSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.speed, None);
+    }
+
+    #[test]
+    fn legacy_capabilities_default_to_no_speed_selection() {
+        let mut json = serde_json::to_value(crate::models::ModelCapabilities::default()).unwrap();
+        json.as_object_mut().unwrap().remove("supported_speeds");
+        let restored: crate::models::ModelCapabilities = serde_json::from_value(json).unwrap();
+        assert!(restored.supported_speeds.is_empty());
+    }
 }

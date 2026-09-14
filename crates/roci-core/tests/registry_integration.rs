@@ -51,6 +51,7 @@ impl ProviderFactory for MockFactory {
                 supports_json_mode: false,
                 supports_json_schema: false,
                 supports_reasoning: false,
+                supported_speeds: Vec::new(),
                 reasoning_effort: Default::default(),
                 supports_system_messages: true,
                 context_length: 4096,
@@ -138,6 +139,7 @@ impl AuthBackend for MockAuthBackend {
 
     async fn start_login(&self, _store: &Arc<dyn TokenStore>) -> Result<AuthStep, AuthError> {
         let token = Token {
+            provider_metadata: None,
             access_token: format!("mock-token-{}", self.store_key),
             refresh_token: None,
             id_token: None,
@@ -162,6 +164,7 @@ impl AuthBackend for MockAuthBackend {
         _store: &Arc<dyn TokenStore>,
         _code: &str,
         _state: &str,
+        _session_data: &serde_json::Value,
     ) -> Result<Token, AuthError> {
         Err(AuthError::Unsupported("mock backend".into()))
     }

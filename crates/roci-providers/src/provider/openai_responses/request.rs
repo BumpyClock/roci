@@ -16,6 +16,10 @@ const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Roci, a helpful assistant.";
 const RESPONSES_PROXY_BASE_URL_ENV: &str = "ROCI_OPENAI_RESPONSES_PROXY_BASE_URL";
 
 impl OpenAiResponsesProvider {
+    fn custom_codex_model(&self) -> bool {
+        self.is_codex && matches!(self.model, crate::models::openai::OpenAiModel::Custom(_))
+    }
+
     fn effective_reasoning_effort(&self, settings: &GenerationSettings) -> Option<ReasoningEffort> {
         settings
             .reasoning_effort
@@ -23,8 +27,23 @@ impl OpenAiResponsesProvider {
     }
 
     pub(crate) fn validate_settings(&self, settings: &GenerationSettings) -> Result<(), RociError> {
+        if let (Some(speed), Some(tier)) = (
+            settings.speed,
+            settings
+                .openai_responses
+                .as_ref()
+                .and_then(|options| options.service_tier),
+        ) {
+            if service_tier_for_speed(speed) != tier {
+                return Err(RociError::InvalidArgument(format!(
+                    "speed {speed} conflicts with OpenAI Responses service tier {tier}"
+                )));
+            }
+        }
         if let Some(effort) = settings.reasoning_effort {
-            if !self.capabilities.supports_reasoning_effort(effort) {
+            // The account catalog can introduce models before the SDK's enums.
+            // Let Codex validate explicit typed efforts for those unknown IDs.
+            if !self.custom_codex_model() && !self.capabilities.supports_reasoning_effort(effort) {
                 return Err(RociError::InvalidArgument(format!(
                     "reasoning effort {effort} not supported for model {}",
                     self.model.as_str()
@@ -218,16 +237,18 @@ impl OpenAiResponsesProvider {
             obj.insert("top_p".into(), top_p.into());
         }
 
-        let needs_reasoning = self.model.is_reasoning() || self.model.is_gpt5_family();
+        let needs_reasoning = self.model.is_reasoning()
+            || self.model.is_gpt5_family()
+            || (self.custom_codex_model() && request.settings.reasoning_effort.is_some());
         if needs_reasoning {
             if let Some(effort) = self.effective_reasoning_effort(&request.settings) {
-                obj.insert(
-                    "reasoning".into(),
-                    serde_json::json!({
-                        "effort": effort.to_string(),
-                        "summary": "auto",
-                    }),
-                );
+                let mut reasoning = serde_json::json!({"effort": effort.to_string()});
+                // Unknown account models may not support reasoning summaries.
+                // Forward only the requested effort instead of guessing support.
+                if !self.custom_codex_model() {
+                    reasoning["summary"] = "auto".into();
+                }
+                obj.insert("reasoning".into(), reasoning);
             }
         }
     }
@@ -267,6 +288,13 @@ impl OpenAiResponsesProvider {
     ) {
         if let Some(ref user) = request.settings.user {
             obj.insert("user".into(), user.clone().into());
+        }
+
+        if let Some(speed) = request.settings.speed {
+            obj.insert(
+                "service_tier".into(),
+                service_tier_for_speed(speed).to_string().into(),
+            );
         }
 
         if let Some(ref options) = request.settings.openai_responses {
@@ -434,5 +462,12 @@ impl OpenAiResponsesProvider {
         } else {
             normalized
         }
+    }
+}
+
+fn service_tier_for_speed(speed: GenerationSpeed) -> OpenAiServiceTier {
+    match speed {
+        GenerationSpeed::Standard => OpenAiServiceTier::Default,
+        GenerationSpeed::Fast => OpenAiServiceTier::Priority,
     }
 }

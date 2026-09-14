@@ -9,11 +9,14 @@ name = "roci-agent"
 path = "src/main.rs"
 
 [dependencies]
+url = "2"
 roci = { path = "../..", features = [
   "agent",
   "audio",
   "mcp",
   "github-copilot",
+  "grok",
+  "cursor",
 ] }
 roci-tools = { path = "../roci-tools", features = ["agent"] }
 clap = { version = "4", features = ["derive"] }

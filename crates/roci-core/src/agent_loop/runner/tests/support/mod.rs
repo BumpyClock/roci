@@ -182,13 +182,19 @@ impl ModelProvider for StubProvider {
 pub(super) fn test_runner(
     scenario: ProviderScenario,
 ) -> (LoopRunner, Arc<std::sync::Mutex<Vec<ProviderRequest>>>) {
+    test_runner_with_capabilities(scenario, ModelCapabilities::default())
+}
+
+pub(super) fn test_runner_with_capabilities(
+    scenario: ProviderScenario,
+    capabilities: ModelCapabilities,
+) -> (LoopRunner, Arc<std::sync::Mutex<Vec<ProviderRequest>>>) {
     let requests = Arc::new(std::sync::Mutex::new(Vec::<ProviderRequest>::new()));
     let provider_requests = requests.clone();
     let factory: ProviderFactory = Arc::new(move |_model, _config| {
-        Ok(Box::new(StubProvider::new(
-            scenario,
-            provider_requests.clone(),
-        )))
+        let mut provider = StubProvider::new(scenario, provider_requests.clone());
+        provider.capabilities = capabilities.clone();
+        Ok(Box::new(provider))
     });
     (
         LoopRunner::with_provider_factory(RociConfig::new(), factory),

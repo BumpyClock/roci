@@ -8,6 +8,7 @@ pub enum ProviderKey {
     Anthropic,
     Google,
     Grok,
+    Cursor,
     Groq,
     Mistral,
     Ollama,
@@ -26,6 +27,7 @@ impl ProviderKey {
             Self::Anthropic => "anthropic",
             Self::Google => "google",
             Self::Grok => "grok",
+            Self::Cursor => "cursor",
             Self::Groq => "groq",
             Self::Mistral => "mistral",
             Self::Ollama => "ollama",
@@ -44,6 +46,7 @@ impl ProviderKey {
             "anthropic" | "claude" => Some(Self::Anthropic),
             "google" | "gemini" => Some(Self::Google),
             "grok" | "xai" => Some(Self::Grok),
+            "cursor" => Some(Self::Cursor),
             "groq" => Some(Self::Groq),
             "mistral" => Some(Self::Mistral),
             "ollama" => Some(Self::Ollama),
@@ -62,6 +65,7 @@ impl ProviderKey {
             Self::OpenAiCompatible => &["openai-compatible", "openai_compatible"],
             Self::GitHubCopilot => &["github-copilot", "github_copilot", "copilot"],
             Self::Grok => &["grok", "xai"],
+            Self::Cursor => &["cursor"],
             Self::OpenAi => &["openai"],
             Self::Anthropic => &["anthropic"],
             Self::Google => &["google"],
@@ -76,9 +80,12 @@ impl ProviderKey {
     /// Token store key for OAuth-backed providers.
     pub const fn token_store_key(self) -> Option<&'static str> {
         match self {
+            Self::Google => Some("gemini"),
             Self::Codex => Some("openai-codex"),
             Self::Anthropic => Some("claude-code"),
             Self::GitHubCopilot => Some("github-copilot"),
+            Self::Grok => Some("xai"),
+            Self::Cursor => Some("cursor"),
             _ => None,
         }
     }

@@ -19,13 +19,34 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Auth(auth_args) => match auth_args.command {
-            AuthCommands::Login(args) => cli::auth::handle_login(&args.provider).await,
-            AuthCommands::Status(args) => cli::auth::handle_status(args.json).await,
-            AuthCommands::Logout(args) => cli::auth::handle_logout(&args.provider).await,
-            AuthCommands::Configure(args) => {
-                cli::auth::handle_configure(&args.provider, args.endpoint.as_deref()).await
+            AuthCommands::Login(args) => {
+                cli::auth::handle_login(
+                    &args.provider,
+                    &auth_args.account,
+                    args.flow.map(Into::into),
+                )
+                .await
             }
-            AuthCommands::Providers(args) => cli::auth::handle_providers(args.json).await,
+            AuthCommands::Import(args) => {
+                cli::auth::handle_import(&args.provider, &auth_args.account).await
+            }
+            AuthCommands::Status(args) => {
+                cli::auth::handle_status(args.json, &auth_args.account).await
+            }
+            AuthCommands::Logout(args) => {
+                cli::auth::handle_logout(&args.provider, &auth_args.account).await
+            }
+            AuthCommands::Configure(args) => {
+                cli::auth::handle_configure(
+                    &args.provider,
+                    args.endpoint.as_deref(),
+                    &auth_args.account,
+                )
+                .await
+            }
+            AuthCommands::Providers(args) => {
+                cli::auth::handle_providers(args.json, &auth_args.account).await
+            }
         },
         Commands::Audio(audio_args) => match audio_args.command {
             AudioCommands::Transcribe(args) => audio_cmd::handle_transcribe(args).await,

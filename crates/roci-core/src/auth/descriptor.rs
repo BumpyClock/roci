@@ -16,6 +16,8 @@ pub enum CredentialFlow {
     ApiKey,
     /// OAuth device-code flow.
     DeviceCode,
+    /// Browser authorization completed by polling, without a user-entered code.
+    BrowserPoll,
     /// OAuth PKCE authorization-code flow.
     Pkce,
 }

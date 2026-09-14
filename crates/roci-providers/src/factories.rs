@@ -7,39 +7,42 @@ use roci_core::auth::CredentialFlow;
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use roci_core::auth::ProviderDescriptor;
 #[cfg(any(test, feature = "openai", feature = "anthropic", feature = "google"))]
+use roci_core::auth::{CredentialMaterial, ResolvedProviderCredential};
+#[cfg(any(test, feature = "openai", feature = "anthropic", feature = "google"))]
 use roci_core::config::RociConfig;
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
+#[cfg(any(test, feature = "openai", feature = "anthropic", feature = "google"))]
 use roci_core::error::RociError;
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
-use roci_core::models::{ModelCatalog, ModelListOptions, ProviderKey};
-#[cfg(any(
-    feature = "google",
-    feature = "grok",
-    feature = "groq",
-    feature = "mistral"
-))]
-use roci_core::provider::require_api_key;
+use roci_core::models::{ModelCatalog, ModelListOptions};
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
 use roci_core::provider::{ModelProvider, ProviderFactory};
 
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
-fn catalog_future<'a>(
-    provider_key: &'a str,
-    options: &'a ModelListOptions,
-    builder: fn(&str) -> ModelCatalog,
-) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-    Box::pin(async move {
-        if options.include_static {
-            Ok(builder(provider_key))
-        } else {
-            Ok(ModelCatalog::default())
-        }
-    })
-}
-
-#[cfg(any(feature = "openrouter", feature = "together", test))]
-fn optional_api_key(config: &RociConfig, provider: &str) -> String {
-    config.get_api_key(provider).unwrap_or_default()
+/// Adapt a selected API-key credential to a transport without losing its endpoint.
+/// Native OAuth must be handled before entering an API-key transport.
+#[cfg(any(test, feature = "openai", feature = "anthropic", feature = "google"))]
+fn api_key_pair(
+    config: &RociConfig,
+    provider: &str,
+    credential: Option<ResolvedProviderCredential>,
+) -> Result<(Option<String>, Option<String>), RociError> {
+    match credential {
+        Some(ResolvedProviderCredential {
+            material: CredentialMaterial::ApiKey(key),
+            endpoint,
+        }) => Ok((
+            Some(key.expose_secret().to_owned()),
+            endpoint.map(|url| url.as_str().to_owned()),
+        )),
+        Some(_) => Err(RociError::UnsupportedOperation(format!(
+            "{provider} requires an API key for this transport"
+        ))),
+        None => Ok((
+            None,
+            config
+                .resolve_provider_endpoint(provider)?
+                .map(|url| url.as_str().to_owned()),
+        )),
+    }
 }
 
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "google"))]
@@ -76,15 +79,22 @@ impl ProviderFactory for OpenAiFactory {
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(
+        Box::pin(crate::models::remote::list_configured_models(
+            config,
             provider_key,
             options,
-            crate::models::catalog::openai_catalog,
-        )
+            "https://api.openai.com/v1",
+            |id| {
+                use crate::models::openai::OpenAiModel;
+                id.parse::<OpenAiModel>()
+                    .unwrap_or_else(|_| OpenAiModel::Custom(id.into()))
+                    .capabilities()
+            },
+        ))
     }
 
     fn create(
@@ -96,7 +106,11 @@ impl ProviderFactory for OpenAiFactory {
         use crate::models::openai::OpenAiModel;
         use std::str::FromStr;
 
-        let (api_key, base_url) = config.get_api_key_and_base_url_for(ProviderKey::OpenAi);
+        let (api_key, base_url) = api_key_pair(
+            config,
+            "openai",
+            config.resolve_provider_credential("openai")?,
+        )?;
         let api_key = api_key.unwrap_or_default();
         let model =
             OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
@@ -133,11 +147,11 @@ impl ProviderFactory for CodexFactory {
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
-        provider_key: &'a str,
+        config: &'a RociConfig,
+        _provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(provider_key, options, crate::models::catalog::codex_catalog)
+        Box::pin(crate::auth::factory::codex_models(config, options))
     }
 
     fn create(
@@ -149,24 +163,24 @@ impl ProviderFactory for CodexFactory {
         use crate::models::openai::OpenAiModel;
         use std::str::FromStr;
 
-        let (api_key, base_url) = config.get_api_key_and_base_url_for(ProviderKey::Codex);
+        let credential = config.resolve_provider_credential("codex")?;
+        if let Some(provider) =
+            crate::auth::factory::managed_provider(config, "codex", model_id, credential.as_ref())?
+        {
+            return Ok(provider);
+        }
+        let (api_key, base_url) = api_key_pair(config, "codex", credential)?;
         let api_key = api_key.unwrap_or_default();
         let base_url =
             base_url.or_else(|| Some("https://chatgpt.com/backend-api/codex".to_string()));
-        let account_id = config.get_account_id_for(ProviderKey::Codex);
+        let account_id = config.get_account_id("codex");
         let model =
             OpenAiModel::from_str(model_id).unwrap_or(OpenAiModel::Custom(model_id.to_string()));
-        if model.uses_responses_api() {
-            Ok(Box::new(
-                crate::provider::openai_responses::OpenAiResponsesProvider::new(
-                    model, api_key, base_url, account_id,
-                ),
-            ))
-        } else {
-            Ok(Box::new(crate::provider::openai::OpenAiProvider::new(
+        Ok(Box::new(
+            crate::provider::openai_responses::OpenAiResponsesProvider::new(
                 model, api_key, base_url, account_id,
-            )))
-        }
+            ),
+        ))
     }
 }
 
@@ -189,15 +203,15 @@ impl ProviderFactory for AnthropicFactory {
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(
+        Box::pin(crate::models::anthropic_catalog::list_models(
+            config,
             provider_key,
             options,
-            crate::models::catalog::anthropic_catalog,
-        )
+        ))
     }
 
     fn create(
@@ -209,7 +223,16 @@ impl ProviderFactory for AnthropicFactory {
         use crate::models::anthropic::AnthropicModel;
         use std::str::FromStr;
 
-        let (api_key, base_url) = config.get_api_key_and_base_url_for(ProviderKey::Anthropic);
+        let credential = config.resolve_provider_credential("anthropic")?;
+        if let Some(provider) = crate::auth::factory::managed_provider(
+            config,
+            "anthropic",
+            model_id,
+            credential.as_ref(),
+        )? {
+            return Ok(provider);
+        }
+        let (api_key, base_url) = api_key_pair(config, "anthropic", credential)?;
         let api_key = api_key.unwrap_or_default();
         let model = AnthropicModel::from_str(model_id)
             .unwrap_or(AnthropicModel::Custom(model_id.to_string()));
@@ -233,20 +256,20 @@ impl ProviderFactory for GoogleFactory {
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
-        explicit_descriptor("google", "Google", &[CredentialFlow::ApiKey], false)
+        explicit_descriptor("google", "Google", &[CredentialFlow::ApiKey], true)
     }
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(
+        Box::pin(crate::models::google_catalog::list_models(
+            config,
             provider_key,
             options,
-            crate::models::catalog::google_catalog,
-        )
+        ))
     }
 
     fn create(
@@ -258,11 +281,20 @@ impl ProviderFactory for GoogleFactory {
         use crate::models::google::GoogleModel;
         use std::str::FromStr;
 
-        let api_key = require_api_key(config, ProviderKey::Google, "Missing GOOGLE_API_KEY")?;
+        let credential = config.resolve_provider_credential("google")?;
+        if let Some(provider) =
+            crate::auth::factory::managed_provider(config, "google", model_id, credential.as_ref())?
+        {
+            return Ok(provider);
+        }
+        let (api_key, base_url) = api_key_pair(config, "google", credential)?;
+        let api_key = api_key.ok_or_else(|| RociError::MissingCredential {
+            provider: "google".into(),
+        })?;
         let model =
             GoogleModel::from_str(model_id).unwrap_or(GoogleModel::Custom(model_id.to_string()));
         Ok(Box::new(crate::provider::google::GoogleProvider::new(
-            model, api_key,
+            model, api_key, base_url,
         )))
     }
 }
@@ -281,16 +313,27 @@ impl ProviderFactory for GrokFactory {
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
-        explicit_descriptor("grok", "Grok", &[CredentialFlow::ApiKey], false)
+        explicit_descriptor("grok", "Grok", &[CredentialFlow::ApiKey], true)
     }
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(provider_key, options, crate::models::catalog::grok_catalog)
+        Box::pin(crate::models::remote::list_configured_models(
+            config,
+            provider_key,
+            options,
+            "https://api.x.ai/v1",
+            |id| {
+                use crate::models::grok::GrokModel;
+                id.parse::<GrokModel>()
+                    .unwrap_or_else(|_| GrokModel::Custom(id.into()))
+                    .capabilities()
+            },
+        ))
     }
 
     fn create(
@@ -302,11 +345,20 @@ impl ProviderFactory for GrokFactory {
         use crate::models::grok::GrokModel;
         use std::str::FromStr;
 
-        let api_key = require_api_key(config, ProviderKey::Grok, "Missing XAI_API_KEY")?;
+        let credential = config.resolve_provider_credential("grok")?;
+        if let Some(provider) =
+            crate::auth::factory::managed_provider(config, "grok", model_id, credential.as_ref())?
+        {
+            return Ok(provider);
+        }
+        let (api_key, base_url) = api_key_pair(config, "grok", credential)?;
+        let api_key = api_key.ok_or_else(|| RociError::MissingCredential {
+            provider: "grok".into(),
+        })?;
         let model =
             GrokModel::from_str(model_id).unwrap_or(GrokModel::Custom(model_id.to_string()));
         Ok(Box::new(crate::provider::grok::GrokProvider::new(
-            model, api_key,
+            model, api_key, base_url,
         )))
     }
 }
@@ -325,16 +377,27 @@ impl ProviderFactory for GroqFactory {
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
-        explicit_descriptor("groq", "Groq", &[CredentialFlow::ApiKey], false)
+        explicit_descriptor("groq", "Groq", &[CredentialFlow::ApiKey], true)
     }
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(provider_key, options, crate::models::catalog::groq_catalog)
+        Box::pin(crate::models::remote::list_configured_models(
+            config,
+            provider_key,
+            options,
+            "https://api.groq.com/openai/v1",
+            |id| {
+                use crate::models::groq::GroqModel;
+                id.parse::<GroqModel>()
+                    .unwrap_or_else(|_| GroqModel::Custom(id.into()))
+                    .capabilities()
+            },
+        ))
     }
 
     fn create(
@@ -346,11 +409,15 @@ impl ProviderFactory for GroqFactory {
         use crate::models::groq::GroqModel;
         use std::str::FromStr;
 
-        let api_key = require_api_key(config, ProviderKey::Groq, "Missing GROQ_API_KEY")?;
+        let (api_key, base_url) =
+            api_key_pair(config, "groq", config.resolve_provider_credential("groq")?)?;
+        let api_key = api_key.ok_or_else(|| RociError::MissingCredential {
+            provider: "groq".into(),
+        })?;
         let model =
             GroqModel::from_str(model_id).unwrap_or(GroqModel::Custom(model_id.to_string()));
         Ok(Box::new(crate::provider::groq::GroqProvider::new(
-            model, api_key,
+            model, api_key, base_url,
         )))
     }
 }
@@ -369,20 +436,27 @@ impl ProviderFactory for MistralFactory {
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
-        explicit_descriptor("mistral", "Mistral", &[CredentialFlow::ApiKey], false)
+        explicit_descriptor("mistral", "Mistral", &[CredentialFlow::ApiKey], true)
     }
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(
+        Box::pin(crate::models::remote::list_configured_models(
+            config,
             provider_key,
             options,
-            crate::models::catalog::mistral_catalog,
-        )
+            "https://api.mistral.ai/v1",
+            |id| {
+                use crate::models::mistral::MistralModel;
+                id.parse::<MistralModel>()
+                    .unwrap_or_else(|_| MistralModel::Custom(id.into()))
+                    .capabilities()
+            },
+        ))
     }
 
     fn create(
@@ -394,11 +468,18 @@ impl ProviderFactory for MistralFactory {
         use crate::models::mistral::MistralModel;
         use std::str::FromStr;
 
-        let api_key = require_api_key(config, ProviderKey::Mistral, "Missing MISTRAL_API_KEY")?;
+        let (api_key, base_url) = api_key_pair(
+            config,
+            "mistral",
+            config.resolve_provider_credential("mistral")?,
+        )?;
+        let api_key = api_key.ok_or_else(|| RociError::MissingCredential {
+            provider: "mistral".into(),
+        })?;
         let model =
             MistralModel::from_str(model_id).unwrap_or(MistralModel::Custom(model_id.to_string()));
         Ok(Box::new(crate::provider::mistral::MistralProvider::new(
-            model, api_key,
+            model, api_key, base_url,
         )))
     }
 }
@@ -426,15 +507,27 @@ impl ProviderFactory for OllamaFactory {
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(
-            provider_key,
-            options,
-            crate::models::catalog::ollama_catalog,
-        )
+        Box::pin(async move {
+            if !options.include_dynamic {
+                return Ok(ModelCatalog::new());
+            }
+            let base = config
+                .resolve_provider_endpoint("ollama")?
+                .map(|url| url.as_str().to_owned())
+                .unwrap_or_else(|| "http://localhost:11434".into());
+            crate::models::remote::fetch_openai_models(
+                provider_key,
+                &format!("{}/v1/models", base.trim_end_matches('/')),
+                None,
+                |id| crate::models::ollama::OllamaModel::Custom(id.into()).capabilities(),
+                true,
+            )
+            .await
+        })
     }
 
     fn create(
@@ -447,7 +540,8 @@ impl ProviderFactory for OllamaFactory {
         use std::str::FromStr;
 
         let base_url = config
-            .get_base_url_for(ProviderKey::Ollama)
+            .resolve_provider_endpoint("ollama")?
+            .map(|url| url.as_str().to_owned())
             .unwrap_or_else(|| "http://localhost:11434".to_string());
         let model =
             OllamaModel::from_str(model_id).unwrap_or(OllamaModel::Custom(model_id.to_string()));
@@ -480,15 +574,27 @@ impl ProviderFactory for LmStudioFactory {
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(
-            provider_key,
-            options,
-            crate::models::catalog::lmstudio_catalog,
-        )
+        Box::pin(async move {
+            if !options.include_dynamic {
+                return Ok(ModelCatalog::new());
+            }
+            let base = config
+                .resolve_provider_endpoint("lmstudio")?
+                .map(|url| url.as_str().to_owned())
+                .unwrap_or_else(|| "http://localhost:1234".into());
+            crate::models::remote::fetch_openai_models(
+                provider_key,
+                &format!("{}/v1/models", base.trim_end_matches('/')),
+                None,
+                |id| crate::models::lmstudio::LmStudioModel::Custom(id.into()).capabilities(),
+                true,
+            )
+            .await
+        })
     }
 
     fn create(
@@ -500,7 +606,8 @@ impl ProviderFactory for LmStudioFactory {
         use crate::models::lmstudio::LmStudioModel;
 
         let base_url = config
-            .get_base_url_for(ProviderKey::LmStudio)
+            .resolve_provider_endpoint("lmstudio")?
+            .map(|url| url.as_str().to_owned())
             .unwrap_or_else(|| "http://localhost:1234".to_string());
         let model = LmStudioModel::Custom(model_id.to_string());
         Ok(Box::new(crate::provider::lmstudio::LmStudioProvider::new(
@@ -517,23 +624,35 @@ impl ProviderFactory for LmStudioFactory {
 pub struct OpenAiCompatibleFactory;
 
 #[cfg(any(feature = "openai-compatible", feature = "anthropic-compatible"))]
-fn resolve_dedicated_or_inherited_pair(
-    dedicated: (Option<String>, Option<String>),
-    inherited: (Option<String>, Option<String>),
+fn resolve_compatible_credentials(
+    config: &RociConfig,
+    dedicated: &str,
+    inherited: &str,
     missing_key_message: &'static str,
     missing_url_message: &'static str,
 ) -> Result<(String, String), RociError> {
-    let has_any_api_key = dedicated.0.is_some() || inherited.0.is_some();
-    if let (Some(api_key), Some(base_url)) = dedicated {
-        return Ok((api_key, base_url));
+    let first = api_key_pair(
+        config,
+        dedicated,
+        config.resolve_provider_credential(dedicated)?,
+    )?;
+    let mut has_key = first.0.is_some();
+    if let (Some(key), Some(endpoint)) = first {
+        return Ok((key, endpoint));
     }
-    if let (Some(api_key), Some(base_url)) = inherited {
-        return Ok((api_key, base_url));
+    let second = api_key_pair(
+        config,
+        inherited,
+        config.resolve_provider_credential(inherited)?,
+    )?;
+    has_key |= second.0.is_some();
+    if let (Some(key), Some(endpoint)) = second {
+        return Ok((key, endpoint));
     }
-    if !has_any_api_key {
-        Err(RociError::Authentication(missing_key_message.into()))
-    } else {
+    if has_key {
         Err(RociError::Configuration(missing_url_message.into()))
+    } else {
+        Err(RociError::Authentication(missing_key_message.into()))
     }
 }
 
@@ -541,9 +660,10 @@ fn resolve_dedicated_or_inherited_pair(
 fn resolve_openai_compatible_credentials(
     config: &RociConfig,
 ) -> Result<(String, String), RociError> {
-    resolve_dedicated_or_inherited_pair(
-        config.get_api_key_and_base_url_for(ProviderKey::OpenAiCompatible),
-        config.get_api_key_and_base_url_for(ProviderKey::OpenAi),
+    resolve_compatible_credentials(
+        config,
+        "openai-compatible",
+        "openai",
         "Missing OPENAI_COMPAT_API_KEY",
         "Missing OPENAI_COMPAT_BASE_URL",
     )
@@ -579,10 +699,19 @@ impl ProviderFactory for OpenAiCompatibleFactory {
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
         Box::pin(async move {
-            if !options.include_unavailable {
-                self.check_available(config, provider_key)?;
+            if !options.include_dynamic {
+                return Ok(ModelCatalog::default());
             }
-            catalog_future(provider_key, options, crate::models::catalog::empty_catalog).await
+            let (key, base_url) = resolve_openai_compatible_credentials(config)?;
+            let endpoint = crate::models::remote::models_endpoint(&base_url)?;
+            crate::models::remote::fetch_openai_models(
+                provider_key,
+                &endpoint,
+                Some(&key),
+                |id| crate::models::openai::OpenAiModel::Custom(id.into()).capabilities(),
+                false,
+            )
+            .await
         })
     }
 
@@ -611,102 +740,52 @@ impl ProviderFactory for OpenAiCompatibleFactory {
 pub struct GitHubCopilotFactory;
 
 #[cfg(feature = "github-copilot")]
-fn github_copilot_static_catalog(provider_key: &str) -> ModelCatalog {
-    crate::models::catalog::github_copilot_static_catalog(provider_key)
-}
-
-#[cfg(feature = "github-copilot")]
-fn github_copilot_static_catalog_with_warning(provider_key: &str, warning: String) -> ModelCatalog {
-    let mut catalog = github_copilot_static_catalog(provider_key);
-    catalog.update_models(|model| {
-        model.metadata.insert(
-            "warning".to_string(),
-            serde_json::Value::String(warning.clone()),
-        );
-    });
-    catalog
-}
-
-#[cfg(feature = "github-copilot")]
-fn resolve_github_copilot_credentials(config: &RociConfig) -> Result<(String, String), RociError> {
-    // Try the copilot-api token first (saved by `roci auth login copilot`).
-    // On load error, fall through to config-based fallback credentials.
-    // Only hard-fail when the store error *and* no fallback creds exist.
-    let (cached_key, cached_url, load_err) = if let Some(store) = config.token_store() {
-        match store.load("github-copilot-api", "default") {
-            Ok(Some(token)) => {
-                let is_valid = token
-                    .expires_at
-                    .map(|exp| exp > chrono::Utc::now())
-                    .unwrap_or(false);
-                if is_valid {
-                    let url = token.account_id.unwrap_or_default();
-                    (
-                        Some(token.access_token),
-                        if url.is_empty() { None } else { Some(url) },
-                        None,
-                    )
-                } else {
-                    (None, None, None)
-                }
-            }
-            Ok(None) => (None, None, None),
-            Err(e) => (None, None, Some(e)),
-        }
-    } else {
-        (None, None, None)
-    };
-
-    let cached = (cached_key, cached_url);
-    let fallback = config.get_api_key_and_base_url_for(ProviderKey::GitHubCopilot);
-    let has_any_api_key = cached.0.is_some() || fallback.0.is_some();
-    if let (Some(api_key), Some(base_url)) = cached {
-        return Ok((api_key, base_url));
+fn resolve_github_copilot_credentials(
+    config: &RociConfig,
+    credential: Option<&ResolvedProviderCredential>,
+) -> Result<(String, String), RociError> {
+    if let Some(ResolvedProviderCredential {
+        material: CredentialMaterial::ApiKey(key),
+        endpoint,
+    }) = credential
+    {
+        return Ok((
+            key.expose_secret().to_owned(),
+            endpoint
+                .as_ref()
+                .ok_or_else(|| RociError::MissingConfiguration {
+                    key: "base_url".into(),
+                    provider: "github-copilot".into(),
+                })?
+                .as_str()
+                .to_owned(),
+        ));
     }
-    if let (Some(api_key), Some(base_url)) = fallback {
-        return Ok((api_key, base_url));
-    }
-    if !has_any_api_key {
-        return Err(match load_err {
-            Some(error) => RociError::Authentication(format!(
-                "failed to load github-copilot-api credentials: {error}"
-            )),
-            None => RociError::MissingCredential {
-                provider: "github-copilot".to_string(),
-            },
+    // A still-valid derived credential remains usable without a primary login.
+    // Never treat the primary GitHub OAuth token as a Copilot API credential.
+    let cached = config
+        .token_store()
+        .map(|store| store.load("github-copilot-api", "default"))
+        .transpose()?
+        .flatten()
+        .filter(|token| {
+            token
+                .expires_at
+                .is_some_and(|expiry| expiry > chrono::Utc::now())
         });
-    }
-    Err(RociError::MissingConfiguration {
-        key: "base_url".to_string(),
-        provider: "github-copilot".to_string(),
-    })
-}
-
-#[cfg(feature = "github-copilot")]
-fn should_fallback_to_copilot_static(error: &RociError) -> bool {
-    match error {
-        RociError::UnsupportedOperation(_) => true,
-        RociError::Api { status, .. } => (500..=599).contains(status),
-        RociError::Network(error) => error.is_timeout() || error.is_connect(),
-        RociError::Timeout(_) => true,
-        _ => false,
-    }
-}
-
-#[cfg(feature = "github-copilot")]
-fn fallback_warning(error: &RociError) -> Option<String> {
-    match error {
-        RociError::Api {
-            status, message, ..
-        } if (500..=599).contains(status) => Some(format!(
-            "dynamic /models discovery failed with status {status}: {message}"
-        )),
-        RociError::Network(error) if error.is_timeout() || error.is_connect() => {
-            Some(format!("dynamic /models discovery failed: {error}"))
-        }
-        RociError::Timeout(ms) => Some(format!("dynamic /models discovery timed out after {ms}ms")),
-        _ => None,
-    }
+    let token = cached.ok_or_else(|| RociError::MissingCredential {
+        provider: "github-copilot".into(),
+    })?;
+    let endpoint = credential
+        .and_then(|credential| credential.endpoint.as_ref())
+        .map(|url| url.as_str().to_owned())
+        .or(token.account_id)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| RociError::MissingConfiguration {
+            key: "base_url".into(),
+            provider: "github-copilot".into(),
+        })?;
+    Ok((token.access_token, endpoint))
 }
 
 #[cfg(feature = "github-copilot")]
@@ -719,12 +798,17 @@ impl ProviderFactory for GitHubCopilotFactory {
         explicit_descriptor("github-copilot", "GitHub Copilot", &[], false)
     }
 
-    fn is_available(&self, config: &RociConfig, _provider_key: &str) -> bool {
-        resolve_github_copilot_credentials(config).is_ok()
+    fn is_available(&self, config: &RociConfig, provider_key: &str) -> bool {
+        self.check_available(config, provider_key).is_ok()
     }
 
     fn check_available(&self, config: &RociConfig, _provider_key: &str) -> Result<(), RociError> {
-        resolve_github_copilot_credentials(config).map(|_| ())
+        let credential = config.resolve_provider_credential("github-copilot")?;
+        if matches!(credential.as_ref().map(|credential| &credential.material), Some(CredentialMaterial::OAuth(token)) if token.is_valid() || token.refresh_token.is_some())
+        {
+            return Ok(());
+        }
+        resolve_github_copilot_credentials(config, credential.as_ref()).map(|_| ())
     }
 
     fn list_models<'a>(
@@ -735,43 +819,39 @@ impl ProviderFactory for GitHubCopilotFactory {
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
         Box::pin(async move {
             if !options.include_dynamic {
-                return if options.include_static {
-                    Ok(github_copilot_static_catalog(provider_key))
-                } else {
-                    Ok(ModelCatalog::default())
-                };
+                return Ok(ModelCatalog::new());
             }
-
-            let (api_key, base_url) = match resolve_github_copilot_credentials(config) {
-                Ok(credentials) => credentials,
-                Err(_error) if options.include_static => {
-                    return Ok(github_copilot_static_catalog(provider_key));
-                }
-                Err(error) => return Err(error),
-            };
-
-            match crate::provider::github_copilot::list_copilot_models(
+            let credential = config.resolve_provider_credential("github-copilot")?;
+            let (api_key, base_url) =
+                match crate::auth::factory::copilot_credentials(config, None, credential.as_ref())
+                    .await?
+                {
+                    Some(credentials) => credentials,
+                    None => resolve_github_copilot_credentials(config, credential.as_ref())?,
+                };
+            let result = crate::provider::github_copilot::list_copilot_models(
                 &api_key,
                 &base_url,
                 provider_key,
             )
-            .await
-            {
-                Ok(catalog) => Ok(catalog),
-                Err(error)
-                    if options.include_static && should_fallback_to_copilot_static(&error) =>
+            .await;
+            if matches!(result, Err(RociError::Api { status: 401, .. })) {
+                if let Some((api_key, base_url)) = crate::auth::factory::copilot_credentials(
+                    config,
+                    Some(&api_key),
+                    credential.as_ref(),
+                )
+                .await?
                 {
-                    if let Some(warning) = fallback_warning(&error) {
-                        Ok(github_copilot_static_catalog_with_warning(
-                            provider_key,
-                            warning,
-                        ))
-                    } else {
-                        Ok(github_copilot_static_catalog(provider_key))
-                    }
+                    return crate::provider::github_copilot::list_copilot_models(
+                        &api_key,
+                        &base_url,
+                        provider_key,
+                    )
+                    .await;
                 }
-                Err(error) => Err(error),
             }
+            result
         })
     }
 
@@ -781,7 +861,16 @@ impl ProviderFactory for GitHubCopilotFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let (api_key, base_url) = resolve_github_copilot_credentials(config)?;
+        let credential = config.resolve_provider_credential("github-copilot")?;
+        if let Some(provider) = crate::auth::factory::managed_provider(
+            config,
+            "github-copilot",
+            model_id,
+            credential.as_ref(),
+        )? {
+            return Ok(provider);
+        }
+        let (api_key, base_url) = resolve_github_copilot_credentials(config, credential.as_ref())?;
         Ok(Box::new(
             crate::provider::github_copilot::GitHubCopilotProvider::new(
                 model_id.to_string(),
@@ -803,9 +892,10 @@ pub struct AnthropicCompatibleFactory;
 fn resolve_anthropic_compatible_credentials(
     config: &RociConfig,
 ) -> Result<(String, String), RociError> {
-    resolve_dedicated_or_inherited_pair(
-        config.get_api_key_and_base_url("anthropic-compatible"),
-        config.get_api_key_and_base_url_for(ProviderKey::Anthropic),
+    resolve_compatible_credentials(
+        config,
+        "anthropic-compatible",
+        "anthropic",
         "Missing ANTHROPIC_COMPAT_API_KEY",
         "Missing ANTHROPIC_COMPAT_BASE_URL",
     )
@@ -841,10 +931,11 @@ impl ProviderFactory for AnthropicCompatibleFactory {
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
         Box::pin(async move {
-            if !options.include_unavailable {
-                self.check_available(config, provider_key)?;
+            if !options.include_dynamic {
+                return Ok(ModelCatalog::default());
             }
-            catalog_future(provider_key, options, crate::models::catalog::empty_catalog).await
+            let (key, endpoint) = resolve_anthropic_compatible_credentials(config)?;
+            crate::models::anthropic_catalog::fetch(provider_key, &endpoint, &key, false).await
         })
     }
 
@@ -874,7 +965,11 @@ pub struct AzureFactory;
 
 #[cfg(feature = "azure")]
 fn resolve_azure_credentials(config: &RociConfig) -> Result<(String, String), RociError> {
-    let (api_key, endpoint) = config.get_api_key_and_base_url_for(ProviderKey::Azure);
+    let (api_key, endpoint) = api_key_pair(
+        config,
+        "azure",
+        config.resolve_provider_credential("azure")?,
+    )?;
     let api_key = api_key.ok_or_else(|| RociError::MissingCredential {
         provider: "azure".to_string(),
     })?;
@@ -906,14 +1001,20 @@ impl ProviderFactory for AzureFactory {
     fn list_models<'a>(
         &'a self,
         config: &'a RociConfig,
-        provider_key: &'a str,
+        _provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
         Box::pin(async move {
-            if !options.include_unavailable {
-                self.check_available(config, provider_key)?;
+            if !options.include_dynamic {
+                return Ok(ModelCatalog::default());
             }
-            catalog_future(provider_key, options, crate::models::catalog::empty_catalog).await
+            match resolve_azure_credentials(config) {
+                Ok(_) => Err(RociError::ModelDiscoveryUnsupported {
+                    provider: "azure".into(),
+                    reason: "Azure model selection requires deployment names; deployment discovery requires Azure management credentials, which this provider does not configure".into(),
+                }),
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -948,16 +1049,27 @@ impl ProviderFactory for OpenRouterFactory {
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
-        explicit_descriptor("openrouter", "OpenRouter", &[CredentialFlow::ApiKey], false)
+        explicit_descriptor("openrouter", "OpenRouter", &[CredentialFlow::ApiKey], true)
     }
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(provider_key, options, crate::models::catalog::empty_catalog)
+        Box::pin(crate::models::remote::list_configured_models(
+            config,
+            provider_key,
+            options,
+            "https://openrouter.ai/api/v1",
+            |id| {
+                use crate::models::openai::OpenAiModel;
+                id.parse::<OpenAiModel>()
+                    .unwrap_or_else(|_| OpenAiModel::Custom(id.into()))
+                    .capabilities()
+            },
+        ))
     }
 
     fn create(
@@ -966,9 +1078,18 @@ impl ProviderFactory for OpenRouterFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = optional_api_key(config, "openrouter");
+        let (api_key, base_url) = api_key_pair(
+            config,
+            "openrouter",
+            config.resolve_provider_credential("openrouter")?,
+        )?;
+        let api_key = api_key.unwrap_or_default();
         Ok(Box::new(
-            crate::provider::openrouter::OpenRouterProvider::new(model_id.to_string(), api_key),
+            crate::provider::openrouter::OpenRouterProvider::new(
+                model_id.to_string(),
+                api_key,
+                base_url,
+            ),
         ))
     }
 }
@@ -987,16 +1108,27 @@ impl ProviderFactory for TogetherFactory {
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
-        explicit_descriptor("together", "Together", &[CredentialFlow::ApiKey], false)
+        explicit_descriptor("together", "Together", &[CredentialFlow::ApiKey], true)
     }
 
     fn list_models<'a>(
         &'a self,
-        _config: &'a RociConfig,
+        config: &'a RociConfig,
         provider_key: &'a str,
         options: &'a ModelListOptions,
     ) -> BoxFuture<'a, Result<ModelCatalog, RociError>> {
-        catalog_future(provider_key, options, crate::models::catalog::empty_catalog)
+        Box::pin(crate::models::remote::list_configured_models(
+            config,
+            provider_key,
+            options,
+            "https://api.together.xyz/v1",
+            |id| {
+                use crate::models::openai::OpenAiModel;
+                id.parse::<OpenAiModel>()
+                    .unwrap_or_else(|_| OpenAiModel::Custom(id.into()))
+                    .capabilities()
+            },
+        ))
     }
 
     fn create(
@@ -1005,10 +1137,16 @@ impl ProviderFactory for TogetherFactory {
         _provider_key: &str,
         model_id: &str,
     ) -> Result<Box<dyn ModelProvider>, RociError> {
-        let api_key = optional_api_key(config, "together");
+        let (api_key, base_url) = api_key_pair(
+            config,
+            "together",
+            config.resolve_provider_credential("together")?,
+        )?;
+        let api_key = api_key.unwrap_or_default();
         Ok(Box::new(crate::provider::together::TogetherProvider::new(
             model_id.to_string(),
             api_key,
+            base_url,
         )))
     }
 }
@@ -1072,6 +1210,7 @@ mod tests {
                 "claude-code",
                 "default",
                 &Token {
+                    provider_metadata: None,
                     access_token: "oauth-token".into(),
                     refresh_token: None,
                     id_token: None,
@@ -1095,14 +1234,32 @@ mod tests {
         let mut registry = roci_core::provider::ProviderRegistry::new();
         registry.register(Arc::new(AnthropicFactory));
 
-        assert_eq!(config.get_api_key("anthropic"), Some("stored-key".into()));
+        assert_eq!(
+            config
+                .resolve_provider_credential("anthropic")
+                .unwrap()
+                .map(|credential| match credential.material {
+                    CredentialMaterial::ApiKey(key) => key.expose_secret().to_owned(),
+                    CredentialMaterial::OAuth(token) => token.access_token,
+                }),
+            Some("stored-key".into())
+        );
         assert_eq!(registry.is_available("anthropic", &config), Some(true));
         assert!(registry
             .create_provider("anthropic", "claude-sonnet-4", &config)
             .is_ok());
 
         credential_store.clear("anthropic").unwrap();
-        assert_eq!(config.get_api_key("anthropic"), Some("oauth-token".into()));
+        assert_eq!(
+            config
+                .resolve_provider_credential("anthropic")
+                .unwrap()
+                .map(|credential| match credential.material {
+                    CredentialMaterial::ApiKey(key) => key.expose_secret().to_owned(),
+                    CredentialMaterial::OAuth(token) => token.access_token,
+                }),
+            Some("oauth-token".into())
+        );
         assert_eq!(registry.is_available("anthropic", &config), Some(true));
         assert!(registry
             .create_provider("anthropic", "claude-sonnet-4", &config)
@@ -1114,7 +1271,17 @@ mod tests {
         let config = config_without_credentials();
         config.set_api_key("openai", "openai-key".to_string());
 
-        assert_eq!(optional_api_key(&config, "openrouter"), "");
+        assert_eq!(
+            api_key_pair(
+                &config,
+                "openrouter",
+                config.resolve_provider_credential("openrouter").unwrap()
+            )
+            .unwrap()
+            .0
+            .unwrap_or_default(),
+            ""
+        );
     }
 
     #[test]
@@ -1122,7 +1289,17 @@ mod tests {
         let config = config_without_credentials();
         config.set_api_key("openrouter", "openrouter-key".to_string());
 
-        assert_eq!(optional_api_key(&config, "openrouter"), "openrouter-key");
+        assert_eq!(
+            api_key_pair(
+                &config,
+                "openrouter",
+                config.resolve_provider_credential("openrouter").unwrap()
+            )
+            .unwrap()
+            .0
+            .unwrap_or_default(),
+            "openrouter-key"
+        );
     }
 
     #[test]
@@ -1130,7 +1307,17 @@ mod tests {
         let config = config_without_credentials();
         config.set_api_key("openai", "openai-key".to_string());
 
-        assert_eq!(optional_api_key(&config, "together"), "");
+        assert_eq!(
+            api_key_pair(
+                &config,
+                "together",
+                config.resolve_provider_credential("together").unwrap()
+            )
+            .unwrap()
+            .0
+            .unwrap_or_default(),
+            ""
+        );
     }
 
     #[test]
@@ -1138,43 +1325,68 @@ mod tests {
         let config = config_without_credentials();
         config.set_api_key("together", "together-key".to_string());
 
-        assert_eq!(optional_api_key(&config, "together"), "together-key");
+        assert_eq!(
+            api_key_pair(
+                &config,
+                "together",
+                config.resolve_provider_credential("together").unwrap()
+            )
+            .unwrap()
+            .0
+            .unwrap_or_default(),
+            "together-key"
+        );
     }
 
     #[cfg(feature = "openai")]
     #[tokio::test]
-    async fn factory_registration_lists_static_openai_catalog() {
+    async fn factory_registration_lists_live_openai_catalog() {
+        use wiremock::{
+            matchers::{header, method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data":[{"id":"future-openai-model"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let config = config_without_credentials();
+        config.set_api_key("openai", "test-key".into());
+        config.set_base_url("openai", format!("{}/v1", server.uri()));
         let mut registry = roci_core::provider::ProviderRegistry::new();
         crate::register_default_providers(&mut registry);
         let options = ModelListOptions {
-            provider_key: Some("openai".to_string()),
-            include_unavailable: true,
-            ..ModelListOptions::default()
+            provider_key: Some("openai".into()),
+            include_static: false,
+            ..Default::default()
         };
-
         let catalog = registry.list_models(&config, &options).await.unwrap();
-
-        assert!(catalog
-            .models()
-            .iter()
-            .any(|model| model.provider_key == "openai" && model.model_id == "gpt-4o"));
+        assert_eq!(catalog.models().len(), 1);
+        assert_eq!(catalog.models()[0].model_id, "future-openai-model");
+        assert!(matches!(
+            catalog.models()[0].source,
+            roci_core::models::ModelCatalogSource::Dynamic { .. }
+        ));
     }
 
     #[cfg(feature = "openai")]
     #[tokio::test]
-    async fn static_factory_honors_include_static_false() {
+    async fn openai_factory_honors_include_dynamic_false_without_static_fallback() {
         let config = config_without_credentials();
         let options = ModelListOptions {
-            include_static: false,
-            ..ModelListOptions::default()
+            include_dynamic: false,
+            ..Default::default()
         };
-
         let catalog = OpenAiFactory
             .list_models(&config, "openai", &options)
             .await
             .unwrap();
-
         assert!(catalog.models().is_empty());
     }
 
@@ -1192,150 +1404,85 @@ mod tests {
             config
         }
 
-        fn static_model_count() -> usize {
-            crate::models::catalog::github_copilot_static_catalog("github-copilot")
-                .models()
-                .len()
-        }
-
         #[tokio::test]
-        async fn missing_credentials_falls_back_to_static_when_enabled() {
-            let config = config_without_credentials();
-
-            let catalog = GitHubCopilotFactory
-                .list_models(&config, "github-copilot", &ModelListOptions::default())
+        async fn missing_credentials_do_not_return_static_models() {
+            let err = GitHubCopilotFactory
+                .list_models(
+                    &config_without_credentials(),
+                    "github-copilot",
+                    &ModelListOptions::default(),
+                )
                 .await
-                .unwrap();
-
-            assert_eq!(catalog.models().len(), static_model_count());
-            assert!(matches!(
-                catalog.models()[0].source,
-                ModelCatalogSource::Static
-            ));
+                .unwrap_err();
+            assert!(matches!(err, RociError::MissingCredential { .. }));
         }
 
         #[tokio::test]
-        async fn include_dynamic_false_skips_http_and_returns_static() {
-            // Fresh server: the shared HTTP client must not reuse sockets from another test runtime.
-            let server = MockServer::builder().start().await;
+        async fn disabled_dynamic_discovery_is_empty_without_http() {
+            let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "data": [{"id": "dynamic-model"}]
-                })))
+                .respond_with(ResponseTemplate::new(200))
                 .expect(0)
                 .mount(&server)
                 .await;
             let config = config_with_copilot(server.uri());
-            let options = ModelListOptions {
-                include_dynamic: false,
-                ..ModelListOptions::default()
-            };
-
             let catalog = GitHubCopilotFactory
-                .list_models(&config, "github-copilot", &options)
+                .list_models(
+                    &config,
+                    "github-copilot",
+                    &ModelListOptions {
+                        include_dynamic: false,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
-
-            assert_eq!(catalog.models().len(), static_model_count());
-            assert!(catalog
-                .models()
-                .iter()
-                .all(|model| matches!(model.source, ModelCatalogSource::Static)));
-            server.verify().await;
+            assert!(catalog.models().is_empty());
         }
 
         #[tokio::test]
-        async fn include_static_false_requires_credentials_and_configuration() {
-            let options = ModelListOptions {
-                include_static: false,
-                ..ModelListOptions::default()
-            };
-            let missing_creds = config_without_credentials();
-
-            let err = GitHubCopilotFactory
-                .list_models(&missing_creds, "github-copilot", &options)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, RociError::MissingCredential { .. }));
-
-            let missing_config = config_without_credentials();
-            missing_config.set_api_key("github-copilot", "test-token".to_string());
-
-            let err = GitHubCopilotFactory
-                .list_models(&missing_config, "github-copilot", &options)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, RociError::MissingConfiguration { .. }));
-        }
-
-        #[tokio::test]
-        async fn unsupported_models_endpoint_falls_back_to_static() {
-            let server = MockServer::builder().start().await;
-            Mock::given(method("GET"))
-                .and(path("/models"))
-                .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
-                .mount(&server)
-                .await;
-            let config = config_with_copilot(server.uri());
-
-            let catalog = GitHubCopilotFactory
-                .list_models(&config, "github-copilot", &ModelListOptions::default())
-                .await
-                .unwrap();
-
-            assert_eq!(catalog.models().len(), static_model_count());
-            assert!(catalog
-                .models()
-                .iter()
-                .all(|model| matches!(model.source, ModelCatalogSource::Static)));
-        }
-
-        #[tokio::test]
-        async fn authentication_errors_do_not_fallback_to_static() {
-            for status in [401, 403] {
-                let server = MockServer::builder().start().await;
+        async fn discovery_errors_do_not_return_static_models() {
+            for status in [401, 403, 404, 503] {
+                let server = MockServer::start().await;
                 Mock::given(method("GET"))
                     .and(path("/models"))
-                    .respond_with(ResponseTemplate::new(status).set_body_string("auth failed"))
+                    .respond_with(ResponseTemplate::new(status))
                     .mount(&server)
                     .await;
                 let config = config_with_copilot(server.uri());
-
-                let err = GitHubCopilotFactory
+                assert!(GitHubCopilotFactory
                     .list_models(&config, "github-copilot", &ModelListOptions::default())
                     .await
-                    .unwrap_err();
-
-                assert!(matches!(err, RociError::Authentication(_)));
+                    .is_err());
             }
         }
 
         #[tokio::test]
-        async fn server_errors_fallback_to_static_with_warning_metadata() {
-            let server = MockServer::builder().start().await;
+        async fn live_catalog_preserves_unrecognized_models() {
+            let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
-                .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"data":[{"id":"future-copilot-model"}]})),
+                )
                 .mount(&server)
                 .await;
-            let config = config_with_copilot(server.uri());
-
             let catalog = GitHubCopilotFactory
-                .list_models(&config, "github-copilot", &ModelListOptions::default())
+                .list_models(
+                    &config_with_copilot(server.uri()),
+                    "github-copilot",
+                    &ModelListOptions::default(),
+                )
                 .await
                 .unwrap();
-
-            assert_eq!(catalog.models().len(), static_model_count());
-            assert!(catalog.models().iter().all(|model| {
-                model
-                    .metadata
-                    .get("warning")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|warning| warning.contains("status 503"))
-            }));
+            assert_eq!(catalog.models().len(), 1);
+            assert_eq!(catalog.models()[0].model_id, "future-copilot-model");
+            assert!(matches!(
+                catalog.models()[0].source,
+                ModelCatalogSource::Dynamic { .. }
+            ));
         }
 
         #[test]
@@ -1368,6 +1515,7 @@ mod tests {
                     "github-copilot-api",
                     "default",
                     &Token {
+                        provider_metadata: None,
                         access_token: "api-token".to_string(),
                         refresh_token: None,
                         id_token: None,
@@ -1495,6 +1643,8 @@ mod tests {
     fn built_in_descriptors_match_explicit_table() {
         // Drift guard: every built-in factory must keep an explicit descriptor.
         let expected: &[(&str, &str, &[CredentialFlow], bool)] = &[
+            #[cfg(feature = "cursor")]
+            ("cursor", "Cursor", &[], true),
             #[cfg(feature = "openai")]
             ("openai", "OpenAI", &[CredentialFlow::ApiKey], true),
             #[cfg(feature = "openai")]
@@ -1502,13 +1652,13 @@ mod tests {
             #[cfg(feature = "anthropic")]
             ("anthropic", "Anthropic", &[CredentialFlow::ApiKey], true),
             #[cfg(feature = "google")]
-            ("google", "Google", &[CredentialFlow::ApiKey], false),
+            ("google", "Google", &[CredentialFlow::ApiKey], true),
             #[cfg(feature = "grok")]
-            ("grok", "Grok", &[CredentialFlow::ApiKey], false),
+            ("grok", "Grok", &[CredentialFlow::ApiKey], true),
             #[cfg(feature = "groq")]
-            ("groq", "Groq", &[CredentialFlow::ApiKey], false),
+            ("groq", "Groq", &[CredentialFlow::ApiKey], true),
             #[cfg(feature = "mistral")]
-            ("mistral", "Mistral", &[CredentialFlow::ApiKey], false),
+            ("mistral", "Mistral", &[CredentialFlow::ApiKey], true),
             #[cfg(feature = "ollama")]
             ("ollama", "Ollama", &[CredentialFlow::Local], true),
             #[cfg(feature = "lmstudio")]
@@ -1532,9 +1682,9 @@ mod tests {
             #[cfg(feature = "azure")]
             ("azure", "Azure OpenAI", &[CredentialFlow::ApiKey], true),
             #[cfg(feature = "openrouter")]
-            ("openrouter", "OpenRouter", &[CredentialFlow::ApiKey], false),
+            ("openrouter", "OpenRouter", &[CredentialFlow::ApiKey], true),
             #[cfg(feature = "together")]
-            ("together", "Together", &[CredentialFlow::ApiKey], false),
+            ("together", "Together", &[CredentialFlow::ApiKey], true),
         ];
 
         let mut registry = roci_core::provider::ProviderRegistry::new();

@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 use roci_core::auth::{AuthService, FileTokenStore, ProviderAuthManager, TokenStoreConfig};
 use roci_core::config::RociConfig;
-#[cfg(any(feature = "github-copilot", feature = "ollama"))]
+#[cfg(any(feature = "github-copilot", feature = "ollama", feature = "lmstudio"))]
 use roci_core::models::ModelListOptions;
 use roci_core::provider::ProviderRegistry;
 
@@ -21,6 +21,8 @@ use roci_core::provider::ProviderRegistry;
 #[test]
 fn register_default_providers_matches_enabled_features() {
     let expected: &[&str] = &[
+        #[cfg(feature = "cursor")]
+        "cursor",
         #[cfg(feature = "openai")]
         "openai",
         #[cfg(feature = "openai")]
@@ -64,7 +66,7 @@ fn register_default_providers_matches_enabled_features() {
 
 #[cfg(feature = "github-copilot")]
 #[tokio::test]
-async fn explicit_github_copilot_catalog_falls_back_without_credentials() {
+async fn explicit_github_copilot_catalog_requires_credentials() {
     let config = RociConfig::new()
         .with_token_store(None)
         .with_provider_credential_store(None);
@@ -75,34 +77,75 @@ async fn explicit_github_copilot_catalog_falls_back_without_credentials() {
         ..ModelListOptions::default()
     };
 
-    let catalog = registry.list_models(&config, &options).await.unwrap();
-
-    assert!(!catalog.models().is_empty());
-    assert!(catalog
-        .models()
-        .iter()
-        .all(|model| model.provider_key == "github-copilot"));
+    let error = registry.list_models(&config, &options).await.unwrap_err();
+    assert!(matches!(
+        error,
+        roci_core::error::RociError::MissingCredential { provider } if provider == "github-copilot"
+    ));
 }
 
-#[cfg(feature = "ollama")]
+#[cfg(any(feature = "ollama", feature = "lmstudio"))]
 #[tokio::test]
-async fn register_default_providers_all_catalog_keeps_local_ollama_without_credentials() {
+async fn register_default_providers_all_catalog_discovers_local_models_without_credentials() {
+    use roci_core::models::ModelCatalogSource;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    let server = MockServer::start().await;
     let config = RociConfig::new()
         .with_token_store(None)
         .with_provider_credential_store(None);
     let mut registry = ProviderRegistry::new();
     roci_providers::register_default_providers(&mut registry);
-    assert_eq!(registry.requires_credentials("ollama"), Some(false));
+    let locals = [
+        #[cfg(feature = "ollama")]
+        ("ollama", "/ollama", "arbitrary-local-ollama-model"),
+        #[cfg(feature = "lmstudio")]
+        ("lmstudio", "/lmstudio", "arbitrary-local-lmstudio-model"),
+    ];
+    for (provider, base, id) in locals {
+        assert_eq!(registry.requires_credentials(provider), Some(false));
+        config.set_base_url(provider, format!("{}{base}", server.uri()));
+        let route = format!("{base}/v1/models");
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": id}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
 
     let catalog = registry
         .list_models(&config, &ModelListOptions::default())
         .await
         .unwrap();
 
-    assert!(catalog
-        .models()
-        .iter()
-        .any(|model| model.provider_key == "ollama" && model.model_id == "llama3.3"));
+    // Exact membership excludes both bundled model names and unavailable remote
+    // providers; each local server determines its own installed model inventory.
+    assert_eq!(catalog.models().len(), locals.len());
+    for (provider, _, id) in locals {
+        let model = catalog
+            .models()
+            .iter()
+            .find(|model| model.provider_key == provider)
+            .unwrap();
+        assert_eq!(model.model_id, id);
+        assert!(model.policy.local);
+        assert!(!model.policy.requires_credentials);
+        assert!(
+            matches!(&model.source, ModelCatalogSource::Dynamic { endpoint } if endpoint.starts_with(&server.uri()))
+        );
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), locals.len());
+    for request in requests {
+        assert!(!request.headers.contains_key("authorization"));
+        assert!(!request.headers.contains_key("x-api-key"));
+    }
 }
 
 // ---------------------------------------------------------------------------

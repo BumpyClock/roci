@@ -10,6 +10,20 @@ use thiserror::Error;
 const CREDENTIAL_RECORD_VERSION: u32 = 1;
 const KEYRING_SERVICE: &str = "dev.roci.provider-credentials";
 
+/// Credential material selected for a provider, preserving the wire auth scheme.
+#[derive(Debug, Clone)]
+pub enum CredentialMaterial {
+    ApiKey(ProviderApiKey),
+    OAuth(super::Token),
+}
+
+/// One credential and its associated endpoint from the same configuration snapshot.
+#[derive(Debug, Clone)]
+pub struct ResolvedProviderCredential {
+    pub material: CredentialMaterial,
+    pub endpoint: Option<ProviderEndpoint>,
+}
+
 /// Secret API-key input accepted by provider configuration APIs.
 ///
 /// This type deliberately implements neither `Display` nor `Serialize`; its
@@ -116,6 +130,11 @@ pub enum ProviderCredentialStoreError {
 /// [`crate::config::RociConfig::with_provider_credential_store`]. Implementations
 /// must fail closed.
 pub trait ProviderCredentialStore: Send + Sync {
+    /// Return the backing store for an account-binding facade, when present.
+    fn unscoped_store(&self) -> Option<Arc<dyn ProviderCredentialStore>> {
+        None
+    }
+
     /// Load the provider record, or `None` when no Roci-owned record exists.
     fn load(
         &self,

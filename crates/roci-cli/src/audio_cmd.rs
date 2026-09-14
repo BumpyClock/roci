@@ -6,6 +6,7 @@ use roci::audio::{
     AudioFormat, AudioProvider, OpenAiTtsProvider, OpenAiWhisperTranscriptionProvider,
     SpeechProvider, SpeechRequest, TranscriptionResult, Voice,
 };
+use roci::auth::CredentialMaterial;
 use roci::config::RociConfig;
 use roci::error::RociError;
 use roci::models::ProviderKey;
@@ -83,10 +84,16 @@ fn build_tts_provider(model: &str) -> Result<OpenAiTtsProvider, Box<dyn std::err
 
 fn require_openai_credentials() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
     let config = RociConfig::from_env();
-    let api_key = config
-        .get_api_key_for(ProviderKey::OpenAi)
+    let credential = config
+        .resolve_provider_credential("openai")?
         .ok_or_else(|| RociError::Authentication("Missing OPENAI_API_KEY".into()))?;
-    let base_url = config.get_base_url_for(ProviderKey::OpenAi);
+    let CredentialMaterial::ApiKey(key) = credential.material else {
+        return Err(RociError::Authentication("OpenAI audio requires an API key".into()).into());
+    };
+    let api_key = key.expose_secret().to_owned();
+    let base_url = credential
+        .endpoint
+        .map(|endpoint| endpoint.as_str().to_owned());
     Ok((api_key, base_url))
 }
 

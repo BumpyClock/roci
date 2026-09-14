@@ -19,14 +19,14 @@ pub struct GrokProvider {
 }
 
 impl GrokProvider {
-    pub fn new(model: GrokModel, api_key: String) -> Self {
+    pub fn new(model: GrokModel, api_key: String, base_url: Option<String>) -> Self {
         let capabilities = model.capabilities();
         let openai_model = OpenAiModel::Custom(model.as_str().to_string());
         Self {
             inner: OpenAiProvider::new(
                 openai_model,
                 api_key,
-                Some("https://api.x.ai/v1".to_string()),
+                Some(base_url.unwrap_or_else(|| "https://api.x.ai/v1".into())),
                 None,
             ),
             capabilities,
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn grok_3_provider_supports_image_input() {
-        let provider = GrokProvider::new(GrokModel::Grok3, String::new());
+        let provider = GrokProvider::new(GrokModel::Grok3, String::new(), None);
         let caps = provider.capabilities();
 
         assert!(caps.input.image.is_some());
