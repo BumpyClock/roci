@@ -302,6 +302,13 @@ terminal outcomes follow the same commit path. Import, bootstrap, and history
 reset also pass through this owner; replay invalidation must succeed before a
 replacement projection becomes visible.
 
+Once first polled, queueing, prompting, continuation, cancellation, import,
+history replacement, and reset run as owned operations. Dropping their response
+future does not abandon the operation between its semantic commit and its
+provider, queue, or history update. Use `cancel_turn` or `abort` to cancel
+execution explicitly. This applies to the operation's lifetime within the
+running Tokio runtime; it does not promise recovery after process termination.
+
 The synchronous raw `AgentEvent` callback is still forwarded immediately.
 Semantic events commit asynchronously, so receiving a raw callback does not mean
 the corresponding semantic state is already committed. Hosts use semantic

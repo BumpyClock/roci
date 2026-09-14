@@ -93,6 +93,10 @@ use crate::types::{GenerationSettings, ModelMessage, Usage};
 /// let result = agent.continue_without_input().await?;
 /// agent.reset().await;
 /// ```
+/// Once first polled, lifecycle operations (prompt, enqueue, continuation,
+/// cancellation, import, history replacement, and reset) continue if their
+/// response future is dropped. Use [`Self::cancel_turn`] or [`Self::abort`] to
+/// cancel execution explicitly.
 #[derive(Clone)]
 pub struct AgentRuntime {
     config: AgentConfig,

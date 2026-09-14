@@ -970,7 +970,7 @@ async fn pre_start_cancel_does_not_commit_canceled_prompt_to_provider_ledger() {
         let hook_calls = hook_calls_for_hook.clone();
         Box::pin(async move {
             if hook_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                entered.notify_waiters();
+                entered.notify_one();
                 release.notified().await;
             }
             Ok(BeforeAgentStartHookResult::Continue)

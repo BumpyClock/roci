@@ -131,6 +131,12 @@ impl AgentRuntime {
     ///
     /// Returns [`RociError::InvalidState`] if the runtime is not idle.
     pub async fn replace_messages(&self, messages: Vec<ModelMessage>) -> Result<(), RociError> {
+        self.run_owned(move |runtime| async move { runtime.replace_messages_owned(messages).await })
+            .await
+            .map_err(Self::map_chat_projection_error)?
+    }
+
+    async fn replace_messages_owned(&self, messages: Vec<ModelMessage>) -> Result<(), RociError> {
         let state_guard = self.lock_state_for_idle_mutation()?;
         let mut existing_messages = self.messages.try_lock().map_err(|_| {
             RociError::InvalidState("Agent is busy (messages lock contended)".into())

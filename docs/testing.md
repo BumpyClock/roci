@@ -47,6 +47,12 @@ acknowledgement. Cover queue/cancel, stream and terminal transitions, and replay
 invalidation before import or history replacement. Resource, retry, and subagent
 events must use the same semantic commit path.
 
+Hold an append or replay invalidation and drop the caller of enqueue, cancel,
+history replacement, import, or reset. After releasing storage, the owned
+operation must finish its queue/provider/history update and allow the runtime
+to become idle. Dropping an acknowledgement must not strand a committed turn
+or leave semantic and provider history diverged.
+
 Keep raw callback timing separate: forwarding a synchronous `AgentEvent` does
 not establish semantic commit. These checks also do not establish atomicity
 between semantic events, the provider ledger, and resource files.

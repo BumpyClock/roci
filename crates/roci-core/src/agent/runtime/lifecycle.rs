@@ -12,6 +12,24 @@ use crate::models::{
 use crate::types::{ModelMessage, Role, Usage};
 
 impl AgentRuntime {
+    /// First polling a public operation transfers it to a runtime-owned task.
+    /// Dropping the response waiter must not abandon post-commit lifecycle work.
+    pub(super) async fn run_owned<T, F>(
+        &self,
+        operation: impl FnOnce(Self) -> F + Send + 'static,
+    ) -> Result<T, AgentRuntimeError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let runtime = self.clone();
+        tokio::spawn(async move { operation(runtime).await })
+            .await
+            .map_err(|error| AgentRuntimeError::ProjectionFailed {
+                message: format!("runtime operation task failed: {error}"),
+            })
+    }
+
     async fn queue_chat_turn(&self, messages: Vec<ModelMessage>) -> Result<TurnId, RociError> {
         self.semantic
             .queue_turn(messages)
@@ -30,6 +48,12 @@ impl AgentRuntime {
     ///
     /// Returns [`RociError::InvalidState`] if the runtime is not idle.
     pub async fn import_thread(&self, imported: ImportedThread) -> Result<(), RociError> {
+        self.run_owned(move |runtime| async move { runtime.import_thread_owned(imported).await })
+            .await
+            .map_err(Self::map_chat_projection_error)?
+    }
+
+    async fn import_thread_owned(&self, imported: ImportedThread) -> Result<(), RociError> {
         let state_guard = self.lock_state_for_idle_mutation()?;
         let mut existing_messages = self.messages.try_lock().map_err(|_| {
             RociError::InvalidState("Agent is busy (messages lock contended)".into())
@@ -57,6 +81,13 @@ impl AgentRuntime {
     /// Queued turns execute one at a time. Per-turn settings and approval policy
     /// are frozen when this method is called.
     pub async fn enqueue_turn(&self, request: EnqueueTurnRequest) -> Result<TurnId, RociError> {
+        self.increment_queued_turn_count();
+        self.run_owned(move |runtime| async move { runtime.enqueue_turn_owned(request).await })
+            .await
+            .map_err(Self::map_chat_projection_error)?
+    }
+
+    async fn enqueue_turn_owned(&self, request: EnqueueTurnRequest) -> Result<TurnId, RociError> {
         let options = self
             .current_turn_options(
                 request.generation_settings.clone(),
@@ -64,7 +95,6 @@ impl AgentRuntime {
                 request.collaboration_mode,
             )
             .await;
-        self.increment_queued_turn_count();
         let turn_id = match self.queue_chat_turn(request.messages.clone()).await {
             Ok(turn_id) => turn_id,
             Err(err) => {
@@ -204,7 +234,14 @@ impl AgentRuntime {
     ///
     /// Returns [`RociError::InvalidState`] if the agent is not idle.
     pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunResult, RociError> {
+        let input = input.into();
         self.transition_to_running()?;
+        self.run_owned(move |runtime| async move { runtime.prompt_owned(input).await })
+            .await
+            .map_err(Self::map_chat_projection_error)?
+    }
+
+    async fn prompt_owned(&self, input: PromptInput) -> Result<RunResult, RociError> {
         let candidates = self.current_candidates().await;
         let user_message = match self.compile_user_prompt_with_candidates(input, &candidates) {
             Ok(message) => message,
@@ -232,6 +269,17 @@ impl AgentRuntime {
             ));
         }
         self.transition_to_running()?;
+        self.run_owned(
+            move |runtime| async move { runtime.prompt_message_owned(user_message).await },
+        )
+        .await
+        .map_err(Self::map_chat_projection_error)?
+    }
+
+    async fn prompt_message_owned(
+        &self,
+        user_message: ModelMessage,
+    ) -> Result<RunResult, RociError> {
         self.prompt_user_message(user_message).await
     }
 
@@ -317,7 +365,14 @@ impl AgentRuntime {
         &self,
         input: impl Into<PromptInput>,
     ) -> Result<RunResult, RociError> {
+        let input = input.into();
         self.transition_to_running()?;
+        self.run_owned(move |runtime| async move { runtime.continue_run_owned(input).await })
+            .await
+            .map_err(Self::map_chat_projection_error)?
+    }
+
+    async fn continue_run_owned(&self, input: PromptInput) -> Result<RunResult, RociError> {
         let candidates = self.current_candidates().await;
         let user_message = match self.compile_user_prompt_with_candidates(input, &candidates) {
             Ok(message) => message,
@@ -364,7 +419,12 @@ impl AgentRuntime {
     /// - the last message is assistant and there are no queued steering/follow-ups.
     pub async fn continue_without_input(&self) -> Result<RunResult, RociError> {
         self.transition_to_running()?;
+        self.run_owned(|runtime| async move { runtime.continue_without_input_owned().await })
+            .await
+            .map_err(Self::map_chat_projection_error)?
+    }
 
+    async fn continue_without_input_owned(&self) -> Result<RunResult, RociError> {
         let snapshot = self.messages.lock().await.clone();
         if snapshot.is_empty() {
             self.restore_idle_after_preflight_error().await;
@@ -423,16 +483,36 @@ impl AgentRuntime {
     /// Returns `true` if an abort signal was successfully sent, `false` if
     /// the agent was not running or the handle was already consumed.
     pub async fn abort(&self) -> bool {
-        let active_turn_id = self
-            .semantic
-            .read_thread(self.default_thread_id())
-            .ok()
-            .and_then(|thread| thread.active_turn_id);
+        match self
+            .run_owned(|runtime| async move { runtime.abort_owned().await })
+            .await
+        {
+            Ok(aborted) => aborted,
+            Err(error) => {
+                self.record_background_error(error.to_string()).await;
+                false
+            }
+        }
+    }
+
+    async fn abort_owned(&self) -> bool {
+        let provider_turn_id = self
+            .active_provider_call
+            .lock()
+            .await
+            .as_ref()
+            .map(|call| call.turn_id);
+        let active_turn_id = provider_turn_id.or_else(|| {
+            self.semantic
+                .read_thread(self.default_thread_id())
+                .ok()
+                .and_then(|thread| thread.active_turn_id)
+        });
 
         if let Some(turn_id) = active_turn_id {
-            if self.cancel_turn(turn_id).await.is_ok() {
-                return true;
-            }
+            // A rejected semantic cancellation must never fall through to an
+            // uncommitted provider abort.
+            return self.cancel_turn_owned(turn_id).await.is_ok();
         }
 
         self.abort_legacy().await
@@ -446,6 +526,11 @@ impl AgentRuntime {
     /// canceled turns. Returns [`AgentRuntimeError::StaleRuntime`] when the
     /// turn id revision no longer matches the current thread revision.
     pub async fn cancel_turn(&self, turn_id: TurnId) -> Result<TurnSnapshot, AgentRuntimeError> {
+        self.run_owned(move |runtime| async move { runtime.cancel_turn_owned(turn_id).await })
+            .await?
+    }
+
+    async fn cancel_turn_owned(&self, turn_id: TurnId) -> Result<TurnSnapshot, AgentRuntimeError> {
         let canceled = self.semantic.cancel_turn(turn_id).await?;
 
         // Provider execution may start before its semantic TurnStarted batch commits.
@@ -516,8 +601,17 @@ impl AgentRuntime {
 
     /// Reset the agent: abort any in-flight run, then clear messages and queues.
     pub async fn reset(&self) {
+        if let Err(error) = self
+            .run_owned(|runtime| async move { runtime.reset_owned().await })
+            .await
+        {
+            self.record_background_error(error.to_string()).await;
+        }
+    }
+
+    async fn reset_owned(&self) {
         self.cancel_all_chat_turns().await;
-        self.abort().await;
+        self.abort_owned().await;
         self.wait_for_current_run_idle().await;
         self.wait_for_queued_turns_to_drain().await;
 
@@ -564,7 +658,7 @@ impl AgentRuntime {
             .map(|turn| turn.turn_id)
             .collect::<Vec<_>>();
         for turn_id in turn_ids {
-            let _ = self.cancel_turn(turn_id).await;
+            let _ = self.cancel_turn_owned(turn_id).await;
         }
     }
 

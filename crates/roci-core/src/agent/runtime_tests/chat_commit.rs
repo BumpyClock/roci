@@ -23,6 +23,7 @@ enum GateTarget {
     Any,
     TurnStarted,
     TurnCanceled,
+    Invalidate,
 }
 
 struct GatedCommitStore {
@@ -81,6 +82,7 @@ impl AgentRuntimeEventStore for GatedCommitStore {
     ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
         let matches = match self.target {
             GateTarget::Any => true,
+            GateTarget::Invalidate => false,
             GateTarget::TurnStarted => events
                 .iter()
                 .any(|event| matches!(event.payload, AgentRuntimeEventPayload::TurnStarted { .. })),
@@ -116,6 +118,17 @@ impl AgentRuntimeEventStore for GatedCommitStore {
         thread_id: ThreadId,
         latest_seq: u64,
     ) -> Result<(), AgentRuntimeError> {
+        if matches!(self.target, GateTarget::Invalidate) {
+            let gate = self.gates.lock().unwrap().pop_front();
+            if let Some(gate) = gate {
+                self.entered.send(()).unwrap();
+                if !gate.await.expect("test should release invalidation") {
+                    return Err(AgentRuntimeError::ProjectionFailed {
+                        message: "injected invalidation failure".into(),
+                    });
+                }
+            }
+        }
         self.inner.invalidate_thread(thread_id, latest_seq).await
     }
 }
@@ -385,4 +398,289 @@ async fn semantic_commit_cancel_only_aborts_after_successful_append() {
 
     provider_gate.notify_one();
     assert_next_turn_completes(&agent, "after committed cancellation").await;
+}
+
+#[tokio::test]
+async fn semantic_commit_dropped_enqueue_caller_still_executes_and_drains_queue() {
+    let (store, mut control) = GatedCommitStore::new(GateTarget::Any, 1);
+    let agent = commit_runtime(store);
+    let worker = agent.clone();
+    let caller = tokio::spawn(async move { worker.enqueue_turn(turn("accepted input")).await });
+    control.wait_for_append().await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    control.release(true);
+
+    timeout(WAIT, agent.wait_for_idle())
+        .await
+        .expect("accepted enqueue must execute and release its queued-turn count");
+    let thread = agent.read_thread(agent.default_thread_id()).await.unwrap();
+    assert_eq!(thread.turns.len(), 1);
+    assert_eq!(thread.turns[0].status, TurnStatus::Completed);
+    assert!(agent
+        .messages()
+        .await
+        .iter()
+        .any(|message| message.text() == "accepted input"));
+    assert_replay_matches_snapshot(&agent).await;
+    assert_next_turn_completes(&agent, "after dropped enqueue caller").await;
+}
+
+#[tokio::test]
+async fn semantic_commit_dropped_cancel_caller_still_aborts_provider() {
+    let (store, mut control) = GatedCommitStore::new(GateTarget::TurnCanceled, 1);
+    let provider_gate = Arc::new(tokio::sync::Notify::new());
+    let mut config = test_agent_config();
+    config.candidates = vec!["stub:cancel-commit".parse().unwrap()];
+    config.chat.event_store = Some(store);
+    let agent = AgentRuntime::new(
+        registry_with_gated_streaming_provider("stub", provider_gate.clone()),
+        test_config(),
+        config,
+    );
+    let mut events = agent.subscribe(None).await;
+    let turn_id = agent.enqueue_turn(turn("blocked provider")).await.unwrap();
+    loop {
+        let event = timeout(WAIT, events.recv()).await.unwrap().unwrap();
+        if matches!(event.payload, AgentRuntimeEventPayload::TurnStarted { .. }) {
+            break;
+        }
+    }
+    let worker = agent.clone();
+    let caller = tokio::spawn(async move { worker.cancel_turn(turn_id).await });
+    control.wait_for_append().await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    control.release(true);
+
+    timeout(WAIT, agent.wait_for_idle())
+        .await
+        .expect("accepted cancellation must abort provider after its caller drops");
+    let thread = agent.read_thread(agent.default_thread_id()).await.unwrap();
+    assert_eq!(thread.turns[0].status, TurnStatus::Canceled);
+    assert_replay_matches_snapshot(&agent).await;
+    provider_gate.notify_one();
+    assert_next_turn_completes(&agent, "after dropped cancel caller").await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HistoryMutation {
+    Replace,
+    Import,
+    Reset,
+}
+
+#[tokio::test]
+async fn semantic_commit_dropped_history_caller_finishes_provider_history_update() {
+    for operation in [
+        HistoryMutation::Replace,
+        HistoryMutation::Import,
+        HistoryMutation::Reset,
+    ] {
+        let (store, mut control) = GatedCommitStore::new(GateTarget::Invalidate, 1);
+        let agent = commit_runtime(store);
+        agent.prompt("old history").await.unwrap();
+        let expected = match operation {
+            HistoryMutation::Reset => Vec::new(),
+            _ => vec![ModelMessage::user("replacement history")],
+        };
+        let mut snapshots = agent.watch_snapshot();
+        snapshots.borrow_and_update();
+        let worker = agent.clone();
+        let messages = expected.clone();
+        let caller = tokio::spawn(async move {
+            match operation {
+                HistoryMutation::Replace => worker.replace_messages(messages).await.unwrap(),
+                HistoryMutation::Import => {
+                    let mut projector = ChatProjector::new(ChatRuntimeConfig {
+                        default_thread_id: Some(worker.default_thread_id()),
+                        ..Default::default()
+                    });
+                    let thread = projector.bootstrap_thread(messages.clone()).unwrap();
+                    worker
+                        .import_thread(super::chat::ImportedThread {
+                            thread,
+                            model_messages: messages,
+                        })
+                        .await
+                        .unwrap();
+                }
+                HistoryMutation::Reset => worker.reset().await,
+            }
+        });
+        control.wait_for_append().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        control.release(true);
+
+        timeout(WAIT, snapshots.changed()).await
+            .unwrap_or_else(|_| panic!("{operation:?} must publish its final provider-history snapshot after caller cancellation"))
+            .unwrap();
+        assert_eq!(agent.messages().await, expected, "{operation:?}");
+        assert_eq!(agent.state().await, AgentState::Idle, "{operation:?}");
+        let thread = agent.read_thread(agent.default_thread_id()).await.unwrap();
+        assert_eq!(
+            thread
+                .messages
+                .iter()
+                .map(|message| message.payload.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "{operation:?}"
+        );
+        agent.prompt("after dropped history caller").await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantic_commit_first_poll_admits_direct_run_before_owned_task_executes() {
+    // A current-thread runtime cannot schedule the owned task during these
+    // synchronous polls, so admission cannot depend on task scheduling.
+    for operation in [
+        "prompt",
+        "prompt_message",
+        "continue_run",
+        "continue_without_input",
+    ] {
+        let (store, _) = GatedCommitStore::new(GateTarget::Any, 0);
+        let agent = commit_runtime(store);
+        agent
+            .replace_messages(vec![ModelMessage::user("seed history")])
+            .await
+            .unwrap();
+        let mut caller = Box::pin(async {
+            match operation {
+                "prompt" => agent.prompt("admitted prompt").await,
+                "prompt_message" => {
+                    agent
+                        .prompt_message(ModelMessage::user("admitted message"))
+                        .await
+                }
+                "continue_run" => agent.continue_run("admitted continuation").await,
+                "continue_without_input" => agent.continue_without_input().await,
+                _ => unreachable!(),
+            }
+        });
+        assert!(futures::poll!(caller.as_mut()).is_pending(), "{operation}");
+        assert_eq!(
+            agent.state().await,
+            AgentState::Running,
+            "{operation} must reserve execution on first poll"
+        );
+        let mut idle = Box::pin(agent.wait_for_idle());
+        assert!(
+            futures::poll!(idle.as_mut()).is_pending(),
+            "{operation} must be visible to idle waiters immediately"
+        );
+        drop(idle);
+        drop(caller);
+
+        timeout(WAIT, agent.wait_for_idle())
+            .await
+            .expect("admitted direct run must survive waiter drop");
+        let thread = agent.read_thread(agent.default_thread_id()).await.unwrap();
+        assert_eq!(
+            thread.turns.last().unwrap().status,
+            TurnStatus::Completed,
+            "{operation}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantic_commit_first_poll_admits_enqueue_before_owned_task_executes() {
+    let (store, _) = GatedCommitStore::new(GateTarget::Any, 0);
+    let agent = commit_runtime(store);
+    let mut caller = Box::pin(agent.enqueue_turn(turn("admitted queued input")));
+    assert!(futures::poll!(caller.as_mut()).is_pending());
+    let mut idle = Box::pin(agent.wait_for_idle());
+    assert!(
+        futures::poll!(idle.as_mut()).is_pending(),
+        "an accepted enqueue must count as outstanding work before the task runs"
+    );
+    drop(idle);
+    drop(caller);
+
+    timeout(WAIT, agent.wait_for_idle())
+        .await
+        .expect("accepted enqueue must drain after waiter drop");
+    let thread = agent.read_thread(agent.default_thread_id()).await.unwrap();
+    assert_eq!(thread.turns.len(), 1);
+    assert_eq!(thread.turns[0].status, TurnStatus::Completed);
+    assert_replay_matches_snapshot(&agent).await;
+}
+
+#[tokio::test]
+async fn semantic_commit_abort_failure_does_not_abort_provider() {
+    let (store, mut control) = GatedCommitStore::new(GateTarget::TurnCanceled, 1);
+    let provider_gate = Arc::new(tokio::sync::Notify::new());
+    let mut config = test_agent_config();
+    config.candidates = vec!["stub:abort-commit".parse().unwrap()];
+    config.chat.event_store = Some(store);
+    let agent = AgentRuntime::new(
+        registry_with_gated_streaming_provider("stub", provider_gate.clone()),
+        test_config(),
+        config,
+    );
+    let mut subscription = agent.subscribe(None).await;
+    agent.enqueue_turn(turn("blocked provider")).await.unwrap();
+    loop {
+        let event = timeout(WAIT, subscription.recv()).await.unwrap().unwrap();
+        if matches!(event.payload, AgentRuntimeEventPayload::TurnStarted { .. }) {
+            break;
+        }
+    }
+    let committed_running = agent.read_snapshot().await;
+    let worker = agent.clone();
+    let abort = tokio::spawn(async move { worker.abort().await });
+    control.wait_for_append().await;
+    control.release(false);
+    assert!(!timeout(WAIT, abort).await.unwrap().unwrap());
+    assert_eq!(agent.state().await, AgentState::Running);
+    assert_eq!(agent.read_snapshot().await, committed_running);
+    assert!(timeout(Duration::from_millis(25), agent.wait_for_idle())
+        .await
+        .is_err());
+    assert_replay_matches_snapshot(&agent).await;
+
+    assert!(agent.abort().await);
+    timeout(WAIT, agent.wait_for_idle()).await.unwrap();
+    provider_gate.notify_one();
+    assert_next_turn_completes(&agent, "after rejected abort").await;
+}
+
+#[tokio::test]
+async fn semantic_commit_abort_targets_provider_before_turn_started_commits() {
+    let (store, mut control) = GatedCommitStore::new(GateTarget::TurnStarted, 1);
+    let provider_gate = Arc::new(tokio::sync::Notify::new());
+    let mut config = test_agent_config();
+    config.candidates = vec!["stub:abort-queued".parse().unwrap()];
+    config.chat.event_store = Some(store);
+    let agent = AgentRuntime::new(
+        registry_with_gated_streaming_provider("stub", provider_gate.clone()),
+        test_config(),
+        config,
+    );
+    let turn_id = agent.enqueue_turn(turn("blocked provider")).await.unwrap();
+    control.wait_for_append().await;
+    assert_eq!(agent.chat_turn_status(turn_id).unwrap(), TurnStatus::Queued);
+    let worker = agent.clone();
+    let mut abort = tokio::spawn(async move { worker.abort().await });
+    assert!(
+        timeout(Duration::from_millis(25), &mut abort)
+            .await
+            .is_err(),
+        "abort must wait for its semantic cancellation to commit"
+    );
+    assert_eq!(agent.state().await, AgentState::Running);
+    control.release(true);
+    assert!(timeout(WAIT, abort).await.unwrap().unwrap());
+    timeout(WAIT, agent.wait_for_idle()).await.unwrap();
+    assert_eq!(
+        agent.chat_turn_status(turn_id).unwrap(),
+        TurnStatus::Canceled
+    );
+    assert_replay_matches_snapshot(&agent).await;
+    provider_gate.notify_one();
+    assert_next_turn_completes(&agent, "after queued provider abort").await;
 }
