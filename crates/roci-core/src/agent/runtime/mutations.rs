@@ -136,13 +136,8 @@ impl AgentRuntime {
             RociError::InvalidState("Agent is busy (messages lock contended)".into())
         })?;
         let snapshot = self
-            .chat_projector
-            .lock()
-            .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
-            .bootstrap_thread(messages.clone())
-            .map_err(Self::map_chat_projection_error)?;
-        self.runtime_event_store
-            .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
+            .semantic
+            .bootstrap(messages.clone())
             .await
             .map_err(Self::map_chat_projection_error)?;
         if let Some(ledger) = &self.provider_ledger {

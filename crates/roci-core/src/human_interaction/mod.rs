@@ -7,11 +7,13 @@
 use std::collections::HashMap;
 #[cfg(feature = "agent")]
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, Mutex};
+#[cfg(feature = "agent")]
+use tokio::sync::Mutex;
+use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
 #[cfg(feature = "agent")]
@@ -637,13 +639,13 @@ struct PendingHumanInteractionRecord {
 pub struct PendingHumanInteraction {
     coordinator: HumanInteractionCoordinator,
     request_id: HumanInteractionRequestId,
-    rx: PendingReceiver,
+    rx: Option<PendingReceiver>,
 }
 
 /// Coordinates human interaction requests and responses.
 #[derive(Debug, Clone)]
 pub struct HumanInteractionCoordinator {
-    pending: Arc<Mutex<HashMap<HumanInteractionRequestId, PendingHumanInteractionRecord>>>,
+    pending: Arc<StdMutex<HashMap<HumanInteractionRequestId, PendingHumanInteractionRecord>>>,
     completion_tx: broadcast::Sender<HumanInteractionRequestId>,
 }
 
@@ -659,7 +661,7 @@ impl HumanInteractionCoordinator {
     pub fn new() -> Self {
         let (completion_tx, _) = broadcast::channel(32);
         Self {
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(StdMutex::new(HashMap::new())),
             completion_tx,
         }
     }
@@ -672,13 +674,16 @@ impl HumanInteractionCoordinator {
         let (tx, rx) = oneshot::channel();
         let request_id = request.request_id;
 
-        let mut pending = self.pending.lock().await;
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         pending.insert(request_id, PendingHumanInteractionRecord { request, tx });
 
         PendingHumanInteraction {
             coordinator: self.clone(),
             request_id,
-            rx,
+            rx: Some(rx),
         }
     }
 
@@ -688,7 +693,10 @@ impl HumanInteractionCoordinator {
         response: HumanInteractionResponse,
     ) -> Result<(), UnknownHumanInteractionRequest> {
         let request_id = response.request_id;
-        let mut pending = self.pending.lock().await;
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
 
         if let Some(record) = pending.remove(&request_id) {
             let _ = record.tx.send(Ok(response));
@@ -705,7 +713,10 @@ impl HumanInteractionCoordinator {
         request_id: HumanInteractionRequestId,
         error: HumanInteractionError,
     ) -> Result<(), UnknownHumanInteractionRequest> {
-        let mut pending = self.pending.lock().await;
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
 
         if let Some(record) = pending.remove(&request_id) {
             let _ = record.tx.send(Err(error));
@@ -765,7 +776,10 @@ impl HumanInteractionCoordinator {
 
     /// Cancel all pending requests.
     pub async fn cancel_all(&self) {
-        let mut pending = self.pending.lock().await;
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let pending_ids = pending.keys().copied().collect::<Vec<_>>();
         pending.clear();
         drop(pending);
@@ -777,7 +791,10 @@ impl HumanInteractionCoordinator {
 
     /// Return whether a request is still pending.
     pub async fn is_pending(&self, request_id: HumanInteractionRequestId) -> bool {
-        let pending = self.pending.lock().await;
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         pending.contains_key(&request_id)
     }
 
@@ -786,7 +803,10 @@ impl HumanInteractionCoordinator {
         &self,
         request_id: HumanInteractionRequestId,
     ) -> Option<HumanInteractionRequest> {
-        let pending = self.pending.lock().await;
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         pending
             .get(&request_id)
             .map(|record| record.request.clone())
@@ -794,7 +814,10 @@ impl HumanInteractionCoordinator {
 
     /// Return pending request snapshots.
     pub async fn pending_requests(&self) -> Vec<HumanInteractionRequest> {
-        let pending = self.pending.lock().await;
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         pending
             .values()
             .map(|record| record.request.clone())
@@ -806,8 +829,11 @@ impl HumanInteractionCoordinator {
         self.completion_tx.subscribe()
     }
 
-    async fn remove_request(&self, request_id: HumanInteractionRequestId) {
-        let mut pending = self.pending.lock().await;
+    fn remove_request(&self, request_id: HumanInteractionRequestId) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let removed = pending.remove(&request_id).is_some();
         drop(pending);
         if removed {
@@ -816,21 +842,32 @@ impl HumanInteractionCoordinator {
     }
 }
 
+impl Drop for PendingHumanInteraction {
+    fn drop(&mut self) {
+        // The waiter owns this registration. Abort may drop its future without
+        // producing a response, so retire it before returning control to the host.
+        self.coordinator.remove_request(self.request_id);
+    }
+}
+
 impl PendingHumanInteraction {
     /// Wait for response with optional timeout.
     pub async fn wait(
-        self,
+        mut self,
         timeout_ms: Option<u64>,
     ) -> Result<HumanInteractionResponse, HumanInteractionError> {
         let request_id = self.request_id;
-        let coordinator = self.coordinator;
-        let rx = self.rx;
+        let coordinator = self.coordinator.clone();
+        let rx = self
+            .rx
+            .take()
+            .expect("pending interaction receiver consumed once");
 
         let result = if let Some(ms) = timeout_ms {
             match tokio::time::timeout(std::time::Duration::from_millis(ms), rx).await {
                 Ok(result) => result,
                 Err(_) => {
-                    coordinator.remove_request(request_id).await;
+                    coordinator.remove_request(request_id);
                     return Err(HumanInteractionError::Timeout { request_id });
                 }
             }
@@ -847,7 +884,7 @@ impl PendingHumanInteraction {
             },
             Ok(Err(error)) => Err(error),
             Err(_) => {
-                coordinator.remove_request(request_id).await;
+                coordinator.remove_request(request_id);
                 Err(HumanInteractionError::Canceled { request_id })
             }
         }
@@ -1139,6 +1176,69 @@ mod tests {
         assert!(matches!(
             response.result,
             UserInputResult::Question { ref answer } if answer == "C"
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_waiter_retires_only_its_request_once() {
+        for poll_wait in [false, true] {
+            let coordinator = HumanInteractionCoordinator::new();
+            let mut completions = coordinator.subscribe_completion();
+            let request_id = Uuid::new_v4();
+            let sibling_id = Uuid::new_v4();
+            let pending = coordinator
+                .create_user_input_request(user_input_request(request_id))
+                .await;
+            let sibling = coordinator
+                .create_user_input_request(user_input_request(sibling_id))
+                .await;
+
+            if poll_wait {
+                let mut wait = Box::pin(pending.wait(None));
+                assert!(futures::poll!(wait.as_mut()).is_pending());
+                drop(wait);
+            } else {
+                drop(pending);
+            }
+
+            assert!(!coordinator.is_pending(request_id).await);
+            assert!(coordinator.is_pending(sibling_id).await);
+            assert_eq!(completions.try_recv().unwrap(), request_id);
+            assert!(matches!(
+                completions.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                coordinator.submit_user_input_response(UserInputResponse {
+                    request_id,
+                    result: UserInputResult::Canceled,
+                }).await,
+                Err(UnknownUserInputRequest(actual)) if actual == request_id
+            ));
+            drop(sibling);
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_waiter_drop_does_not_duplicate_completion() {
+        let coordinator = HumanInteractionCoordinator::new();
+        let mut completions = coordinator.subscribe_completion();
+        let request_id = Uuid::new_v4();
+        let pending = coordinator
+            .create_user_input_request(user_input_request(request_id))
+            .await;
+        coordinator
+            .submit_user_input_response(UserInputResponse {
+                request_id,
+                result: UserInputResult::Question { answer: "C".into() },
+            })
+            .await
+            .unwrap();
+        pending.wait_user_input(None).await.unwrap();
+        assert_eq!(completions.try_recv().unwrap(), request_id);
+        assert!(matches!(
+            completions.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
         ));
     }
 

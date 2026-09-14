@@ -221,7 +221,6 @@ async fn subagent_runtime_wiring_delegate_tool_publishes_semantic_started_event(
         test_config(),
         config,
     );
-    agent.ensure_runtime_event_publisher().await;
     let mut events = agent.subscribe(None).await;
     tokio::task::yield_now().await;
     let delegate_tool = agent
@@ -281,7 +280,6 @@ async fn subagent_runtime_bridge_persists_more_than_broadcast_capacity_without_g
         test_config(),
         config,
     );
-    agent.ensure_runtime_event_publisher().await;
     let thread_id = agent.read_snapshot().await.threads[0].thread_id;
     let mut live = agent.subscribe(None).await;
     let delegate_tool = agent
@@ -390,29 +388,24 @@ async fn subagent_event_never_attaches_to_unrelated_active_parent_turn() {
         test_config(),
         config,
     );
-    agent.ensure_runtime_event_publisher().await;
     let mut events = agent.subscribe(None).await;
-    let parent_turn_id = {
-        let mut projector = agent
-            .chat_projector
-            .lock()
-            .expect("chat projector lock should not be poisoned");
-        let turn_id = projector
-            .queue_turn(vec![ModelMessage::user("delegate")])
-            .turn_id;
-        projector
-            .start_turn(turn_id)
-            .expect("parent turn should start");
-        projector
-            .start_tool(
+    let parent_turn_id = agent
+        .semantic
+        .transact(|projector| {
+            let queued = projector.queue_turn(vec![ModelMessage::user("delegate")]);
+            let turn_id = queued.turn_id;
+            let mut events = queued.events;
+            events.push(projector.start_turn(turn_id)?);
+            events.push(projector.start_tool(
                 turn_id,
                 "parent-call-1",
                 "delegate_subagent",
                 serde_json::Value::Null,
-            )
-            .expect("parent delegate tool should start");
-        turn_id
-    };
+            )?);
+            Ok((turn_id, events))
+        })
+        .await
+        .expect("parent turn should start");
     let delegate_tool = agent
         .resolve_tools_for_run()
         .await
@@ -420,21 +413,11 @@ async fn subagent_event_never_attaches_to_unrelated_active_parent_turn() {
         .into_iter()
         .find(|tool| tool.name() == "delegate_subagent")
         .expect("delegate tool should be injected");
-    let projector = agent.chat_projector.clone();
-    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
-    let (rotate_tx, rotate_rx) = std::sync::mpsc::channel();
-    let rotate_parent = tokio::task::spawn_blocking(move || {
-        let mut projector = projector
-            .lock()
-            .expect("chat projector lock should not be poisoned");
-        locked_tx
-            .send(())
-            .expect("test should wait for projector lock");
-        rotate_rx
-            .recv()
-            .expect("test should request parent rotation");
-        projector
-            .complete_tool(
+    // Complete the original parent and activate an unrelated turn before child events arrive.
+    let unrelated_turn_id = agent
+        .semantic
+        .transact(move |projector| {
+            let mut events = vec![projector.complete_tool(
                 parent_turn_id,
                 "parent-call-1",
                 crate::types::AgentToolResult {
@@ -442,20 +425,16 @@ async fn subagent_event_never_attaches_to_unrelated_active_parent_turn() {
                     result: serde_json::Value::Null,
                     is_error: false,
                 },
-            )
-            .expect("parent delegate tool should complete");
-        projector
-            .complete_turn(parent_turn_id)
-            .expect("original parent turn should complete");
-        let unrelated_turn_id = projector
-            .queue_turn(vec![ModelMessage::user("unrelated")])
-            .turn_id;
-        projector
-            .start_turn(unrelated_turn_id)
-            .expect("unrelated parent turn should start");
-        unrelated_turn_id
-    });
-    locked_rx.await.expect("projector lock holder should start");
+            )?];
+            events.push(projector.complete_turn(parent_turn_id)?);
+            let queued = projector.queue_turn(vec![ModelMessage::user("unrelated")]);
+            let unrelated_turn_id = queued.turn_id;
+            events.extend(queued.events);
+            events.push(projector.start_turn(unrelated_turn_id)?);
+            Ok((unrelated_turn_id, events))
+        })
+        .await
+        .expect("parent rotation should complete");
 
     delegate_tool
         .execute(
@@ -471,12 +450,6 @@ async fn subagent_event_never_attaches_to_unrelated_active_parent_turn() {
         )
         .await
         .expect("delegate tool should execute");
-    rotate_tx
-        .send(())
-        .expect("parent rotation task should still run");
-    let unrelated_turn_id = rotate_parent
-        .await
-        .expect("parent rotation task should complete");
 
     loop {
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())

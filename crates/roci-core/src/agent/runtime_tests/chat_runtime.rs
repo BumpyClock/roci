@@ -663,6 +663,42 @@ async fn reset_clears_chat_messages_and_invalidates_prior_ids() {
 }
 
 #[tokio::test]
+async fn reset_preserves_committed_history_when_replay_invalidation_fails() {
+    let registry = registry_with_streaming_provider("stub", 8, 3);
+    let mut config = test_agent_config();
+    config.candidates = vec!["stub:chat-runtime"
+        .parse()
+        .expect("stub model should parse")];
+    config.chat.event_store = Some(Arc::new(FailingInvalidationStore {
+        inner: super::chat::InMemoryAgentRuntimeEventStore::new(),
+    }));
+    let agent = AgentRuntime::new(registry, test_config(), config);
+    agent
+        .prompt("retain this exchange")
+        .await
+        .expect("prompt should run");
+    let before = agent.read_snapshot().await;
+    let messages = agent.messages().await;
+    let usage = agent.session_usage().await;
+    assert!(!messages.is_empty());
+
+    timeout(Duration::from_secs(2), agent.reset())
+        .await
+        .expect("failed reset should return");
+
+    assert_eq!(agent.read_snapshot().await, before);
+    assert_eq!(agent.messages().await, messages);
+    assert_eq!(agent.session_usage().await, usage);
+    assert_eq!(agent.state().await, AgentState::Idle);
+    assert!(agent
+        .snapshot()
+        .await
+        .last_error
+        .expect("failed reset should report its error")
+        .contains("injected invalidation failure"));
+}
+
+#[tokio::test]
 async fn queued_cancel_prevents_provider_call_and_emits_turn_canceled() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let registry = registry_with_counting_blocking_provider("stub", provider_calls.clone());
@@ -768,7 +804,9 @@ async fn idle_mutations_reject_while_turn_is_queued() {
     assert!(matches!(result, Err(RociError::InvalidState(_))));
 
     agent.cancel_turn(turn_id).await.expect("turn cancels");
-    agent.wait_for_idle().await;
+    timeout(Duration::from_secs(2), agent.wait_for_idle())
+        .await
+        .expect("canceling the queued turn should not strand provider execution");
 }
 
 #[tokio::test]
@@ -1555,6 +1593,41 @@ impl ModelProvider for FullMessageRecordingProvider {
             }),
         ];
         Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+struct FailingInvalidationStore {
+    inner: super::chat::InMemoryAgentRuntimeEventStore,
+}
+
+#[async_trait]
+impl AgentRuntimeEventStore for FailingInvalidationStore {
+    async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
+        self.inner.append(event).await
+    }
+
+    async fn append_batch(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
+        self.inner.append_batch(events).await
+    }
+
+    async fn events_after(
+        &self,
+        cursor: RuntimeCursor,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.inner.events_after(cursor).await
+    }
+
+    async fn invalidate_thread(
+        &self,
+        _thread_id: ThreadId,
+        _latest_seq: u64,
+    ) -> Result<(), AgentRuntimeError> {
+        Err(AgentRuntimeError::ProjectionFailed {
+            message: "injected invalidation failure".to_string(),
+        })
     }
 }
 

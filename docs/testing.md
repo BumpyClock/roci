@@ -29,6 +29,28 @@ cargo test -p roci-tools      # Built-in and workspace tool contracts
 - Unix auth file smoke (four real `roci-agent` processes under temp `HOME`): `cargo test -p roci-cli --test auth_cli_unix`
 - To inspect test output: append `-- --nocapture`
 
+### Semantic runtime commit verification
+
+Focused failure and ordering coverage lives in
+`crates/roci-core/src/agent/runtime_tests/chat_commit.rs`:
+
+```bash
+cargo test -p roci-core --features agent "agent::runtime::tests::chat_commit::"
+cargo test --workspace --all-features
+```
+
+Use a controllable event store to hold or fail an append. While the append is
+pending, snapshot reads must return the previous committed view. A failed batch
+must neither replace that view nor publish semantic events. Successful commands
+must preserve event order and make their committed view visible before
+acknowledgement. Cover queue/cancel, stream and terminal transitions, and replay
+invalidation before import or history replacement. Resource, retry, and subagent
+events must use the same semantic commit path.
+
+Keep raw callback timing separate: forwarding a synchronous `AgentEvent` does
+not establish semantic commit. These checks also do not establish atomicity
+between semantic events, the provider ledger, and resource files.
+
 ## Live tmux/provider verification
 
 Do not call provider-facing work done, fixed, ready, or successfully verified until a live provider call has run in an interactive tmux session and produced a successful provider response.
@@ -257,6 +279,14 @@ tmux new-session -d -s roci-session-resume \
    ls -la "$ROOT/live-resume"; exec zsh'
 echo "attach: tmux attach -t roci-session-resume"
 ```
+
+For semantic commit changes, run a second `roci-agent chat` process in that tmux
+session with the same session root and ID and a short follow-up prompt. Export
+the resumed session and inspect its semantic snapshot and event log: both turns
+must have their terminal outcomes, sequence numbers must remain ordered, and
+the resumed provider context must contain the earlier exchange. Record both
+commands, provider/model/endpoint, response text, and exit codes. This live
+resume check complements the controlled append-failure tests above.
 
 Provider-facing durable recovery smoke should run in tmux and use framed OpenAI-compatible endpoint:
 

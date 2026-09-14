@@ -1,3 +1,8 @@
+use super::chat::{
+    AgentRuntimeError, AgentRuntimeEvent, AgentRuntimeEventPayload, AgentRuntimeEventStore,
+    ChatProjector, ChatRuntimeConfig, InMemoryAgentRuntimeEventStore, RuntimeCursor, ThreadId,
+    TurnStatus,
+};
 use super::support::*;
 use super::*;
 use crate::agent_loop::AgentEvent;
@@ -11,7 +16,7 @@ use crate::tools::{
 use crate::types::{AgentToolCall, StreamEventType, TextStreamDelta, Usage};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
@@ -316,4 +321,157 @@ async fn abort_while_waiting_for_user_input_unblocks_run() {
         .expect("prompt should resolve to run result");
 
     assert_eq!(result.status, RunStatus::Canceled);
+}
+
+struct FailingInteractionStore {
+    inner: InMemoryAgentRuntimeEventStore,
+    failed: AtomicBool,
+}
+
+#[async_trait]
+impl AgentRuntimeEventStore for FailingInteractionStore {
+    async fn append(&self, event: AgentRuntimeEvent) -> Result<RuntimeCursor, AgentRuntimeError> {
+        Ok(self.append_batch(vec![event]).await?.remove(0))
+    }
+
+    async fn append_batch(
+        &self,
+        events: Vec<AgentRuntimeEvent>,
+    ) -> Result<Vec<RuntimeCursor>, AgentRuntimeError> {
+        if events.iter().any(|event| {
+            matches!(
+                event.payload,
+                AgentRuntimeEventPayload::HumanInteractionRequested { .. }
+            )
+        }) && !self.failed.swap(true, Ordering::SeqCst)
+        {
+            return Err(AgentRuntimeError::ProjectionFailed {
+                message: "injected human interaction append failure".into(),
+            });
+        }
+        self.inner.append_batch(events).await
+    }
+
+    async fn events_after(
+        &self,
+        cursor: RuntimeCursor,
+    ) -> Result<Vec<AgentRuntimeEvent>, AgentRuntimeError> {
+        self.inner.events_after(cursor).await
+    }
+
+    async fn invalidate_thread(
+        &self,
+        thread_id: ThreadId,
+        latest_seq: u64,
+    ) -> Result<(), AgentRuntimeError> {
+        self.inner.invalidate_thread(thread_id, latest_seq).await
+    }
+}
+
+#[tokio::test]
+async fn failed_human_interaction_append_unblocks_run_without_user_response() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(AskUserFactory {
+        calls: calls.clone(),
+    }));
+    let coordinator = Arc::new(HumanInteractionCoordinator::new());
+    let store = Arc::new(FailingInteractionStore {
+        inner: InMemoryAgentRuntimeEventStore::new(),
+        failed: AtomicBool::new(false),
+    });
+    let ask_user_tool: Arc<dyn Tool> = Arc::new(
+        AgentTool::new(
+            "ask_user",
+            "ask without a timeout",
+            AgentToolParameters::empty(),
+            |_, ctx| async move {
+                let callback = ctx
+                    .request_user_input
+                    .as_ref()
+                    .expect("runtime should provide user input");
+                let response = callback(UserInputRequest {
+                    request_id: uuid::Uuid::new_v4(),
+                    tool_call_id: "ask-user-call-1".into(),
+                    prompt: AskUserPrompt::Question {
+                        id: "invisible_question".into(),
+                        question: "Will never be shown".into(),
+                        placeholder: None,
+                        default: None,
+                        multiline: false,
+                    },
+                    timeout_ms: None,
+                })
+                .await
+                .map_err(|error| RociError::InvalidState(error.to_string()))?;
+                Ok(serde_json::to_value(response).unwrap())
+            },
+        )
+        .with_static_safety(ToolSafetyPlan::host_input(), host_input_safety_summary()),
+    );
+    let mut config = test_agent_config();
+    config.candidates = vec!["stub:ask-user-runtime".parse().unwrap()];
+    config.tools = vec![ask_user_tool];
+    config.user_input_timeout_ms = None;
+    config.human_interaction_coordinator = Some(coordinator.clone());
+    config.chat.event_store = Some(store.clone());
+    let agent = AgentRuntime::new(Arc::new(registry), test_config(), config);
+    let thread_id = agent.default_thread_id();
+
+    let error = timeout(
+        std::time::Duration::from_secs(2),
+        agent.prompt("ask a question"),
+    )
+    .await
+    .expect("failed request publication must not wait for an invisible user response")
+    .expect_err("request publication failure should propagate");
+
+    assert!(error
+        .to_string()
+        .contains("injected human interaction append failure"));
+    assert!(
+        store.failed.load(Ordering::SeqCst),
+        "must exercise the requested-event append failure"
+    );
+    assert_eq!(agent.state().await, AgentState::Idle);
+    assert!(
+        coordinator.pending_requests().await.is_empty(),
+        "aborted interaction must not remain in the coordinator"
+    );
+    let snapshot = agent.read_thread(thread_id).await.unwrap();
+    assert_eq!(snapshot.turns.len(), 1);
+    assert_eq!(snapshot.turns[0].status, TurnStatus::Failed);
+    assert!(snapshot.human_interactions.is_empty());
+    let replay = agent
+        .subscribe(Some(RuntimeCursor::new(thread_id, 0)))
+        .await
+        .replay()
+        .unwrap();
+    assert!(!replay.iter().any(|event| matches!(
+        event.payload,
+        AgentRuntimeEventPayload::HumanInteractionRequested { .. }
+    )));
+    let reconstructed = ChatProjector::from_events(
+        ChatRuntimeConfig {
+            default_thread_id: Some(thread_id),
+            ..Default::default()
+        },
+        replay,
+    )
+    .unwrap();
+    assert_eq!(agent.read_snapshot().await, reconstructed.read_snapshot());
+
+    let next = timeout(
+        std::time::Duration::from_secs(2),
+        agent.prompt("continue after storage failure"),
+    )
+    .await
+    .expect("next prompt should not be stranded")
+    .expect("store recovers after one failure");
+    assert_eq!(next.status, RunStatus::Completed);
+    assert!(next
+        .messages
+        .iter()
+        .any(|message| message.text() == "unit confirmed"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }

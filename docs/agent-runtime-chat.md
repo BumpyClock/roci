@@ -22,10 +22,10 @@ runtime state.
 ## Public APIs
 
 - `read_snapshot() -> RuntimeSnapshot` (async)
-  - Returns all in-memory projected threads, including `thread_id`, `revision`,
-    and `last_seq`.
+  - Returns all committed projected threads, including `thread_id`, `revision`,
+    and `last_seq`. Pending event-store writes are not visible.
 - `read_thread(thread_id: ThreadId) -> Result<ThreadSnapshot, AgentRuntimeError>` (async)
-  - Returns one thread projection.
+  - Returns one committed thread projection.
   - `Err(ThreadNotFound)` when the thread id is unknown.
 - `default_thread_id() -> ThreadId`
   - Returns the runtime-owned default thread id used for queued turns.
@@ -40,8 +40,8 @@ runtime state.
   - Invalidates retained replay at `imported.thread.last_seq`.
   - Requires idle runtime state.
 - `enqueue_turn(request: EnqueueTurnRequest) -> Result<TurnId, RociError>` (async)
-  - Returns a stable `TurnId` after semantic queue projection and before provider
-    execution starts.
+  - Returns a stable `TurnId` after the semantic queue event batch commits and
+    before provider execution starts.
   - Runtime serializes queued turns so only one provider run is active at a time.
   - The first queued turn prepends the configured system prompt to provider
     context when runtime history is empty. Later turns reuse that persisted
@@ -286,6 +286,35 @@ plan output, the turn fails instead of synthesizing a plan from prose.
   - bounded by replay capacity (default: `ChatRuntimeConfig::default().replay_capacity = 512`)
 - Event store contract is only for replaying semantic `AgentRuntimeEvent`.
 - Raw `AgentEvent` stream is not intended as public persistence/replay API.
+
+### Semantic commit ownership
+
+A private runtime owner serializes semantic commands. For each command it stages
+the projection and per-run stream state, appends the generated events as one
+atomic batch, installs the committed view, publishes live events, then
+acknowledges the command. Event-store adapters must commit the whole batch or
+none of it.
+
+While an append is pending, snapshot reads return the previous committed view.
+An append failure leaves that view unchanged and publishes none of the failed
+batch. Queueing, cancellation, resource events, retries, subagent events, and
+terminal outcomes follow the same commit path. Import, bootstrap, and history
+reset also pass through this owner; replay invalidation must succeed before a
+replacement projection becomes visible.
+
+The synchronous raw `AgentEvent` callback is still forwarded immediately.
+Semantic events commit asynchronously, so receiving a raw callback does not mean
+the corresponding semantic state is already committed. Hosts use semantic
+subscriptions and snapshots for committed chat state.
+
+A failed streaming commit wakes and aborts the matching provider call, including
+when a tool is waiting for human input that could not be published. The run
+reports the original commit error and attempts to commit a failed terminal state.
+Dropping a pending interaction removes only that request from its coordinator.
+
+This boundary covers semantic projection and event batches. The provider context
+ledger and actual resource files remain separate transactions; a semantic commit
+does not make writes across those files atomic.
 
 ### Durable session event store
 

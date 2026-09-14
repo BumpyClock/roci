@@ -1,6 +1,6 @@
 use super::{
-    AgentRuntime, AgentRuntimeError, AgentRuntimeEventPayload, AgentState, EnqueueTurnRequest,
-    ImportedThread, QueuedTurn, ThreadId, TurnId, TurnSnapshot, TurnStatus,
+    AgentRuntime, AgentRuntimeError, AgentState, EnqueueTurnRequest, ImportedThread, QueuedTurn,
+    ThreadId, TurnId, TurnSnapshot, TurnStatus,
 };
 use crate::agent_loop::RunResult;
 use crate::attachments::{compile_prompt_input, PromptInput};
@@ -13,30 +13,15 @@ use crate::types::{ModelMessage, Role, Usage};
 
 impl AgentRuntime {
     async fn queue_chat_turn(&self, messages: Vec<ModelMessage>) -> Result<TurnId, RociError> {
-        let (turn_id, events, previous_projector) = {
-            let mut projector = self
-                .chat_projector
-                .lock()
-                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
-            let previous_projector = projector.clone();
-            let projection = projector.queue_turn(messages);
-            (projection.turn_id, projection.events, previous_projector)
-        };
-        if let Err(err) = self.publish_runtime_events(events).await {
-            if let Ok(mut projector) = self.chat_projector.lock() {
-                *projector = previous_projector;
-            }
-            return Err(Self::map_chat_projection_error(err));
-        }
-        Ok(turn_id)
+        self.semantic
+            .queue_turn(messages)
+            .await
+            .map_err(Self::map_chat_projection_error)
     }
 
     /// Return the runtime's default semantic thread id.
     pub fn default_thread_id(&self) -> ThreadId {
-        self.chat_projector
-            .lock()
-            .expect("chat projector mutex poisoned")
-            .default_thread_id()
+        self.semantic.default_thread_id()
     }
 
     /// Import a full semantic thread snapshot and separate provider ledger.
@@ -50,13 +35,8 @@ impl AgentRuntime {
             RociError::InvalidState("Agent is busy (messages lock contended)".into())
         })?;
         let snapshot = self
-            .chat_projector
-            .lock()
-            .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
-            .import_thread(imported.thread)
-            .map_err(Self::map_chat_projection_error)?;
-        self.runtime_event_store
-            .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
+            .semantic
+            .import_thread(imported.thread, true)
             .await
             .map_err(Self::map_chat_projection_error)?;
         if let Some(ledger) = &self.provider_ledger {
@@ -443,12 +423,11 @@ impl AgentRuntime {
     /// Returns `true` if an abort signal was successfully sent, `false` if
     /// the agent was not running or the handle was already consumed.
     pub async fn abort(&self) -> bool {
-        let active_turn_id = self.chat_projector.lock().ok().and_then(|projector| {
-            projector
-                .read_thread(projector.default_thread_id())
-                .ok()
-                .and_then(|thread| thread.active_turn_id)
-        });
+        let active_turn_id = self
+            .semantic
+            .read_thread(self.default_thread_id())
+            .ok()
+            .and_then(|thread| thread.active_turn_id);
 
         if let Some(turn_id) = active_turn_id {
             if self.cancel_turn(turn_id).await.is_ok() {
@@ -467,36 +446,13 @@ impl AgentRuntime {
     /// canceled turns. Returns [`AgentRuntimeError::StaleRuntime`] when the
     /// turn id revision no longer matches the current thread revision.
     pub async fn cancel_turn(&self, turn_id: TurnId) -> Result<TurnSnapshot, AgentRuntimeError> {
-        let (previous_status, events, canceled) = {
-            let mut projector =
-                self.chat_projector
-                    .lock()
-                    .map_err(|_| AgentRuntimeError::ProjectionFailed {
-                        message: "chat projector lock poisoned".into(),
-                    })?;
-            let previous = projector.turn_snapshot(turn_id)?;
-            let mut events = projector.cancel_pending_approvals(turn_id)?;
-            let event = projector.cancel_turn(turn_id)?;
-            let canceled = match &event.payload {
-                AgentRuntimeEventPayload::TurnCanceled { turn } => turn.clone(),
-                _ => {
-                    return Err(AgentRuntimeError::ProjectionFailed {
-                        message: format!("cancel projection emitted non-cancel event: {turn_id}"),
-                    });
-                }
-            };
-            events.push(event);
-            (previous.status, events, canceled)
-        };
+        let canceled = self.semantic.cancel_turn(turn_id).await?;
 
-        if previous_status == TurnStatus::Running {
-            let abort_sent = self.abort_active_provider_call().await;
-            if abort_sent {
-                self.transition_running_to_aborting().await;
-            }
+        // Provider execution may start before its semantic TurnStarted batch commits.
+        // Target the actual call by turn id, even if the committed turn was queued.
+        if self.abort_active_provider_call(turn_id).await {
+            self.transition_running_to_aborting().await;
         }
-
-        self.publish_runtime_events(events).await?;
 
         Ok(canceled)
     }
@@ -511,17 +467,23 @@ impl AgentRuntime {
         drop(state);
         self.broadcast_snapshot().await;
 
-        let mut abort_tx = self.active_abort_tx.lock().await;
-        if let Some(tx) = abort_tx.take() {
-            tx.send(()).is_ok()
+        let mut abort_tx = self.active_provider_call.lock().await;
+        if let Some(call) = abort_tx.take() {
+            call.abort_tx.send(()).is_ok()
         } else {
             false
         }
     }
 
-    pub(super) async fn abort_active_provider_call(&self) -> bool {
-        let mut abort_tx = self.active_abort_tx.lock().await;
-        abort_tx.take().is_some_and(|tx| tx.send(()).is_ok())
+    pub(super) async fn abort_active_provider_call(&self, turn_id: TurnId) -> bool {
+        let mut active = self.active_provider_call.lock().await;
+        if active.as_ref().is_some_and(|call| call.turn_id == turn_id) {
+            active
+                .take()
+                .is_some_and(|call| call.abort_tx.send(()).is_ok())
+        } else {
+            false
+        }
     }
 
     async fn transition_running_to_aborting(&self) {
@@ -562,6 +524,14 @@ impl AgentRuntime {
         #[cfg(feature = "agent")]
         self.human_interaction_coordinator.cancel_all().await;
 
+        let snapshot = match self.semantic.bootstrap(Vec::new()).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                self.record_background_error(err.to_string()).await;
+                return;
+            }
+        };
+        let thread_id = snapshot.thread_id;
         self.messages.lock().await.clear();
         self.steering_queue.lock().await.clear();
         self.follow_up_queue.lock().await.clear();
@@ -569,21 +539,8 @@ impl AgentRuntime {
         *self.is_streaming.lock().await = false;
         *self.last_error.lock().await = None;
         *self.session_usage.lock().await = Usage::default();
-        let snapshot = self
-            .chat_projector
-            .lock()
-            .expect("chat projector mutex poisoned")
-            .bootstrap_thread(Vec::new())
-            .expect("empty chat bootstrap cannot fail");
-        if let Err(err) = self
-            .runtime_event_store
-            .invalidate_thread(snapshot.thread_id, snapshot.last_seq)
-            .await
-        {
-            *self.last_error.lock().await = Some(err.to_string());
-        }
         if let Some(ledger) = &self.provider_ledger {
-            if let Err(err) = ledger.append_ledger_invalidated(snapshot.thread_id) {
+            if let Err(err) = ledger.append_ledger_invalidated(thread_id) {
                 *self.last_error.lock().await = Some(err.to_string());
             }
             *self.persisted_provider_message_count.lock().await = 0;
@@ -598,20 +555,14 @@ impl AgentRuntime {
 
     async fn cancel_all_chat_turns(&self) {
         let turn_ids = self
-            .chat_projector
-            .lock()
-            .ok()
-            .map(|projector| {
-                projector
-                    .read_snapshot()
-                    .threads
-                    .into_iter()
-                    .flat_map(|thread| thread.turns)
-                    .filter(|turn| matches!(turn.status, TurnStatus::Queued | TurnStatus::Running))
-                    .map(|turn| turn.turn_id)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .semantic
+            .read_snapshot()
+            .threads
+            .into_iter()
+            .flat_map(|thread| thread.turns)
+            .filter(|turn| matches!(turn.status, TurnStatus::Queued | TurnStatus::Running))
+            .map(|turn| turn.turn_id)
+            .collect::<Vec<_>>();
         for turn_id in turn_ids {
             let _ = self.cancel_turn(turn_id).await;
         }

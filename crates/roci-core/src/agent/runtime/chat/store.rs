@@ -16,7 +16,9 @@ pub trait AgentRuntimeEventStore: Send + Sync {
 
     /// Append a semantic runtime event batch.
     ///
-    /// Stores should commit either every event in the batch or none of them.
+    /// Implementations must commit every event in the batch or none of them.
+    /// Returning an error must leave replay unchanged; the semantic runtime
+    /// installs its corresponding projection only after this operation succeeds.
     async fn append_batch(
         &self,
         events: Vec<AgentRuntimeEvent>,

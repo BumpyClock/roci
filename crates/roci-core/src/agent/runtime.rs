@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 
 pub mod chat;
 mod config;
@@ -23,6 +23,7 @@ mod events;
 mod lifecycle;
 mod mutations;
 mod run_loop;
+mod semantic;
 mod state;
 mod summary;
 mod types;
@@ -110,7 +111,7 @@ pub struct AgentRuntime {
     messages: Arc<Mutex<Vec<ModelMessage>>>,
     steering_queue: Arc<Mutex<Vec<ModelMessage>>>,
     follow_up_queue: Arc<Mutex<Vec<ModelMessage>>>,
-    active_abort_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    active_provider_call: Arc<Mutex<Option<ActiveProviderCall>>>,
     queued_turn_state: Arc<Mutex<QueuedTurnState>>,
     queued_turn_count: Arc<StdMutex<usize>>,
     queued_turn_notify: Arc<Notify>,
@@ -120,13 +121,7 @@ pub struct AgentRuntime {
     last_error: Arc<Mutex<Option<String>>>,
     snapshot_tx: watch::Sender<AgentSnapshot>,
     snapshot_rx: watch::Receiver<AgentSnapshot>,
-    chat_projector: Arc<StdMutex<ChatProjector>>,
-    runtime_event_tx: broadcast::Sender<AgentRuntimeEvent>,
-    runtime_event_store: Arc<dyn AgentRuntimeEventStore>,
-    runtime_event_send_lock: Arc<StdMutex<()>>,
-    runtime_event_publish_tx: mpsc::UnboundedSender<RuntimeEventPublishRequest>,
-    runtime_event_publish_rx:
-        Arc<Mutex<Option<mpsc::UnboundedReceiver<RuntimeEventPublishRequest>>>>,
+    semantic: semantic::SemanticRuntime,
     #[cfg(feature = "agent")]
     subagent_controller: Option<Arc<crate::agent::subagents::SubagentRoutingController>>,
     session_config: Option<crate::session::SessionConfig>,
@@ -144,6 +139,11 @@ pub struct AgentRuntime {
     tool_permission_session_approvals: crate::human_interaction::ToolPermissionSessionApprovals,
 }
 
+struct ActiveProviderCall {
+    turn_id: TurnId,
+    abort_tx: oneshot::Sender<()>,
+}
+
 #[derive(Debug)]
 struct QueuedTurn {
     turn_id: TurnId,
@@ -155,12 +155,6 @@ struct QueuedTurn {
 struct QueuedTurnState {
     turns: VecDeque<QueuedTurn>,
     worker_active: bool,
-}
-
-pub(super) struct RuntimeEventPublishRequest {
-    pub events: Vec<AgentRuntimeEvent>,
-    pub ack_tx: Option<oneshot::Sender<Result<Vec<RuntimeCursor>, AgentRuntimeError>>>,
-    pub error_slot: Option<Arc<StdMutex<Option<AgentRuntimeError>>>>,
 }
 
 impl AgentRuntime {
@@ -219,11 +213,11 @@ impl AgentRuntime {
         };
         let session_config = config.session.clone();
         let sandbox_provider = config.sandbox_provider.clone();
-        let (runtime_event_tx, _) = broadcast::channel(replay_capacity.get());
-        let (runtime_event_publish_tx, runtime_event_publish_rx) =
-            mpsc::unbounded_channel::<RuntimeEventPublishRequest>();
-        let runtime_event_send_lock = Arc::new(StdMutex::new(()));
-        let chat_projector = Arc::new(StdMutex::new(ChatProjector::new(config.chat.clone())));
+        let semantic = semantic::SemanticRuntime::new(
+            ChatProjector::new(config.chat.clone()),
+            runtime_event_store,
+            replay_capacity.get(),
+        );
         let (state_tx, state_rx) = watch::channel(AgentState::Idle);
         let initial_snapshot = AgentSnapshot {
             state: AgentState::Idle,
@@ -269,13 +263,7 @@ impl AgentRuntime {
         };
         #[cfg(feature = "agent")]
         if let (Some(controller), Some(events)) = (&subagent_controller, subagent_events) {
-            spawn_subagent_runtime_event_bridge(
-                controller.clone(),
-                events,
-                chat_projector.clone(),
-                runtime_event_publish_tx.clone(),
-                runtime_event_send_lock.clone(),
-            );
+            spawn_subagent_runtime_event_bridge(controller.clone(), events, semantic.clone());
         }
         Ok(Self {
             config,
@@ -294,7 +282,7 @@ impl AgentRuntime {
             messages: Arc::new(Mutex::new(Vec::new())),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
             follow_up_queue: Arc::new(Mutex::new(Vec::new())),
-            active_abort_tx: Arc::new(Mutex::new(None)),
+            active_provider_call: Arc::new(Mutex::new(None)),
             queued_turn_state: Arc::new(Mutex::new(QueuedTurnState::default())),
             queued_turn_count: Arc::new(StdMutex::new(0)),
             queued_turn_notify: Arc::new(Notify::new()),
@@ -304,12 +292,7 @@ impl AgentRuntime {
             last_error: Arc::new(Mutex::new(None)),
             snapshot_tx,
             snapshot_rx,
-            chat_projector,
-            runtime_event_tx,
-            runtime_event_store,
-            runtime_event_send_lock,
-            runtime_event_publish_tx,
-            runtime_event_publish_rx: Arc::new(Mutex::new(Some(runtime_event_publish_rx))),
+            semantic,
             #[cfg(feature = "agent")]
             subagent_controller,
             session_config,
@@ -397,16 +380,11 @@ impl AgentRuntime {
         snapshot: RuntimeSnapshot,
         model_messages: Vec<ModelMessage>,
     ) -> Result<(), RociError> {
-        {
-            let mut projector = self
-                .chat_projector
-                .lock()
-                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
-            for thread in snapshot.threads {
-                projector
-                    .import_thread(thread)
-                    .map_err(Self::map_chat_projection_error)?;
-            }
+        for thread in snapshot.threads {
+            self.semantic
+                .import_thread(thread, false)
+                .await
+                .map_err(Self::map_chat_projection_error)?;
         }
         *self.messages.lock().await = model_messages;
         self.broadcast_snapshot().await;
@@ -539,9 +517,7 @@ fn normalized_replay_capacity(replay_capacity: usize) -> NonZeroUsize {
 fn spawn_subagent_runtime_event_bridge(
     controller: Arc<crate::agent::subagents::SubagentRoutingController>,
     mut events: mpsc::UnboundedReceiver<crate::agent::subagents::SubagentEvent>,
-    chat_projector: Arc<StdMutex<ChatProjector>>,
-    runtime_event_publish_tx: mpsc::UnboundedSender<RuntimeEventPublishRequest>,
-    runtime_event_send_lock: Arc<StdMutex<()>>,
+    semantic: semantic::SemanticRuntime,
 ) {
     use std::collections::HashMap;
 
@@ -556,10 +532,8 @@ fn spawn_subagent_runtime_event_bridge(
     tokio::spawn(async move {
         let mut sequences: HashMap<SubagentId, u64> = HashMap::new();
         let mut parent_turn_ids: HashMap<SubagentId, Option<TurnId>> = HashMap::new();
-        let projection_error = Arc::new(StdMutex::new(None));
 
         'events: while let Some(event) = events.recv().await {
-            log_projection_error(&projection_error, None, None, None);
             let subagent_id = subagent_event_id(&event);
             {
                 let Some(controller) = controller.upgrade() else {
@@ -567,27 +541,26 @@ fn spawn_subagent_runtime_event_bridge(
                 };
                 let sequence = sequences.get(&subagent_id).copied().unwrap_or(0) + 1;
                 let metadata = controller.metadata(subagent_id).await;
-                let (thread_id, discovered_parent_turn_id) = match chat_projector.lock() {
-                    Ok(projector) => {
-                        let thread_id = projector.default_thread_id();
-                        let discovered_parent_turn_id =
-                            projector.read_thread(thread_id).ok().and_then(|thread| {
-                                metadata
-                                    .as_ref()
-                                    .and_then(|metadata| metadata.parent_tool_call_id.as_deref())
-                                    .and_then(|parent_tool_call_id| {
-                                        thread
-                                            .tools
-                                            .iter()
-                                            .find(|tool| tool.tool_call_id == parent_tool_call_id)
-                                            .map(|tool| tool.turn_id)
-                                    })
-                                    .or(thread.active_turn_id)
-                            });
-                        (thread_id, discovered_parent_turn_id)
-                    }
-                    Err(_) => continue,
-                };
+                // Resolve parent association against committed state after preceding loop events.
+                if let Err(err) = semantic.flush().await {
+                    log_chat_projection_error(subagent_id, sequence, None, &err);
+                    continue;
+                }
+                let thread_id = semantic.default_thread_id();
+                let discovered_parent_turn_id =
+                    semantic.read_thread(thread_id).ok().and_then(|thread| {
+                        metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.parent_tool_call_id.as_deref())
+                            .and_then(|parent_tool_call_id| {
+                                thread
+                                    .tools
+                                    .iter()
+                                    .find(|tool| tool.tool_call_id == parent_tool_call_id)
+                                    .map(|tool| tool.turn_id)
+                            })
+                            .or(thread.active_turn_id)
+                    });
                 let parent_turn_id = *parent_turn_ids
                     .entry(subagent_id)
                     .or_insert(discovered_parent_turn_id);
@@ -605,57 +578,26 @@ fn spawn_subagent_runtime_event_bridge(
                     continue;
                 };
                 sequences.insert(subagent_id, sequence);
-                let projected = match chat_projector.lock() {
-                    Ok(mut projector) => {
-                        if let Some(turn_id) = parent_turn_id {
+                let projected = semantic
+                    .transact(move |projector| {
+                        let event = if let Some(turn_id) = parent_turn_id {
                             projector
                                 .record_subagent_event(turn_id, payload.clone())
                                 .or_else(|_| {
                                     projector.record_subagent_event_for_thread(thread_id, payload)
-                                })
+                                })?
                         } else {
-                            projector.record_subagent_event_for_thread(thread_id, payload)
-                        }
-                    }
-                    Err(_) => continue,
-                };
-                let projected = match projected {
-                    Ok(projected) => projected,
-                    Err(err) => {
-                        log_chat_projection_error(subagent_id, sequence, Some(thread_id), &err);
-                        continue;
-                    }
-                };
-                if let Err(err) = AgentRuntime::queue_runtime_event_to(
-                    &runtime_event_publish_tx,
-                    &runtime_event_send_lock,
-                    projected,
-                    projection_error.clone(),
-                ) {
+                            projector.record_subagent_event_for_thread(thread_id, payload)?
+                        };
+                        Ok(((), vec![event]))
+                    })
+                    .await;
+                if let Err(err) = projected {
                     log_chat_projection_error(subagent_id, sequence, Some(thread_id), &err);
-                    continue;
                 }
-                log_projection_error(
-                    &projection_error,
-                    Some(subagent_id),
-                    Some(sequence),
-                    Some(thread_id),
-                );
             }
         }
     });
-
-    fn log_projection_error(
-        slot: &Arc<StdMutex<Option<AgentRuntimeError>>>,
-        subagent_id: Option<SubagentId>,
-        sequence: Option<u64>,
-        thread_id: Option<ThreadId>,
-    ) {
-        let Some(err) = slot.lock().ok().and_then(|mut error| error.take()) else {
-            return;
-        };
-        log_chat_projection_error_context(subagent_id, sequence, thread_id, &err);
-    }
 
     fn log_chat_projection_error(
         subagent_id: SubagentId,

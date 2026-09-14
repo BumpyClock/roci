@@ -4,6 +4,7 @@ mod api_key;
 mod before_agent_start;
 mod budget;
 mod chat_cancel;
+mod chat_commit;
 mod chat_contracts;
 mod chat_projection;
 mod chat_runtime;

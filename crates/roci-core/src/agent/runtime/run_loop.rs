@@ -64,49 +64,18 @@ impl AgentRuntime {
             TerminalTurnOutcome::Failed(_) => TurnStatus::Failed,
             TerminalTurnOutcome::Canceled => TurnStatus::Canceled,
         };
-        let events: Result<Vec<_>, AgentRuntimeError> = (|| {
-            let mut projector =
-                self.chat_projector
-                    .lock()
-                    .map_err(|_| AgentRuntimeError::ProjectionFailed {
-                        message: "chat projector lock poisoned".into(),
-                    })?;
-            let mut events = if status == TurnStatus::Canceled {
-                projector.cancel_pending_approvals(turn_id)
-            } else {
-                Ok(Vec::new())
-            }?;
-            if status == TurnStatus::Canceled {
-                events.extend(projector.cancel_pending_human_interactions(turn_id)?);
-            }
-            let event = match outcome {
-                TerminalTurnOutcome::Completed => projector.complete_turn(turn_id),
-                TerminalTurnOutcome::Failed(error) => projector.fail_turn(turn_id, error),
-                TerminalTurnOutcome::Canceled => projector.cancel_turn(turn_id),
-            };
-            events.push(event?);
-            Ok::<_, AgentRuntimeError>(events)
-        })();
-
-        let events = match events {
-            Ok(events) => events,
-            Err(AgentRuntimeError::AlreadyTerminal {
-                status: terminal_status,
-                ..
-            }) if terminal_status == status => return Ok(()),
-            Err(err) => return Err(Self::map_chat_projection_error(err)),
+        let error = match outcome {
+            TerminalTurnOutcome::Failed(error) => Some(error),
+            _ => None,
         };
-
-        self.publish_runtime_events(events)
+        self.semantic
+            .terminal_turn(turn_id, status, error)
             .await
-            .map(|_| ())
             .map_err(Self::map_chat_projection_error)
     }
 
     pub(super) fn chat_turn_status(&self, turn_id: TurnId) -> Result<TurnStatus, RociError> {
-        self.chat_projector
-            .lock()
-            .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?
+        self.semantic
             .turn_snapshot(turn_id)
             .map(|turn| turn.status)
             .map_err(Self::map_chat_projection_error)
@@ -481,17 +450,40 @@ impl AgentRuntime {
 
             let mut handle: RunHandle = self.runner.start(request).await?;
             let abort_tx = handle.take_abort_sender();
-            *self.active_abort_tx.lock().await = abort_tx;
+            *self.active_provider_call.lock().await =
+                abort_tx.map(|abort_tx| super::ActiveProviderCall { turn_id, abort_tx });
             if self.chat_turn_status(turn_id)? == TurnStatus::Canceled {
-                self.abort_active_provider_call().await;
+                self.abort_active_provider_call(turn_id).await;
             }
 
-            Ok::<RunResult, RociError>(handle.wait().await)
+            let completion = handle.wait();
+            tokio::pin!(completion);
+            let result = tokio::select! {
+                result = &mut completion => result,
+                () = chat_projection_error.wait() => {
+                    // A failed semantic interaction event must not leave a provider/tool
+                    // waiting for input that subscribers can never observe.
+                    self.abort_active_provider_call(turn_id).await;
+                    completion.await
+                }
+            };
+            Ok::<RunResult, RociError>(result)
         }
         .await;
 
-        self.active_abort_tx.lock().await.take();
+        self.active_provider_call.lock().await.take();
         *self.is_streaming.lock().await = false;
+
+        let flush_result = self.semantic.flush().await;
+        let sink_error = chat_projection_error.take().filter(|err| {
+            !matches!(err, AgentRuntimeError::AlreadyTerminal {
+                turn_id: id, status: TurnStatus::Canceled,
+            } if *id == turn_id)
+        });
+        let run_result = match flush_result.err().or(sink_error) {
+            Some(err) => Err(Self::map_chat_projection_error(err)),
+            None => run_result,
+        };
 
         let mut plan_contract_error = None;
         let projection_result = match &run_result {
@@ -590,54 +582,18 @@ impl AgentRuntime {
         if let Some(error) = plan_contract_error {
             return Err(RociError::InvalidState(error));
         }
-        if let Some(err) = chat_projection_error
-            .lock()
-            .map_err(|_| RociError::InvalidState("chat projection lock poisoned".into()))?
-            .take()
-        {
-            match err {
-                AgentRuntimeError::AlreadyTerminal {
-                    turn_id: terminal_turn_id,
-                    status: TurnStatus::Canceled,
-                } if terminal_turn_id == turn_id => {}
-                err => return Err(Self::map_chat_projection_error(err)),
-            }
-        }
         run_result
     }
 
     fn build_retry_event_sink(
         &self,
         turn_id: TurnId,
-        projection_error: std::sync::Arc<std::sync::Mutex<Option<AgentRuntimeError>>>,
+        projection_error: super::semantic::SemanticRunErrors,
     ) -> RunEventSink {
-        let chat_projector = self.chat_projector.clone();
-        let runtime_event_publish_tx = self.runtime_event_publish_tx.clone();
-        let runtime_event_send_lock = self.runtime_event_send_lock.clone();
+        let semantic = self.semantic.clone();
         std::sync::Arc::new(move |event| {
-            let RunEventPayload::Retry { event } = event.payload else {
-                return;
-            };
-            let projection_result = chat_projector
-                .lock()
-                .map_err(|_| AgentRuntimeError::ProjectionFailed {
-                    message: "chat projector lock poisoned".into(),
-                })
-                .and_then(|mut projector| projector.record_retry(turn_id, event))
-                .and_then(|event| {
-                    AgentRuntime::queue_runtime_event_to(
-                        &runtime_event_publish_tx,
-                        &runtime_event_send_lock,
-                        event,
-                        projection_error.clone(),
-                    )
-                });
-            if let Err(err) = projection_result {
-                if let Ok(mut stored_error) = projection_error.lock() {
-                    if stored_error.is_none() {
-                        *stored_error = Some(err);
-                    }
-                }
+            if let RunEventPayload::Retry { event } = event.payload {
+                semantic.retry(turn_id, event, projection_error.clone());
             }
         })
     }
@@ -658,23 +614,9 @@ impl AgentRuntime {
             ));
         };
 
-        let events = {
-            let mut projector = self
-                .chat_projector
-                .lock()
-                .map_err(|_| RociError::InvalidState("chat projector lock poisoned".into()))?;
-            super::events::project_plan_update_and_mirror(
-                &mut projector,
-                turn_id,
-                plan,
-                self.session_resources.as_deref(),
-            )
-        }
-        .map_err(Self::map_chat_projection_error)?;
-
-        self.publish_runtime_events(events)
+        self.semantic
+            .plan(turn_id, plan, self.session_resources.clone())
             .await
-            .map(|_| ())
             .map_err(Self::map_chat_projection_error)
     }
 

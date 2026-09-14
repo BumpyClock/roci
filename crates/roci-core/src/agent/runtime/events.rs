@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
+
+use super::semantic::SemanticRunErrors;
 
 use super::{
     AgentRuntime, AgentRuntimeError, AgentRuntimeEvent, AgentSnapshot, AgentState, ChatProjector,
@@ -33,13 +35,23 @@ pub(super) fn project_plan_update_and_mirror(
     Ok(events)
 }
 
-#[derive(Debug, Default)]
-struct ChatProjectionRunState {
+#[derive(Debug, Clone, Default)]
+pub(super) struct ChatProjectionRunState {
     turn_started: bool,
     active_message_id: Option<MessageId>,
     remaining_context_message_lifecycles: usize,
     skipping_context_message: bool,
     suppress_plan_events: bool,
+}
+
+impl ChatProjectionRunState {
+    pub(super) fn new(initial_count: usize, mode: CollaborationMode) -> Self {
+        Self {
+            remaining_context_message_lifecycles: initial_count,
+            suppress_plan_events: mode == CollaborationMode::Plan,
+            ..Self::default()
+        }
+    }
 }
 
 fn ensure_turn_started(
@@ -56,7 +68,7 @@ fn ensure_turn_started(
     Ok(vec![event])
 }
 
-fn project_agent_event(
+pub(super) fn project_agent_event(
     projector: &mut ChatProjector,
     run_state: &mut ChatProjectionRunState,
     turn_id: TurnId,
@@ -239,7 +251,7 @@ impl AgentRuntime {
         turn_id: TurnId,
         initial_message_count: usize,
         collaboration_mode: CollaborationMode,
-    ) -> (AgentEventSink, Arc<StdMutex<Option<AgentRuntimeError>>>) {
+    ) -> (AgentEventSink, SemanticRunErrors) {
         let original_sink = self.config.event_sink.clone();
         let turn_index = self.turn_index.clone();
         let is_streaming = self.is_streaming.clone();
@@ -247,49 +259,20 @@ impl AgentRuntime {
         let last_error = self.last_error.clone();
         let state = self.state.clone();
         let snapshot_tx = self.snapshot_tx.clone();
-        let chat_projector = self.chat_projector.clone();
-        let runtime_event_publish_tx = self.runtime_event_publish_tx.clone();
-        let runtime_event_send_lock = self.runtime_event_send_lock.clone();
+        let semantic = self.semantic.clone();
         let session_resources = self.session_resources.clone();
-        let projection_error = Arc::new(StdMutex::new(None));
+        let projection_error = SemanticRunErrors::default();
         let projection_error_for_sink = projection_error.clone();
-        let projection_error_for_publish = projection_error.clone();
-        let projection_run_state = Arc::new(StdMutex::new(ChatProjectionRunState {
-            remaining_context_message_lifecycles: initial_message_count,
-            suppress_plan_events: collaboration_mode == CollaborationMode::Plan,
-            ..ChatProjectionRunState::default()
-        }));
 
         let sink: AgentEventSink = Arc::new(move |event: AgentEvent| {
-            if let (Ok(mut projector), Ok(mut run_state)) =
-                (chat_projector.lock(), projection_run_state.lock())
-            {
-                let projection_result = project_agent_event(
-                    &mut projector,
-                    &mut run_state,
-                    turn_id,
-                    &event,
-                    session_resources.as_deref(),
-                )
-                .and_then(|events| {
-                    for event in events {
-                        AgentRuntime::queue_runtime_event_to(
-                            &runtime_event_publish_tx,
-                            &runtime_event_send_lock,
-                            event,
-                            projection_error_for_publish.clone(),
-                        )?;
-                    }
-                    Ok(())
-                });
-                if let Err(err) = projection_result {
-                    if let Ok(mut stored_error) = projection_error_for_sink.lock() {
-                        if stored_error.is_none() {
-                            *stored_error = Some(err);
-                        }
-                    }
-                }
-            }
+            semantic.event(
+                turn_id,
+                event.clone(),
+                initial_message_count,
+                collaboration_mode,
+                session_resources.clone(),
+                projection_error_for_sink.clone(),
+            );
 
             if let AgentEvent::TurnStart {
                 turn_index: idx, ..
