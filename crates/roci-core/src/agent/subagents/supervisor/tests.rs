@@ -316,8 +316,13 @@ fn dummy_tool(name: &str) -> Arc<dyn Tool> {
     ))
 }
 
-fn captured_tool_names(config: &AgentConfig) -> Vec<&str> {
-    config.tools.iter().map(|tool| tool.name()).collect()
+fn captured_tool_names(config: &AgentConfig) -> Vec<String> {
+    ToolCatalog::from_tools(config.tools.clone(), ToolOrigin::Custom)
+        .unwrap()
+        .resolve_descriptors(&config.tool_visibility_policy)
+        .into_iter()
+        .map(|descriptor| descriptor.name)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -639,7 +644,8 @@ async fn spawn_rejects_unknown_tool_policy_entry() {
         Err(err) => err,
     };
 
-    assert!(err.to_string().contains("subagent tool 'missing'"));
+    assert!(matches!(err, RociError::Configuration(ref message)
+        if message.contains("unknown native tool 'missing'")));
 }
 
 // ---------------------------------------------------------------------------

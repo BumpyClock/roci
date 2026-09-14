@@ -169,6 +169,7 @@ use logical paths under `files/`.
   - `ToolCatalog` deduplicates tools by name with deterministic first-wins behavior.
   - `ToolVisibilityPolicy` supports hiding all tools, allow-only names, and excluded names after static + dynamic tool discovery and before provider tool definitions are built.
   - Policy precedence is `no_tools` first, then exclusions, then allow-only.
+  - The default policy is unrestricted. An explicit `allow_only([])` allows no tools; `allow()` returns `None` for unrestricted and `Some(set)` for an explicit selection. CLI omission of `--tool` keeps the unrestricted default.
   - Built-in tools expose catalog metadata from `roci-tools`; CLI chat maps `--no-tools`, `--tool`, and `--exclude-tool` onto the same policy.
 - Coding tools receive an optional canonical `workspace_root` through
   `AgentConfig`/`RunRequest` and `ToolExecutionContext`. Both runtime entry
@@ -305,6 +306,27 @@ Sub-agent behavior is driven by named profiles (`SubagentProfile`), not ad-hoc p
 **Inheritance:** single-parent only (`inherits` field). Child scalar fields replace parent. `models` replaces wholesale. `tools` uses `ToolPolicy` semantics (`Inherit`, `Replace`, `InheritWithOverrides`).
 
 **TOML format:** Both single-file (top-level fields) and multi-profile (`[[profiles]]`) formats are supported via `TomlProfileFile`.
+
+### Profile capability enforcement
+
+Main and child runtimes apply the shared profile projection rules to native
+tools visible under the host's `ToolVisibilityPolicy`. The host policy is the
+capability ceiling; a main profile's additional restrictions do not become the
+child's ceiling. `excluded_tools` applies to both contexts, while
+`default_agent_excluded_tools` applies only to the main runtime. Explicit
+references to unavailable native tools fail before provider execution.
+
+Both runtimes preserve the full registered native catalog until dynamic tools
+have been merged, reserving native names and aliases even when a profile hides
+them. A shared conversion applies the projection to the host policy, and final
+catalog resolution supplies both model-visible definitions and executable tools.
+An excluded tool cannot be restored by a dynamic name or alias collision.
+
+MCP servers are validated against the host's actual dynamic providers and scoped
+before discovery and execution. Profile selection never implicitly inherits all
+MCP servers, and an empty native selection does not disable explicitly selected
+MCP servers. The CLI owns profile file discovery and selection; enforcement stays
+in the SDK.
 
 ### Model fallback
 

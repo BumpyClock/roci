@@ -13,11 +13,8 @@ use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
-use crate::tools::dynamic::{DynamicToolProvider, ScopedDynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::types::{ModelMessage, ReasoningEffort};
-
-use super::types::ToolPolicy;
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -93,7 +90,8 @@ impl SubagentLauncher for InProcessLauncher {
 /// - workspace/sandbox: inherit parent host boundaries.
 /// - provider fields: inherit dynamic providers, transport, retry, API key, headers,
 ///   metadata, and key fn.
-/// - tools: replace with profile-selected child tools.
+/// - tools: retain the supplied native catalog so names remain reserved during
+///   dynamic discovery; the supervisor applies profile restrictions to visibility.
 /// - user input coordinator: replace with supervisor coordinator.
 /// - compaction: inherit. Chat config: reset to avoid sharing parent event store.
 pub(super) fn build_child_config(
@@ -158,89 +156,6 @@ pub(super) fn build_child_config(
     })
 }
 
-pub(super) fn select_child_tools(
-    parent_tools: &[Arc<dyn Tool>],
-    policy: &ToolPolicy,
-) -> Result<Vec<Arc<dyn Tool>>, RociError> {
-    match policy {
-        ToolPolicy::Inherit => Ok(parent_tools.to_vec()),
-        ToolPolicy::Replace { tools } => tools
-            .iter()
-            .map(|name| find_parent_tool(parent_tools, name))
-            .collect(),
-        ToolPolicy::InheritWithOverrides { add, remove } => {
-            for name in remove {
-                find_parent_tool(parent_tools, name)?;
-            }
-            let mut selected: Vec<_> = parent_tools
-                .iter()
-                .filter(|tool| !remove.iter().any(|name| name == tool.name()))
-                .cloned()
-                .collect();
-            for name in add {
-                if selected.iter().any(|tool| tool.name() == name) {
-                    continue;
-                }
-                selected.push(find_parent_tool(parent_tools, name)?);
-            }
-            Ok(selected)
-        }
-    }
-}
-
-pub(super) fn select_child_dynamic_tool_providers(
-    parent_providers: &[Arc<dyn DynamicToolProvider>],
-    requested_server_ids: &[String],
-) -> Result<Vec<Arc<dyn DynamicToolProvider>>, RociError> {
-    if requested_server_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut matched_server_ids = std::collections::HashSet::new();
-    let mut selected = Vec::<Arc<dyn DynamicToolProvider>>::new();
-    for provider in parent_providers {
-        let provider_server_ids = provider.server_ids();
-        let intersection = requested_server_ids
-            .iter()
-            .filter(|server_id| provider_server_ids.contains(server_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if intersection.is_empty() {
-            continue;
-        }
-        matched_server_ids.extend(intersection.iter().cloned());
-        selected.push(Arc::new(ScopedDynamicToolProvider::new(
-            provider.clone(),
-            intersection,
-        )));
-    }
-
-    let unknown = requested_server_ids
-        .iter()
-        .filter(|server_id| !matched_server_ids.contains(*server_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unknown.is_empty() {
-        return Err(RociError::Configuration(format!(
-            "subagent MCP server ids are not available from parent dynamic providers: {}",
-            unknown.join(", ")
-        )));
-    }
-
-    Ok(selected)
-}
-
-fn find_parent_tool(
-    parent_tools: &[Arc<dyn Tool>],
-    name: &str,
-) -> Result<Arc<dyn Tool>, RociError> {
-    parent_tools
-        .iter()
-        .find(|tool| tool.name() == name)
-        .cloned()
-        .ok_or_else(|| RociError::Configuration(format!("subagent tool '{name}' is not available")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,9 +168,9 @@ mod tests {
     use crate::agent_loop::RetryMode;
     use crate::session::LogicalPath;
     use crate::tools::arguments::ToolArguments;
-    use crate::tools::dynamic::DynamicTool;
+    use crate::tools::dynamic::{scope_dynamic_tool_providers, DynamicTool, DynamicToolProvider};
     use crate::tools::tool::ToolExecutionContext;
-    use crate::tools::{AgentTool, AgentToolParameters, SandboxProvider};
+    use crate::tools::SandboxProvider;
     use crate::types::GenerationSettings;
 
     struct TestDynamicToolProvider {
@@ -480,11 +395,9 @@ mod tests {
             server_ids: vec!["figma".into()],
         });
 
-        let selected = select_child_dynamic_tool_providers(
-            &[multi_server, unrelated],
-            &["linear".to_string()],
-        )
-        .unwrap();
+        let selected =
+            scope_dynamic_tool_providers(&[multi_server, unrelated], &["linear".to_string()])
+                .unwrap();
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].server_ids(), vec!["linear"]);
@@ -496,7 +409,7 @@ mod tests {
             server_ids: vec!["github".into()],
         });
 
-        let selected = select_child_dynamic_tool_providers(&[provider], &[]).unwrap();
+        let selected = scope_dynamic_tool_providers(&[provider], &[]).unwrap();
 
         assert!(selected.is_empty());
     }
@@ -507,7 +420,7 @@ mod tests {
             server_ids: vec!["github".into()],
         });
 
-        let result = select_child_dynamic_tool_providers(
+        let result = scope_dynamic_tool_providers(
             &[provider],
             &["github".to_string(), "missing".to_string()],
         );
@@ -539,84 +452,5 @@ mod tests {
         };
 
         assert!(err.to_string().contains("invalid reasoning_effort"));
-    }
-
-    #[test]
-    fn select_child_tools_applies_tool_policy() {
-        let parent = vec![
-            dummy_tool("read"),
-            dummy_tool("write"),
-            dummy_tool("shell"),
-            dummy_tool("search"),
-        ];
-
-        let replaced = select_child_tools(
-            &parent,
-            &ToolPolicy::Replace {
-                tools: vec!["read".into(), "shell".into()],
-            },
-        )
-        .unwrap();
-        assert_eq!(tool_names(&replaced), vec!["read", "shell"]);
-
-        let reshaped = select_child_tools(
-            &parent,
-            &ToolPolicy::InheritWithOverrides {
-                add: vec!["write".into()],
-                remove: vec!["shell".into(), "write".into()],
-            },
-        )
-        .unwrap();
-        assert_eq!(tool_names(&reshaped), vec!["read", "search", "write"]);
-    }
-
-    #[test]
-    fn select_child_tools_rejects_unknown_replace_tool() {
-        let parent = vec![dummy_tool("read")];
-        let result = select_child_tools(
-            &parent,
-            &ToolPolicy::Replace {
-                tools: vec!["missing".into()],
-            },
-        );
-        let err = match result {
-            Ok(_) => panic!("expected missing tool to fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("missing"));
-    }
-
-    #[test]
-    fn select_child_tools_rejects_unknown_remove_tool() {
-        let parent = vec![dummy_tool("read")];
-        let result = select_child_tools(
-            &parent,
-            &ToolPolicy::InheritWithOverrides {
-                add: Vec::new(),
-                remove: vec!["missing".into()],
-            },
-        );
-        let err = match result {
-            Ok(_) => panic!("expected missing remove tool to fail"),
-            Err(err) => err,
-        };
-
-        assert!(err
-            .to_string()
-            .contains("subagent tool 'missing' is not available"));
-    }
-
-    fn dummy_tool(name: &str) -> Arc<dyn Tool> {
-        Arc::new(AgentTool::new(
-            name,
-            "test tool",
-            AgentToolParameters::empty(),
-            |_args, _ctx| async { Ok(serde_json::Value::Null) },
-        ))
-    }
-
-    fn tool_names(tools: &[Arc<dyn Tool>]) -> Vec<&str> {
-        tools.iter().map(|tool| tool.name()).collect()
     }
 }

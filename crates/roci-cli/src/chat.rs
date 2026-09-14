@@ -219,7 +219,9 @@ pub async fn handle_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error
             );
         }
     }
-    let tools = roci_tools::builtin::tool_catalog().resolve(&tool_visibility_policy);
+    // The SDK applies visibility after dynamic discovery, preserving native
+    // names and aliases even when the host hides their tools.
+    let tools = roci_tools::builtin::tool_catalog().resolve(&ToolVisibilityPolicy::default());
     let agent_config = AgentConfig {
         candidates,
         system_prompt,
@@ -354,9 +356,13 @@ fn tool_visibility_policy_from_args<'a>(
     allowed_tools: impl IntoIterator<Item = &'a str>,
     excluded_tools: impl IntoIterator<Item = &'a str>,
 ) -> ToolVisibilityPolicy {
-    let mut policy = ToolVisibilityPolicy::default();
+    let allowed_tools = allowed_tools.into_iter().collect::<Vec<_>>();
+    let mut policy = if allowed_tools.is_empty() {
+        ToolVisibilityPolicy::default()
+    } else {
+        ToolVisibilityPolicy::allow_only(allowed_tools)
+    };
     policy.set_no_tools(no_tools);
-    policy.extend_allow(allowed_tools);
     policy.extend_exclude(excluded_tools);
     policy
 }
@@ -379,6 +385,24 @@ mod tests {
         persist_explicit_agent_profile,
     };
     use crate::cli::ChatApprovalArg;
+
+    #[test]
+    fn cli_tool_filters_preserve_unfiltered_default_and_host_restrictions() {
+        for (no_tools, allow, exclude, expected) in [
+            (false, vec![], vec![], vec!["read_file", "shell"]),
+            (false, vec!["read_file"], vec![], vec!["read_file"]),
+            (false, vec![], vec!["shell"], vec!["read_file"]),
+            (false, vec!["shell"], vec!["shell"], vec![]),
+            (true, vec!["read_file"], vec![], vec![]),
+        ] {
+            let policy = super::tool_visibility_policy_from_args(no_tools, allow, exclude);
+            let visible = ["read_file", "shell"]
+                .into_iter()
+                .filter(|name| policy.allows(name))
+                .collect::<Vec<_>>();
+            assert_eq!(visible, expected);
+        }
+    }
 
     #[test]
     fn copilot_provider_available_in_default_registry() {

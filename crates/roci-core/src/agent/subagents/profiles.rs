@@ -8,6 +8,7 @@ use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::models::LanguageModel;
 use crate::provider::ProviderRegistry;
+use crate::tools::catalog::{ToolCatalog, ToolVisibilityPolicy};
 
 use super::config::{TomlProfile, TomlProfileFile};
 use super::types::{
@@ -315,6 +316,22 @@ pub fn project_subagent_profile(
         skills: profile.skills.clone(),
         mcp_servers,
     })
+}
+
+/// Apply native projection restrictions without releasing excluded names or
+/// aliases for dynamic tools to reuse. Unrelated dynamic tools retain host policy.
+pub(crate) fn profile_tool_visibility_policy(
+    base: &ToolVisibilityPolicy,
+    catalog: &ToolCatalog,
+    projection: &NativeToolProjection,
+) -> ToolVisibilityPolicy {
+    let mut policy = base.clone();
+    for descriptor in catalog.descriptors() {
+        if !projection.dispatch.contains(&descriptor.name) {
+            policy.extend_exclude(std::iter::once(descriptor.name).chain(descriptor.aliases));
+        }
+    }
+    policy
 }
 
 fn is_viable_model_candidate(

@@ -106,6 +106,51 @@ pub trait DynamicToolProvider: Send + Sync {
     }
 }
 
+/// Select providers scoped to the requested server IDs, rejecting unavailable IDs.
+/// An empty selection grants no dynamic tools.
+#[cfg(feature = "agent")]
+pub(crate) fn scope_dynamic_tool_providers(
+    parent_providers: &[Arc<dyn DynamicToolProvider>],
+    requested_server_ids: &[String],
+) -> Result<Vec<Arc<dyn DynamicToolProvider>>, RociError> {
+    if requested_server_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut matched_server_ids = std::collections::HashSet::new();
+    let mut selected = Vec::<Arc<dyn DynamicToolProvider>>::new();
+    for provider in parent_providers {
+        let provider_server_ids = provider.server_ids();
+        let intersection = requested_server_ids
+            .iter()
+            .filter(|server_id| provider_server_ids.contains(server_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if intersection.is_empty() {
+            continue;
+        }
+        matched_server_ids.extend(intersection.iter().cloned());
+        selected.push(Arc::new(ScopedDynamicToolProvider::new(
+            provider.clone(),
+            intersection,
+        )));
+    }
+
+    let unknown = requested_server_ids
+        .iter()
+        .filter(|server_id| !matched_server_ids.contains(*server_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(RociError::Configuration(format!(
+            "MCP server ids are not available from dynamic providers: {}",
+            unknown.join(", ")
+        )));
+    }
+
+    Ok(selected)
+}
+
 /// Restricts dynamic discovery to a fixed set of provider server ids.
 pub struct ScopedDynamicToolProvider {
     provider: Arc<dyn DynamicToolProvider>,

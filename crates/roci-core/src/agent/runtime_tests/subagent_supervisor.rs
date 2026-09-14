@@ -17,7 +17,7 @@ use crate::agent::subagents::supervisor::SubagentSupervisor;
 use crate::agent::subagents::types::SubagentEvent;
 use crate::agent::subagents::types::{
     ModelCandidate, SnapshotMode, SubagentContext, SubagentInput, SubagentProfile, SubagentSpec,
-    SubagentStatus, SubagentSupervisorConfig,
+    SubagentStatus, SubagentSupervisorConfig, ToolPolicy,
 };
 use crate::agent::subagents::SubagentPromptPolicy;
 use crate::agent_loop::AgentEvent;
@@ -27,10 +27,12 @@ use crate::models::{LanguageModel, ModelCapabilities, ModelInputCapabilities};
 use crate::provider::{
     ModelProvider, ProviderFactory, ProviderRegistry, ProviderRequest, ProviderResponse,
 };
+use crate::tools::dynamic::{DynamicTool, DynamicToolProvider};
 use crate::tools::tool::Tool;
 use crate::tools::{
-    AgentTool, AgentToolParameters, AskUserPrompt, ToolSafetyKind, ToolSafetyPlan,
-    ToolSafetySummary, UserInputRequest, UserInputResult,
+    AgentTool, AgentToolParameters, AskUserPrompt, ToolArguments, ToolExecutionContext,
+    ToolSafetyKind, ToolSafetyPlan, ToolSafetySummary, ToolVisibilityPolicy, UserInputRequest,
+    UserInputResult,
 };
 use crate::types::{ModelMessage, Role, StreamEventType, TextStreamDelta, Usage};
 
@@ -136,6 +138,7 @@ fn make_supervisor_with_config(sup_config: SubagentSupervisorConfig) -> Subagent
 struct RecordingProviderFactory {
     requests: Arc<Mutex<Vec<ProviderRequest>>>,
     response_text: String,
+    tool_calls: Vec<String>,
 }
 
 impl RecordingProviderFactory {
@@ -143,6 +146,7 @@ impl RecordingProviderFactory {
         Self {
             requests,
             response_text: response_text.into(),
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -163,6 +167,7 @@ impl ProviderFactory for RecordingProviderFactory {
             model_id: model_id.to_string(),
             requests: self.requests.clone(),
             response_text: self.response_text.clone(),
+            tool_calls: self.tool_calls.clone(),
             capabilities: ModelCapabilities {
                 supports_streaming: false,
                 input: ModelInputCapabilities::default(),
@@ -177,6 +182,7 @@ struct RecordingProvider {
     model_id: String,
     requests: Arc<Mutex<Vec<ProviderRequest>>>,
     response_text: String,
+    tool_calls: Vec<String>,
     capabilities: ModelCapabilities,
 }
 
@@ -211,6 +217,47 @@ impl ModelProvider for RecordingProvider {
             .lock()
             .expect("request capture lock should not be poisoned")
             .push(request.clone());
+
+        if !self.tool_calls.is_empty()
+            && !request
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Tool)
+        {
+            let mut deltas = self
+                .tool_calls
+                .iter()
+                .map(|name| {
+                    Ok(TextStreamDelta {
+                        text: String::new(),
+                        event_type: StreamEventType::ToolCallDelta,
+                        tool_call: Some(crate::types::AgentToolCall {
+                            id: format!("call-{name}"),
+                            name: name.clone(),
+                            arguments: serde_json::json!({}),
+                            called_as: None,
+                            recipient: None,
+                        }),
+                        finish_reason: None,
+                        usage: None,
+                        reasoning: None,
+                        reasoning_signature: None,
+                        reasoning_type: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            deltas.push(Ok(TextStreamDelta {
+                text: String::new(),
+                event_type: StreamEventType::Done,
+                tool_call: None,
+                finish_reason: None,
+                usage: Some(Usage::default()),
+                reasoning: None,
+                reasoning_signature: None,
+                reasoning_type: None,
+            }));
+            return Ok(Box::pin(stream::iter(deltas)));
+        }
 
         Ok(Box::pin(futures::stream::iter(vec![
             Ok(TextStreamDelta {
@@ -272,6 +319,467 @@ fn make_recording_supervisor(
         profile_registry,
     );
     (supervisor, requests)
+}
+
+fn make_tool_policy_supervisor(
+    mut base_config: AgentConfig,
+    mut profile: SubagentProfile,
+    attempted_tools: &[&str],
+) -> (SubagentSupervisor, Arc<Mutex<Vec<ProviderRequest>>>) {
+    base_config.approval_policy = crate::agent_loop::ApprovalPolicy::always();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut factory = RecordingProviderFactory::new(requests.clone(), "child finished");
+    factory.tool_calls = attempted_tools
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(factory));
+    let roci_config = RociConfig::default();
+    roci_config.set_api_key("test", "test-key".into());
+    profile.name = "test:policy".into();
+    profile.models = vec![ModelCandidate {
+        provider: "test".into(),
+        model: "test-model".into(),
+        reasoning_effort: None,
+    }];
+    let mut profiles = SubagentProfileRegistry::new();
+    profiles.register(profile).unwrap();
+    (
+        SubagentSupervisor::new(
+            Arc::new(registry),
+            roci_config,
+            base_config,
+            SubagentSupervisorConfig::default(),
+            profiles,
+        ),
+        requests,
+    )
+}
+
+fn counting_tool(name: &str, calls: &Arc<Mutex<Vec<String>>>) -> Arc<dyn Tool> {
+    let calls = calls.clone();
+    let tool_name = name.to_string();
+    Arc::new(
+        AgentTool::new(
+            name,
+            "records execution",
+            AgentToolParameters::empty(),
+            move |_, _| {
+                let calls = calls.clone();
+                let name = tool_name.clone();
+                async move {
+                    calls.lock().unwrap().push(name.clone());
+                    Ok(serde_json::json!({ "executed": name }))
+                }
+            },
+        )
+        .with_static_safety(
+            ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+            ToolSafetySummary {
+                read_only_by_default: true,
+                destructive_by_default: false,
+                concurrency_safe_by_default: true,
+                approval_kind: ToolSafetyKind::Read,
+            },
+        ),
+    )
+}
+
+async fn run_tool_policy_child(
+    supervisor: &SubagentSupervisor,
+) -> crate::agent::subagents::types::SubagentRunResult {
+    let handle = supervisor
+        .spawn(SubagentSpec {
+            profile: "test:policy".into(),
+            label: None,
+            input: SubagentInput::Prompt {
+                task: "exercise the tools".into(),
+            },
+            overrides: Default::default(),
+        })
+        .await
+        .expect("child should launch");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+        .await
+        .expect("scripted child should finish");
+    assert_eq!(
+        result.status,
+        SubagentStatus::Completed,
+        "{:?}",
+        result.messages
+    );
+    result
+}
+
+fn advertised_tool_names(requests: &Arc<Mutex<Vec<ProviderRequest>>>) -> Vec<String> {
+    requests.lock().unwrap()[0]
+        .tools
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
+fn assert_tool_rejected(messages: &[ModelMessage], name: &str) {
+    let result = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|part| match part {
+            crate::types::ContentPart::ToolResult(result)
+                if result.tool_call_id == format!("call-{name}") =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("forced tool call should receive a result");
+    assert!(result.is_error, "hidden tool must return an error");
+    assert!(result.result["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not found"));
+}
+
+#[tokio::test]
+async fn child_profile_exclusions_hide_schema_and_reject_forced_dispatch() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut config = make_base_config();
+    config.tools = vec![
+        counting_tool("allowed", &calls),
+        counting_tool("excluded", &calls),
+    ];
+    let (supervisor, requests) = make_tool_policy_supervisor(
+        config,
+        SubagentProfile {
+            excluded_tools: vec!["excluded".into()],
+            ..Default::default()
+        },
+        &["excluded", "allowed"],
+    );
+
+    let result = run_tool_policy_child(&supervisor).await;
+
+    assert_eq!(advertised_tool_names(&requests), ["allowed"]);
+    assert_eq!(*calls.lock().unwrap(), ["allowed"]);
+    assert_tool_rejected(&result.messages, "excluded");
+}
+
+#[tokio::test]
+async fn child_profile_main_only_exclusion_keeps_child_tool_callable() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut config = make_base_config();
+    config.tools = vec![counting_tool("child_allowed", &calls)];
+    let (supervisor, requests) = make_tool_policy_supervisor(
+        config,
+        SubagentProfile {
+            default_agent_excluded_tools: vec!["child_allowed".into()],
+            ..Default::default()
+        },
+        &["child_allowed"],
+    );
+
+    run_tool_policy_child(&supervisor).await;
+
+    assert_eq!(advertised_tool_names(&requests), ["child_allowed"]);
+    assert_eq!(*calls.lock().unwrap(), ["child_allowed"]);
+}
+
+#[tokio::test]
+async fn child_profile_cannot_widen_host_tool_visibility() {
+    for host_policy in [
+        ToolVisibilityPolicy::exclude(["host_denied"]),
+        ToolVisibilityPolicy::allow_only(["allowed"]),
+        ToolVisibilityPolicy::no_tools(),
+    ] {
+        let no_tools = host_policy.is_no_tools();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_base_config();
+        config.tools = vec![
+            counting_tool("allowed", &calls),
+            counting_tool("host_denied", &calls),
+        ];
+        config.tool_visibility_policy = host_policy;
+        let (supervisor, requests) = make_tool_policy_supervisor(
+            config,
+            SubagentProfile::default(),
+            &["host_denied", "allowed"],
+        );
+
+        let result = run_tool_policy_child(&supervisor).await;
+
+        let expected = if no_tools { vec![] } else { vec!["allowed"] };
+        assert_eq!(advertised_tool_names(&requests), expected);
+        assert_eq!(*calls.lock().unwrap(), expected);
+        assert_tool_rejected(&result.messages, "host_denied");
+        if no_tools {
+            assert_tool_rejected(&result.messages, "allowed");
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_profile_explicit_host_forbidden_tool_fails_before_provider_call() {
+    for tools in [
+        ToolPolicy::Replace {
+            tools: vec!["host_denied".into()],
+        },
+        ToolPolicy::InheritWithOverrides {
+            add: vec!["host_denied".into()],
+            remove: Vec::new(),
+        },
+    ] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_base_config();
+        config.tools = vec![counting_tool("host_denied", &calls)];
+        config.tool_visibility_policy = ToolVisibilityPolicy::exclude(["host_denied"]);
+        let (supervisor, requests) = make_tool_policy_supervisor(
+            config,
+            SubagentProfile {
+                tools,
+                ..Default::default()
+            },
+            &["host_denied"],
+        );
+
+        let error = supervisor
+            .spawn(SubagentSpec {
+                profile: "test:policy".into(),
+                label: None,
+                input: SubagentInput::Prompt {
+                    task: "exercise the tools".into(),
+                },
+                overrides: Default::default(),
+            })
+            .await
+            .err()
+            .expect("host-forbidden explicit tool should reject child configuration");
+
+        assert!(
+            matches!(error, RociError::Configuration(message) if message.contains("host_denied"))
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn child_profile_empty_native_selection_rejects_forced_dispatch() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut config = make_base_config();
+    config.tools = vec![counting_tool("native", &calls)];
+    let (supervisor, requests) = make_tool_policy_supervisor(
+        config,
+        SubagentProfile {
+            tools: ToolPolicy::Replace { tools: Vec::new() },
+            ..Default::default()
+        },
+        &["native"],
+    );
+
+    let result = run_tool_policy_child(&supervisor).await;
+
+    assert!(advertised_tool_names(&requests).is_empty());
+    assert!(calls.lock().unwrap().is_empty());
+    assert_tool_rejected(&result.messages, "native");
+}
+
+struct ScopedPolicyTools {
+    calls: Arc<Mutex<Vec<String>>>,
+    tools: Vec<(String, DynamicTool)>,
+}
+
+fn scoped_policy_tools(
+    calls: &Arc<Mutex<Vec<String>>>,
+    tools: &[(&str, &str, Option<&str>)],
+) -> Arc<dyn DynamicToolProvider> {
+    Arc::new(ScopedPolicyTools {
+        calls: calls.clone(),
+        tools: tools
+            .iter()
+            .map(|(server_id, name, alias)| {
+                let mut tool = DynamicTool::new(*name, "server tool", AgentToolParameters::empty())
+                    .with_safety(
+                        ToolSafetyPlan::safe_read_only(ToolSafetyKind::Read),
+                        ToolSafetySummary {
+                            read_only_by_default: true,
+                            destructive_by_default: false,
+                            concurrency_safe_by_default: true,
+                            approval_kind: ToolSafetyKind::Read,
+                        },
+                    );
+                tool.aliases = alias.iter().map(|alias| (*alias).to_string()).collect();
+                ((*server_id).to_string(), tool)
+            })
+            .collect(),
+    })
+}
+
+#[async_trait]
+impl DynamicToolProvider for ScopedPolicyTools {
+    fn server_ids(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .map(|(server_id, _)| server_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    async fn list_tools(&self) -> Result<Vec<DynamicTool>, RociError> {
+        self.list_tools_for_servers(&self.server_ids()).await
+    }
+
+    async fn list_tools_for_servers(
+        &self,
+        server_ids: &[String],
+    ) -> Result<Vec<DynamicTool>, RociError> {
+        Ok(self
+            .tools
+            .iter()
+            .filter(|(server_id, _)| server_ids.contains(server_id))
+            .map(|(_, tool)| tool.clone())
+            .collect())
+    }
+
+    async fn execute_tool(
+        &self,
+        name: &str,
+        _args: &ToolArguments,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<serde_json::Value, RociError> {
+        self.calls.lock().unwrap().push(name.to_string());
+        Ok(serde_json::json!({ "executed": name }))
+    }
+
+    async fn execute_tool_for_servers(
+        &self,
+        server_ids: &[String],
+        name: &str,
+        args: &ToolArguments,
+        ctx: &ToolExecutionContext,
+    ) -> Result<serde_json::Value, RociError> {
+        if !self.tools.iter().any(|(server_id, tool)| {
+            server_ids.contains(server_id)
+                && (tool.name == name || tool.aliases.iter().any(|alias| alias == name))
+        }) {
+            return Err(RociError::InvalidState(
+                "tool is outside server selection".into(),
+            ));
+        }
+        self.execute_tool(name, args, ctx).await
+    }
+}
+
+#[tokio::test]
+async fn child_profile_scopes_mcp_without_reenabling_empty_native_selection() {
+    for mcp_servers in [vec!["alpha".to_string()], Vec::new()] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_base_config();
+        config.tools = vec![counting_tool("native", &calls)];
+        config.dynamic_tool_providers = vec![scoped_policy_tools(
+            &calls,
+            &[("alpha", "alpha_tool", None), ("beta", "beta_tool", None)],
+        )];
+        let has_mcp = !mcp_servers.is_empty();
+        let (supervisor, requests) = make_tool_policy_supervisor(
+            config,
+            SubagentProfile {
+                tools: ToolPolicy::Replace { tools: Vec::new() },
+                mcp_servers,
+                ..Default::default()
+            },
+            &["native", "alpha_tool", "beta_tool"],
+        );
+
+        let result = run_tool_policy_child(&supervisor).await;
+
+        let expected = if has_mcp { vec!["alpha_tool"] } else { vec![] };
+        assert_eq!(advertised_tool_names(&requests), expected);
+        assert_eq!(*calls.lock().unwrap(), expected);
+        assert_tool_rejected(&result.messages, "native");
+        assert_tool_rejected(&result.messages, "beta_tool");
+        if !has_mcp {
+            assert_tool_rejected(&result.messages, "alpha_tool");
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_profile_excluded_native_name_cannot_be_reclaimed_by_mcp() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut config = make_base_config();
+    config.tools = vec![counting_tool("shell", &calls)];
+    config.dynamic_tool_providers = vec![scoped_policy_tools(
+        &calls,
+        &[("alpha", "shell", None), ("alpha", "allowed_remote", None)],
+    )];
+    let (supervisor, requests) = make_tool_policy_supervisor(
+        config,
+        SubagentProfile {
+            excluded_tools: vec!["shell".into()],
+            mcp_servers: vec!["alpha".into()],
+            ..Default::default()
+        },
+        &["shell", "allowed_remote"],
+    );
+
+    let result = run_tool_policy_child(&supervisor).await;
+
+    assert_eq!(advertised_tool_names(&requests), ["allowed_remote"]);
+    assert_eq!(*calls.lock().unwrap(), ["allowed_remote"]);
+    assert_tool_rejected(&result.messages, "shell");
+}
+
+#[tokio::test]
+async fn child_profile_mcp_alias_collision_with_excluded_native_fails_before_provider() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut config = make_base_config();
+    config.tools = vec![counting_tool("shell", &calls)];
+    config.dynamic_tool_providers = vec![scoped_policy_tools(
+        &calls,
+        &[
+            ("alpha", "remote_shell", Some("shell")),
+            ("alpha", "allowed_remote", None),
+        ],
+    )];
+    let (supervisor, requests) = make_tool_policy_supervisor(
+        config,
+        SubagentProfile {
+            excluded_tools: vec!["shell".into()],
+            mcp_servers: vec!["alpha".into()],
+            ..Default::default()
+        },
+        &["shell", "remote_shell", "allowed_remote"],
+    );
+
+    let handle = supervisor
+        .spawn(SubagentSpec {
+            profile: "test:policy".into(),
+            label: None,
+            input: SubagentInput::Prompt {
+                task: "exercise the tools".into(),
+            },
+            overrides: Default::default(),
+        })
+        .await
+        .expect("child runtime should launch before discovering MCP tools");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+        .await
+        .expect("child should reject alias collision without hanging");
+
+    assert_eq!(result.status, SubagentStatus::Failed);
+    let error = result
+        .error
+        .as_deref()
+        .expect("alias collision should explain child failure");
+    assert!(
+        error.contains("shell") && error.contains("collides"),
+        "{error}"
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(calls.lock().unwrap().is_empty());
 }
 
 struct BlockingAskUserFactory;

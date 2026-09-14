@@ -625,3 +625,133 @@ fn subagent_snapshot(
         _ => None,
     }
 }
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn main_profile_empty_native_selection_does_not_reopen_catalog() {
+    let mut profiles = SubagentProfileRegistry::new();
+    profiles
+        .register(SubagentProfile {
+            name: "empty".into(),
+            tools: crate::agent::subagents::ToolPolicy::Replace { tools: vec![] },
+            default: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut config = test_agent_config();
+    config.tools = vec![dummy_tool("read_file")];
+    config.subagents = Some(AgentSubagentConfig {
+        profiles,
+        enabled: true,
+        main_profile: None,
+        supervisor: Default::default(),
+    });
+    let agent = AgentRuntime::new(test_registry(), test_config(), config);
+
+    // Includes the injected management tools: an exact empty selection must
+    // not restore either those tools or the host's read_file tool.
+    assert!(resolved_tool_names(&agent).await.is_empty());
+}
+
+#[cfg(feature = "agent")]
+struct ProfileMcpProvider;
+
+#[cfg(feature = "agent")]
+#[async_trait::async_trait]
+impl DynamicToolProvider for ProfileMcpProvider {
+    fn server_ids(&self) -> Vec<String> {
+        vec!["docs".into(), "private".into()]
+    }
+
+    async fn list_tools(&self) -> Result<Vec<DynamicTool>, RociError> {
+        panic!("a selected profile must use scoped discovery");
+    }
+
+    async fn list_tools_for_servers(
+        &self,
+        server_ids: &[String],
+    ) -> Result<Vec<DynamicTool>, RociError> {
+        assert_eq!(server_ids, ["docs"]);
+        Ok(vec![DynamicTool::new(
+            "documentation_search",
+            "Search documentation",
+            AgentToolParameters::empty(),
+        )])
+    }
+
+    async fn execute_tool(
+        &self,
+        _name: &str,
+        _args: &ToolArguments,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<serde_json::Value, RociError> {
+        panic!("this fixture verifies discovery only");
+    }
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn main_profile_native_selection_and_mcp_scope_are_independent() {
+    for (native, servers, expected) in [
+        (
+            vec!["read_file"],
+            vec!["docs"],
+            vec!["read_file", "documentation_search"],
+        ),
+        (vec![], vec!["docs"], vec!["documentation_search"]),
+        (vec![], vec![], vec![]),
+    ] {
+        let mut profiles = SubagentProfileRegistry::new();
+        profiles
+            .register(SubagentProfile {
+                name: "scoped".into(),
+                tools: crate::agent::subagents::ToolPolicy::Replace {
+                    tools: native.into_iter().map(str::to_owned).collect(),
+                },
+                mcp_servers: servers.into_iter().map(str::to_owned).collect(),
+                default: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut config = test_agent_config();
+        config.tools = vec![dummy_tool("read_file"), dummy_tool("shell")];
+        config.dynamic_tool_providers = vec![Arc::new(ProfileMcpProvider)];
+        config.subagents = Some(AgentSubagentConfig {
+            profiles,
+            enabled: true,
+            main_profile: None,
+            supervisor: Default::default(),
+        });
+        let agent = AgentRuntime::new(test_registry(), test_config(), config);
+        assert_eq!(resolved_tool_names(&agent).await, expected);
+    }
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn main_profile_rejects_mcp_server_not_registered_with_host() {
+    let mut profiles = SubagentProfileRegistry::new();
+    profiles
+        .register(SubagentProfile {
+            name: "unknown-server".into(),
+            mcp_servers: vec!["missing".into()],
+            default: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut config = test_agent_config();
+    config.dynamic_tool_providers = vec![Arc::new(ProfileMcpProvider)];
+    config.subagents = Some(AgentSubagentConfig {
+        profiles,
+        enabled: true,
+        main_profile: None,
+        supervisor: Default::default(),
+    });
+    let agent = AgentRuntime::new(test_registry(), test_config(), config);
+    let error = match agent.resolve_tools_for_run().await {
+        Ok(_) => panic!("unknown MCP server must be rejected before discovery"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, RociError::Configuration(message)
+        if message.contains("unknown mcp server 'missing'")));
+}

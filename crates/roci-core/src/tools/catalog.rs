@@ -20,7 +20,7 @@ pub enum ToolOrigin {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolVisibilityPolicy {
     no_tools: bool,
-    allow: BTreeSet<String>,
+    allow: Option<BTreeSet<String>>,
     exclude: BTreeSet<String>,
 }
 
@@ -30,17 +30,17 @@ impl ToolVisibilityPolicy {
     pub fn no_tools() -> Self {
         Self {
             no_tools: true,
-            allow: BTreeSet::new(),
+            allow: None,
             exclude: BTreeSet::new(),
         }
     }
 
-    /// Build policy that allows only listed tool names.
+    /// Build policy that allows only listed tool names. An empty list allows no tools.
     #[must_use]
     pub fn allow_only(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             no_tools: false,
-            allow: names.into_iter().map(Into::into).collect(),
+            allow: Some(names.into_iter().map(Into::into).collect()),
             exclude: BTreeSet::new(),
         }
     }
@@ -50,14 +50,16 @@ impl ToolVisibilityPolicy {
     pub fn exclude(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             no_tools: false,
-            allow: BTreeSet::new(),
+            allow: None,
             exclude: names.into_iter().map(Into::into).collect(),
         }
     }
 
     /// Add allowed tool names.
     pub fn extend_allow(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
-        self.allow.extend(names.into_iter().map(Into::into));
+        self.allow
+            .get_or_insert_with(BTreeSet::new)
+            .extend(names.into_iter().map(Into::into));
     }
 
     /// Add excluded tool names.
@@ -76,13 +78,13 @@ impl ToolVisibilityPolicy {
         self.no_tools
     }
 
-    /// Allowed-name set. Empty means all names allowed unless excluded.
+    /// Allowed-name set. `None` is unrestricted; `Some(empty)` allows no tools.
     ///
     /// Precedence: [`Self::no_tools`] hides every tool, then exclusions hide
-    /// matching names, then non-empty allow set admits only matching names.
+    /// matching names, then an explicit allow set admits only matching names.
     #[must_use]
-    pub const fn allow(&self) -> &BTreeSet<String> {
-        &self.allow
+    pub const fn allow(&self) -> Option<&BTreeSet<String>> {
+        self.allow.as_ref()
     }
 
     /// Excluded-name set. Exclusions win over allow entries with same name.
@@ -97,7 +99,7 @@ impl ToolVisibilityPolicy {
         if self.no_tools || self.exclude.contains(name) {
             return false;
         }
-        self.allow.is_empty() || self.allow.contains(name)
+        self.allow.as_ref().is_none_or(|allow| allow.contains(name))
     }
 
     /// Return whether a descriptor should be visible.
@@ -110,7 +112,7 @@ impl ToolVisibilityPolicy {
         if self.no_tools || matches(&self.exclude) {
             return false;
         }
-        self.allow.is_empty() || matches(&self.allow)
+        self.allow.as_ref().is_none_or(matches)
     }
 }
 
@@ -518,6 +520,14 @@ mod tests {
         .unwrap();
 
         for (policy, expected) in [
+            (
+                ToolVisibilityPolicy::default(),
+                vec!["read_file", "write_file"],
+            ),
+            (
+                ToolVisibilityPolicy::allow_only(Vec::<String>::new()),
+                vec![],
+            ),
             (
                 ToolVisibilityPolicy::allow_only(["read_file"]),
                 vec!["read_file"],

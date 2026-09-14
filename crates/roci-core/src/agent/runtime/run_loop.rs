@@ -20,7 +20,10 @@ use crate::types::{
     GenerationSettings, ModelMessage, OpenAiResponsesOptions, ResponseFormat, Role,
 };
 #[cfg(feature = "agent")]
-use crate::{agent::subagents::project_main_agent_profile, tools::catalog::ToolVisibilityPolicy};
+use crate::{
+    agent::subagents::{profiles::profile_tool_visibility_policy, project_main_agent_profile},
+    tools::dynamic::scope_dynamic_tool_providers,
+};
 
 enum TerminalTurnOutcome {
     Completed,
@@ -111,11 +114,43 @@ impl AgentRuntime {
 
     pub(super) async fn resolve_tools_for_run(&self) -> Result<Vec<Arc<dyn Tool>>, RociError> {
         let static_tools = self.tools.lock().await.clone();
-        let providers = self.dynamic_tool_providers.lock().await.clone();
-        let mut catalog = Self::merge_static_and_dynamic_tools(static_tools, providers).await?;
+        let mut providers = self.dynamic_tool_providers.lock().await.clone();
+        let mut catalog = ToolCatalog::from_tools(static_tools, ToolOrigin::Custom)?;
+        let mut policy = self.config.tool_visibility_policy.clone();
         #[cfg(feature = "agent")]
-        self.inject_subagent_tools(&mut catalog)?;
-        let policy = self.effective_tool_visibility_policy(&catalog).await?;
+        {
+            self.inject_subagent_tools(&mut catalog)?;
+            if let Some(controller) = &self.subagent_controller {
+                if let Some(profile) = controller
+                    .effective_main_profile(&crate::agent::subagents::SubagentCaller::main_agent())
+                    .await?
+                {
+                    // Project native tools before dynamic discovery. MCP selection has
+                    // its own server-level contract and must not be filtered as native names.
+                    let base_names = catalog
+                        .resolve_descriptors(&self.config.tool_visibility_policy)
+                        .into_iter()
+                        .map(|descriptor| descriptor.name)
+                        .collect::<Vec<_>>();
+                    let base_name_refs = base_names.iter().map(String::as_str).collect::<Vec<_>>();
+                    let server_ids = providers
+                        .iter()
+                        .flat_map(|provider| provider.server_ids())
+                        .collect::<Vec<_>>();
+                    let server_id_refs = server_ids.iter().map(String::as_str).collect::<Vec<_>>();
+                    let projection =
+                        project_main_agent_profile(&profile, &base_name_refs, &server_id_refs)?;
+                    policy =
+                        profile_tool_visibility_policy(&policy, &catalog, &projection.native_tools);
+                    providers = scope_dynamic_tool_providers(
+                        &providers,
+                        &projection.mcp_servers.server_ids,
+                    )?;
+                }
+            }
+        }
+        Self::merge_dynamic_tools(&mut catalog, providers).await?;
+        // Host policy remains the ceiling for both native and discovered tools.
         Ok(catalog.resolve(&policy))
     }
 
@@ -130,52 +165,10 @@ impl AgentRuntime {
         Ok(())
     }
 
-    #[cfg(feature = "agent")]
-    async fn effective_tool_visibility_policy(
-        &self,
-        catalog: &ToolCatalog,
-    ) -> Result<ToolVisibilityPolicy, RociError> {
-        let base_policy = &self.config.tool_visibility_policy;
-        let Some(controller) = &self.subagent_controller else {
-            return Ok(base_policy.clone());
-        };
-        let Some(profile) = controller
-            .effective_main_profile(&crate::agent::subagents::SubagentCaller::main_agent())
-            .await?
-        else {
-            return Ok(base_policy.clone());
-        };
-        let base_names = catalog
-            .resolve_descriptors(base_policy)
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<Vec<_>>();
-        let base_name_refs = base_names.iter().map(String::as_str).collect::<Vec<_>>();
-        let available_mcp_servers = profile
-            .mcp_servers
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let projection =
-            project_main_agent_profile(&profile, &base_name_refs, &available_mcp_servers)?;
-        Ok(ToolVisibilityPolicy::allow_only(
-            projection.native_tools.dispatch,
-        ))
-    }
-
-    #[cfg(not(feature = "agent"))]
-    async fn effective_tool_visibility_policy(
-        &self,
-        _catalog: &ToolCatalog,
-    ) -> Result<crate::tools::catalog::ToolVisibilityPolicy, RociError> {
-        Ok(self.config.tool_visibility_policy.clone())
-    }
-
-    async fn merge_static_and_dynamic_tools(
-        static_tools: Vec<Arc<dyn Tool>>,
+    async fn merge_dynamic_tools(
+        catalog: &mut ToolCatalog,
         providers: Vec<Arc<dyn DynamicToolProvider>>,
-    ) -> Result<ToolCatalog, RociError> {
-        let mut catalog = ToolCatalog::from_tools(static_tools, ToolOrigin::Custom)?;
+    ) -> Result<(), RociError> {
         for provider in providers {
             let discovered = provider.list_tools().await?;
             for tool in discovered {
@@ -185,7 +178,7 @@ impl AgentRuntime {
                 )?;
             }
         }
-        Ok(catalog)
+        Ok(())
     }
 
     pub(super) async fn current_turn_options(

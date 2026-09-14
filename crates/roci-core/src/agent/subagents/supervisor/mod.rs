@@ -38,15 +38,16 @@ use crate::agent::runtime::HumanInteractionCoordinator;
 use crate::config::RociConfig;
 use crate::error::RociError;
 use crate::provider::ProviderRegistry;
+use crate::tools::catalog::{ToolCatalog, ToolOrigin, ToolVisibilityPolicy};
+use crate::tools::dynamic::scope_dynamic_tool_providers;
 
 use super::context::build_child_initial_messages;
 use super::events::{emit_subagent_event, CriticalSubagentEventSink};
 use super::handle::SubagentHandle;
-use super::launcher::{
-    build_child_config, select_child_dynamic_tool_providers, select_child_tools, InProcessLauncher,
-    SubagentLauncher,
+use super::launcher::{build_child_config, InProcessLauncher, SubagentLauncher};
+use super::profiles::{
+    profile_tool_visibility_policy, project_subagent_profile, SubagentProfileRegistry,
 };
-use super::profiles::SubagentProfileRegistry;
 use super::prompt::SubagentPromptPolicy;
 use super::types::{
     SubagentContext, SubagentEvent, SubagentId, SubagentRunResult, SubagentSnapshot, SubagentSpec,
@@ -248,20 +249,47 @@ impl SubagentSupervisor {
             self.critical_event_sink.clone(),
         );
 
-        let child_tools = select_child_tools(&self.base_config.tools, &profile.tools)?;
-        let child_dynamic_tool_providers = select_child_dynamic_tool_providers(
+        // Host policy is the capability ceiling; the main agent's profile can
+        // hide additional tools without withholding them from delegated children.
+        let catalog = ToolCatalog::from_tools(self.base_config.tools.clone(), ToolOrigin::Custom)?;
+        let host_tools = catalog.resolve(&self.base_config.tool_visibility_policy);
+        let native_names = host_tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+        let available_mcp_servers = self
+            .base_config
+            .dynamic_tool_providers
+            .iter()
+            .flat_map(|provider| provider.server_ids())
+            .collect::<Vec<_>>();
+        let available_mcp_server_refs = available_mcp_servers
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let projection =
+            project_subagent_profile(&profile, &native_names, &available_mcp_server_refs)?;
+        let child_policy = profile_tool_visibility_policy(
+            &self.base_config.tool_visibility_policy,
+            &catalog,
+            &projection.native_tools,
+        );
+        let child_dynamic_tool_providers = scope_dynamic_tool_providers(
             &self.base_config.dynamic_tool_providers,
-            &profile.mcp_servers,
+            &projection.mcp_servers.server_ids,
         )?;
         let mut child_config = build_child_config(
             &self.base_config,
             resolved_model.candidates.clone(),
-            child_tools,
+            // Keep the complete native namespace reserved through dynamic merge;
+            // the projected policy controls both schema visibility and dispatch.
+            catalog.resolve(&ToolVisibilityPolicy::default()),
             resolved_model.reasoning_effort.as_deref(),
             Some(child_event_sink),
             #[cfg(feature = "agent")]
             self.coordinator.clone(),
         )?;
+        child_config.tool_visibility_policy = child_policy;
         child_config.dynamic_tool_providers = child_dynamic_tool_providers;
 
         // 6. Launch child runtime seeded with the full initial messages.

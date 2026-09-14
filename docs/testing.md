@@ -338,6 +338,32 @@ Acceptance: log contains `[subagent] started`, `[subagent] ... completed`,
 
 Use `.env` for local secrets and `.env.example` as the template.
 
+### Profile capability enforcement
+
+Run the behavior coverage through actual child runtimes:
+
+```bash
+cargo test -p roci-core --features agent,mcp child_profile_
+cargo test -p roci-core --features agent,mcp main_profile_
+cargo test -p roci-cli cli_tool_filters
+```
+
+These checks cover excluded schemas and forced dispatch rejection, host policy,
+main-only exclusions, empty selections, scoped MCP execution, and native/MCP
+name or alias collisions. A passing projection-helper test alone does not prove
+child enforcement.
+
+For live verification, use the subagent tmux smoke above with a temporary
+profile containing `excluded_tools = ["shell"]` and
+`default_agent_excluded_tools = ["read_file"]`. Select that profile for the main
+runtime, create a random marker in a workspace-relative `sentinel.txt`, and ask
+the main agent to delegate reading it through `read_file`. The child must return
+the marker, with started/completed semantic events and CLI exit zero. This proves
+main-only exclusions do not remove child capabilities. A model's claim that a
+tool is unavailable is not evidence of denial; use the automated forced-dispatch
+tests for that assertion. Record the provider/model and show the tmux attach
+command. Report unavailable provider targets separately from successful runs.
+
 ### Durable subagent selection
 
 Run this separate smoke when profile persistence or resume precedence changes.
