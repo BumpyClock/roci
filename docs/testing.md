@@ -7,7 +7,12 @@
 - Runs tests across all workspace crates
 
 For all provider and capability features, run `cargo test --workspace --all-features`.
-Use the workspace MSRV (Rust 1.96.1 or newer).
+Use the pinned workspace toolchain, Rust 1.96.1. Reproducible external gates are
+`cargo test --workspace --locked` and
+`cargo test --workspace --all-features --locked`; neither is replaced by the
+opt-in push hook's fmt/check/Clippy checks. The hook stays offline and never
+runs live provider smoke, model inference or toolchain installation. See
+[contributing.md](contributing.md#opt-in-push-checks) for setup and harness tests.
 
 ### Per-crate testing
 
