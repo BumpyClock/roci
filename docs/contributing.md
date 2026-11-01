@@ -13,6 +13,32 @@ cargo build
 cargo test
 ```
 
+## Opt-in push checks
+
+`rust-toolchain.toml` pins the workspace MSRV, Rust 1.96.1, with rustfmt and
+Clippy. Prepare explicitly with
+`rustup toolchain install 1.96.1 --profile minimal --component rustfmt --component clippy`
+and `cargo +1.96.1 fetch --locked` before using offline push checks.
+
+Run `scripts/install-hooks.sh` explicitly to select the tracked `.githooks`
+directory. It is idempotent and refuses custom hooksPath settings or existing
+active hooks. It does not install tools, run validation, or copy hooks into
+shared Git directories. No hooks install automatically.
+
+The hook requires a clean checkout and all nondeleted pushed refs to equal
+checked-out HEAD. It never stashes or switches refs. Every push runs full
+workspace rustfmt, locked offline default-feature `cargo check`, and locked
+offline all-feature Clippy. No changed-file pruning is used, so new branches,
+unknown bases, empty ranges, renamed/deleted files and shared Cargo changes
+cannot skip workspace dependents. Deletion-only pushes skip checks. Missing
+prepared tools or offline dependencies fail, without downloads.
+
+`python3 scripts/test_hooks.py` exercises executable hooks and installers in
+disposable Git repos with stub Rust commands. Linux real-tool validation is
+separate from this harness. Windows/macOS hook execution remains unqualified.
+No latency budget is promised. Default/all-feature hermetic tests and live
+provider qualification remain separate gates in [testing.md](testing.md).
+
 ## Workspace Crates
 
 | Crate | Path | Purpose |
